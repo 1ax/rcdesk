@@ -1,14 +1,54 @@
+mod capture;
+mod encode;
+mod pipeline;
 mod platform;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let version = env!("CARGO_PKG_VERSION");
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
-    if std::env::args().nth(1).as_deref() == Some("--version") {
-        println!("{version}");
-        return Ok(());
-    }
+use clap::{Parser, Subcommand};
+use tokio::sync::mpsc::error::TryRecvError;
 
+use capture::FrameSource;
+use encode::openh264::OpenH264Encoder;
+use encode::{Encoder, EncoderConfig};
+use pipeline::Pipeline;
+
+#[derive(Parser)]
+#[command(name = "rcdesk-host", version, about = "rcdesk host agent")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// List capturable displays.
+    ListDisplays,
+    /// Run the capture -> convert -> encode pipeline without a network
+    /// transport, and print throughput/size statistics.
+    Bench {
+        /// Use the synthetic frame source instead of real screen capture.
+        #[arg(long)]
+        synthetic: bool,
+        /// Display id to capture (scap only); defaults to the first display.
+        #[arg(long)]
+        display: Option<u32>,
+        #[arg(long, default_value_t = 30)]
+        fps: u32,
+        #[arg(long, default_value_t = 6000)]
+        bitrate: u32,
+        #[arg(long, default_value_t = 5)]
+        seconds: u32,
+        /// Optional path to dump the raw Annex-B stream to.
+        #[arg(long)]
+        dump: Option<PathBuf>,
+    },
+}
+
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -16,8 +56,142 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    let version = env!("CARGO_PKG_VERSION");
     let platform = platform::name();
     tracing::info!("rcdesk-host {version} on {platform}");
 
+    let cli = Cli::parse();
+    match cli.command {
+        Command::ListDisplays => run_list_displays(),
+        Command::Bench {
+            synthetic,
+            display,
+            fps,
+            bitrate,
+            seconds,
+            dump,
+        } => run_bench(synthetic, display, fps, bitrate, seconds, dump),
+    }
+}
+
+fn run_list_displays() -> anyhow::Result<()> {
+    let displays = capture::list_displays()?;
+    if displays.is_empty() {
+        println!("no capturable displays found");
+    }
+    for display in displays {
+        println!("{}\t{}", display.id, display.title);
+    }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn build_scap_source(display: Option<u32>, fps: u32) -> anyhow::Result<Box<dyn FrameSource>> {
+    let source = capture::scap::ScapSource::new(display, fps)?;
+    Ok(Box::new(source))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn build_scap_source(_display: Option<u32>, _fps: u32) -> anyhow::Result<Box<dyn FrameSource>> {
+    Err(capture::CaptureError::Unsupported.into())
+}
+
+fn run_bench(
+    synthetic: bool,
+    display: Option<u32>,
+    fps: u32,
+    bitrate_kbps: u32,
+    seconds: u32,
+    dump: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let source: Box<dyn FrameSource> = if synthetic {
+        Box::new(capture::synthetic::SyntheticSource::new(1280, 720, fps))
+    } else {
+        build_scap_source(display, fps)?
+    };
+
+    let (width, height) = source.size();
+    let cfg = EncoderConfig {
+        width,
+        height,
+        fps,
+        bitrate_kbps,
+        keyframe_interval_frames: fps.max(1) * 2,
+    };
+    let encoder: Box<dyn Encoder> = Box::new(OpenH264Encoder::new(cfg)?);
+
+    let mut handle = Pipeline::start(source, encoder);
+    let mut dump_file = dump.as_ref().map(std::fs::File::create).transpose()?;
+
+    let mut sizes: Vec<usize> = Vec::new();
+    let start = Instant::now();
+    let run_for = Duration::from_secs(u64::from(seconds));
+    // Exercise request_keyframe() (mirrors a PLI/FIR from a client, see
+    // ARCHITECTURE.md §4.1) partway through the run rather than only on
+    // connect, so the bench also demonstrates forced-keyframe behaviour.
+    let keyframe_request_at = run_for / 2;
+    let mut requested_keyframe = false;
+
+    while start.elapsed() < run_for {
+        if !requested_keyframe && start.elapsed() >= keyframe_request_at {
+            handle.request_keyframe();
+            requested_keyframe = true;
+        }
+        match handle.frames.try_recv() {
+            Ok(frame) => {
+                if let Some(file) = dump_file.as_mut() {
+                    file.write_all(&frame.data)?;
+                }
+                sizes.push(frame.data.len());
+            }
+            Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
+            Err(TryRecvError::Disconnected) => break,
+        }
+    }
+
+    // Pick up whatever already landed in the channel without waiting further.
+    while let Ok(frame) = handle.frames.try_recv() {
+        if let Some(file) = dump_file.as_mut() {
+            file.write_all(&frame.data)?;
+        }
+        sizes.push(frame.data.len());
+    }
+
+    handle.stop();
+    let elapsed = start.elapsed().as_secs_f64().max(1e-9);
+
+    let captured = handle.stats.captured.load(Ordering::Relaxed);
+    let encoded = handle.stats.encoded.load(Ordering::Relaxed);
+    let dropped = handle.stats.dropped.load(Ordering::Relaxed);
+    let keyframes = handle.stats.keyframes.load(Ordering::Relaxed);
+
+    let total_bytes: usize = sizes.iter().sum();
+    let avg_fps = encoded as f64 / elapsed;
+    let avg_kbps = (total_bytes as f64 * 8.0 / 1000.0) / elapsed;
+    let avg_size = if sizes.is_empty() {
+        0.0
+    } else {
+        total_bytes as f64 / sizes.len() as f64
+    };
+    let p95_size = percentile(&sizes, 95.0);
+
+    println!("captured={captured} encoded={encoded} dropped={dropped} keyframes={keyframes}");
+    println!("avg_fps={avg_fps:.2} avg_bitrate_kbps={avg_kbps:.1}");
+    println!("avg_frame_size_bytes={avg_size:.1} p95_frame_size_bytes={p95_size}");
+
+    if let Some(path) = dump.as_ref() {
+        println!("dumped Annex-B stream to {}", path.display());
+    }
+
+    Ok(())
+}
+
+fn percentile(sizes: &[usize], pct: f64) -> usize {
+    if sizes.is_empty() {
+        return 0;
+    }
+    let mut sorted = sizes.to_vec();
+    sorted.sort_unstable();
+    let idx = ((pct / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
 }

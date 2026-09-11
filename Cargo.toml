@@ -18,3 +18,6 @@ anyhow = "1"
 ts-rs = "12"
 axum = { version = "0.8", features = ["ws"] }
 rand = "0.10"
+openh264 = "0.9"
+scap = "0.0.8"
+clap = { version = "4", features = ["derive"] }

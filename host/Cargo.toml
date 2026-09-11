@@ -9,3 +9,9 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
+openh264 = { workspace = true }
+clap = { workspace = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+scap = { workspace = true }

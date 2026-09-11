@@ -1,0 +1,176 @@
+//! `openh264`-backed `Encoder`: software H.264, built from source (the
+//! `source` feature, on by default) so it compiles the same way on all three
+//! target OSes without needing a system-provided shared library.
+
+use std::time::Instant;
+
+use ::openh264::encoder::{
+    BitRate, Encoder as Oh264Encoder, EncoderConfig as Oh264Config, FrameRate, FrameType,
+    IntraFramePeriod, Profile, RateControlMode, SpsPpsStrategy, UsageType,
+};
+use ::openh264::formats::YUVSlices;
+use ::openh264::OpenH264API;
+use ::openh264::Timestamp;
+
+use super::{EncodeError, EncodedFrame, Encoder, EncoderConfig, I420Frame};
+
+pub struct OpenH264Encoder {
+    inner: Oh264Encoder,
+    fps: u32,
+    frame_count: u64,
+}
+
+impl OpenH264Encoder {
+    pub fn new(cfg: EncoderConfig) -> Result<Self, EncodeError> {
+        tracing::info!(
+            width = cfg.width,
+            height = cfg.height,
+            fps = cfg.fps,
+            bitrate_kbps = cfg.bitrate_kbps,
+            "initializing openh264 encoder"
+        );
+
+        let api = OpenH264API::from_source();
+        let oh264_cfg = Oh264Config::new()
+            .bitrate(BitRate::from_bps(cfg.bitrate_kbps.saturating_mul(1000)))
+            .max_frame_rate(FrameRate::from_hz(cfg.fps as f32))
+            .usage_type(UsageType::ScreenContentRealTime)
+            .rate_control_mode(RateControlMode::Bitrate)
+            .profile(Profile::Baseline)
+            .sps_pps_strategy(SpsPpsStrategy::ConstantId)
+            .intra_frame_period(IntraFramePeriod::from_num_frames(
+                cfg.keyframe_interval_frames,
+            ))
+            .skip_frames(false)
+            .num_threads(0);
+
+        let inner = Oh264Encoder::with_api_config(api, oh264_cfg)
+            .map_err(|err| EncodeError::Backend(err.to_string()))?;
+
+        Ok(Self {
+            inner,
+            fps: cfg.fps.max(1),
+            frame_count: 0,
+        })
+    }
+}
+
+impl Encoder for OpenH264Encoder {
+    fn encode(
+        &mut self,
+        frame: &I420Frame,
+        force_keyframe: bool,
+    ) -> Result<Option<EncodedFrame>, EncodeError> {
+        if force_keyframe {
+            self.inner.force_intra_frame();
+        }
+
+        let w = frame.width as usize;
+        let h = frame.height as usize;
+        let cw = w.div_ceil(2);
+        let source = YUVSlices::new((&frame.y, &frame.u, &frame.v), (w, h), (w, cw, cw));
+
+        let ts_ms = (self.frame_count * 1000) / u64::from(self.fps);
+        let bitstream = self
+            .inner
+            .encode_at(&source, Timestamp::from_millis(ts_ms))
+            .map_err(|err| EncodeError::Backend(err.to_string()))?;
+
+        self.frame_count += 1;
+
+        let data = bitstream.to_vec();
+        if data.is_empty() {
+            return Ok(None);
+        }
+
+        let keyframe =
+            bitstream.frame_type() == FrameType::IDR || super::nal_types(&data).contains(&5);
+
+        Ok(Some(EncodedFrame {
+            data,
+            keyframe,
+            ts: Instant::now(),
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::synthetic::SyntheticSource;
+    use crate::capture::FrameSource;
+    use crate::encode::{nal_types, to_i420};
+
+    fn test_cfg() -> EncoderConfig {
+        EncoderConfig {
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_kbps: 2000,
+            keyframe_interval_frames: 60,
+        }
+    }
+
+    #[test]
+    fn first_frame_is_keyframe_with_sps_pps_idr() {
+        let mut source = SyntheticSource::new(64, 64, 1000);
+        let mut encoder = OpenH264Encoder::new(test_cfg()).expect("encoder init");
+
+        let raw = source.next_frame().expect("frame");
+        let i420 = to_i420(&raw);
+        let encoded = encoder
+            .encode(&i420, false)
+            .expect("encode")
+            .expect("first frame must produce output");
+
+        assert!(encoded.keyframe);
+        let types = nal_types(&encoded.data);
+        assert!(types.contains(&7), "missing SPS: {types:?}");
+        assert!(types.contains(&8), "missing PPS: {types:?}");
+        assert!(types.contains(&5), "missing IDR: {types:?}");
+    }
+
+    #[test]
+    fn thirty_frames_have_deltas_respect_force_keyframe_and_stay_small() {
+        let mut source = SyntheticSource::new(64, 64, 1000);
+        let mut encoder = OpenH264Encoder::new(test_cfg()).expect("encoder init");
+
+        let mut outputs = Vec::new();
+        for i in 0..30u32 {
+            let raw = source.next_frame().expect("frame");
+            let i420 = to_i420(&raw);
+            let force = i == 19; // 20th frame (0-indexed)
+            if let Some(encoded) = encoder.encode(&i420, force).expect("encode") {
+                outputs.push((i, encoded));
+            }
+        }
+
+        assert!(!outputs.is_empty());
+        assert!(outputs[0].1.keyframe);
+
+        let has_delta = outputs
+            .iter()
+            .skip(1)
+            .take(10)
+            .any(|(_, f)| nal_types(&f.data).contains(&1));
+        assert!(
+            has_delta,
+            "expected at least one non-keyframe (NAL 1) among the next 10 frames"
+        );
+
+        let forced = outputs
+            .iter()
+            .find(|(idx, _)| *idx == 19)
+            .expect("frame 20 should produce output");
+        assert!(
+            nal_types(&forced.1.data).contains(&5),
+            "expected IDR after force_keyframe"
+        );
+
+        let total_size: usize = outputs.iter().map(|(_, f)| f.data.len()).sum();
+        assert!(
+            total_size < 200 * 1024,
+            "total encoded size too large: {total_size} bytes"
+        );
+    }
+}

@@ -217,7 +217,8 @@ VPS владельца (FastVPS, Эстония), Docker Compose: `rcdesk-server
 
 ### Фаза 1 — MVP по LAN (Mac-хост → Chrome/Safari)
 - 1.1 Сигнальный сервер: WS, комнаты по PIN, пересылка SDP/ICE. ✅
-- 1.2 Хост: захват `scap` → `openh264` → видеотрек webrtc-rs; подключение по PIN.
+- 1.2a Хост: захват `scap`/синтетика → I420 → `openh264` → конвейер, CLI `bench`. ✅
+- 1.2b Хост: WebRTC-транспорт (видеотрек H.264, data channels), сигналинг по PIN, loopback-тест.
 - 1.3 Веб-клиент: PIN → сессия → `<video>`, оверлей статистики.
 - 1.4 Ввод: data channels `input`/`pointer`, раскладка `event.code` → macOS, `enigo`.
 - 1.5 Курсор: локальная отрисовка по форме с хоста; курсор исключён из захвата.
@@ -262,9 +263,10 @@ VPS владельца (FastVPS, Эстония), Docker Compose: `rcdesk-server
 | tokio-tungstenite 0.30 | server (dev) | WS-клиент в интеграционных тестах сигналинга |
 | futures-util 0.3 | server | `split()` WebSocket на sink/stream |
 | rand 0.10 | server | генерация PIN и идентификаторов |
-| webrtc | host | WebRTC-стек |
-| scap | host | захват экрана |
-| openh264 | host | H.264 (программный) |
+| webrtc 0.20 + rtc 0.20 | host | WebRTC-стек (async-обёртка + sans-IO ядро; `rtc` нужен напрямую для типов) |
+| scap 0.0.8 | host (macOS/Windows) | захват экрана; NV12 на macOS, BGRA на Windows |
+| openh264 0.9 (source) | host | H.264 программный + SIMD-конверсия BGRA→I420 |
+| clap 4 (derive) | host | CLI |
 | enigo | host | инъекция ввода |
 | arboard | host | буфер обмена (фаза 2) |
 | vite 8, typescript 7, vitest 5 | web | сборка, типы, тесты; `vite.config.ts` использует `defineConfig` из `vitest/config` |
