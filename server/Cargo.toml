@@ -1,0 +1,16 @@
+[package]
+name = "rcdesk-server"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

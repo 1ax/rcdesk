@@ -213,7 +213,7 @@ VPS владельца (FastVPS, Эстония), Docker Compose: `rcdesk-server
 ### Фаза 0 — бутстрап
 - 0.1 Репозиторий, документы процесса и архитектуры. ✅
 - 0.2 Скелет: workspace (`proto`, `host`, `server`), `web` (Vite+TS), CI с гейтами
-  на трёх ОС, `proto` с первым сообщением и генерацией TS.
+  на трёх ОС, `proto` с первым сообщением и генерацией TS. ✅
 
 ### Фаза 1 — MVP по LAN (Mac-хост → Chrome/Safari)
 - 1.1 Сигнальный сервер: WS, комнаты по PIN, пересылка SDP/ICE.
@@ -255,12 +255,13 @@ VPS владельца (FastVPS, Эстония), Docker Compose: `rcdesk-server
 | tokio | host, server | async runtime |
 | tracing, tracing-subscriber | host, server | логи |
 | serde, serde_json | все | сериализация протокола |
-| ts-rs | proto | генерация TS-типов |
+| ts-rs 12 | proto | генерация TS-типов; каталог через `TS_RS_EXPORT_DIR` в `.cargo/config.toml` |
 | thiserror, anyhow | host, server | ошибки библиотек / приложений |
-| axum, tokio-tungstenite | server | HTTP + WebSocket |
+| axum 0.8 | server | HTTP + WebSocket (ws-фича axum, без отдельного tungstenite) |
+| tower (util), http-body-util | server (dev) | тесты роутера через `oneshot` |
 | webrtc | host | WebRTC-стек |
 | scap | host | захват экрана |
 | openh264 | host | H.264 (программный) |
 | enigo | host | инъекция ввода |
 | arboard | host | буфер обмена (фаза 2) |
-| vite, typescript, vitest | web | сборка, типы, тесты |
+| vite 8, typescript 7, vitest 5 | web | сборка, типы, тесты; `vite.config.ts` использует `defineConfig` из `vitest/config` |
