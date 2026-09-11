@@ -66,6 +66,39 @@ jobs:
           name: web-dist
           path: web/dist
 
+  # Кросс-компиляции нет: openh264 собирается из исходников под MSVC, поэтому
+  # exe для Windows-стенда владельца собирает CI, а не локальная macOS-машина.
+  # Артефакт скачивается со страницы запуска workflow (Actions -> Deploy ->
+  # запуск -> Artifacts). deploy от этого job не зависит -- деплой прода не
+  # должен ждать сборку хоста.
+  build-host:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: rcdesk-host-windows-x64
+            binary: target/release/rcdesk-host.exe
+          - os: macos-latest
+            artifact: rcdesk-host-macos-arm64
+            binary: target/release/rcdesk-host
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - run: cargo build --release -p rcdesk-host
+      - name: Дымовая проверка -- бинарник запускается
+        run: cargo run --release -p rcdesk-host -- --version
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
+
   deploy:
     needs: [build-push, build-web]
     runs-on: ubuntu-latest
