@@ -21,3 +21,7 @@ rand = "0.10"
 openh264 = "0.9"
 scap = "0.0.8"
 clap = { version = "4", features = ["derive"] }
+webrtc = "0.20"
+rtc = "0.20"
+bytes = "1"
+async-trait = "0.1"

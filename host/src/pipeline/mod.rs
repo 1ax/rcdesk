@@ -169,6 +169,13 @@ impl PipelineHandle {
         self.request_keyframe.store(true, Ordering::Release);
     }
 
+    /// Shares the underlying keyframe-request flag so a transport layer
+    /// (e.g. a PLI/FIR handler on the WebRTC video track) can set it
+    /// directly, the same way `request_keyframe()` does.
+    pub fn keyframe_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.request_keyframe)
+    }
+
     /// Stops both threads and waits for them to finish.
     ///
     /// For the synthetic source this returns promptly (it sleeps in bounded

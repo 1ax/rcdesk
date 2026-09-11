@@ -218,7 +218,7 @@ VPS владельца (FastVPS, Эстония), Docker Compose: `rcdesk-server
 ### Фаза 1 — MVP по LAN (Mac-хост → Chrome/Safari)
 - 1.1 Сигнальный сервер: WS, комнаты по PIN, пересылка SDP/ICE. ✅
 - 1.2a Хост: захват `scap`/синтетика → I420 → `openh264` → конвейер, CLI `bench`. ✅
-- 1.2b Хост: WebRTC-транспорт (видеотрек H.264, data channels), сигналинг по PIN, loopback-тест.
+- 1.2b Хост: WebRTC-транспорт (видеотрек H.264, data channels), сигналинг по PIN, loopback-тест. ✅
 - 1.3 Веб-клиент: PIN → сессия → `<video>`, оверлей статистики.
 - 1.4 Ввод: data channels `input`/`pointer`, раскладка `event.code` → macOS, `enigo`.
 - 1.5 Курсор: локальная отрисовка по форме с хоста; курсор исключён из захвата.
@@ -267,6 +267,9 @@ VPS владельца (FastVPS, Эстония), Docker Compose: `rcdesk-server
 | scap 0.0.8 | host (macOS/Windows) | захват экрана; NV12 на macOS, BGRA на Windows |
 | openh264 0.9 (source) | host | H.264 программный + SIMD-конверсия BGRA→I420 |
 | clap 4 (derive) | host | CLI |
+| bytes 1, async-trait 0.1 | host | `Sample.data`, impl `PeerConnectionEventHandler` |
+| tokio-tungstenite 0.30, futures-util 0.3 | host | WS-клиент сигналинга |
+| windows-capture =1.4.4 (пин) | host (Windows) | совместимость scap 0.0.8, см. docs/host-libs-api-notes.md |
 | enigo | host | инъекция ввода |
 | arboard | host | буфер обмена (фаза 2) |
 | vite 8, typescript 7, vitest 5 | web | сборка, типы, тесты; `vite.config.ts` использует `defineConfig` из `vitest/config` |

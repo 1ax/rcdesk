@@ -58,9 +58,21 @@
   ```
 - **PLI/FIR от браузера** приходят на трек: `while let Some(ev) = track.poll().await {
   match ev { TrackLocalEvent::OnRtcpPacket(pkts) => … } }` — пакеты `rtc::rtcp`,
-  проверять `downcast_ref::<PictureLossIndication>()` / `FullIntraRequest`
-  (`rtc::rtcp::payload_feedbacks::{picture_loss_indication, full_intra_request}`).
-  Также там Receiver Reports (потери/jitter) — база для адаптации битрейта (фаза 2).
+  проверять `pkt.as_any().downcast_ref::<PictureLossIndication>()` / `FullIntraRequest`.
+  **НО (найдено в 1.2b):** `NoopInterceptor` — внутреннее звено любой цепочки, включая
+  `register_default_interceptors` — намеренно дропает входящие RTCP при чтении; дефолтные
+  интерцепторы (NACK, reports, TWCC) их не пробрасывают. Нужен свой интерцептор, который
+  копирует RTCP в свою очередь `poll_read` — см. `RtcpForwarder` в `host/src/transport/mod.rs`
+  (`registry.with(|next| RtcpForwarder { next, .. })`). Макросы `#[derive(Interceptor)]`
+  требуют прямых зависимостей `sansio`/`shared`/`interceptor` — написан руками через
+  `rtc::sansio::Protocol` + `rtc::interceptor::Interceptor`.
+- Реэкспорты: `webrtc::peer_connection::*` отдаёт `MediaEngine`, `Registry`,
+  `register_default_interceptors`, `RTCConfigurationBuilder`, `RTCIceServer`,
+  `RTCSessionDescription`, `RTCIceCandidateInit`, `RTCPeerConnectionState`. Через `rtc::` нужны
+  `MIME_TYPE_H264`, `RTCRtpCodec*`, `RtpCodecKind`, `RTCPFeedback`, `Sample`, rtcp-пакеты.
+- Отправлять сэмплы можно только после `RTCPeerConnectionState::Connected`: до готовности
+  DTLS/SRTP `write_sample` молча дропает данные (`local_srtp_context is not set yet`),
+  и форсированный стартовый ключевой кадр теряется.
 - Data channel: `pc.create_data_channel(label, Option<RTCDataChannelInit>)` →
   `Arc<dyn DataChannel>`; `RTCDataChannelInit { ordered: bool, max_retransmits: Option<u16>,
   max_packet_life_time, protocol, negotiated, .. }` из `rtc::data_channel::init`.
@@ -70,6 +82,11 @@
   через `buffered_amount_low_threshold` / `writable().await`.
 
 ## scap 0.0.8
+
+- ⚠️ На Windows `scap` 0.0.8 не собирается с `windows-capture` 1.5+ (сигнатура `Settings::new`
+  выросла с 5 до 8 аргументов). В `host/Cargo.toml` прямой пин `windows-capture = "=1.4.4"`.
+  В 1.5+/2.x есть `DirtyRegionSettings` и `MinimumUpdateIntervalSettings` — аргумент за прямой
+  крейт в фазе 2.
 
 - Разрешение: `scap::has_permission()`, `scap::request_permission()`, `scap::is_supported()`.
 - Цели: `scap::get_all_targets() -> Vec<Target>` (`Target::Display(Display{id,title,raw_handle})`

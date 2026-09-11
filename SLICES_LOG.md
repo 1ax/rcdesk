@@ -13,8 +13,9 @@
 
 **Состояние на 2026-09-11:**
 - Фаза 0 закрыта, CI зелёный на ubuntu/macos/windows (run 34610667883).
-- 1.1 (сигнальный сервер) и 1.2a (видеоконвейер хоста без сети) закрыты, CI зелёный.
-  Следующий — 1.2b (WebRTC-транспорт + сигналинг хоста + loopback-тест), затем 1.3 (веб-клиент).
+- 1.1, 1.2a, 1.2b закрыты локально: хост умеет зарегистрироваться по PIN, поднять WebRTC
+  и слать H.264; loopback-тест ловит RTP и PLI без браузера. Следующий — 1.3 (веб-клиент:
+  PIN → сессия → `<video>`), после него первая живая проверка в Safari/Chrome.
 - ⚠️ Живой захват экрана ещё не проверялся: у терминала нет разрешения «Запись экрана».
   Владельцу при возвращении: Системные настройки → Конфиденциальность → Запись экрана →
   включить приложение терминала (или IDE), из которого запускается `cargo run`.
@@ -32,6 +33,8 @@
 - ⚪ D2: домен `rcdesk.app` не куплен; проверить цену в корзине регистратора (Google может ставить премиум).
 - ⚪ D3: `scap` 0.0.8 не экспортирует `get_main_display`, `BGRAFrame` без stride (принят packed), `Capturer` не `Send` (обёрнут `unsafe impl Send` с инвариантом «один поток»). Если упрёмся — переход на прямые `screencapturekit`/`windows-capture`.
 - ⚪ D4: openh264 с `skip_frames(false)` не держит потолок битрейта на сложном контенте; адаптация — фаза 2.3.
+- ⚪ D5: `windows-capture` запинен на =1.4.4 из-за scap 0.0.8; снять пин при переходе на прямой windows-capture 2.x (вместе с D3).
+- ⚪ D6: хост не переподключается к сигнальному серверу при обрыве WS (процесс завершается) — фаза 3.5.
 
 ---
 
@@ -104,3 +107,25 @@
   `avg_fps=30.09`, 583 кбит/с (контент простой). openh264 из исходников собирается ~11 с.
 - Отклонения исполнителя приняты: главный дисплей = первый `Target::Display`; размер через
   `get_output_frame_size()`; новый lint 1.98 `chunks_exact_to_as_chunks` учтён.
+
+### 1.2b WebRTC-транспорт и сигналинг хоста (2026-09-11)
+
+- `host` стал lib+bin. `transport::PeerSession`: PC с одним кодеком H.264 pt 102 (`42e01f`,
+  rtcp-fb nack/pli/fir/remb), видеотрек `TrackLocalStaticSample`, 4 data channel до оффера
+  (`input`, `pointer` unordered/0 retransmits, `control`, `file`), события `SessionEvent`
+  (LocalIce, ConnectionState, DataChannelMessage, KeyframeRequested). `start_video` ждёт
+  `Connected` (иначе SRTP молча дропает), затем форсирует ключевой кадр и пишет сэмплы.
+- **Находка исполнителя:** `NoopInterceptor` в `rtc` глотает входящие RTCP; добавлен
+  `RtcpForwarder` (ручной интерцептор), иначе PLI никогда не доходил. Заметка в
+  `docs/host-libs-api-notes.md` исправлена.
+- `signaling::SignalingClient`: Hello → HostRegister → Registered(PIN); PeerJoined → конвейер +
+  сессия + Offer; Answer/Ice → в сессию; Bye/Failed → закрыть. `serve` в CLI печатает `PIN:`.
+- `host/tests/loopback.rs`: второй PeerConnection в процессе как «браузер»: on_track ≤10 с,
+  ≥30 RTP-пакетов, SPS в первых payload'ах, PLI → `KeyframeRequested` + рост `stats.keyframes`.
+  Стабильно ~1.25 с.
+- CI после 1.2a: ubuntu падал на dead_code (бинарный крейт без scap) — снято переходом на lib;
+  **Windows падал внутри scap 0.0.8** (`windows-capture` 1.5.0 сломала `Settings::new`) —
+  архитектор запинил `windows-capture = "=1.4.4"` в манифесте хоста.
+- Гейты (архитектор перепроверил): host lib 11, loopback 1, proto 5, server 5, signaling 7 —
+  все `ok`; web ✓. Ручная проверка исполнителя: `serve --synthetic` печатает PIN, сервер
+  логирует `host registered`.

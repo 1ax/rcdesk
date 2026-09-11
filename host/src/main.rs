@@ -1,8 +1,3 @@
-mod capture;
-mod encode;
-mod pipeline;
-mod platform;
-
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -11,10 +6,13 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 use tokio::sync::mpsc::error::TryRecvError;
 
-use capture::FrameSource;
-use encode::openh264::OpenH264Encoder;
-use encode::{Encoder, EncoderConfig};
-use pipeline::Pipeline;
+use rcdesk_host::capture::{self, FrameSource};
+use rcdesk_host::encode::openh264::OpenH264Encoder;
+use rcdesk_host::encode::{Encoder, EncoderConfig};
+use rcdesk_host::pipeline::Pipeline;
+use rcdesk_host::platform;
+use rcdesk_host::signaling::{HostContext, SignalingClient};
+use rcdesk_host::transport::SessionConfig;
 
 #[derive(Parser)]
 #[command(name = "rcdesk-host", version, about = "rcdesk host agent")]
@@ -46,9 +44,34 @@ enum Command {
         #[arg(long)]
         dump: Option<PathBuf>,
     },
+    /// Connect to a signaling server, register as a host, and serve
+    /// incoming WebRTC sessions.
+    Serve {
+        /// Signaling server WebSocket URL.
+        #[arg(long, default_value = "ws://127.0.0.1:8080/ws")]
+        server: String,
+        /// Host name shown to clients. Defaults to $HOSTNAME, or
+        /// "rcdesk-host" if that isn't set.
+        #[arg(long)]
+        name: Option<String>,
+        /// Use the synthetic frame source instead of real screen capture.
+        #[arg(long)]
+        synthetic: bool,
+        /// Display id to capture (scap only); defaults to the first display.
+        #[arg(long)]
+        display: Option<u32>,
+        #[arg(long, default_value_t = 30)]
+        fps: u32,
+        #[arg(long, default_value_t = 6000)]
+        bitrate: u32,
+        /// STUN/TURN server URL. Repeatable.
+        #[arg(long = "stun", default_value = "stun:stun.l.google.com:19302")]
+        stun: Vec<String>,
+    },
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -71,6 +94,15 @@ fn main() -> anyhow::Result<()> {
             seconds,
             dump,
         } => run_bench(synthetic, display, fps, bitrate, seconds, dump),
+        Command::Serve {
+            server,
+            name,
+            synthetic,
+            display,
+            fps,
+            bitrate,
+            stun,
+        } => run_serve(server, name, synthetic, display, fps, bitrate, stun).await,
     }
 }
 
@@ -194,4 +226,54 @@ fn percentile(sizes: &[usize], pct: f64) -> usize {
     sorted.sort_unstable();
     let idx = ((pct / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
     sorted[idx.min(sorted.len() - 1)]
+}
+
+async fn run_serve(
+    server: String,
+    name: Option<String>,
+    synthetic: bool,
+    display: Option<u32>,
+    fps: u32,
+    bitrate: u32,
+    stun: Vec<String>,
+) -> anyhow::Result<()> {
+    let name = name
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "rcdesk-host".to_string());
+
+    let client = SignalingClient::connect(&server, &name).await?;
+    println!("PIN: {}", client.pin());
+    tracing::info!(
+        pin = client.pin(),
+        host_id = client.host_id(),
+        "registered with signaling server"
+    );
+
+    let runtime = webrtc::runtime::default_runtime()
+        .ok_or_else(|| anyhow::anyhow!("no webrtc runtime available"))?;
+
+    let build_source: Box<dyn Fn() -> anyhow::Result<Box<dyn FrameSource>> + Send + Sync> =
+        if synthetic {
+            Box::new(move || {
+                Ok(
+                    Box::new(capture::synthetic::SyntheticSource::new(1280, 720, fps))
+                        as Box<dyn FrameSource>,
+                )
+            })
+        } else {
+            Box::new(move || build_scap_source(display, fps))
+        };
+
+    let ctx = HostContext {
+        session: SessionConfig {
+            ice_servers: stun,
+            udp_addrs: vec!["0.0.0.0:0".to_string()],
+            fps,
+        },
+        bitrate_kbps: bitrate,
+        build_source,
+        runtime,
+    };
+
+    client.run(ctx).await
 }

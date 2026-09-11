@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[lib]
+name = "rcdesk_host"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rcdesk-host"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -12,6 +20,22 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 openh264 = { workspace = true }
 clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+webrtc = { workspace = true }
+rtc = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+proto = { package = "rcdesk-proto", path = "../proto" }
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 scap = { workspace = true }
+
+# scap 0.0.8 вызывает пятиаргументный `Settings::new`, который сломан в windows-capture 1.5+
+# (там 8 аргументов). Прямой пин держит lock-файл на совместимой версии даже после
+# `cargo update`. Убрать при переходе на прямой windows-capture 2.x (долг D3/D5).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-capture = "=1.4.4"
