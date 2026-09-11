@@ -1,4 +1,5 @@
-mod app;
+use rcdesk_server::app::app;
+use rcdesk_server::registry::Registry;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -19,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("rcdesk-server listening on {addr}");
 
-    axum::serve(listener, app::app()).await?;
+    axum::serve(listener, app(Registry::new())).await?;
 
     Ok(())
 }

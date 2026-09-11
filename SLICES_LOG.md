@@ -12,8 +12,9 @@
 > чата читает сначала голову, в тело ныряет по ссылке на слайс.
 
 **Состояние на 2026-09-11:**
-- Фаза 0 закрыта локально (0.1 документы, 0.2 скелет + CI). Первый push и статус CI
-  на трёх ОС — см. запись 0.2. Следующий: слайс 1.1 (сигнальный сервер).
+- Фаза 0 закрыта, CI зелёный на ubuntu/macos/windows (run 34610667883).
+- Слайс 1.1 (сигнальный сервер) готов локально; следующий — 1.2 (хост: захват → openh264
+  → WebRTC). Разведка API для 1.2 зафиксирована в `docs/host-libs-api-notes.md`.
 - Владелец 2026-09-11 разрешил архитектору коммитить самостоятельно на раннем этапе
   («мне пока нечего проверять»); push для проверки CI — в фазе 0 тоже архитектор.
 - Решения владельца: аудитория — владелец и небольшая команда; тестовый Windows —
@@ -57,3 +58,24 @@
   build ✓.
 - Версии: ts-rs 12.0.1, axum 0.8.9, tower 0.5.3, http-body-util 0.1.5, vite 8.3.0,
   typescript 7.0.2, vitest 5.0.0, tokio 1.53.1.
+
+## Слайс 1 — MVP по LAN
+
+### 1.1 Сигнальный сервер (2026-09-11)
+
+- `proto::signal`: полный набор MVP-сообщений (Hello, HostRegister/Registered, Join/Joined/
+  PeerJoined, Offer/Answer/Ice/Bye, Error) + `IceCandidate`; TS-типы перегенерированы.
+- `server`: `registry.rs` (in-memory, `std::sync::Mutex` — секции без `.await`), `ws.rs`
+  (`GET /ws`: read-loop + writer-задача через unbounded mpsc; первое сообщение — Hello;
+  host: register → forward; client: join → forward; Bye и обрывы освобождают хост, PIN
+  живёт пока хост подключён; один хост — одна сессия). Крейт получил `lib.rs`, чтобы
+  интеграционные тесты видели `app()`/`Registry`.
+- Тесты: 4 unit в registry, 7 интеграционных в `server/tests/signaling.rs` через
+  tokio-tungstenite (регистрация, join, пересылка offer/answer/ice, unknown pin, host busy,
+  освобождение хоста после отключения клиента, «первое сообщение не Hello»).
+- Гейты (архитектор перепроверил): fmt чисто; clippy `Finished`; тесты host 2, proto 5,
+  server lib 5, signaling 7 — все `ok`; web `Tests 1 passed (1)`, build ✓.
+- Архитектор ослабил пины версий до мажора (`rand = "0.10"` и т.п.) — конвенция workspace.
+- Разведка перед 1.2 (архитектор, пробная сборка в песочнице): `webrtc` 0.20 — новая
+  архитектура поверх sans-IO `rtc`; `scap` на macOS отдаёт NV12, на Windows BGRA; PLI
+  приходит как `TrackLocalEvent::OnRtcpPacket`. Всё в `docs/host-libs-api-notes.md`.

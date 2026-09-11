@@ -216,7 +216,7 @@ VPS владельца (FastVPS, Эстония), Docker Compose: `rcdesk-server
   на трёх ОС, `proto` с первым сообщением и генерацией TS. ✅
 
 ### Фаза 1 — MVP по LAN (Mac-хост → Chrome/Safari)
-- 1.1 Сигнальный сервер: WS, комнаты по PIN, пересылка SDP/ICE.
+- 1.1 Сигнальный сервер: WS, комнаты по PIN, пересылка SDP/ICE. ✅
 - 1.2 Хост: захват `scap` → `openh264` → видеотрек webrtc-rs; подключение по PIN.
 - 1.3 Веб-клиент: PIN → сессия → `<video>`, оверлей статистики.
 - 1.4 Ввод: data channels `input`/`pointer`, раскладка `event.code` → macOS, `enigo`.
@@ -259,6 +259,9 @@ VPS владельца (FastVPS, Эстония), Docker Compose: `rcdesk-server
 | thiserror, anyhow | host, server | ошибки библиотек / приложений |
 | axum 0.8 | server | HTTP + WebSocket (ws-фича axum, без отдельного tungstenite) |
 | tower (util), http-body-util | server (dev) | тесты роутера через `oneshot` |
+| tokio-tungstenite 0.30 | server (dev) | WS-клиент в интеграционных тестах сигналинга |
+| futures-util 0.3 | server | `split()` WebSocket на sink/stream |
+| rand 0.10 | server | генерация PIN и идентификаторов |
 | webrtc | host | WebRTC-стек |
 | scap | host | захват экрана |
 | openh264 | host | H.264 (программный) |

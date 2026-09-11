@@ -1,8 +1,14 @@
 use axum::routing::get;
 use axum::Router;
 
-pub fn app() -> Router {
-    Router::new().route("/healthz", get(healthz))
+use crate::registry::Registry;
+use crate::ws::ws_handler;
+
+pub fn app(registry: Registry) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/ws", get(ws_handler))
+        .with_state(registry)
 }
 
 async fn healthz() -> &'static str {
@@ -19,7 +25,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_returns_ok() {
-        let response = app()
+        let response = app(Registry::new())
             .oneshot(
                 Request::builder()
                     .uri("/healthz")
