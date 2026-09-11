@@ -1,0 +1,119 @@
+# Заметки по API библиотек хоста (проверено по исходникам 2026-09-11)
+
+Версии: `webrtc` 0.20.5 (поверх sans-IO `rtc` 0.20.5), `scap` 0.0.8, `openh264` 0.9.8,
+`enigo` 0.6.1. Пробная сборка всех четырёх вместе на macOS arm64 — 30 с, чисто.
+**API `webrtc` 0.20 — новая архитектура, НЕ совпадает с 0.11–0.13 из памяти моделей.**
+
+## webrtc 0.20
+
+- Фича по умолчанию `runtime-tokio`. Рантайм передаётся явно: `webrtc::runtime::tokio`
+  (см. `examples/common/mod.rs`: `runtime() -> Arc<dyn Runtime>`, `interval()`).
+- Соединение:
+  ```rust
+  use webrtc::peer_connection::{PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
+      RTCConfigurationBuilder, RTCIceServer, RTCPeerConnectionIceEvent};
+  use rtc::peer_connection::configuration::media_engine::{MediaEngine, MIME_TYPE_H264};
+  use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
+  use rtc::interceptor::Registry;
+  use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind,
+      RTCRtpEncodingParameters, RTCRtpCodingParameters};
+
+  let mut me = MediaEngine::default();
+  let video_codec = RTCRtpCodecParameters { rtp_codec: RTCRtpCodec {
+      mime_type: MIME_TYPE_H264.to_owned(), clock_rate: 90000, channels: 0,
+      sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f".to_owned(),
+      rtcp_feedback: vec![] }, payload_type: 102, ..Default::default() };
+  me.register_codec(video_codec.clone(), RtpCodecKind::Video)?;
+  let registry = register_default_interceptors(Registry::new(), &mut me)?;
+  let config = RTCConfigurationBuilder::new().with_ice_servers(vec![RTCIceServer{ urls: vec!["stun:stun.l.google.com:19302".into()], ..Default::default() }]).build();
+  let pc = PeerConnectionBuilder::new().with_configuration(config).with_media_engine(me)
+      .with_interceptor_registry(registry).with_handler(handler).with_runtime(runtime.clone())
+      .with_udp_addrs(vec!["0.0.0.0:0"]).build().await?;
+  ```
+  `with_udp_addrs(["0.0.0.0:0"])` — wildcard биндит по сокету на каждый интерфейс
+  (без loopback/link-local) → нормальные host-кандидаты.
+- События — трейт `PeerConnectionEventHandler` (`#[async_trait]`), все методы с
+  дефолтами: `on_negotiation_needed`, `on_ice_candidate(RTCPeerConnectionIceEvent)`,
+  `on_ice_candidate_error`, `on_signaling_state_change`, `on_ice_connection_state_change`,
+  `on_ice_gathering_state_change`, `on_connection_state_change(RTCPeerConnectionState)`,
+  `on_data_channel(Arc<dyn DataChannel>)`, `on_track(Arc<dyn TrackRemote>)`.
+  Trickle ICE: в `on_ice_candidate` брать `event.candidate` и слать через сигналинг.
+- SDP: `pc.create_offer(None).await?`, `pc.set_local_description(offer).await?`,
+  `pc.set_remote_description(RTCSessionDescription).await?`, `pc.local_description().await`,
+  `pc.add_ice_candidate(...)`, `pc.close().await?`. `RTCSessionDescription` — serde.
+- Видеотрек (сэмплы Annex-B H.264, один access unit на sample):
+  ```rust
+  use webrtc::media_stream::{MediaStreamTrack, track_local::{TrackLocal, static_sample::TrackLocalStaticSample}};
+  use rtc::media::Sample;
+  let ssrc = rand::random::<u32>();
+  let track = Arc::new(TrackLocalStaticSample::new(MediaStreamTrack::new(
+      "rcdesk-stream".into(), "rcdesk-video".into(), "screen".into(), RtpCodecKind::Video,
+      vec![RTCRtpEncodingParameters { rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() },
+           codec: video_codec.rtp_codec.clone(), ..Default::default() }]))?);
+  let sender = pc.add_track(Arc::clone(&track) as Arc<dyn TrackLocal>).await?;
+  // после переговоров:
+  let pt = sender.get_parameters().await?.rtp_parameters.codecs.first().unwrap().payload_type;
+  let ssrc = *track.ssrcs().await.first().unwrap();
+  track.sample_writer(ssrc, pt).write_sample(&Sample { data: bytes, duration, ..Default::default() }).await?;
+  ```
+- **PLI/FIR от браузера** приходят на трек: `while let Some(ev) = track.poll().await {
+  match ev { TrackLocalEvent::OnRtcpPacket(pkts) => … } }` — пакеты `rtc::rtcp`,
+  проверять `downcast_ref::<PictureLossIndication>()` / `FullIntraRequest`
+  (`rtc::rtcp::payload_feedbacks::{picture_loss_indication, full_intra_request}`).
+  Также там Receiver Reports (потери/jitter) — база для адаптации битрейта (фаза 2).
+- Data channel: `pc.create_data_channel(label, Option<RTCDataChannelInit>)` →
+  `Arc<dyn DataChannel>`; `RTCDataChannelInit { ordered: bool, max_retransmits: Option<u16>,
+  max_packet_life_time, protocol, negotiated, .. }` из `rtc::data_channel::init`.
+  Приём: `while let Some(ev) = dc.poll().await { match ev { DataChannelEvent::OnOpen |
+  OnClose | OnError | OnMessage(msg /* msg.data: Bytes, msg.is_string */) } }`.
+  Отправка: `dc.send_text(&str)`, `dc.send(BytesMut)`, `dc.try_send*`, backpressure
+  через `buffered_amount_low_threshold` / `writable().await`.
+
+## scap 0.0.8
+
+- Разрешение: `scap::has_permission()`, `scap::request_permission()`, `scap::is_supported()`.
+- Цели: `scap::get_all_targets() -> Vec<Target>` (`Target::Display(Display{id,title,raw_handle})`
+  / `Target::Window`), `scap::get_main_display()`.
+- `Capturer::build(Options { fps, show_cursor, show_highlight, target, crop_area,
+  output_type: FrameType, output_resolution: Resolution::Captured, excluded_targets })`
+  → `Result<Capturer, CapturerBuildError{NotSupported|PermissionNotGranted}>`;
+  `start_capture()`, `stop_capture()`, **блокирующий** `get_next_frame() -> Result<Frame, RecvError>`
+  (std mpsc) — вызывать из выделенного потока, не из tokio-таска.
+- **macOS:** `FrameType::YUVFrame` → `Frame::YUVFrame(YUVFrame { display_time, width, height,
+  luminance_bytes, luminance_stride, chrominance_bytes, chrominance_stride })` — это
+  **NV12** (`YCbCr420v`, биплан: Y + перемешанный CbCr). Для openh264 нужно I420 —
+  деинтерливинг CbCr в два плана (дёшево, один проход).
+  Кадры приходят только при изменении экрана (плюс `SCFrameStatus::Idle` даёт пустой
+  BGRA-кадр width=0 только в режиме BGRAFrame — в YUV-режиме просто нет кадра).
+- **Windows:** только `Frame::BGRA(BGRAFrame { display_time, width, height, data })`
+  (WGC, BGRA8). Конверсия в I420 — `openh264::formats::{YUVBuffer::from_rgb8_source,
+  BgraSliceU8}` (SIMD-ускорена в крейте).
+- `show_cursor: false` поддержан на обеих платформах.
+- Предупреждение future-incompat от транзитивного `block 0.1.6` (objc-стек) — не наш код.
+
+## openh264 0.9.8
+
+- `Encoder::with_api_config(OpenH264API::from_source(), EncoderConfig::new()
+  .bitrate(BitRate::from_bps(..)).max_frame_rate(FrameRate::from_hz(30.0))
+  .usage_type(UsageType::ScreenContentRealTime).rate_control_mode(RateControlMode::Bitrate)
+  .profile(Profile::Baseline).level(Level::Level_3_1).sps_pps_strategy(SpsPpsStrategy::ConstantId)
+  .intra_frame_period(IntraFramePeriod::from_num_frames(..)).skip_frames(false)
+  .num_threads(n).complexity(Complexity::Low))`.
+  (Проверить точные имена конструкторов `BitRate/FrameRate/IntraFramePeriod` по `encoder.rs`
+  строки ~190–410 перед использованием.)
+- `encoder.encode(&yuv)` / `encode_at(&yuv, Timestamp::from_millis(ms))` →
+  `EncodedBitStream`: `.to_vec()` — Annex-B со start-кодами, `frame_type()`;
+  `encoder.force_intra_frame()` — ключевой кадр по PLI.
+- Источники YUV: `YUVBuffer::from_vec(i420, w, h)`, `YUVBuffer::new(w,h)`,
+  `YUVSlices::new((y,u,v), (w,h), (sy,su,sv))` — без копии, реализует `YUVSource`.
+  Ширина/высота должны быть чётными.
+
+## enigo 0.6.1
+
+- `Enigo::new(&Settings::default())`, трейты `Keyboard` (`key(Key, Direction)`, `text(&str)`,
+  `raw(u16, Direction)` — платформенный код клавиши) и `Mouse` (`move_mouse(x, y, Coordinate::Abs)`,
+  `button(Button, Direction)`, `scroll(len, Axis)`), `Direction::{Press, Release, Click}`.
+- `Key` — часть вариантов за `cfg(target_os)`; для маппинга `event.code` → клавиша
+  использовать `Key::Unicode(char)` для символов и `Key::{Shift, Control, Alt, Meta, …}`
+  для модификаторов, либо `raw(vk)` с платформенной таблицей (решение слайса 1.4).
+- macOS: нужно разрешение «Универсальный доступ», иначе события молча не доставляются.
