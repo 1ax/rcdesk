@@ -29,6 +29,10 @@ bytes = { workspace = true }
 async-trait = { workspace = true }
 proto = { package = "rcdesk-proto", path = "../proto" }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+# tungstenite подключает rustls с default-features=false — без `tls12` rustls умеет только
+# TLS 1.3, а nginx на VPS отдаёт только TLS 1.2 (алерт ProtocolVersion). Провайдер ring —
+# тот же, что уже в графе.
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std", "logging"] }
 futures-util = "0.3"
 base64 = { workspace = true }
 
