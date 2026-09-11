@@ -1,10 +1,18 @@
-//! The real `Injector`: macOS (CGEvent) and Windows (`SendInput`) via
-//! `enigo` (see `docs/host-libs-api-notes.md`'s `enigo` section).
+//! The real `Injector`: macOS (CGEvent) via `enigo`, Windows mouse/wheel via
+//! `enigo` and keys via `SendInput` directly (see
+//! `docs/host-libs-api-notes.md`'s `enigo` section).
 //!
 //! macOS requires the "Universal Access" (Accessibility) TCC permission;
 //! without it, events are silently not delivered (see `docs/dev-run.md`).
 //! There is nobody to click a permission dialog in a headless/terminal
 //! session, so `Settings::open_prompt_to_get_permissions` is left `false`.
+//!
+//! On Windows, key events bypass `enigo::raw`: `input::keymap`'s Windows
+//! table encodes the "extended key" scancode prefix as `0xE0xx`, but
+//! `enigo` 0.6.1's `raw()` derives the extended-key flag itself from an
+//! incomplete virtual-key table and doesn't accept that prefix (see
+//! `docs/host-libs-api-notes.md`). `crate::platform::windows::keyboard`
+//! sends the scancode as-is via `SendInput` instead.
 
 use ::enigo::{Axis, Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 
@@ -79,6 +87,14 @@ impl Injector for EnigoInjector {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    fn key(&mut self, keycode: u16, pressed: bool) {
+        if let Err(err) = crate::platform::windows::keyboard::send_scancode(keycode, pressed) {
+            tracing::warn!(?err, keycode, pressed, "failed to send key event");
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
     fn key(&mut self, keycode: u16, pressed: bool) {
         if let Err(err) = self.enigo.raw(keycode, direction(pressed)) {
             tracing::warn!(?err, keycode, pressed, "failed to send key event");

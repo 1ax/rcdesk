@@ -3,7 +3,7 @@ mod macos;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod other;
 #[cfg(target_os = "windows")]
-mod windows;
+pub mod windows;
 
 #[cfg(target_os = "macos")]
 pub fn name() -> &'static str {

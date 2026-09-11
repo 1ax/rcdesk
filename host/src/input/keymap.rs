@@ -14,6 +14,34 @@ pub fn to_keycode(code: &str) -> Option<u16> {
     platform::to_keycode(code)
 }
 
+/// Splits a Windows PS/2 Scan Code Set 1 scancode (as produced by
+/// `to_keycode` on Windows) into its base byte and whether it carries the
+/// `0xE0` "extended key" prefix -- see `platform::windows::keyboard`, which
+/// needs both parts to build the `SendInput` `KEYBDINPUT`.
+pub fn scan_parts(scan: u16) -> (u16, bool) {
+    if scan & 0xFF00 == 0xE000 {
+        (scan & 0x00FF, true)
+    } else {
+        (scan, false)
+    }
+}
+
+#[cfg(test)]
+mod scan_parts_tests {
+    use super::scan_parts;
+
+    #[test]
+    fn extended_scan_splits_off_the_e0_prefix() {
+        assert_eq!(scan_parts(0xE04B), (0x4B, true));
+    }
+
+    #[test]
+    fn plain_scan_is_returned_unchanged_with_no_extended_flag() {
+        assert_eq!(scan_parts(0x4B), (0x4B, false));
+        assert_eq!(scan_parts(0x1C), (0x1C, false));
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     /// `kVK_*` CGKeyCodes (see `HIToolbox/Events.h`). Values confirmed
@@ -155,15 +183,18 @@ mod platform {
     /// PS/2 Scan Code Set 1 scancodes (the set Windows `SendInput` with
     /// `KEYEVENTF_SCANCODE` expects). A handful of navigation/modifier keys
     /// share their base scan byte with a numpad key (e.g. `ArrowLeft` and
-    /// `Numpad4` are both `0x4B`); on real hardware and in `enigo::raw`
-    /// those are disambiguated by the "extended key" flag, which `enigo`
-    /// derives itself from the scancode -> virtual-key translation (see
-    /// `docs/host-libs-api-notes.md`). `NumpadEnter` shares `Enter`'s
-    /// scancode (`0x1C`) the same way, but `enigo` 0.6.1's own source notes
-    /// that virtual key isn't in its extended-key table yet (`is_extended_key`
-    /// in `win_impl.rs`, "TODO: ... ENTER key in the numeric keypad ...
-    /// missing"), so `NumpadEnter` currently behaves like plain `Enter` --
-    /// an upstream limitation, not a bug in this table.
+    /// `Numpad4` are both byte `0x4B`); on real hardware those are
+    /// disambiguated by the "extended key" (`E0`) prefix, which this table
+    /// encodes directly in the value's high byte (`0xE0xx`) for the
+    /// navigation/modifier keys that carry it, leaving the corresponding
+    /// numpad keys as plain `0x00xx`. `enigo::raw` does *not* honor an `E0`
+    /// prefix -- on Windows it looks the scancode up in its own incomplete
+    /// virtual-key table to decide the extended-key flag (see
+    /// `docs/host-libs-api-notes.md`'s `enigo` section) -- so these values
+    /// are sent by `crate::platform::windows::keyboard::send_scancode`
+    /// (via `input::keymap::scan_parts`) instead of through `enigo`.
+    /// `NumpadEnter` (`0xE01C`) and `Enter` (`0x1C`) are correctly
+    /// distinguished this way.
     pub(super) fn to_keycode(code: &str) -> Option<u16> {
         Some(match code {
             "Escape" => 0x01,
@@ -194,9 +225,9 @@ mod platform {
             "BracketLeft" => 0x1A,
             "BracketRight" => 0x1B,
             "Enter" => 0x1C,
-            "NumpadEnter" => 0x1C,
+            "NumpadEnter" => 0xE01C,
             "ControlLeft" => 0x1D,
-            "ControlRight" => 0x1D,
+            "ControlRight" => 0xE01D,
             "KeyA" => 0x1E,
             "KeyS" => 0x1F,
             "KeyD" => 0x20,
@@ -221,11 +252,11 @@ mod platform {
             "Comma" => 0x33,
             "Period" => 0x34,
             "Slash" => 0x35,
-            "NumpadDivide" => 0x35,
+            "NumpadDivide" => 0xE035,
             "ShiftRight" => 0x36,
             "NumpadMultiply" => 0x37,
             "AltLeft" => 0x38,
-            "AltRight" => 0x38,
+            "AltRight" => 0xE038,
             "Space" => 0x39,
             "CapsLock" => 0x3A,
             "F1" => 0x3B,
@@ -238,34 +269,36 @@ mod platform {
             "F8" => 0x42,
             "F9" => 0x43,
             "F10" => 0x44,
-            "Home" => 0x47,
+            "Home" => 0xE047,
             "Numpad7" => 0x47,
-            "ArrowUp" => 0x48,
+            "ArrowUp" => 0xE048,
             "Numpad8" => 0x48,
-            "PageUp" => 0x49,
+            "PageUp" => 0xE049,
             "Numpad9" => 0x49,
             "NumpadSubtract" => 0x4A,
-            "ArrowLeft" => 0x4B,
+            "ArrowLeft" => 0xE04B,
             "Numpad4" => 0x4B,
             "Numpad5" => 0x4C,
-            "ArrowRight" => 0x4D,
+            "ArrowRight" => 0xE04D,
             "Numpad6" => 0x4D,
             "NumpadAdd" => 0x4E,
-            "End" => 0x4F,
+            "End" => 0xE04F,
             "Numpad1" => 0x4F,
-            "ArrowDown" => 0x50,
+            "ArrowDown" => 0xE050,
             "Numpad2" => 0x50,
-            "PageDown" => 0x51,
+            "PageDown" => 0xE051,
             "Numpad3" => 0x51,
-            "Insert" => 0x52,
+            "Insert" => 0xE052,
             "Numpad0" => 0x52,
-            "Delete" => 0x53,
+            "Delete" => 0xE053,
             "NumpadDecimal" => 0x53,
             "IntlBackslash" => 0x56,
             "F11" => 0x57,
             "F12" => 0x58,
-            "MetaLeft" => 0x5B,
-            "MetaRight" => 0x5C,
+            "MetaLeft" => 0xE05B,
+            "MetaRight" => 0xE05C,
+            "ContextMenu" => 0xE05D,
+            "PrintScreen" => 0xE037,
             _ => return None,
         })
     }
@@ -278,14 +311,24 @@ mod platform {
         fn maps_the_spot_checked_keys() {
             assert_eq!(to_keycode("KeyA"), Some(0x1E));
             assert_eq!(to_keycode("Enter"), Some(0x1C));
-            assert_eq!(to_keycode("ArrowLeft"), Some(0x4B));
-            assert_eq!(to_keycode("MetaLeft"), Some(0x5B));
+            assert_eq!(to_keycode("ArrowLeft"), Some(0xE04B));
+            assert_eq!(to_keycode("MetaLeft"), Some(0xE05B));
             assert_eq!(to_keycode("Numpad1"), Some(0x4F));
         }
 
         #[test]
         fn unknown_code_maps_to_none() {
             assert_eq!(to_keycode("Unknown"), None);
+        }
+
+        #[test]
+        fn extended_keys_carry_e0_prefix_and_numpad_keys_do_not() {
+            assert_eq!(to_keycode("Numpad4"), Some(0x4B));
+            assert_eq!(to_keycode("ArrowLeft"), Some(0xE04B));
+            assert_eq!(to_keycode("Enter"), Some(0x1C));
+            assert_eq!(to_keycode("NumpadEnter"), Some(0xE01C));
+            assert_eq!(to_keycode("NumpadDecimal"), Some(0x53));
+            assert_eq!(to_keycode("Delete"), Some(0xE053));
         }
     }
 }

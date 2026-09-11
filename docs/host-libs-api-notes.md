@@ -134,3 +134,8 @@
   использовать `Key::Unicode(char)` для символов и `Key::{Shift, Control, Alt, Meta, …}`
   для модификаторов, либо `raw(vk)` с платформенной таблицей (решение слайса 1.4).
 - macOS: нужно разрешение «Универсальный доступ», иначе события молча не доставляются.
+- Windows: `raw()` сам транслирует скан-код в VK через `MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX)`
+  и выставляет `KEYEVENTF_EXTENDEDKEY` только если VK есть в своей неполной таблице
+  (`is_extended_key` в `win_impl.rs`); префикс `E0` в самом скан-коде не принимает и не понимает.
+  Поэтому клавиши на Windows шлём напрямую через `SendInput`
+  (`host/src/platform/windows/keyboard.rs`), `enigo` остаётся только для мыши и колеса.
