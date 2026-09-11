@@ -9,6 +9,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use rcdesk_host::capture::{self, FrameSource};
 use rcdesk_host::encode::openh264::OpenH264Encoder;
 use rcdesk_host::encode::{Encoder, EncoderConfig};
+use rcdesk_host::input::{Injector, NoopInjector};
 use rcdesk_host::pipeline::Pipeline;
 use rcdesk_host::platform;
 use rcdesk_host::signaling::{HostContext, SignalingClient};
@@ -67,6 +68,12 @@ enum Command {
         /// STUN/TURN server URL. Repeatable.
         #[arg(long = "stun", default_value = "stun:stun.l.google.com:19302")]
         stun: Vec<String>,
+        /// Disable mouse/keyboard injection: input messages are received and
+        /// logged but never touch the real mouse/keyboard. See
+        /// `docs/dev-run.md` -- useful for verifying a session without the
+        /// macOS "Universal Access" permission granted.
+        #[arg(long)]
+        no_input: bool,
     },
 }
 
@@ -102,7 +109,13 @@ async fn main() -> anyhow::Result<()> {
             fps,
             bitrate,
             stun,
-        } => run_serve(server, name, synthetic, display, fps, bitrate, stun).await,
+            no_input,
+        } => {
+            run_serve(
+                server, name, synthetic, display, fps, bitrate, stun, no_input,
+            )
+            .await
+        }
     }
 }
 
@@ -126,6 +139,22 @@ fn build_scap_source(display: Option<u32>, fps: u32) -> anyhow::Result<Box<dyn F
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn build_scap_source(_display: Option<u32>, _fps: u32) -> anyhow::Result<Box<dyn FrameSource>> {
     Err(capture::CaptureError::Unsupported.into())
+}
+
+/// The real, platform-backed injector (see `rcdesk_host::input::enigo`).
+/// Falls back to `NoopInjector` on platforms with no such backend, exactly
+/// like `build_scap_source` falls back to an error for capture -- except
+/// here a no-op is the correct behavior rather than a failure, since a host
+/// with no way to inject input isn't a broken host, just one that can only
+/// be watched.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn build_real_injector() -> anyhow::Result<Box<dyn Injector>> {
+    Ok(Box::new(rcdesk_host::input::enigo::EnigoInjector::new()?))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn build_real_injector() -> anyhow::Result<Box<dyn Injector>> {
+    Ok(Box::new(NoopInjector::new()))
 }
 
 fn run_bench(
@@ -228,6 +257,7 @@ fn percentile(sizes: &[usize], pct: f64) -> usize {
     sorted[idx.min(sorted.len() - 1)]
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_serve(
     server: String,
     name: Option<String>,
@@ -236,6 +266,7 @@ async fn run_serve(
     fps: u32,
     bitrate: u32,
     stun: Vec<String>,
+    no_input: bool,
 ) -> anyhow::Result<()> {
     let name = name
         .or_else(|| std::env::var("HOSTNAME").ok())
@@ -264,6 +295,13 @@ async fn run_serve(
             Box::new(move || build_scap_source(display, fps))
         };
 
+    let build_injector: Box<dyn Fn() -> anyhow::Result<Box<dyn Injector>> + Send + Sync> =
+        if no_input {
+            Box::new(|| Ok(Box::new(NoopInjector::new()) as Box<dyn Injector>))
+        } else {
+            Box::new(build_real_injector)
+        };
+
     let ctx = HostContext {
         session: SessionConfig {
             ice_servers: stun,
@@ -272,6 +310,7 @@ async fn run_serve(
         },
         bitrate_kbps: bitrate,
         build_source,
+        build_injector,
         runtime,
     };
 

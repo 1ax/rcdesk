@@ -5,6 +5,7 @@
 
 pub mod capture;
 pub mod encode;
+pub mod input;
 pub mod pipeline;
 pub mod platform;
 pub mod signaling;

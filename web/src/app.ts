@@ -3,15 +3,17 @@
 // speaks (see `host/src/signaling/mod.rs`): the host is the offer side, so
 // this client only ever answers -- `joined` creates the `PeerSession`,
 // `offer` is answered, ICE trickles both ways, and `ontrack` feeds the
-// `<video>` element. Mouse/keyboard input (slice 1.4) is out of scope here;
-// data channels opened by the host are accepted and stored by label but
-// otherwise unused.
+// `<video>` element. Data channels opened by the host are accepted and
+// stored by label (`PeerSession.getDataChannel`); once both `input` and
+// `pointer` have arrived, `attachInput` (see `input.ts`) starts forwarding
+// mouse/keyboard events to the host.
 
 import "./style.css";
 import { SignalingClient } from "./signaling";
 import { PeerSession } from "./session";
 import { summarizeStats, takeSnapshot } from "./stats";
 import type { Snapshot, StatsSummary } from "./stats";
+import { attachInput } from "./input";
 
 const ICE_SERVERS: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
 
@@ -74,6 +76,11 @@ export function mount(root: Element | null): void {
   const connectBtn = root.querySelector<HTMLButtonElement>("#connect-btn")!;
   const pinStatus = root.querySelector<HTMLParagraphElement>("#pin-status")!;
   const video = root.querySelector<HTMLVideoElement>("#video")!;
+  // Focusable so it can receive `keydown`/`keyup` (see `input.ts`'s
+  // `attachInput`, which listens on the video element itself); a click
+  // gives it focus the same way clicking any input widget would.
+  video.tabIndex = 0;
+  video.addEventListener("click", () => video.focus());
   const overlay = root.querySelector<HTMLDivElement>("#stats-overlay")!;
   const sessionStatus = root.querySelector<HTMLSpanElement>("#session-status")!;
   const disconnectBtn = root.querySelector<HTMLButtonElement>("#disconnect-btn")!;
@@ -83,6 +90,17 @@ export function mount(root: Element | null): void {
   let sessionId: string | null = null;
   let statsTimer: ReturnType<typeof setInterval> | undefined;
   let prevSnapshot: Snapshot | undefined;
+  let inputChannel: RTCDataChannel | null = null;
+  let pointerChannel: RTCDataChannel | null = null;
+  let detachInput: (() => void) | null = null;
+
+  // `input` and `pointer` arrive via `onDataChannel` in whatever order the
+  // host happened to open them in, independent of the connection state
+  // reaching "connected" -- attach as soon as both are in hand.
+  function maybeAttachInput(): void {
+    if (detachInput || !inputChannel || !pointerChannel) return;
+    detachInput = attachInput(video, { input: inputChannel, pointer: pointerChannel });
+  }
 
   function setSessionStatus(status: SessionStatus): void {
     sessionStatus.textContent = status;
@@ -127,6 +145,10 @@ export function mount(root: Element | null): void {
 
   function teardown(reason: string): void {
     stopStatsLoop();
+    detachInput?.();
+    detachInput = null;
+    inputChannel = null;
+    pointerChannel = null;
     session?.close();
     session = null;
     signaling?.close();
@@ -176,9 +198,10 @@ export function mount(root: Element | null): void {
           onTrack: (stream) => {
             video.srcObject = stream;
           },
-          onDataChannel: () => {
-            // Accepted and stored by label in PeerSession; handling input
-            // over these channels is slice 1.4.
+          onDataChannel: (label, dc) => {
+            if (label === "input") inputChannel = dc;
+            else if (label === "pointer") pointerChannel = dc;
+            maybeAttachInput();
           },
           onConnectionStateChange: (state) => {
             if (state === "connected") {

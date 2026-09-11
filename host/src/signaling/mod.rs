@@ -23,6 +23,7 @@ use webrtc::runtime::Runtime;
 use crate::capture::FrameSource;
 use crate::encode::openh264::OpenH264Encoder;
 use crate::encode::{Encoder, EncoderConfig};
+use crate::input::{Injector, InputRouter};
 use crate::pipeline::Pipeline;
 use crate::transport::{PeerSession, SessionConfig, SessionEvent};
 
@@ -38,6 +39,12 @@ pub struct HostContext {
     /// `scap` source is only constructible behind `cfg(...)`, and this
     /// module stays platform-agnostic; `main.rs` supplies the closure.
     pub build_source: Box<dyn Fn() -> anyhow::Result<Box<dyn FrameSource>> + Send + Sync>,
+    /// Builds a fresh input injector for a new session, the same way as
+    /// `build_source` (and for the same reason: the real, `enigo`-backed
+    /// implementation only exists behind `cfg(...)`). `main.rs` supplies
+    /// either that or a `NoopInjector`-returning closure, depending on
+    /// `serve --no-input` (see `docs/dev-run.md`).
+    pub build_injector: Box<dyn Fn() -> anyhow::Result<Box<dyn Injector>> + Send + Sync>,
     pub runtime: Arc<dyn Runtime>,
 }
 
@@ -179,6 +186,11 @@ impl SignalingClient {
 struct ActiveSession {
     peer: Arc<PeerSession>,
     forward_task: tokio::task::JoinHandle<()>,
+    /// Routes `input`/`pointer` data channel messages to the platform
+    /// injector. Dropped at the end of `shutdown` (ordinary field drop),
+    /// which -- per `InputRouter`'s own `Drop` impl -- releases any
+    /// keys/buttons the session left held.
+    router: InputRouter,
 }
 
 impl ActiveSession {
@@ -205,14 +217,18 @@ async fn handle_signal_message(
             *current_session_id = None;
 
             match start_session(ctx, event_tx).await {
-                Ok((peer, forward_task)) => match peer.create_offer().await {
+                Ok((peer, forward_task, router)) => match peer.create_offer().await {
                     Ok(sdp) => {
                         let _ = out_tx.send(SignalMessage::Offer {
                             session_id: session_id.clone(),
                             sdp,
                         });
                         *current_session_id = Some(session_id);
-                        *active = Some(ActiveSession { peer, forward_task });
+                        *active = Some(ActiveSession {
+                            peer,
+                            forward_task,
+                            router,
+                        });
                     }
                     Err(err) => {
                         tracing::warn!(?err, "failed to create offer");
@@ -300,9 +316,29 @@ async fn handle_session_event(
             label,
             data,
             is_string,
-        } => {
-            tracing::trace!(label, len = data.len(), is_string, "data channel message");
-        }
+        } => match label.as_str() {
+            "input" | "pointer" => {
+                if !is_string {
+                    tracing::warn!(label, "non-text message on input channel, ignoring");
+                } else {
+                    match serde_json::from_slice::<proto::input::InputMessage>(&data) {
+                        Ok(msg) => {
+                            if let Some(active) = active.as_ref() {
+                                if active.router.sender().send(msg).is_err() {
+                                    tracing::warn!(label, "input router is no longer running");
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(label, ?err, "failed to parse input message");
+                        }
+                    }
+                }
+            }
+            _ => {
+                tracing::trace!(label, len = data.len(), is_string, "data channel message");
+            }
+        },
         SessionEvent::KeyframeRequested => {
             tracing::debug!("keyframe requested by remote peer (PLI/FIR)");
         }
@@ -315,7 +351,7 @@ async fn handle_session_event(
 async fn start_session(
     ctx: &HostContext,
     events: mpsc::Sender<SessionEvent>,
-) -> anyhow::Result<(Arc<PeerSession>, tokio::task::JoinHandle<()>)> {
+) -> anyhow::Result<(Arc<PeerSession>, tokio::task::JoinHandle<()>, InputRouter)> {
     let source = (ctx.build_source)()?;
     let (width, height) = source.size();
     let fps = ctx.session.fps.max(1);
@@ -350,7 +386,10 @@ async fn start_session(
 
     peer.start_video(video_rx, keyframe_flag);
 
-    Ok((peer, forward_task))
+    let injector = (ctx.build_injector)()?;
+    let router = InputRouter::new(injector);
+
+    Ok((peer, forward_task, router))
 }
 
 async fn send(write: &mut SplitSink<WsStream, Message>, msg: &SignalMessage) -> anyhow::Result<()> {

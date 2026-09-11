@@ -33,6 +33,7 @@ futures-util = "0.3"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 scap = { workspace = true }
+enigo = { workspace = true }
 
 # scap 0.0.8 вызывает пятиаргументный `Settings::new`, который сломан в windows-capture 1.5+
 # (там 8 аргументов). Прямой пин держит lock-файл на совместимой версии даже после

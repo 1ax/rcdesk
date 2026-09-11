@@ -220,7 +220,7 @@ VPS владельца (FastVPS, Эстония), Docker Compose: `rcdesk-server
 - 1.2a Хост: захват `scap`/синтетика → I420 → `openh264` → конвейер, CLI `bench`. ✅
 - 1.2b Хост: WebRTC-транспорт (видеотрек H.264, data channels), сигналинг по PIN, loopback-тест. ✅
 - 1.3 Веб-клиент: PIN → сессия → `<video>`, оверлей статистики. ✅ (Chrome проверен, Safari — за владельцем)
-- 1.4 Ввод: data channels `input`/`pointer`, раскладка `event.code` → macOS, `enigo`.
+- 1.4 Ввод: data channels `input`/`pointer`, раскладка `event.code` → macOS/Windows, `enigo`. ✅ (живая инъекция — за владельцем)
 - 1.5 Курсор: локальная отрисовка по форме с хоста; курсор исключён из захвата.
 - Приёмка: 1080p ≥ 30 fps, LAN-задержка ≤ 80 мс, набор текста и мышь работают
   в Safari и Chrome.
@@ -270,6 +270,6 @@ VPS владельца (FastVPS, Эстония), Docker Compose: `rcdesk-server
 | bytes 1, async-trait 0.1 | host | `Sample.data`, impl `PeerConnectionEventHandler` |
 | tokio-tungstenite 0.30, futures-util 0.3 | host | WS-клиент сигналинга |
 | windows-capture =1.4.4 (пин) | host (Windows) | совместимость scap 0.0.8, см. docs/host-libs-api-notes.md |
-| enigo | host | инъекция ввода |
+| enigo 0.6 | host (macOS/Windows) | инъекция ввода: `raw()` = CGKeyCode / scan-код, `main_display()` для масштаба координат |
 | arboard | host | буфер обмена (фаза 2) |
 | vite 8, typescript 7, vitest 5 | web | сборка, типы, тесты; `vite.config.ts` использует `defineConfig` из `vitest/config` |
