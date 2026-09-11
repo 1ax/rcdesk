@@ -33,7 +33,6 @@ services:
       - "--min-port=49152"
       - "--max-port=65535"
       - "--no-tls"
-      - "--no-dtls"
       - "--no-cli"
       - "--fingerprint"
       - "--log-file=stdout"
