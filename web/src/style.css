@@ -1,0 +1,187 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0c0f;
+  --panel: #16181d;
+  --border: #2a2d34;
+  --text: #e7e9ee;
+  --muted: #8b909c;
+  --accent: #4f8cff;
+  --accent-hover: #6ea0ff;
+  --danger: #e0554f;
+  --ok: #4caf7d;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    Roboto,
+    sans-serif;
+}
+
+#app {
+  height: 100vh;
+}
+
+.pin-screen {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.card {
+  width: 100%;
+  max-width: 320px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 32px 24px;
+  text-align: center;
+}
+
+.card h1 {
+  margin: 0 0 24px;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.pin-input {
+  width: 100%;
+  font-size: 28px;
+  letter-spacing: 0.3em;
+  text-align: center;
+  padding: 12px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.pin-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.btn {
+  width: 100%;
+  margin-top: 16px;
+  padding: 10px 16px;
+  font-size: 15px;
+  font-weight: 600;
+  border: none;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.btn-secondary {
+  background: var(--border);
+  color: var(--text);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: #383c45;
+}
+
+.hint {
+  min-height: 1.2em;
+  margin: 12px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.session-screen {
+  position: relative;
+  height: 100%;
+  background: #000;
+}
+
+.session-screen video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+  display: block;
+}
+
+.overlay {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  padding: 6px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--text);
+  background: rgb(0 0 0 / 55%);
+  border-radius: 6px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.controls {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.status {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgb(0 0 0 / 55%);
+  color: var(--muted);
+  text-transform: capitalize;
+}
+
+.status[data-status="connected"] {
+  color: var(--ok);
+}
+
+.status[data-status="error"],
+.status[data-status="disconnected"] {
+  color: var(--danger);
+}
+
+.controls .btn {
+  width: auto;
+  margin-top: 0;
+  padding: 6px 14px;
+  font-size: 13px;
+}
+
+/* The UA stylesheet hides [hidden] with plain `display: none`, which any
+   class-level `display: flex/block` above would override. Screens are toggled
+   via the `hidden` attribute, so make it win. */
+[hidden] {
+  display: none !important;
+}
