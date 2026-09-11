@@ -185,7 +185,7 @@ impl WinCursorSource {
         }
 
         // 32bpp DIBs are BGRA in memory (little-endian); swap R/B to RGBA.
-        for px in buf.chunks_exact_mut(4) {
+        for px in buf.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
         }
 
