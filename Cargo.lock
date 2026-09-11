@@ -2413,10 +2413,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "enigo",
  "futures-util",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "openh264",
  "rand 0.10.2",
  "rcdesk-proto",
@@ -2430,6 +2434,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webrtc",
+ "windows 0.61.3",
  "windows-capture",
 ]
 

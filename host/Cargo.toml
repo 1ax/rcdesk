@@ -30,6 +30,7 @@ async-trait = { workspace = true }
 proto = { package = "rcdesk-proto", path = "../proto" }
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
+base64 = { workspace = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 scap = { workspace = true }
@@ -40,3 +41,27 @@ enigo = { workspace = true }
 # `cargo update`. Убрать при переходе на прямой windows-capture 2.x (долг D3/D5).
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-capture = "=1.4.4"
+# Версия совпадает с той, что уже тянет windows-capture 1.4.4 (см. Cargo.lock) --
+# не добавляет вторую версию `windows` в граф.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Версии совпадают с теми, что уже тянет `enigo` для macOS (см. Cargo.lock) --
+# не добавляет вторую версию objc2*/ в граф.
+objc2 = { version = "0.6", features = ["relax-void-encoding"] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "NSGeometry",
+    "NSData",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSCursor",
+    "NSImage",
+    "NSBitmapImageRep",
+] }

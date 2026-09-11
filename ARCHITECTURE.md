@@ -31,7 +31,7 @@ fps, аппаратное кодирование. Ориентир — Chrome Re
 | Веб-клиент | **TypeScript** + Vite, без UI-фреймворка (при росте UI — Preact) | Клиент — это `<video>`, canvas курсора, обработчики ввода и панель. Фреймворк не нужен. |
 | Сигнальный сервер | **Rust**, `axum` + `tokio-tungstenite` | Один язык с хостом, общие типы из `proto`. Нагрузка ничтожна. |
 | TURN/STUN | `coturn` в Docker | Стандарт де-факто. |
-| Реверс-прокси/TLS | Caddy | Автоматический Let's Encrypt, минимум конфигурации. `.app` — зона с принудительным HTTPS (HSTS preload), что нам и нужно. |
+| Реверс-прокси/TLS | nginx из FastPanel на VPS владельца (как в crewtally) | Порты 80/443 на VPS уже за FastPanel; LE-сертификат выпускает панель. `.app` — зона с принудительным HTTPS (HSTS preload), что нам и нужно. Caddy — запасной вариант для чистого сервера. |
 | CI | GitHub Actions: `macos-latest`, `windows-latest`, `ubuntu-latest` (web, server) | Публичный репо — без лимита минут. |
 
 Версии крейтов на момент выбора (crates.io, 2026-09-11): `webrtc` 0.20.5, `str0m`
@@ -187,10 +187,11 @@ DTLS-сертификата хоста в клиенте — защита от �
 
 ## 11. Инфраструктура
 
-VPS владельца (FastVPS, Эстония), Docker Compose: `rcdesk-server`, `coturn`,
-`caddy` (TLS, статика веб-клиента, прокси WSS). DNS `rcdesk.app` → VPS;
-`turn.rcdesk.app` → тот же IP. Порты: 443 (https/wss), 3478 udp/tcp и 5349 tls
-(TURN), диапазон relay UDP 49152–65535. Деплой — GitHub Actions по push в `main`
+VPS владельца (FastVPS, Эстония), отдельный пользователь FastPanel `rcdesk`. Docker Compose:
+`rcdesk-server` (порт 8080 на localhost) и `coturn` (host-сеть). nginx FastPanel: статика
+`web/dist`, прокси `/ws` и `/healthz` на 8080, TLS от панели. DNS `rcdesk.app` → VPS;
+`turn.rcdesk.app` → тот же IP (без CDN-прокси). Порты: 443 (https/wss), 3478 udp/tcp и
+5349 tls (TURN), диапазон relay UDP 49152–65535. Деплой — GitHub Actions по push в `main`
 после зелёных гейтов (фаза 3).
 
 Трафик через сервер — только при TURN-релее; при прямом P2P сервер видит лишь
