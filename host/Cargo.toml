@@ -63,5 +63,6 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "NSCursor",
     "NSImage",
+    "NSImageRep",
     "NSBitmapImageRep",
 ] }

@@ -4,6 +4,7 @@
 //! without the binary (see `tests/loopback.rs`).
 
 pub mod capture;
+pub mod cursor;
 pub mod encode;
 pub mod input;
 pub mod pipeline;

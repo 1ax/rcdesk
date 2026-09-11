@@ -29,7 +29,9 @@ use rtc::rtp_transceiver::rtp_sender::{
 use rtc::sansio::Protocol;
 use rtc::shared::error::Error;
 
-use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
+use webrtc::data_channel::{
+    DataChannel, DataChannelEvent, RTCDataChannelInit, RTCDataChannelState,
+};
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use webrtc::media_stream::track_local::{TrackLocal, TrackLocalEvent};
 use webrtc::media_stream::Track;
@@ -242,6 +244,10 @@ pub struct PeerSession {
     events: mpsc::Sender<SessionEvent>,
     connected: Arc<AtomicBool>,
     fps: u32,
+    /// The `control` data channel (cursor shape, app-level ping/pong; see
+    /// ARCHITECTURE.md §5), kept aside from the other three so
+    /// `send_control` can write to it directly.
+    control_channel: Arc<dyn DataChannel>,
 }
 
 /// `(label, RTCDataChannelInit)` for the four channels every session opens
@@ -288,6 +294,31 @@ fn default_data_channel_init() -> RTCDataChannelInit {
         protocol: String::new(),
         negotiated: None,
     }
+}
+
+/// Opens the four fixed data channels and spawns a task per channel that
+/// forwards `OnMessage` events and logs `OnOpen`/`OnClose`. Message handling
+/// beyond logging/forwarding is out of scope for this slice, except for the
+/// `control` channel's handle, which this returns so `PeerSession::new` can
+/// keep it aside for `send_control`.
+///
+/// A free function (rather than a `PeerSession` method) because it runs
+/// before the session exists -- `PeerSession::new` builds it from this
+/// call's result, see `data_channel_specs`'s doc comment on why the
+/// channels are opened before the offer.
+async fn open_data_channels(
+    pc: &dyn PeerConnection,
+    events: mpsc::Sender<SessionEvent>,
+) -> anyhow::Result<Arc<dyn DataChannel>> {
+    let mut control_channel = None;
+    for (label, init) in data_channel_specs() {
+        let dc = pc.create_data_channel(label, Some(init)).await?;
+        if label == "control" {
+            control_channel = Some(Arc::clone(&dc));
+        }
+        spawn_data_channel_reader(label, dc, events.clone());
+    }
+    control_channel.ok_or_else(|| anyhow::anyhow!("data_channel_specs did not include \"control\""))
 }
 
 impl PeerSession {
@@ -386,6 +417,8 @@ impl PeerSession {
             .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal>)
             .await?;
 
+        let control_channel = open_data_channels(pc.as_ref(), events.clone()).await?;
+
         let session = Arc::new(PeerSession {
             pc,
             video_track,
@@ -393,22 +426,10 @@ impl PeerSession {
             events: events.clone(),
             connected,
             fps: cfg.fps.max(1),
+            control_channel,
         });
 
-        session.open_data_channels().await?;
-
         Ok(session)
-    }
-
-    /// Opens the four fixed data channels and spawns a task per channel that
-    /// forwards `OnMessage` events and logs `OnOpen`/`OnClose`. Message
-    /// handling beyond logging/forwarding is out of scope for this slice.
-    async fn open_data_channels(&self) -> anyhow::Result<()> {
-        for (label, init) in data_channel_specs() {
-            let dc = self.pc.create_data_channel(label, Some(init)).await?;
-            spawn_data_channel_reader(label, dc, self.events.clone());
-        }
-        Ok(())
     }
 
     /// Creates an SDP offer, sets it as the local description, and returns
@@ -442,6 +463,27 @@ impl PeerSession {
         if let Err(err) = self.pc.close().await {
             tracing::warn!(?err, "error closing peer connection");
         }
+    }
+
+    /// Sends a `ControlMessage` down the `control` data channel, JSON
+    /// encoded (see ARCHITECTURE.md §5). A channel that isn't open yet (or
+    /// any more) is not an error -- there is nobody to receive the message,
+    /// and the caller (see `crate::cursor`'s watcher task in
+    /// `crate::signaling`) has no queue to retry into; the next state change
+    /// will be sent once the channel does open.
+    pub async fn send_control(&self, msg: &proto::control::ControlMessage) -> anyhow::Result<()> {
+        let ready_state = self
+            .control_channel
+            .ready_state()
+            .await
+            .unwrap_or(RTCDataChannelState::Closed);
+        if ready_state != RTCDataChannelState::Open {
+            tracing::trace!(?ready_state, "control channel not open, dropping message");
+            return Ok(());
+        }
+        let json = serde_json::to_string(msg)?;
+        self.control_channel.send_text(&json).await?;
+        Ok(())
     }
 
     /// Starts the two tasks that drive the video track:

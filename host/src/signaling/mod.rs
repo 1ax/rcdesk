@@ -8,7 +8,10 @@
 //! command) exits.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -16,11 +19,13 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use proto::control::ControlMessage;
 use proto::signal::{Role, SignalMessage};
 use webrtc::peer_connection::RTCPeerConnectionState;
 use webrtc::runtime::Runtime;
 
 use crate::capture::FrameSource;
+use crate::cursor::{self, CursorSource, CursorState};
 use crate::encode::openh264::OpenH264Encoder;
 use crate::encode::{Encoder, EncoderConfig};
 use crate::input::{Injector, InputRouter};
@@ -28,6 +33,12 @@ use crate::pipeline::Pipeline;
 use crate::transport::{PeerSession, SessionConfig, SessionEvent};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// How often the cursor watcher thread polls the platform for the current
+/// system cursor shape (see `crate::cursor::watch`). 33ms is roughly 30Hz --
+/// plenty for a cursor shape, which changes far less often than the pointer
+/// moves.
+const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(33);
 
 /// What the signaling client needs to build a fresh `PeerSession` and video
 /// pipeline for each joining peer.
@@ -45,6 +56,11 @@ pub struct HostContext {
     /// either that or a `NoopInjector`-returning closure, depending on
     /// `serve --no-input` (see `docs/dev-run.md`).
     pub build_injector: Box<dyn Fn() -> anyhow::Result<Box<dyn Injector>> + Send + Sync>,
+    /// Builds a fresh cursor-shape source for a new session, the same way as
+    /// `build_source`/`build_injector` (and for the same reason: the real,
+    /// platform-backed implementation only exists behind `cfg(...)`).
+    /// `main.rs` supplies either that or `cursor::NoopCursorSource`.
+    pub build_cursor_source: Box<dyn Fn() -> Box<dyn CursorSource> + Send + Sync>,
     pub runtime: Arc<dyn Runtime>,
 }
 
@@ -191,12 +207,23 @@ struct ActiveSession {
     /// which -- per `InputRouter`'s own `Drop` impl -- releases any
     /// keys/buttons the session left held.
     router: InputRouter,
+    /// The task that reads cursor-shape changes and forwards them over
+    /// `control` (see `start_session`). It owns the session's
+    /// `cursor::CursorWatcher` itself: `CursorWatcher` implements `Drop` to
+    /// stop its background polling thread, which makes it impossible to
+    /// partially move its `rx` field out of a separately-held watcher (Rust
+    /// disallows moving fields out of any type that implements `Drop`) --
+    /// so instead the watcher lives inside this task's future, and aborting
+    /// the task (below) drops that future, which drops the watcher, which
+    /// stops the thread.
+    cursor_task: tokio::task::JoinHandle<()>,
 }
 
 impl ActiveSession {
     async fn shutdown(self) {
         self.peer.close().await;
         self.forward_task.abort();
+        self.cursor_task.abort();
     }
 }
 
@@ -217,7 +244,7 @@ async fn handle_signal_message(
             *current_session_id = None;
 
             match start_session(ctx, event_tx).await {
-                Ok((peer, forward_task, router)) => match peer.create_offer().await {
+                Ok((peer, forward_task, router, cursor_task)) => match peer.create_offer().await {
                     Ok(sdp) => {
                         let _ = out_tx.send(SignalMessage::Offer {
                             session_id: session_id.clone(),
@@ -228,11 +255,13 @@ async fn handle_signal_message(
                             peer,
                             forward_task,
                             router,
+                            cursor_task,
                         });
                     }
                     Err(err) => {
                         tracing::warn!(?err, "failed to create offer");
                         forward_task.abort();
+                        cursor_task.abort();
                     }
                 },
                 Err(err) => {
@@ -335,6 +364,29 @@ async fn handle_session_event(
                     }
                 }
             }
+            "control" => {
+                if !is_string {
+                    tracing::warn!(label, "non-text message on control channel, ignoring");
+                } else {
+                    match serde_json::from_slice::<ControlMessage>(&data) {
+                        Ok(ControlMessage::Ping { ts }) => {
+                            if let Some(active) = active.as_ref() {
+                                if let Err(err) =
+                                    active.peer.send_control(&ControlMessage::Pong { ts }).await
+                                {
+                                    tracing::warn!(?err, "failed to send pong");
+                                }
+                            }
+                        }
+                        Ok(other) => {
+                            tracing::trace!(label, ?other, "unexpected control message, ignoring");
+                        }
+                        Err(err) => {
+                            tracing::warn!(label, ?err, "failed to parse control message");
+                        }
+                    }
+                }
+            }
             _ => {
                 tracing::trace!(label, len = data.len(), is_string, "data channel message");
             }
@@ -348,10 +400,16 @@ async fn handle_session_event(
 /// Builds the video pipeline and the `PeerSession` for one joining peer, and
 /// starts the task that feeds encoded frames from the pipeline into the
 /// session's video track.
+#[allow(clippy::type_complexity)]
 async fn start_session(
     ctx: &HostContext,
     events: mpsc::Sender<SessionEvent>,
-) -> anyhow::Result<(Arc<PeerSession>, tokio::task::JoinHandle<()>, InputRouter)> {
+) -> anyhow::Result<(
+    Arc<PeerSession>,
+    tokio::task::JoinHandle<()>,
+    InputRouter,
+    tokio::task::JoinHandle<()>,
+)> {
     let source = (ctx.build_source)()?;
     let (width, height) = source.size();
     let fps = ctx.session.fps.max(1);
@@ -389,7 +447,43 @@ async fn start_session(
     let injector = (ctx.build_injector)()?;
     let router = InputRouter::new(injector);
 
-    Ok((peer, forward_task, router))
+    // The watcher's background thread is polled by this task, not directly
+    // by `ActiveSession` -- see `ActiveSession::cursor_task`'s doc comment
+    // for why (`CursorWatcher` implements `Drop`, so its `rx` field can't be
+    // moved out to live separately from the rest of the struct). The first
+    // state a fresh watcher reads always counts as a "change" (see
+    // `cursor::watch`'s doc comment), so this newly connected client gets
+    // the host's current cursor shape right away.
+    let cursor_source = (ctx.build_cursor_source)();
+    let mut cursor_watcher = cursor::watch(cursor_source, CURSOR_POLL_INTERVAL);
+    let cursor_peer = Arc::clone(&peer);
+    let cursor_task = tokio::spawn(async move {
+        while let Some(state) = cursor_watcher.rx.recv().await {
+            let msg = cursor_state_to_control(state);
+            if let Err(err) = cursor_peer.send_control(&msg).await {
+                tracing::warn!(?err, "failed to send cursor control message");
+            }
+        }
+    });
+
+    Ok((peer, forward_task, router, cursor_task))
+}
+
+/// Converts a cursor-shape change into the wire message `send_control`
+/// sends, base64-encoding the raw RGBA bytes (see
+/// `proto::control::ControlMessage::CursorShape`'s doc comment).
+fn cursor_state_to_control(state: CursorState) -> ControlMessage {
+    match state {
+        CursorState::Hidden => ControlMessage::CursorHidden,
+        CursorState::Shape(image) => ControlMessage::CursorShape {
+            width: image.width,
+            height: image.height,
+            hotspot_x: image.hotspot_x,
+            hotspot_y: image.hotspot_y,
+            scale: image.scale,
+            rgba: BASE64_STANDARD.encode(image.rgba),
+        },
+    }
 }
 
 async fn send(write: &mut SplitSink<WsStream, Message>, msg: &SignalMessage) -> anyhow::Result<()> {

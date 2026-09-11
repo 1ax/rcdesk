@@ -222,7 +222,7 @@ VPS владельца (FastVPS, Эстония), отдельный польз�
 - 1.2b Хост: WebRTC-транспорт (видеотрек H.264, data channels), сигналинг по PIN, loopback-тест. ✅
 - 1.3 Веб-клиент: PIN → сессия → `<video>`, оверлей статистики. ✅ (Chrome проверен, Safari — за владельцем)
 - 1.4 Ввод: data channels `input`/`pointer`, раскладка `event.code` → macOS/Windows, `enigo`. ✅ (живая инъекция — за владельцем)
-- 1.5 Курсор: локальная отрисовка по форме с хоста; курсор исключён из захвата.
+- 1.5 Курсор: форма с хоста по каналу `control` → CSS `cursor: url()`; курсор исключён из захвата; прикладной ping/pong. ✅
 - Приёмка: 1080p ≥ 30 fps, LAN-задержка ≤ 80 мс, набор текста и мышь работают
   в Safari и Chrome.
 
@@ -271,6 +271,9 @@ VPS владельца (FastVPS, Эстония), отдельный польз�
 | bytes 1, async-trait 0.1 | host | `Sample.data`, impl `PeerConnectionEventHandler` |
 | tokio-tungstenite 0.30, futures-util 0.3 | host | WS-клиент сигналинга |
 | windows-capture =1.4.4 (пин) | host (Windows) | совместимость scap 0.0.8, см. docs/host-libs-api-notes.md |
+| base64 0.22 | host | RGBA курсора в JSON |
+| objc2 0.6, objc2-foundation 0.3, objc2-app-kit 0.3 | host (macOS) | NSCursor → NSBitmapImageRep (те же версии, что тянет enigo) |
+| windows 0.61 | host (Windows) | GetCursorInfo/GetIconInfo/GetDIBits (та же версия, что у windows-capture) |
 | enigo 0.6 | host (macOS/Windows) | инъекция ввода: `raw()` = CGKeyCode / scan-код, `main_display()` для масштаба координат |
 | arboard | host | буфер обмена (фаза 2) |
 | vite 8, typescript 7, vitest 5 | web | сборка, типы, тесты; `vite.config.ts` использует `defineConfig` из `vitest/config` |

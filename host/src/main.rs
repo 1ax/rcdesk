@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use tokio::sync::mpsc::error::TryRecvError;
 
 use rcdesk_host::capture::{self, FrameSource};
+use rcdesk_host::cursor::CursorSource;
 use rcdesk_host::encode::openh264::OpenH264Encoder;
 use rcdesk_host::encode::{Encoder, EncoderConfig};
 use rcdesk_host::input::{Injector, NoopInjector};
@@ -155,6 +156,24 @@ fn build_real_injector() -> anyhow::Result<Box<dyn Injector>> {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn build_real_injector() -> anyhow::Result<Box<dyn Injector>> {
     Ok(Box::new(NoopInjector::new()))
+}
+
+/// The real, platform-backed cursor-shape source (see
+/// `rcdesk_host::cursor::macos`/`::windows`), the same fallback pattern as
+/// `build_real_injector`.
+#[cfg(target_os = "macos")]
+fn build_real_cursor_source() -> Box<dyn CursorSource> {
+    Box::new(rcdesk_host::cursor::macos::MacCursorSource::new())
+}
+
+#[cfg(target_os = "windows")]
+fn build_real_cursor_source() -> Box<dyn CursorSource> {
+    Box::new(rcdesk_host::cursor::windows::WinCursorSource::new())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn build_real_cursor_source() -> Box<dyn CursorSource> {
+    Box::new(rcdesk_host::cursor::NoopCursorSource::new())
 }
 
 fn run_bench(
@@ -311,6 +330,7 @@ async fn run_serve(
         bitrate_kbps: bitrate,
         build_source,
         build_injector,
+        build_cursor_source: Box::new(build_real_cursor_source),
         runtime,
     };
 

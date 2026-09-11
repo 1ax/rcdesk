@@ -14,6 +14,8 @@ import { PeerSession } from "./session";
 import { summarizeStats, takeSnapshot } from "./stats";
 import type { Snapshot, StatsSummary } from "./stats";
 import { attachInput } from "./input";
+import { applyCursor } from "./cursor";
+import type { ControlMessage } from "./generated/ControlMessage";
 
 const ICE_SERVERS: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
 
@@ -24,7 +26,10 @@ function signalUrl(): string {
   return `${scheme}://${location.host}/ws`;
 }
 
-function formatOverlay(s: StatsSummary): string {
+/** `appRttMs`, when given, is the application-level ping/pong round trip
+ * measured over the `control` channel (see `startPingLoop`) -- distinct
+ * from `rttMs`, the WebRTC-level candidate-pair RTT from `getStats()`. */
+function formatOverlay(s: StatsSummary, appRttMs?: number): string {
   const parts: string[] = [];
   if (s.fps !== undefined) parts.push(`${s.fps.toFixed(0)} fps`);
   if (s.width !== undefined && s.height !== undefined) parts.push(`${s.width}x${s.height}`);
@@ -32,8 +37,13 @@ function formatOverlay(s: StatsSummary): string {
   if (s.rttMs !== undefined) parts.push(`rtt ${s.rttMs.toFixed(0)} ms`);
   if (s.packetsLost !== undefined) parts.push(`loss ${s.packetsLost}`);
   if (s.codec !== undefined) parts.push(s.codec.replace(/^video\//, "").toUpperCase());
+  if (appRttMs !== undefined) parts.push(`app ${appRttMs.toFixed(0)} ms`);
   return parts.join(" · ");
 }
+
+/** How often `app.ts` sends a `control`-channel `ping` to measure the
+ * application-level round trip shown as `app N ms` in the overlay. */
+const PING_INTERVAL_MS = 1000;
 
 const STATS_INTERVAL_MS = 1000;
 
@@ -93,6 +103,11 @@ export function mount(root: Element | null): void {
   let inputChannel: RTCDataChannel | null = null;
   let pointerChannel: RTCDataChannel | null = null;
   let detachInput: (() => void) | null = null;
+  let pingTimer: ReturnType<typeof setInterval> | undefined;
+  // The most recent application-level ping/pong round trip (see
+  // `startPingLoop`), shown in the overlay as `app N ms` -- `undefined`
+  // until the first `pong` arrives.
+  let appRttMs: number | undefined;
 
   // `input` and `pointer` arrive via `onDataChannel` in whatever order the
   // host happened to open them in, independent of the connection state
@@ -100,6 +115,46 @@ export function mount(root: Element | null): void {
   function maybeAttachInput(): void {
     if (detachInput || !inputChannel || !pointerChannel) return;
     detachInput = attachInput(video, { input: inputChannel, pointer: pointerChannel });
+  }
+
+  function stopPingLoop(): void {
+    if (pingTimer !== undefined) {
+      clearInterval(pingTimer);
+      pingTimer = undefined;
+    }
+  }
+
+  /** Sends a `ping` once a second so the overlay can show the
+   * application-level round trip (`app N ms`, see `formatOverlay`) -- how
+   * long a message actually takes over the `control` data channel, as
+   * opposed to the WebRTC-level candidate-pair RTT `getStats()` reports. */
+  function startPingLoop(dc: RTCDataChannel): void {
+    stopPingLoop();
+    pingTimer = setInterval(() => {
+      if (dc.readyState !== "open") return;
+      const msg: ControlMessage = { type: "ping", ts: performance.now() };
+      dc.send(JSON.stringify(msg));
+    }, PING_INTERVAL_MS);
+  }
+
+  function setupControlChannel(dc: RTCDataChannel): void {
+    if (dc.readyState === "open") startPingLoop(dc);
+    else dc.addEventListener("open", () => startPingLoop(dc));
+    dc.addEventListener("message", (event: MessageEvent<unknown>) => {
+      if (typeof event.data !== "string") return;
+      let msg: ControlMessage;
+      try {
+        msg = JSON.parse(event.data) as ControlMessage;
+      } catch (err) {
+        console.error("invalid control message", err);
+        return;
+      }
+      if (msg.type === "pong") {
+        appRttMs = performance.now() - msg.ts;
+        return;
+      }
+      applyCursor(video, msg);
+    });
   }
 
   function setSessionStatus(status: SessionStatus): void {
@@ -135,7 +190,7 @@ export function mount(root: Element | null): void {
           const now = Date.now();
           const summary = summarizeStats(report.values(), prevSnapshot, now);
           prevSnapshot = takeSnapshot(report.values(), now);
-          overlay.textContent = formatOverlay(summary);
+          overlay.textContent = formatOverlay(summary, appRttMs);
         })
         .catch((err: unknown) => {
           console.error("failed to read stats", err);
@@ -145,10 +200,12 @@ export function mount(root: Element | null): void {
 
   function teardown(reason: string): void {
     stopStatsLoop();
+    stopPingLoop();
     detachInput?.();
     detachInput = null;
     inputChannel = null;
     pointerChannel = null;
+    appRttMs = undefined;
     session?.close();
     session = null;
     signaling?.close();
@@ -156,6 +213,7 @@ export function mount(root: Element | null): void {
     sessionId = null;
     prevSnapshot = undefined;
     video.srcObject = null;
+    video.style.cursor = "";
     overlay.textContent = "";
     connectBtn.disabled = false;
     pinStatus.textContent = reason;
@@ -201,6 +259,7 @@ export function mount(root: Element | null): void {
           onDataChannel: (label, dc) => {
             if (label === "input") inputChannel = dc;
             else if (label === "pointer") pointerChannel = dc;
+            else if (label === "control") setupControlChannel(dc);
             maybeAttachInput();
           },
           onConnectionStateChange: (state) => {
