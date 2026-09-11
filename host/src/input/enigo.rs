@@ -14,7 +14,10 @@
 //! `docs/host-libs-api-notes.md`). `crate::platform::windows::keyboard`
 //! sends the scancode as-is via `SendInput` instead.
 
-use ::enigo::{Axis, Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
+use ::enigo::{Axis, Button, Coordinate, Direction, Enigo, Mouse, Settings};
+// `Keyboard` (`raw()`) is only used by the non-Windows `key()` below.
+#[cfg(not(target_os = "windows"))]
+use ::enigo::Keyboard;
 
 use proto::input::PointerButton;
 
