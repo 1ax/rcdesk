@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tokio::sync::mpsc::error::TryRecvError;
 
 use rcdesk_host::capture::{self, FrameSource};
@@ -21,6 +21,23 @@ use rcdesk_host::transport::SessionConfig;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// Which screen-capture backend to use on Windows. No effect on
+/// macOS/other (there is only `scap`/synthetic there) beyond `Gdi` being
+/// rejected -- see `build_screen_source`.
+#[derive(Clone, Copy, ValueEnum)]
+enum CaptureBackend {
+    /// Windows Graphics Capture (`scap`) if the video driver reports
+    /// Direct3D 11 support, GDI (`BitBlt`) otherwise.
+    Auto,
+    /// Force Windows Graphics Capture (`scap`), even if the driver looks
+    /// like it can't do Direct3D 11 -- for comparing against `gdi` on
+    /// hardware where `auto` already falls back.
+    Wgc,
+    /// Force GDI (`BitBlt`): works on any driver/VM, higher CPU cost, no
+    /// "yellow border" capture indicator.
+    Gdi,
 }
 
 #[derive(Subcommand)]
@@ -45,6 +62,12 @@ enum Command {
         /// Optional path to dump the raw Annex-B stream to.
         #[arg(long)]
         dump: Option<PathBuf>,
+        /// Windows only: which screen-capture backend to use. `auto` picks
+        /// Windows Graphics Capture when the video driver reports Direct3D
+        /// 11 support, GDI otherwise; `gdi`/`wgc` force one or the other.
+        /// Ignored (and ignored by `--synthetic`) on other platforms.
+        #[arg(long, value_enum, default_value_t = CaptureBackend::Auto)]
+        capture: CaptureBackend,
     },
     /// Connect to a signaling server, register as a host, and serve
     /// incoming WebRTC sessions.
@@ -78,11 +101,22 @@ enum Command {
         /// macOS "Universal Access" permission granted.
         #[arg(long)]
         no_input: bool,
+        /// Windows only: which screen-capture backend to use. `auto` picks
+        /// Windows Graphics Capture when the video driver reports Direct3D
+        /// 11 support, GDI otherwise; `gdi`/`wgc` force one or the other.
+        /// Ignored (and ignored by `--synthetic`) on other platforms.
+        #[arg(long, value_enum, default_value_t = CaptureBackend::Auto)]
+        capture: CaptureBackend,
     },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Must happen before any GDI/enigo/GetSystemMetrics call -- see
+    // `platform::windows::dpi` for why.
+    #[cfg(target_os = "windows")]
+    rcdesk_host::platform::windows::dpi::set_dpi_aware();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -104,7 +138,8 @@ async fn main() -> anyhow::Result<()> {
             bitrate,
             seconds,
             dump,
-        } => run_bench(synthetic, display, fps, bitrate, seconds, dump),
+            capture,
+        } => run_bench(synthetic, display, fps, bitrate, seconds, dump, capture),
         Command::Serve {
             server,
             name,
@@ -114,9 +149,10 @@ async fn main() -> anyhow::Result<()> {
             bitrate,
             stun,
             no_input,
+            capture,
         } => {
             run_serve(
-                server, name, synthetic, display, fps, bitrate, stun, no_input,
+                server, name, synthetic, display, fps, bitrate, stun, no_input, capture,
             )
             .await
         }
@@ -134,20 +170,60 @@ fn run_list_displays() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-fn build_scap_source(display: Option<u32>, fps: u32) -> anyhow::Result<Box<dyn FrameSource>> {
-    let source = capture::scap::ScapSource::new(display, fps)?;
-    Ok(Box::new(source))
+/// Builds the real screen-capture source. On Windows this is where
+/// `--capture auto` decides between Windows Graphics Capture (`scap`) and
+/// the GDI fallback (`capture::gdi`) by probing Direct3D 11 support first
+/// (`platform::windows::d3d::wgc_supported`) -- see that module and
+/// `capture::gdi` for why: `scap` 0.0.8 panics outright on drivers below
+/// feature level 11_0 instead of returning an error.
+#[cfg(target_os = "windows")]
+fn build_screen_source(
+    display: Option<u32>,
+    fps: u32,
+    backend: CaptureBackend,
+) -> anyhow::Result<Box<dyn FrameSource>> {
+    let use_wgc = match backend {
+        CaptureBackend::Wgc => true,
+        CaptureBackend::Gdi => false,
+        CaptureBackend::Auto => rcdesk_host::platform::windows::d3d::wgc_supported(),
+    };
+    if use_wgc {
+        tracing::info!(backend = "wgc", "screen capture backend");
+        Ok(Box::new(capture::scap::ScapSource::new(display, fps)?))
+    } else {
+        tracing::info!(backend = "gdi", "screen capture backend");
+        Ok(Box::new(capture::gdi::GdiSource::new(display, fps)?))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn build_screen_source(
+    display: Option<u32>,
+    fps: u32,
+    backend: CaptureBackend,
+) -> anyhow::Result<Box<dyn FrameSource>> {
+    match backend {
+        CaptureBackend::Gdi => Err(anyhow::anyhow!(
+            "--capture gdi is a Windows-only fallback, not supported on macOS"
+        )),
+        CaptureBackend::Auto | CaptureBackend::Wgc => {
+            Ok(Box::new(capture::scap::ScapSource::new(display, fps)?))
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn build_scap_source(_display: Option<u32>, _fps: u32) -> anyhow::Result<Box<dyn FrameSource>> {
+fn build_screen_source(
+    _display: Option<u32>,
+    _fps: u32,
+    _backend: CaptureBackend,
+) -> anyhow::Result<Box<dyn FrameSource>> {
     Err(capture::CaptureError::Unsupported.into())
 }
 
 /// The real, platform-backed injector (see `rcdesk_host::input::enigo`).
 /// Falls back to `NoopInjector` on platforms with no such backend, exactly
-/// like `build_scap_source` falls back to an error for capture -- except
+/// like `build_screen_source` falls back to an error for capture -- except
 /// here a no-op is the correct behavior rather than a failure, since a host
 /// with no way to inject input isn't a broken host, just one that can only
 /// be watched.
@@ -186,11 +262,12 @@ fn run_bench(
     bitrate_kbps: u32,
     seconds: u32,
     dump: Option<PathBuf>,
+    capture: CaptureBackend,
 ) -> anyhow::Result<()> {
     let source: Box<dyn FrameSource> = if synthetic {
         Box::new(capture::synthetic::SyntheticSource::new(1280, 720, fps))
     } else {
-        build_scap_source(display, fps)?
+        build_screen_source(display, fps, capture)?
     };
 
     let (width, height) = source.size();
@@ -289,6 +366,7 @@ async fn run_serve(
     bitrate: u32,
     stun: Vec<String>,
     no_input: bool,
+    capture: CaptureBackend,
 ) -> anyhow::Result<()> {
     let name = name
         .or_else(|| std::env::var("HOSTNAME").ok())
@@ -314,7 +392,7 @@ async fn run_serve(
                 )
             })
         } else {
-            Box::new(move || build_scap_source(display, fps))
+            Box::new(move || build_screen_source(display, fps, capture))
         };
 
     let build_injector: Box<dyn Fn() -> anyhow::Result<Box<dyn Injector>> + Send + Sync> =

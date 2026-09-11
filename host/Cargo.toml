@@ -51,7 +51,15 @@ windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    # `D3D11CreateDevice` (see `platform::windows::d3d`) is gated on both
+    # Direct3D11 *and* Dxgi in the `windows` crate itself (its `padapter`
+    # parameter requires `IDXGIAdapter`, from `Win32_Graphics_Dxgi`) even
+    # though this crate never names a Dxgi type directly.
+    "Win32_Graphics_Dxgi",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

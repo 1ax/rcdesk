@@ -3,12 +3,15 @@
 //! platform-independent generator used by tests, CI and local development on
 //! machines without screen-recording permission.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub mod synthetic;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod scap;
+
+#[cfg(target_os = "windows")]
+pub mod gdi;
 
 /// A single raw (unencoded) video frame captured from a source.
 ///
@@ -100,4 +103,110 @@ pub fn list_displays() -> Result<Vec<DisplayInfo>, CaptureError> {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn list_displays() -> Result<Vec<DisplayInfo>, CaptureError> {
     Err(CaptureError::Unsupported)
+}
+
+/// Fixed-rate pacing shared by `FrameSource` implementations that must poll
+/// on a timer instead of blocking on the OS for the next frame (used by
+/// [`gdi::GdiSource`] -- `synthetic::SyntheticSource` has its own copy of
+/// this exact logic since it predates this type and is out of scope here to
+/// change; `scap::ScapSource` needs no pacer at all, `get_next_frame` blocks
+/// until the OS has a frame ready).
+pub struct FramePacer {
+    next_tick: Instant,
+    interval: Duration,
+}
+
+impl FramePacer {
+    /// `fps` of 0 is treated as 1 (a single frame per second) rather than
+    /// producing a zero/infinite interval.
+    pub fn new(fps: u32) -> Self {
+        let interval = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
+        Self {
+            next_tick: Instant::now(),
+            interval,
+        }
+    }
+
+    /// Blocks until the next scheduled tick, then advances the schedule by
+    /// one interval.
+    ///
+    /// If the caller fell behind by more than a full interval (e.g. a slow
+    /// `BitBlt`, or the thread being descheduled), the schedule is snapped
+    /// to `now + interval` instead of advancing by single intervals from the
+    /// old baseline -- otherwise the next several calls would all return
+    /// instantly in a burst to "catch up", which is not what a capture pacer
+    /// wants (it would just produce a pile of duplicate/stale frames).
+    pub fn wait(&mut self) {
+        let now = Instant::now();
+        if now < self.next_tick {
+            std::thread::sleep(self.next_tick - now);
+        } else if now - self.next_tick > self.interval {
+            self.next_tick = now;
+        }
+        self.next_tick += self.interval;
+    }
+}
+
+/// `true` if `cur` is byte-for-byte identical to the previous frame, i.e.
+/// nothing changed on screen and encoding it again would be wasted work.
+/// `None` (no previous frame yet, e.g. the first frame) is never
+/// "unchanged".
+pub fn frame_unchanged(prev: Option<&[u8]>, cur: &[u8]) -> bool {
+    matches!(prev, Some(p) if p == cur)
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+
+    #[test]
+    fn wait_paces_at_the_configured_fps() {
+        let mut pacer = FramePacer::new(100); // 10ms interval
+        let start = Instant::now();
+        pacer.wait();
+        pacer.wait();
+        assert!(
+            start.elapsed() >= Duration::from_millis(10),
+            "two waits at 100fps should take at least one 10ms interval"
+        );
+    }
+
+    #[test]
+    fn wait_resets_schedule_after_falling_behind_instead_of_bursting() {
+        let mut pacer = FramePacer::new(100); // 10ms interval
+        pacer.wait();
+
+        // Simulate the caller falling far behind (e.g. a slow capture call)
+        // without the pacer's own knowledge.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let before = Instant::now();
+        pacer.wait();
+        // Falling behind must not leave a backlog of already-due ticks: the
+        // next scheduled tick has to be at or after "now", so the *next*
+        // call to `wait()` sleeps again instead of returning instantly too.
+        assert!(
+            pacer.next_tick >= before,
+            "pacer must not owe a backlog of ticks after falling behind"
+        );
+    }
+
+    #[test]
+    fn frame_unchanged_is_false_with_no_previous_frame() {
+        assert!(!frame_unchanged(None, &[1, 2, 3]));
+    }
+
+    #[test]
+    fn frame_unchanged_is_true_for_identical_bytes() {
+        let prev = vec![1u8, 2, 3, 4];
+        let cur = vec![1u8, 2, 3, 4];
+        assert!(frame_unchanged(Some(&prev), &cur));
+    }
+
+    #[test]
+    fn frame_unchanged_is_false_when_a_byte_differs() {
+        let prev = vec![1u8, 2, 3, 4];
+        let cur = vec![1u8, 2, 3, 5];
+        assert!(!frame_unchanged(Some(&prev), &cur));
+    }
 }

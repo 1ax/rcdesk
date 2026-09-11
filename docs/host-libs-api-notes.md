@@ -87,6 +87,18 @@
   выросла с 5 до 8 аргументов). В `host/Cargo.toml` прямой пин `windows-capture = "=1.4.4"`.
   В 1.5+/2.x есть `DirtyRegionSettings` и `MinimumUpdateIntervalSettings` — аргумент за прямой
   крейт в фазе 2.
+- ⚠️ Найдено на тестовом стенде (Windows 10, ATI Radeon HD 4600, Direct3D 10.1, легаси-драйвер
+  WDDM 1.1): `windows-capture` 1.4.4's `create_d3d_device` (`d3d11.rs:55`) требует у
+  `D3D11CreateDevice` уровень поддержки ≥ `D3D_FEATURE_LEVEL_11_0` и превращает более низкий
+  уровень в `Error::FeatureLevelNotSatisfied` — корректно, `Result`. Но `scap` 0.0.8 это
+  значение разворачивает через `.unwrap()`
+  (`scap-0.0.8/src/capturer/engine/win/mod.rs:120`, `WCStream::start_capture`:
+  `Capturer::start_free_threaded(st.to_owned()).unwrap()`), поэтому на таком железе `bench`/
+  `serve` не возвращают ошибку, а паникуют. Решение: пробное `D3D11CreateDevice` до вызова
+  scap — `platform::windows::d3d::wgc_supported()` (host/src/platform/windows/d3d.rs), с тем же
+  набором feature levels/флагов, что и `create_d3d_device`; `main.rs` вызывает его для
+  `--capture auto` и при `false` уходит на запасной захват через GDI
+  (`host/src/capture/gdi.rs`, `BitBlt`).
 
 - Разрешение: `scap::has_permission()`, `scap::request_permission()`, `scap::is_supported()`.
 - Цели: `scap::get_all_targets() -> Vec<Target>` (`Target::Display(Display{id,title,raw_handle})`
