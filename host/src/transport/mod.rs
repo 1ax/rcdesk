@@ -153,8 +153,9 @@ impl<P: Interceptor> Interceptor for RtcpForwarder<P> {
 /// Configuration for one `PeerSession`.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
-    /// STUN/TURN server URLs (e.g. `stun:stun.l.google.com:19302`).
-    pub ice_servers: Vec<String>,
+    /// STUN/TURN servers (from the signaling server's `Registered` reply,
+    /// merged with any `--stun` CLI overrides; see `crate::signaling`).
+    pub ice_servers: Vec<proto::signal::IceServer>,
     /// Local UDP addresses to bind (see `with_udp_addrs`); `["0.0.0.0:0"]` in
     /// production, `["127.0.0.1:0"]` for the loopback test.
     pub udp_addrs: Vec<String>,
@@ -370,9 +371,10 @@ impl PeerSession {
         let ice_servers = cfg
             .ice_servers
             .iter()
-            .map(|url| RTCIceServer {
-                urls: vec![url.clone()],
-                ..Default::default()
+            .map(|server| RTCIceServer {
+                urls: server.urls.clone(),
+                username: server.username.clone().unwrap_or_default(),
+                credential: server.credential.clone().unwrap_or_default(),
             })
             .collect();
         let configuration = RTCConfigurationBuilder::new()

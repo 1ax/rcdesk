@@ -28,6 +28,23 @@ cargo run -p rcdesk-host -- serve --synthetic
 PIN: 123456
 ```
 
+## ICE-серверы (STUN/TURN)
+
+По умолчанию `serve` не задаёт свой список ICE-серверов: он использует то,
+что пришло от сигнального сервера в `Registered` (см. `server/src/ice.rs`) --
+локально это один STUN `stun:stun.l.google.com:19302` (дефолт сервера без
+`RCDESK_*` переменных). Флаг `--stun <url>` (повторяемый) добавляет ещё
+серверы поверх присланных сервером, а не заменяет их.
+
+## Подключение к проду
+
+```
+cargo run -p rcdesk-host -- serve --server wss://rcdesk.app/ws
+```
+
+`tokio-tungstenite` собран с `rustls-tls-webpki-roots`, так что `wss://`
+работает без дополнительной настройки TLS.
+
 **Терминал 3 — веб-клиент:**
 
 ```

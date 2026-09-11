@@ -262,6 +262,7 @@ VPS владельца (FastVPS, Эстония), отдельный польз�
 | axum 0.8 | server | HTTP + WebSocket (ws-фича axum, без отдельного tungstenite) |
 | tower (util), http-body-util | server (dev) | тесты роутера через `oneshot` |
 | tokio-tungstenite 0.30 | server (dev) | WS-клиент в интеграционных тестах сигналинга |
+| hmac 0.12, sha1 0.10, base64 | server | TURN-креды по REST-схеме coturn (`use-auth-secret`) |
 | futures-util 0.3 | server | `split()` WebSocket на sink/stream |
 | rand 0.10 | server | генерация PIN и идентификаторов |
 | webrtc 0.20 + rtc 0.20 | host | WebRTC-стек (async-обёртка + sans-IO ядро; `rtc` нужен напрямую для типов) |
@@ -269,7 +270,7 @@ VPS владельца (FastVPS, Эстония), отдельный польз�
 | openh264 0.9 (source) | host | H.264 программный + SIMD-конверсия BGRA→I420 |
 | clap 4 (derive) | host | CLI |
 | bytes 1, async-trait 0.1 | host | `Sample.data`, impl `PeerConnectionEventHandler` |
-| tokio-tungstenite 0.30, futures-util 0.3 | host | WS-клиент сигналинга |
+| tokio-tungstenite 0.30 (rustls-tls-webpki-roots), futures-util 0.3 | host | WS/WSS-клиент сигналинга |
 | windows-capture =1.4.4 (пин) | host (Windows) | совместимость scap 0.0.8, см. docs/host-libs-api-notes.md |
 | base64 0.22 | host | RGBA курсора в JSON |
 | objc2 0.6, objc2-foundation 0.3, objc2-app-kit 0.3 | host (macOS) | NSCursor → NSBitmapImageRep (те же версии, что тянет enigo) |

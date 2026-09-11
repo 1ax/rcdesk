@@ -14,16 +14,15 @@ use futures_util::{SinkExt, StreamExt};
 use proto::signal::{Role, SignalMessage};
 use tokio::sync::mpsc;
 
+use crate::app::AppState;
+use crate::ice::{self, IceConfig};
 use crate::registry::{Registry, Tx};
 
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(registry): State<Registry>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, registry))
+pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn handle_socket(socket: WebSocket, registry: Registry) {
+async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<SignalMessage>();
 
@@ -44,7 +43,7 @@ async fn handle_socket(socket: WebSocket, registry: Registry) {
     });
 
     tracing::info!("websocket connection opened");
-    run_connection(&mut stream, tx.clone(), &registry).await;
+    run_connection(&mut stream, tx.clone(), &state.registry, &state.ice).await;
     tracing::info!("websocket connection closed");
 
     // Drop our own sender clone so the writer task's channel closes once no
@@ -87,7 +86,12 @@ async fn next_message(stream: &mut SplitStream<WebSocket>, tx: &Tx) -> Option<Si
     }
 }
 
-async fn run_connection(stream: &mut SplitStream<WebSocket>, tx: Tx, registry: &Registry) {
+async fn run_connection(
+    stream: &mut SplitStream<WebSocket>,
+    tx: Tx,
+    registry: &Registry,
+    ice: &IceConfig,
+) {
     let role = match next_message(stream, &tx).await {
         Some(SignalMessage::Hello { role, .. }) => role,
         Some(_) => {
@@ -100,12 +104,17 @@ async fn run_connection(stream: &mut SplitStream<WebSocket>, tx: Tx, registry: &
     };
 
     match role {
-        Role::Host => run_host(stream, tx, registry).await,
-        Role::Client => run_client(stream, tx, registry).await,
+        Role::Host => run_host(stream, tx, registry, ice).await,
+        Role::Client => run_client(stream, tx, registry, ice).await,
     }
 }
 
-async fn run_host(stream: &mut SplitStream<WebSocket>, tx: Tx, registry: &Registry) {
+async fn run_host(
+    stream: &mut SplitStream<WebSocket>,
+    tx: Tx,
+    registry: &Registry,
+    ice: &IceConfig,
+) {
     let name = match next_message(stream, &tx).await {
         Some(SignalMessage::HostRegister { name }) => name,
         Some(_) => {
@@ -122,6 +131,7 @@ async fn run_host(stream: &mut SplitStream<WebSocket>, tx: Tx, registry: &Regist
     let _ = tx.send(SignalMessage::Registered {
         host_id: host_id.clone(),
         pin,
+        ice_servers: ice.ice_servers(ice::now_unix()),
     });
 
     loop {
@@ -202,7 +212,12 @@ async fn run_host(stream: &mut SplitStream<WebSocket>, tx: Tx, registry: &Regist
     }
 }
 
-async fn run_client(stream: &mut SplitStream<WebSocket>, tx: Tx, registry: &Registry) {
+async fn run_client(
+    stream: &mut SplitStream<WebSocket>,
+    tx: Tx,
+    registry: &Registry,
+    ice: &IceConfig,
+) {
     loop {
         let msg = match next_message(stream, &tx).await {
             Some(msg) => msg,
@@ -216,6 +231,7 @@ async fn run_client(stream: &mut SplitStream<WebSocket>, tx: Tx, registry: &Regi
                     let _ = tx.send(SignalMessage::Joined {
                         session_id: session_id.clone(),
                         host_name,
+                        ice_servers: ice.ice_servers(ice::now_unix()),
                     });
                     let _ = host_tx.send(SignalMessage::PeerJoined { session_id });
                 }

@@ -10,14 +10,12 @@
 
 import "./style.css";
 import { SignalingClient } from "./signaling";
-import { PeerSession } from "./session";
+import { PeerSession, toRtcIceServers } from "./session";
 import { summarizeStats, takeSnapshot } from "./stats";
 import type { Snapshot, StatsSummary } from "./stats";
 import { attachInput } from "./input";
 import { applyCursor } from "./cursor";
 import type { ControlMessage } from "./generated/ControlMessage";
-
-const ICE_SERVERS: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
 
 type SessionStatus = "connecting" | "connected" | "disconnected" | "error";
 
@@ -246,7 +244,7 @@ export function mount(root: Element | null): void {
       setSessionStatus("connecting");
 
       session = new PeerSession(
-        { iceServers: ICE_SERVERS },
+        { iceServers: toRtcIceServers(msg.ice_servers) },
         {
           onIceCandidate: (candidate) => {
             if (sessionId) {

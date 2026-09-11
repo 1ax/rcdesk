@@ -6,6 +6,7 @@
 // its own.
 
 import type { IceCandidate } from "./generated/IceCandidate";
+import type { IceServer } from "./generated/IceServer";
 
 /** Minimal shape of `RTCPeerConnection` this class depends on, so tests can
  * inject a fake implementation. */
@@ -55,6 +56,18 @@ function iceCandidateFromRtc(c: RTCIceCandidate): IceCandidate {
     sdp_mid: c.sdpMid,
     sdp_mline_index: c.sdpMLineIndex,
   };
+}
+
+/** Maps the proto `IceServer`s sent in `joined` (snake_case, see
+ * `server/src/ice.rs`) to the browser's `RTCIceServer[]`, turning the `null`
+ * ts-rs gives `Option::None` into `undefined` (the shape `RTCPeerConnection`
+ * expects for "no credential"). */
+export function toRtcIceServers(servers: IceServer[]): RTCIceServer[] {
+  return servers.map((s) => ({
+    urls: s.urls,
+    username: s.username ?? undefined,
+    credential: s.credential ?? undefined,
+  }));
 }
 
 /** One WebRTC peer session, client (answer) side. */

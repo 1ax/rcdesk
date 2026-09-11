@@ -23,6 +23,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }
 futures-util = "0.3"
+base64 = { workspace = true }
+hmac = "0.12"
+sha1 = "0.10"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

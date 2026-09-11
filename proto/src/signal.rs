@@ -17,6 +17,17 @@ pub struct IceCandidate {
     pub sdp_mline_index: Option<u16>,
 }
 
+/// One STUN/TURN server, as sent to a host or client so it can build its own
+/// `RTCPeerConnection` configuration (see ARCHITECTURE.md §11 and
+/// `server/src/ice.rs`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct IceServer {
+    pub urls: Vec<String>,
+    pub username: Option<String>,
+    pub credential: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(export)]
@@ -26,13 +37,18 @@ pub enum SignalMessage {
     /// host -> server
     HostRegister { name: String },
     /// server -> host
-    Registered { host_id: String, pin: String },
+    Registered {
+        host_id: String,
+        pin: String,
+        ice_servers: Vec<IceServer>,
+    },
     /// client -> server
     Join { pin: String },
     /// server -> client
     Joined {
         session_id: String,
         host_name: String,
+        ice_servers: Vec<IceServer>,
     },
     /// server -> host
     PeerJoined { session_id: String },

@@ -69,6 +69,7 @@ pub struct HostContext {
 pub struct SignalingClient {
     host_id: String,
     pin: String,
+    ice_servers: Vec<proto::signal::IceServer>,
     write: SplitSink<WsStream, Message>,
     read: SplitStream<WsStream>,
 }
@@ -96,8 +97,12 @@ impl SignalingClient {
         )
         .await?;
 
-        let (host_id, pin) = match next_message(&mut read).await {
-            Some(SignalMessage::Registered { host_id, pin }) => (host_id, pin),
+        let (host_id, pin, ice_servers) = match next_message(&mut read).await {
+            Some(SignalMessage::Registered {
+                host_id,
+                pin,
+                ice_servers,
+            }) => (host_id, pin, ice_servers),
             Some(SignalMessage::Error { message }) => {
                 anyhow::bail!("signaling server rejected registration: {message}")
             }
@@ -108,6 +113,7 @@ impl SignalingClient {
         Ok(Self {
             host_id,
             pin,
+            ice_servers,
             write,
             read,
         })
@@ -119,6 +125,13 @@ impl SignalingClient {
 
     pub fn host_id(&self) -> &str {
         &self.host_id
+    }
+
+    /// ICE servers the signaling server sent in `Registered`. `main.rs`
+    /// merges these with any `--stun` CLI overrides before building the
+    /// `SessionConfig` used for every session (see `docs/dev-run.md`).
+    pub fn ice_servers(&self) -> &[proto::signal::IceServer] {
+        &self.ice_servers
     }
 
     /// Drives the signaling connection: forwards SDP/ICE between the wire

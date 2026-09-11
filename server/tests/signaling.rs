@@ -3,6 +3,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use proto::signal::{IceCandidate, Role, SignalMessage};
 use rcdesk_server::app::app;
+use rcdesk_server::ice::IceConfig;
 use rcdesk_server::registry::Registry;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -20,8 +21,11 @@ async fn spawn_server() -> String {
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
     let registry = Registry::new();
+    let ice = IceConfig::from_env();
     tokio::spawn(async move {
-        axum::serve(listener, app(registry)).await.expect("serve");
+        axum::serve(listener, app(registry, ice))
+            .await
+            .expect("serve");
     });
     format!("ws://{addr}/ws")
 }
@@ -119,10 +123,16 @@ async fn host_registers_and_receives_six_digit_pin() {
     .await;
 
     match recv(&mut host).await {
-        SignalMessage::Registered { host_id, pin } => {
+        SignalMessage::Registered {
+            host_id,
+            pin,
+            ice_servers,
+        } => {
             assert_eq!(host_id.len(), 16);
             assert_eq!(pin.len(), 6);
             assert!(pin.chars().all(|c| c.is_ascii_digit()));
+            assert!(!ice_servers.is_empty());
+            assert!(ice_servers[0].urls[0].starts_with("stun:"));
         }
         other => panic!("expected registered, got {other:?}"),
     }
@@ -155,8 +165,11 @@ async fn client_join_succeeds_and_host_is_notified() {
         SignalMessage::Joined {
             session_id,
             host_name,
+            ice_servers,
         } => {
             assert_eq!(host_name, "My Mac");
+            assert!(!ice_servers.is_empty());
+            assert!(ice_servers[0].urls[0].starts_with("stun:"));
             session_id
         }
         other => panic!("expected joined, got {other:?}"),

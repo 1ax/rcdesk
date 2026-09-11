@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { PeerSession } from "./session";
+import { PeerSession, toRtcIceServers } from "./session";
 import type { RTCPeerConnectionLike } from "./session";
 
 /** A fake `RTCPeerConnection` covering exactly what `PeerSession` uses, so
@@ -75,6 +75,28 @@ describe("PeerSession.addRemoteIce", () => {
       sdpMid: "0",
       sdpMLineIndex: 1,
     });
+  });
+});
+
+describe("toRtcIceServers", () => {
+  it("maps urls/username/credential and turns null into undefined", () => {
+    expect(
+      toRtcIceServers([
+        { urls: ["stun:stun.l.google.com:19302"], username: null, credential: null },
+        {
+          urls: ["turn:turn.rcdesk.app:3478?transport=udp"],
+          username: "1700000000:rcdesk",
+          credential: "c29tZS1jcmVk",
+        },
+      ]),
+    ).toEqual([
+      { urls: ["stun:stun.l.google.com:19302"], username: undefined, credential: undefined },
+      {
+        urls: ["turn:turn.rcdesk.app:3478?transport=udp"],
+        username: "1700000000:rcdesk",
+        credential: "c29tZS1jcmVk",
+      },
+    ]);
   });
 });
 

@@ -1,4 +1,5 @@
 use rcdesk_server::app::app;
+use rcdesk_server::ice::IceConfig;
 use rcdesk_server::registry::Registry;
 
 #[tokio::main]
@@ -20,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("rcdesk-server listening on {addr}");
 
-    axum::serve(listener, app(Registry::new())).await?;
+    axum::serve(listener, app(Registry::new(), IceConfig::from_env())).await?;
 
     Ok(())
 }

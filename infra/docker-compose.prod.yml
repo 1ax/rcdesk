@@ -1,0 +1,40 @@
+# Production docker-compose для rcdesk.
+# Запускается на сервере из ~/app (пользователь rcdesk) рядом с .env (chmod 600).
+# server публикуется ТОЛЬКО на 127.0.0.1 -- внешний FastPanel-Nginx на этом же
+# сервере проксирует /ws и /healthz на 127.0.0.1:8100 (см. ARCHITECTURE.md §11).
+# Образ тянется из ghcr.io (публикуется .github/workflows/deploy.yml).
+
+services:
+  server:
+    image: ghcr.io/1ax/rcdesk-server:${IMAGE_TAG:-latest}
+    ports:
+      - "127.0.0.1:8100:8080"
+    env_file: .env
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+    restart: unless-stopped
+
+  # host-сеть: coturn относится к диапазону relay-портов (49152-65535) через
+  # публикацию по одному в compose непрактично, а TURN должен видеть внешний
+  # IP клиентов напрямую (не за NAT контейнерной сети).
+  coturn:
+    image: coturn/coturn:4
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - "--listening-port=3478"
+      - "--realm=rcdesk.app"
+      - "--use-auth-secret"
+      - "--static-auth-secret=${TURN_SECRET}"
+      - "--external-ip=${TURN_EXTERNAL_IP}"
+      - "--min-port=49152"
+      - "--max-port=65535"
+      - "--no-tls"
+      - "--no-dtls"
+      - "--no-cli"
+      - "--fingerprint"
+      - "--log-file=stdout"
+      - "--no-multicast-peers"

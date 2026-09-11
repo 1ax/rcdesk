@@ -66,8 +66,11 @@ enum Command {
         fps: u32,
         #[arg(long, default_value_t = 6000)]
         bitrate: u32,
-        /// STUN/TURN server URL. Repeatable.
-        #[arg(long = "stun", default_value = "stun:stun.l.google.com:19302")]
+        /// Extra STUN/TURN server URL, added on top of whatever the
+        /// signaling server sends in `Registered` (see `docs/dev-run.md`).
+        /// Repeatable. Empty by default: with no `--stun`, ICE servers come
+        /// entirely from the signaling server.
+        #[arg(long = "stun")]
         stun: Vec<String>,
         /// Disable mouse/keyboard injection: input messages are received and
         /// logged but never touch the real mouse/keyboard. See
@@ -321,9 +324,18 @@ async fn run_serve(
             Box::new(build_real_injector)
         };
 
+    // Server-provided ICE servers (STUN, and TURN when configured -- see
+    // `server/src/ice.rs`) plus any `--stun` overrides from the CLI.
+    let mut ice_servers: Vec<proto::signal::IceServer> = client.ice_servers().to_vec();
+    ice_servers.extend(stun.into_iter().map(|url| proto::signal::IceServer {
+        urls: vec![url],
+        username: None,
+        credential: None,
+    }));
+
     let ctx = HostContext {
         session: SessionConfig {
-            ice_servers: stun,
+            ice_servers,
             udp_addrs: vec!["0.0.0.0:0".to_string()],
             fps,
         },
