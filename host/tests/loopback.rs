@@ -27,8 +27,7 @@ use webrtc::runtime::default_runtime;
 
 use rcdesk_host::capture::synthetic::SyntheticSource;
 use rcdesk_host::capture::FrameSource;
-use rcdesk_host::encode::openh264::OpenH264Encoder;
-use rcdesk_host::encode::{Encoder, EncoderConfig};
+use rcdesk_host::encode::{build_encoder, EncoderConfig, EncoderKind};
 use rcdesk_host::pipeline::Pipeline;
 use rcdesk_host::transport::{PeerSession, SessionConfig, SessionEvent};
 
@@ -168,7 +167,7 @@ async fn run() -> anyhow::Result<()> {
         keyframe_interval_frames: 300,
         max_qp: None,
     };
-    let encoder: Box<dyn Encoder> = Box::new(OpenH264Encoder::new(encoder_cfg)?);
+    let (encoder, _kind) = build_encoder(Some(EncoderKind::OpenH264), encoder_cfg)?;
     let pipeline_handle = Pipeline::start(source, encoder);
     let keyframe_flag = pipeline_handle.keyframe_flag();
     let stats = Arc::clone(&pipeline_handle.stats);

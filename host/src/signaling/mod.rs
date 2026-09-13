@@ -26,8 +26,7 @@ use webrtc::runtime::Runtime;
 
 use crate::capture::FrameSource;
 use crate::cursor::{self, CursorSource, CursorState};
-use crate::encode::openh264::OpenH264Encoder;
-use crate::encode::{Encoder, EncoderConfig};
+use crate::encode::{build_encoder, EncoderConfig, EncoderKind};
 use crate::input::{Injector, InputRouter};
 use crate::pipeline::Pipeline;
 use crate::transport::{PeerSession, SessionConfig, SessionEvent};
@@ -48,6 +47,9 @@ pub struct HostContext {
     /// Hard ceiling on encoder QP (0..=51); `None` leaves the encoder's own
     /// default. See `EncoderConfig::max_qp`.
     pub max_qp: Option<u8>,
+    /// Which H.264 encoder backend to use. `None` means "auto" -- see
+    /// `encode::build_encoder`.
+    pub encoder: Option<EncoderKind>,
     /// Builds a fresh frame source for a new session. A closure (rather than
     /// a `FrameSource` directly baked in here) because a platform-specific
     /// `scap` source is only constructible behind `cfg(...)`, and this
@@ -438,7 +440,8 @@ async fn start_session(
         keyframe_interval_frames: fps * 10,
         max_qp: ctx.max_qp,
     };
-    let encoder: Box<dyn Encoder> = Box::new(OpenH264Encoder::new(encoder_cfg)?);
+    let (encoder, encoder_kind) = build_encoder(ctx.encoder, encoder_cfg)?;
+    tracing::info!(encoder = encoder_kind.name(), "starting session pipeline");
     let handle = Pipeline::start(source, encoder);
     let keyframe_flag = handle.keyframe_flag();
 

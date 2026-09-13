@@ -1,6 +1,8 @@
-//! H.264 encoding: turns `I420Frame`s into Annex-B access units.
+//! H.264 encoding: turns `RawFrame`s into Annex-B access units.
 
 use std::time::Instant;
+
+use crate::capture::RawFrame;
 
 pub mod convert;
 pub mod openh264;
@@ -14,22 +16,72 @@ pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub keyframe: bool,
     pub ts: Instant,
-    /// Wall-clock time the *source* frame was captured (`RawFrame::ts()`),
-    /// as opposed to `ts` (when encoding finished). The encoder doesn't see
-    /// the raw frame, so it fills this with a placeholder; `pipeline::start`
-    /// overwrites it with the real value right after `encode()` returns.
-    /// The transport uses it to stamp RTP timestamps from real capture
-    /// gaps rather than a fixed `1/fps` step (see
-    /// `docs/host-libs-api-notes.md`'s webrtc section).
+    /// Wall-clock time the *source* frame was captured, as opposed to `ts`
+    /// (when encoding finished). The encoder sets this from
+    /// `RawFrame::ts()` right at the start of `encode()`. The transport uses
+    /// it to stamp RTP timestamps from real capture gaps rather than a fixed
+    /// `1/fps` step (see `docs/host-libs-api-notes.md`'s webrtc section).
     pub captured_at: Instant,
 }
 
 pub trait Encoder: Send {
     fn encode(
         &mut self,
-        frame: &I420Frame,
+        frame: &RawFrame,
         force_keyframe: bool,
     ) -> Result<Option<EncodedFrame>, EncodeError>;
+}
+
+/// Which H.264 encoder backend to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderKind {
+    /// Software encoder, built from source (see `openh264.rs`). Available on
+    /// all platforms; the only backend actually implemented so far.
+    OpenH264,
+    /// macOS hardware encoder (VideoToolbox). Not implemented yet -- lands in
+    /// slice 2.2c.
+    VideoToolbox,
+    /// Windows hardware encoder (Media Foundation). Not implemented yet --
+    /// lands in slice 2.2d.
+    MediaFoundation,
+}
+
+impl EncoderKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            EncoderKind::OpenH264 => "openh264",
+            EncoderKind::VideoToolbox => "videotoolbox",
+            EncoderKind::MediaFoundation => "mediafoundation",
+        }
+    }
+}
+
+/// Builds an `Encoder` for the requested backend, returning the `EncoderKind`
+/// actually chosen alongside it (useful when `kind` is `None`, i.e. "auto").
+///
+/// `Some(EncoderKind::VideoToolbox)` / `Some(EncoderKind::MediaFoundation)`
+/// always fail with `EncodeError::Unsupported` in this slice: the hardware
+/// backends themselves land in 2.2c (VideoToolbox) / 2.2d (Media Foundation).
+///
+/// `None` ("auto") always picks openh264 for now; once the hardware backends
+/// exist, auto will try the platform's hardware encoder first and fall back
+/// to openh264 with a `tracing::warn!` if building it fails.
+pub fn build_encoder(
+    kind: Option<EncoderKind>,
+    cfg: EncoderConfig,
+) -> Result<(Box<dyn Encoder>, EncoderKind), EncodeError> {
+    let kind = kind.unwrap_or(EncoderKind::OpenH264);
+    tracing::info!(encoder = kind.name(), "video encoder");
+
+    match kind {
+        EncoderKind::OpenH264 => {
+            let encoder = openh264::OpenH264Encoder::new(cfg)?;
+            Ok((Box::new(encoder), EncoderKind::OpenH264))
+        }
+        EncoderKind::VideoToolbox | EncoderKind::MediaFoundation => {
+            Err(EncodeError::Unsupported(kind))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -52,6 +104,10 @@ pub struct EncoderConfig {
 pub enum EncodeError {
     #[error("encoder backend error: {0}")]
     Backend(String),
+    /// Requested a hardware backend that isn't implemented in this build yet
+    /// (VideoToolbox lands in 2.2c, Media Foundation in 2.2d).
+    #[error("{0:?} encoder is not available in this build")]
+    Unsupported(EncoderKind),
 }
 
 /// Parses an Annex-B bitstream (3- or 4-byte start codes) and returns the
@@ -108,5 +164,31 @@ mod tests {
     #[test]
     fn nal_types_empty_for_no_start_code() {
         assert!(nal_types(&[1, 2, 3, 4]).is_empty());
+    }
+
+    fn test_cfg() -> EncoderConfig {
+        EncoderConfig {
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_kbps: 2000,
+            keyframe_interval_frames: 60,
+            max_qp: None,
+        }
+    }
+
+    #[test]
+    fn build_encoder_rejects_backends_not_built_in() {
+        assert!(matches!(
+            build_encoder(Some(EncoderKind::VideoToolbox), test_cfg()),
+            Err(EncodeError::Unsupported(_))
+        ));
+        assert!(matches!(
+            build_encoder(Some(EncoderKind::MediaFoundation), test_cfg()),
+            Err(EncodeError::Unsupported(_))
+        ));
+
+        let (_, kind) = build_encoder(None, test_cfg()).expect("auto must build openh264");
+        assert_eq!(kind, EncoderKind::OpenH264);
     }
 }

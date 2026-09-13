@@ -12,7 +12,9 @@ use ::openh264::formats::YUVSlices;
 use ::openh264::OpenH264API;
 use ::openh264::Timestamp;
 
-use super::{EncodeError, EncodedFrame, Encoder, EncoderConfig, I420Frame};
+use crate::capture::RawFrame;
+
+use super::{to_i420, EncodeError, EncodedFrame, Encoder, EncoderConfig};
 
 /// Lower QP bound passed to openh264 alongside `EncoderConfig::max_qp`; see
 /// the comment at the call site for why it can't be 0.
@@ -75,17 +77,20 @@ impl OpenH264Encoder {
 impl Encoder for OpenH264Encoder {
     fn encode(
         &mut self,
-        frame: &I420Frame,
+        frame: &RawFrame,
         force_keyframe: bool,
     ) -> Result<Option<EncodedFrame>, EncodeError> {
+        let captured_at = frame.ts();
+        let i420 = to_i420(frame);
+
         if force_keyframe {
             self.inner.force_intra_frame();
         }
 
-        let w = frame.width as usize;
-        let h = frame.height as usize;
+        let w = i420.width as usize;
+        let h = i420.height as usize;
         let cw = w.div_ceil(2);
-        let source = YUVSlices::new((&frame.y, &frame.u, &frame.v), (w, h), (w, cw, cw));
+        let source = YUVSlices::new((&i420.y, &i420.u, &i420.v), (w, h), (w, cw, cw));
 
         let ts_ms = self.started.elapsed().as_millis() as u64;
         let bitstream = self
@@ -105,11 +110,7 @@ impl Encoder for OpenH264Encoder {
             data,
             keyframe,
             ts: Instant::now(),
-            // Placeholder: the encoder never sees the raw frame, so it
-            // doesn't know when it was captured. `pipeline::start`
-            // overwrites this with the real value right after `encode()`
-            // returns (see `EncodedFrame::captured_at`'s doc comment).
-            captured_at: Instant::now(),
+            captured_at,
         }))
     }
 }
@@ -119,7 +120,7 @@ mod tests {
     use super::*;
     use crate::capture::synthetic::SyntheticSource;
     use crate::capture::FrameSource;
-    use crate::encode::{nal_types, to_i420};
+    use crate::encode::nal_types;
 
     fn test_cfg() -> EncoderConfig {
         EncoderConfig {
@@ -138,9 +139,8 @@ mod tests {
         let mut encoder = OpenH264Encoder::new(test_cfg()).expect("encoder init");
 
         let raw = source.next_frame().expect("frame");
-        let i420 = to_i420(&raw);
         let encoded = encoder
-            .encode(&i420, false)
+            .encode(&raw, false)
             .expect("encode")
             .expect("first frame must produce output");
 
@@ -159,9 +159,8 @@ mod tests {
         let mut outputs = Vec::new();
         for i in 0..30u32 {
             let raw = source.next_frame().expect("frame");
-            let i420 = to_i420(&raw);
             let force = i == 19; // 20th frame (0-indexed)
-            if let Some(encoded) = encoder.encode(&i420, force).expect("encode") {
+            if let Some(encoded) = encoder.encode(&raw, force).expect("encode") {
                 outputs.push((i, encoded));
             }
         }
@@ -206,8 +205,7 @@ mod tests {
         let mut outputs = Vec::new();
         for i in 0..30u32 {
             let raw = source.next_frame().expect("frame");
-            let i420 = to_i420(&raw);
-            let encoded = encoder.encode(&i420, false).expect("encode");
+            let encoded = encoder.encode(&raw, false).expect("encode");
             if let Some(encoded) = encoded {
                 outputs.push((i, encoded));
             }

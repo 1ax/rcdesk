@@ -8,8 +8,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use rcdesk_host::capture::{self, FrameSource};
 use rcdesk_host::cursor::CursorSource;
-use rcdesk_host::encode::openh264::OpenH264Encoder;
-use rcdesk_host::encode::{Encoder, EncoderConfig};
+use rcdesk_host::encode::{build_encoder, EncoderConfig, EncoderKind};
 use rcdesk_host::input::{Injector, NoopInjector};
 use rcdesk_host::pipeline::Pipeline;
 use rcdesk_host::platform;
@@ -38,6 +37,35 @@ enum CaptureBackend {
     /// Force GDI (`BitBlt`): works on any driver/VM, higher CPU cost, no
     /// "yellow border" capture indicator.
     Gdi,
+}
+
+/// Which H.264 encoder backend to use.
+#[derive(Clone, Copy, ValueEnum)]
+enum EncoderBackend {
+    /// The platform's hardware encoder if available (VideoToolbox on macOS,
+    /// Media Foundation on Windows), openh264 otherwise. Right now the
+    /// hardware backends aren't implemented yet, so this always resolves to
+    /// openh264 (see `encode::build_encoder`'s doc comment).
+    Auto,
+    /// Software encoder, built from source. Works on every platform.
+    Openh264,
+    /// macOS hardware encoder. Not implemented yet (lands in slice 2.2c) --
+    /// selecting it explicitly fails with an "not available" error.
+    Videotoolbox,
+    /// Windows hardware encoder. Not implemented yet (lands in slice 2.2d)
+    /// -- selecting it explicitly fails with an "not available" error.
+    Mediafoundation,
+}
+
+impl EncoderBackend {
+    fn kind(self) -> Option<EncoderKind> {
+        match self {
+            EncoderBackend::Auto => None,
+            EncoderBackend::Openh264 => Some(EncoderKind::OpenH264),
+            EncoderBackend::Videotoolbox => Some(EncoderKind::VideoToolbox),
+            EncoderBackend::Mediafoundation => Some(EncoderKind::MediaFoundation),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -72,6 +100,10 @@ enum Command {
         /// Ignored (and ignored by `--synthetic`) on other platforms.
         #[arg(long, value_enum, default_value_t = CaptureBackend::Auto)]
         capture: CaptureBackend,
+        /// Which H.264 encoder backend to use. `auto` picks the platform's
+        /// hardware encoder if available, openh264 otherwise.
+        #[arg(long, value_enum, default_value_t = EncoderBackend::Auto)]
+        encoder: EncoderBackend,
     },
     /// Connect to a signaling server, register as a host, and serve
     /// incoming WebRTC sessions.
@@ -115,6 +147,10 @@ enum Command {
         /// Ignored (and ignored by `--synthetic`) on other platforms.
         #[arg(long, value_enum, default_value_t = CaptureBackend::Auto)]
         capture: CaptureBackend,
+        /// Which H.264 encoder backend to use. `auto` picks the platform's
+        /// hardware encoder if available, openh264 otherwise.
+        #[arg(long, value_enum, default_value_t = EncoderBackend::Auto)]
+        encoder: EncoderBackend,
     },
 }
 
@@ -148,8 +184,9 @@ async fn main() -> anyhow::Result<()> {
             max_qp,
             dump,
             capture,
+            encoder,
         } => run_bench(
-            synthetic, display, fps, bitrate, seconds, max_qp, dump, capture,
+            synthetic, display, fps, bitrate, seconds, max_qp, dump, capture, encoder,
         ),
         Command::Serve {
             server,
@@ -162,9 +199,11 @@ async fn main() -> anyhow::Result<()> {
             stun,
             no_input,
             capture,
+            encoder,
         } => {
             run_serve(
                 server, name, synthetic, display, fps, bitrate, max_qp, stun, no_input, capture,
+                encoder,
             )
             .await
         }
@@ -277,6 +316,7 @@ fn run_bench(
     max_qp: Option<u8>,
     dump: Option<PathBuf>,
     capture: CaptureBackend,
+    encoder: EncoderBackend,
 ) -> anyhow::Result<()> {
     let source: Box<dyn FrameSource> = if synthetic {
         Box::new(capture::synthetic::SyntheticSource::new(1280, 720, fps))
@@ -293,7 +333,8 @@ fn run_bench(
         keyframe_interval_frames: fps.max(1) * 2,
         max_qp,
     };
-    let encoder: Box<dyn Encoder> = Box::new(OpenH264Encoder::new(cfg)?);
+    let (encoder, encoder_kind) = build_encoder(encoder.kind(), cfg)?;
+    println!("encoder={}", encoder_kind.name());
 
     let mut handle = Pipeline::start(source, encoder);
     let mut dump_file = dump.as_ref().map(std::fs::File::create).transpose()?;
@@ -301,6 +342,7 @@ fn run_bench(
     let mut sizes: Vec<usize> = Vec::new();
     let mut keyframe_sizes: Vec<usize> = Vec::new();
     let mut delta_sizes: Vec<usize> = Vec::new();
+    let mut capture_to_encoded_us: Vec<usize> = Vec::new();
     let start = Instant::now();
     let run_for = Duration::from_secs(u64::from(seconds));
     // Exercise request_keyframe() (mirrors a PLI/FIR from a client, see
@@ -325,6 +367,7 @@ fn run_bench(
                 } else {
                     delta_sizes.push(frame.data.len());
                 }
+                capture_to_encoded_us.push((frame.ts - frame.captured_at).as_micros() as usize);
             }
             Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
             Err(TryRecvError::Disconnected) => break,
@@ -342,6 +385,7 @@ fn run_bench(
         } else {
             delta_sizes.push(frame.data.len());
         }
+        capture_to_encoded_us.push((frame.ts - frame.captured_at).as_micros() as usize);
     }
 
     handle.stop();
@@ -378,6 +422,19 @@ fn run_bench(
     };
     println!("avg_keyframe_bytes={avg_keyframe_bytes:.1} avg_delta_bytes={avg_delta_bytes:.1}");
 
+    let avg_capture_to_encoded_ms = if capture_to_encoded_us.is_empty() {
+        0.0
+    } else {
+        capture_to_encoded_us.iter().sum::<usize>() as f64
+            / capture_to_encoded_us.len() as f64
+            / 1000.0
+    };
+    let p95_capture_to_encoded_ms = percentile(&capture_to_encoded_us, 95.0) as f64 / 1000.0;
+    println!(
+        "avg_capture_to_encoded_ms={avg_capture_to_encoded_ms:.2} \
+         p95_capture_to_encoded_ms={p95_capture_to_encoded_ms:.2}"
+    );
+
     if let Some(path) = dump.as_ref() {
         println!("dumped Annex-B stream to {}", path.display());
     }
@@ -407,6 +464,7 @@ async fn run_serve(
     stun: Vec<String>,
     no_input: bool,
     capture: CaptureBackend,
+    encoder: EncoderBackend,
 ) -> anyhow::Result<()> {
     let name = name
         .or_else(|| std::env::var("HOSTNAME").ok())
@@ -459,6 +517,7 @@ async fn run_serve(
         },
         bitrate_kbps: bitrate,
         max_qp,
+        encoder: encoder.kind(),
         build_source,
         build_injector,
         build_cursor_source: Box::new(build_real_cursor_source),

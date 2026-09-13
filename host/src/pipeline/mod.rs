@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::capture::{FrameSource, RawFrame};
-use crate::encode::{to_i420, EncodedFrame, Encoder};
+use crate::encode::{EncodedFrame, Encoder};
 
 /// How many encoded frames may sit in the output channel before new ones get
 /// dropped. Keeps memory/latency bounded when nothing is draining the
@@ -123,15 +123,10 @@ impl Pipeline {
                     continue;
                 }
 
-                let i420 = to_i420(&raw);
                 let force_keyframe = request_keyframe.swap(false, Ordering::AcqRel);
 
-                match encoder.encode(&i420, force_keyframe) {
-                    Ok(Some(mut encoded)) => {
-                        // The encoder only sees converted I420 data, not the
-                        // raw frame, so it can't fill this in itself (see
-                        // `EncodedFrame::captured_at`'s doc comment).
-                        encoded.captured_at = captured_at;
+                match encoder.encode(&raw, force_keyframe) {
+                    Ok(Some(encoded)) => {
                         stats.encoded.fetch_add(1, Ordering::Relaxed);
                         if encoded.keyframe {
                             stats.keyframes.fetch_add(1, Ordering::Relaxed);
@@ -209,8 +204,7 @@ impl Drop for PipelineHandle {
 mod tests {
     use super::*;
     use crate::capture::synthetic::SyntheticSource;
-    use crate::encode::openh264::OpenH264Encoder;
-    use crate::encode::EncoderConfig;
+    use crate::encode::{build_encoder, EncoderConfig, EncoderKind};
     use std::time::Instant;
     use tokio::sync::mpsc::error::TryRecvError;
 
@@ -238,7 +232,8 @@ mod tests {
             keyframe_interval_frames: 60,
             max_qp: None,
         };
-        let encoder: Box<dyn Encoder> = Box::new(OpenH264Encoder::new(cfg).expect("encoder init"));
+        let (encoder, _kind) =
+            build_encoder(Some(EncoderKind::OpenH264), cfg).expect("encoder init");
 
         let mut handle = Pipeline::start(source, encoder);
 
