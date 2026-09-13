@@ -127,6 +127,34 @@ fn even_dims(width: u32, height: u32) -> (u32, u32) {
     (width & !1, height & !1)
 }
 
+/// Interleaves an I420 frame's U/V planes into NV12 (Y plane unchanged,
+/// followed by a dense interleaved UV plane: U0 V0 U1 V1 ...). Used by the
+/// Windows Media Foundation encoder, whose input type is NV12 rather than
+/// I420 -- see `mediafoundation.rs`.
+///
+/// The returned Y plane is a copy of `frame.y` (both dense, so this could be
+/// `frame.y.clone()`, but returning an owned `Vec` from both plane
+/// computations keeps the two return values symmetric for callers).
+pub fn i420_to_nv12(frame: &I420Frame) -> (Vec<u8>, Vec<u8>) {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
+
+    let y = frame.y.clone();
+
+    let mut uv = vec![0u8; cw * 2 * ch];
+    for row in 0..ch {
+        for col in 0..cw {
+            let src = row * cw + col;
+            uv[row * cw * 2 + col * 2] = frame.u[src];
+            uv[row * cw * 2 + col * 2 + 1] = frame.v[src];
+        }
+    }
+
+    (y, uv)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +199,23 @@ mod tests {
         for &v in &frame.v {
             assert!((125..=131).contains(&v), "unexpected V value {v}");
         }
+    }
+
+    #[test]
+    fn i420_to_nv12_interleaves_uv_exactly() {
+        // 4x2 I420: Y unchanged, U/V (2x1 each) interleave to U0 V0 U1 V1.
+        let frame = I420Frame {
+            width: 4,
+            height: 2,
+            y: vec![0u8, 1, 2, 3, 4, 5, 6, 7],
+            u: vec![10u8, 30],
+            v: vec![20u8, 40],
+        };
+
+        let (y, uv) = i420_to_nv12(&frame);
+
+        assert_eq!(y, frame.y);
+        assert_eq!(uv, vec![10, 20, 30, 40]);
     }
 
     #[test]

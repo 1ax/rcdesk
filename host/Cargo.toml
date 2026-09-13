@@ -60,6 +60,18 @@ windows = { version = "0.61", features = [
     # parameter requires `IDXGIAdapter`, from `Win32_Graphics_Dxgi`) even
     # though this crate never names a Dxgi type directly.
     "Win32_Graphics_Dxgi",
+    # Media Foundation H.264 encoder MFT (encode::mediafoundation): MFT
+    # enumeration/activation, IMFTransform, media types, samples/buffers.
+    "Win32_Media_MediaFoundation",
+    # CoInitializeEx/CoTaskMemFree -- MFTEnumEx needs COM initialized on the
+    # thread, and hands back its MFT_REGISTER_TYPE_INFO/friendly-name
+    # allocations via CoTaskMemAlloc, freed with CoTaskMemFree. Also gates
+    # ICodecAPI::SetValue together with the two features below (the `windows`
+    # crate requires all three on that one method).
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    # VARIANT, the value type ICodecAPI::SetValue takes.
+    "Win32_System_Variant",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

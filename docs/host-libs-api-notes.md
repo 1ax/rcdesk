@@ -266,3 +266,130 @@
   `CFArray::from_objects` ретейнят переданные элементы сами — временные `CFNumber`/`CFBoolean`,
   созданные прямо в вызове, безопасно живут только до конца выражения (стандартное
   Rust-правило temporary lifetime extension на весь оператор).
+
+## Media Foundation (windows 0.61)
+
+Реализация: `host/src/encode/mediafoundation.rs` (весь файл за
+`#[cfg(target_os = "windows")]` в `encode/mod.rs`, не поэлементно). Проверено
+**только компиляцией** (`cargo check`/`clippy --target x86_64-pc-windows-msvc`
+в отдельном scratch-крейте, сигнатуры сверены с исходником `windows` 0.61.3 из
+локального кэша реестра) — на живом Windows это никогда не запускалось этим
+исполнителем; поведение подтверждает только CI (`windows-latest`, там есть
+программный "H264 Encoder MFT" Microsoft) и тестовый стенд владельца (Windows
+10, без аппаратного H.264 — там `build_encoder(None, ..)`/"auto" штатно уходит
+в openh264, что покрыто отдельным логированием на `info!`, не `warn!`).
+
+- **Крейты/фичи** (`host/Cargo.toml`, секция Windows): к уже имевшимся
+  Direct3D/Dxgi/Gdi-фичам добавлены `Win32_Media_MediaFoundation` (сам MFT-API),
+  `Win32_System_Com` (`CoInitializeEx`/`CoTaskMemFree`, и один из трёх компонентов
+  фичи-гейта на `ICodecAPI::SetValue`), `Win32_System_Ole` и `Win32_System_Variant`
+  (два других компонента того же гейта — `windows` требует все три фичи сразу на
+  этом одном методе, проверено прямо в исходнике крейта). Ни одна из них не тянет
+  новых пакетов в граф (весь функционал — cfg-модули внутри уже имеющегося
+  пакета `windows`), поэтому `Cargo.lock` не меняется.
+- **MFT — не COM-класс напрямую, а через `IMFActivate`.** `MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+  flags, Some(&input_type_info), Some(&output_type_info), &mut activates_ptr, &mut count)`
+  ищет encoder-MFT с входом NV12 и выходом H264; сначала с
+  `MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER` (только аппаратные), и
+  только если пусто и вызывающий явно разрешил (`allow_software`) — второй проход с
+  `MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER`.
+  `build_encoder`: `None`/"auto" вызывает `new(cfg, allow_software = false)` (аппаратный
+  MFT предпочтительнее openh264, но *программный* MFT не имеет преимущества перед уже
+  обкатанным openh264 — лишний риск без выгоды), явный `Some(MediaFoundation)` —
+  `new(cfg, true)` (пользователь осознанно попросил именно этот бэкенд).
+  Результат `MFTEnumEx` — массив `*mut Option<IMFActivate>`, выделенный ОС через
+  `CoTaskMemAlloc`: каждый элемент читается `ptr::read` (забирает +1-ссылку, не
+  роняя элемент второй раз), сам массив освобождается одним `CoTaskMemFree` после
+  цикла. Первый найденный активатор активируется в `IMFTransform`
+  (`IMFActivate::ActivateObject::<IMFTransform>()`); имя MFT для лог-строки —
+  `GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, ..)` через `IMFActivate`'s
+  `Deref<Target = IMFAttributes>` (эта строка тоже `CoTaskMemAlloc`'d, освобождается
+  отдельным `CoTaskMemFree`).
+- **Sync vs async MFT.** `transform.GetAttributes()` может целиком провалиться —
+  тогда MFT синхронный (`is_async = false`), это штатный путь, не ошибка. Если
+  атрибуты есть и `GetUINT32(&MF_TRANSFORM_ASYNC) == 1` — MFT асинхронный, и перед
+  любым использованием обязателен `SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)` на тех
+  же атрибутах (иначе `ProcessInput`/`ProcessOutput` отказывают). Асинхронный MFT
+  дополнительно кастуется в `IMFMediaEventGenerator` (`transform.cast()` — safe
+  метод, не `unsafe`, несмотря на то что почти все остальные вызовы в этом модуле
+  `unsafe`) и гоняется через событийный цикл: `METransformNeedInput` (601) копит
+  "кредиты" на `ProcessInput`, `METransformHaveOutput` (602) запускает
+  `ProcessOutput`. `GetEvent(MF_EVENT_FLAG_NO_WAIT)` — неблокирующий слив всего, что
+  накопилось; `GetEvent(MF_EVENT_FLAG_NONE)` — блокирующее ожидание ровно одного
+  события, используется только когда `encode()` не имеет ни одного кредита и должен
+  дождаться `METransformNeedInput`, прежде чем звать `ProcessInput`. Синхронный MFT
+  устроен проще: `ProcessInput` сразу за `ProcessOutput` в цикле,
+  `MF_E_TRANSFORM_NEED_MORE_INPUT` на выходе — не ошибка, просто "кадр ещё не готов";
+  `MF_E_NOTACCEPTING` на входе — входная очередь MFT полна, `encode()` сливает то, что
+  есть на выходе (кладёт в `pending`, а не роняет — принадлежит предыдущему кадру), и
+  повторяет `ProcessInput` один раз.
+- **Порядок настройки типов: выходной, затем входной** — большинство encoder-MFT
+  выбирают набор допустимых входных типов (`GetInputAvailableType`) исходя из уже
+  установленного выходного. Выходной тип строится с нуля через `MFCreateMediaType()`
+  (не перебором `GetOutputAvailableType`): `MF_MT_MAJOR_TYPE=Video`,
+  `MF_MT_SUBTYPE=H264`, `MF_MT_AVG_BITRATE`, `MF_MT_FRAME_SIZE`/`MF_MT_FRAME_RATE`
+  (упакованы как `(hi << 32) | lo`, по документации `MFVideoFormat`-макросов),
+  `MF_MT_INTERLACE_MODE=Progressive`, `MF_MT_MPEG2_PROFILE=eAVEncH264VProfile_ConstrainedBase`
+  (256). Если `SetOutputType` с Constrained Baseline проваливается —
+  `tracing::warn!` и повтор с `eAVEncH264VProfile_Base` (66, обычная Baseline):
+  Microsoft документирует для своего программного кодера только Base/Main/High,
+  не Constrained Baseline, на части версий Windows. Входной тип сначала ищется
+  перебором `GetInputAvailableType(0, i)` по subtype NV12 (`GetGUID(&MF_MT_SUBTYPE)`);
+  если у MFT нет доступных входных типов вообще (типичная ошибка до того, как выходной
+  тип задан — здесь уже не должно происходить благодаря порядку выше, но обработано
+  как fallback) — тип строится с нуля тем же `MFCreateMediaType()`. В обоих случаях
+  дополняется `MF_MT_FRAME_SIZE`/`MF_MT_FRAME_RATE`/`MF_MT_INTERLACE_MODE` и
+  (только на входе) `MF_MT_ALL_SAMPLES_INDEPENDENT=1`.
+- **`ICodecAPI`/`VARIANT` — ручная сборка union'а.** `ICodecAPI::SetValue` принимает
+  `*const VARIANT`; сам тип — вложенные `union`ы (`VARIANT.Anonymous: VARIANT_0`,
+  `VARIANT_0.Anonymous: ManuallyDrop<VARIANT_0_0>`, `VARIANT_0_0.Anonymous:
+  VARIANT_0_0_0`), собираемые вручную двумя хелперами (`variant_u32`/`variant_bool`) —
+  инициализация union-поля безопасна в Rust (небезопасно только *чтение*), так что
+  сборка идёт без `unsafe`. `vt` — не голый `u16`, а `VARENUM`
+  (`VT_UI4 = VARENUM(19)`, `VT_BOOL = VARENUM(11)`); булево значение — не Rust
+  `bool`, а `VARIANT_BOOL` (`VARIANT_TRUE = -1i16`, `VARIANT_FALSE = 0i16`, из
+  `Win32::Foundation`, не `Win32::System::Variant`). Каст к `ICodecAPI`
+  (`transform.cast::<ICodecAPI>()`) — мягкий: недоступность интерфейса на части
+  MFT (замечено, что не каждый софтверный MFT его реализует) не фатальна,
+  `tracing::warn!` и пропуск всей ICodecAPI-настройки. Из самих свойств
+  фатальны только `CODECAPI_AVEncCommonRateControlMode` (CBR,
+  `eAVEncCommonRateControlMode_CBR = 0`) и `CODECAPI_AVEncCommonMeanBitRate`
+  (без них битрейт не управляется вообще); `CODECAPI_AVLowLatencyMode`,
+  `CODECAPI_AVEncMPVGOPSize`, `CODECAPI_AVEncVideoMaxQP` (только при заданном
+  `max_qp`) и `CODECAPI_AVEncVideoForceKeyFrame` (за кадр, при `force_keyframe`)
+  — мягкие, `tracing::warn!` и продолжение без них.
+- **Выход — уже Annex-B, не AVCC** (в отличие от VideoToolbox выше): и аппаратные, и
+  программный MFT Microsoft отдают H.264 со старт-кодами и SPS/PPS перед каждым IDR
+  сами, так что здесь нет своего `avcc_to_annexb`-конвертера — модуль просто копирует
+  байты выходного буфера и проверяет через переиспользуемый `encode::nal_types`, что
+  NAL 7/8 (SPS/PPS) действительно присутствуют в первом выходе; если нет —
+  `Backend`-ошибка (значит, тип/профиль был настроен неправильно). Промпт для этого
+  под-шага не был проверен на живом MFT, так что эта проверка — единственная защита
+  от молча неправильно сконфигурированного кодера.
+- **Определение ключевого кадра** — `IMFSample::GetUINT32(&MFSampleExtension_CleanPoint)`
+  (наследуется через `Deref<Target = IMFAttributes>`, как и у `IMFMediaType`/`IMFActivate`)
+  ИЛИ найденный NAL 5 (IDR) в уже скопированных байтах — оба пути ИЛИ'ятся вместе, а не
+  берётся первый успешный: не каждый MFT документированно ставит атрибут, так что
+  сканирование NAL — не запасной, а равноправный источник истины.
+- **Владение `MFT_OUTPUT_DATA_BUFFER::pSample`/`pEvents`** (`ManuallyDrop<Option<T>>`,
+  не сами `Option<T>`) — после каждого `ProcessOutput` оба поля обязательно
+  выгребаются через `ManuallyDrop::take` ровно один раз, независимо от того,
+  успешен вызов или нет: МFT либо заполняет/возвращает сэмпл, который сюда
+  передали (когда `!provides_samples`, см. `GetOutputStreamInfo`'s
+  `MFT_OUTPUT_STREAM_PROVIDES_SAMPLES`), либо оставляет слот как был (обычно
+  `None`, когда MFT сам предоставляет сэмплы) — в обоих случаях слот несёт
+  ссылку, которую нужно уронить самим, `ManuallyDrop` этого не делает
+  автоматически.
+- **`MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE` (256) в `dwStatus`** после успешного
+  `ProcessOutput` означает, что выходной тип нужно перечитать
+  (`GetOutputAvailableType(0, 0)`) и переустановить (`SetOutputType`) прежде чем
+  повторить `ProcessOutput` — обработано как `continue` внутри цикла `drain_output`,
+  не как отдельная функция верхнего уровня.
+- **Время сэмплов — 100-наносекундные единицы (`hns`), не микросекунды** (в отличие
+  от VideoToolbox выше, где `CMTime` брал произвольный `timescale`). Входной
+  `IMFSample::SetSampleTime` считается от `frame.ts()` (момент захвата, не момент
+  вызова `encode()`) относительно `started: Instant`, зафиксированного в `new()` —
+  тот же принцип, что у `openh264`/`videotoolbox` (см. их док-комментарии): RTP-время
+  кадра должно идти по реальным разрывам захвата, а не по счётчику кадров.
+  Симметрично на выходе `captured_at` восстанавливается из
+  `IMFSample::GetSampleTime()` того же `started`, не из `Instant::now()`.

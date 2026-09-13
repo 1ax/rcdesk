@@ -5,6 +5,8 @@ use std::time::Instant;
 use crate::capture::RawFrame;
 
 pub mod convert;
+#[cfg(target_os = "windows")]
+pub mod mediafoundation;
 pub mod openh264;
 #[cfg(target_os = "macos")]
 pub mod videotoolbox;
@@ -45,8 +47,9 @@ pub enum EncoderKind {
     /// `target_os = "macos"`; `build_encoder` rejects it with
     /// `EncodeError::Unsupported` everywhere else.
     VideoToolbox,
-    /// Windows hardware encoder (Media Foundation). Not implemented yet --
-    /// lands in slice 2.2d.
+    /// Windows hardware encoder (Media Foundation, see `mediafoundation.rs`).
+    /// Only available when `target_os = "windows"`; `build_encoder` rejects
+    /// it with `EncodeError::Unsupported` everywhere else.
     MediaFoundation,
 }
 
@@ -65,14 +68,20 @@ impl EncoderKind {
 ///
 /// `Some(EncoderKind::VideoToolbox)` builds the macOS hardware encoder on
 /// macOS, and fails with `EncodeError::Unsupported` everywhere else.
-/// `Some(EncoderKind::MediaFoundation)` always fails with
-/// `EncodeError::Unsupported` in this slice: the Windows hardware backend
-/// lands in 2.2d.
+/// `Some(EncoderKind::MediaFoundation)` builds the Windows hardware-or-software
+/// encoder (`allow_software = true`, since explicitly asking for this backend
+/// implies accepting whatever MFT is available) on Windows, and fails with
+/// `EncodeError::Unsupported` everywhere else.
 ///
-/// `None` ("auto") tries the platform's hardware encoder first on macOS,
-/// falling back to openh264 with a `tracing::warn!` if building it fails;
-/// on every other platform it goes straight to openh264 (there is no
-/// hardware backend to try there yet).
+/// `None` ("auto") tries the platform's hardware encoder first (VideoToolbox
+/// on macOS, a *hardware-only* Media Foundation MFT on Windows --
+/// `allow_software = false`, since a software MFT has no advantage over
+/// openh264 and openh264 is the better-tested fallback), falling back to
+/// openh264 if building it fails: with a `tracing::warn!` on macOS (VT
+/// missing entirely is unusual), or a `tracing::info!` on Windows (no
+/// hardware H.264 MFT is the normal case on the owner's Windows 10 test
+/// bench). On every other platform "auto" goes straight to openh264 (there
+/// is no hardware backend to try there yet).
 pub fn build_encoder(
     kind: Option<EncoderKind>,
     cfg: EncoderConfig,
@@ -94,6 +103,28 @@ pub fn build_encoder(
         }
     }
 
+    #[cfg(target_os = "windows")]
+    if kind.is_none() {
+        // Auto: hardware-only (see this function's doc comment for why
+        // software MFTs are excluded here). Failing to find one is the
+        // expected case on hardware without a hardware H.264 encoder (e.g.
+        // the owner's Windows 10 test bench) -- logged at `info!`, not
+        // `warn!`, unlike the macOS branch above.
+        tracing::info!(
+            encoder = EncoderKind::MediaFoundation.name(),
+            "video encoder"
+        );
+        match mediafoundation::MediaFoundationEncoder::new(cfg, false) {
+            Ok(encoder) => return Ok((Box::new(encoder), EncoderKind::MediaFoundation)),
+            Err(err) => {
+                tracing::info!(
+                    error = %err,
+                    "mediafoundation hardware encoder unavailable, falling back to openh264"
+                );
+            }
+        }
+    }
+
     let kind = kind.unwrap_or(EncoderKind::OpenH264);
     tracing::info!(encoder = kind.name(), "video encoder");
 
@@ -109,6 +140,12 @@ pub fn build_encoder(
         }
         #[cfg(not(target_os = "macos"))]
         EncoderKind::VideoToolbox => Err(EncodeError::Unsupported(kind)),
+        #[cfg(target_os = "windows")]
+        EncoderKind::MediaFoundation => {
+            let encoder = mediafoundation::MediaFoundationEncoder::new(cfg, true)?;
+            Ok((Box::new(encoder), EncoderKind::MediaFoundation))
+        }
+        #[cfg(not(target_os = "windows"))]
         EncoderKind::MediaFoundation => Err(EncodeError::Unsupported(kind)),
     }
 }
@@ -133,8 +170,8 @@ pub struct EncoderConfig {
 pub enum EncodeError {
     #[error("encoder backend error: {0}")]
     Backend(String),
-    /// Requested a hardware backend that isn't implemented in this build yet
-    /// (VideoToolbox lands in 2.2c, Media Foundation in 2.2d).
+    /// Requested a hardware backend this build doesn't have -- VideoToolbox
+    /// is only built on macOS, Media Foundation only on Windows.
     #[error("{0:?} encoder is not available in this build")]
     Unsupported(EncoderKind),
 }
@@ -208,15 +245,13 @@ mod tests {
 
     #[test]
     fn build_encoder_rejects_backends_not_built_in() {
-        // Media Foundation isn't implemented on any platform yet (lands in
-        // 2.2d).
-        assert!(matches!(
-            build_encoder(Some(EncoderKind::MediaFoundation), test_cfg()),
-            Err(EncodeError::Unsupported(_))
-        ));
-
         #[cfg(target_os = "macos")]
         {
+            assert!(matches!(
+                build_encoder(Some(EncoderKind::MediaFoundation), test_cfg()),
+                Err(EncodeError::Unsupported(_))
+            ));
+
             let (_, kind) = build_encoder(Some(EncoderKind::VideoToolbox), test_cfg())
                 .expect("videotoolbox must build on macOS");
             assert_eq!(kind, EncoderKind::VideoToolbox);
@@ -225,10 +260,39 @@ mod tests {
             assert_eq!(kind, EncoderKind::VideoToolbox);
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
         {
             assert!(matches!(
                 build_encoder(Some(EncoderKind::VideoToolbox), test_cfg()),
+                Err(EncodeError::Unsupported(_))
+            ));
+
+            // CI (`windows-latest`) always has Microsoft's own software
+            // "H264 Encoder MFT", so an explicit request must succeed there
+            // even with no hardware encoder present.
+            let (_, kind) = build_encoder(Some(EncoderKind::MediaFoundation), test_cfg())
+                .expect("mediafoundation must build on windows (software MFT if no hardware)");
+            assert_eq!(kind, EncoderKind::MediaFoundation);
+
+            // "Auto" only accepts a hardware MFT and falls back to openh264
+            // otherwise -- CI/the owner's test bench have no hardware H.264
+            // encoder, so either outcome is legitimate here; this only
+            // checks `build_encoder` doesn't error out.
+            let (_, kind) = build_encoder(None, test_cfg()).expect("auto must build on windows");
+            assert!(matches!(
+                kind,
+                EncoderKind::MediaFoundation | EncoderKind::OpenH264
+            ));
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            assert!(matches!(
+                build_encoder(Some(EncoderKind::VideoToolbox), test_cfg()),
+                Err(EncodeError::Unsupported(_))
+            ));
+            assert!(matches!(
+                build_encoder(Some(EncoderKind::MediaFoundation), test_cfg()),
                 Err(EncodeError::Unsupported(_))
             ));
 
