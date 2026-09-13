@@ -1,7 +1,10 @@
 name: CI
 
 on:
+  # На push в main гейты гоняет deploy.yml (вызывает этот workflow как reusable),
+  # отдельный запуск CI там был бы дублем. Ветки и PR проверяются здесь.
   push:
+    branches-ignore: [main]
   pull_request:
   workflow_call:
 
