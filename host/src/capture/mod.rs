@@ -117,6 +117,10 @@ pub struct FramePacer {
 }
 
 impl FramePacer {
+    /// How many intervals behind schedule `wait` tolerates (catching up
+    /// with shorter sleeps) before snapping the schedule to `now`.
+    const CATCH_UP_LIMIT: u32 = 4;
+
     /// `fps` of 0 is treated as 1 (a single frame per second) rather than
     /// producing a zero/infinite interval.
     pub fn new(fps: u32) -> Self {
@@ -130,17 +134,19 @@ impl FramePacer {
     /// Blocks until the next scheduled tick, then advances the schedule by
     /// one interval.
     ///
-    /// If the caller fell behind by more than a full interval (e.g. a slow
-    /// `BitBlt`, or the thread being descheduled), the schedule is snapped
-    /// to `now + interval` instead of advancing by single intervals from the
-    /// old baseline -- otherwise the next several calls would all return
-    /// instantly in a burst to "catch up", which is not what a capture pacer
-    /// wants (it would just produce a pile of duplicate/stale frames).
+    /// Ordinary lateness (an oversleeping `thread::sleep`, a slow capture
+    /// call, a busy machine) is absorbed by the fixed schedule: the next few
+    /// calls simply sleep less, so the average rate stays at `fps`. Only when
+    /// the caller has fallen behind by more than `CATCH_UP_LIMIT` intervals
+    /// (e.g. a source built long before its capture thread started) is the
+    /// schedule snapped to `now` instead of advancing from the old baseline
+    /// -- otherwise the next several calls would all return instantly in a
+    /// burst of duplicate/stale frames to "catch up".
     pub fn wait(&mut self) {
         let now = Instant::now();
         if now < self.next_tick {
             std::thread::sleep(self.next_tick - now);
-        } else if now - self.next_tick > self.interval {
+        } else if now - self.next_tick > self.interval * Self::CATCH_UP_LIMIT {
             self.next_tick = now;
         }
         self.next_tick += self.interval;
