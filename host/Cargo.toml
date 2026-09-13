@@ -79,3 +79,49 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSImageRep",
     "NSBitmapImageRep",
 ] }
+# CoreFoundation container/number/string types used to build VideoToolbox's
+# encoder-specification/property/frame-property dictionaries (encode::videotoolbox).
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFBase",
+    "CFString",
+    "CFNumber",
+    "CFDictionary",
+    "CFArray",
+] }
+# CVPixelBuffer: the image container VideoToolbox's compression session
+# encodes from -- built and filled from each `RawFrame` in encode::videotoolbox.
+objc2-core-video = { version = "0.3", default-features = false, features = [
+    "std",
+    "CVBase",
+    "CVBuffer",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+    "CVReturn",
+] }
+# CMTime/CMSampleBuffer/CMBlockBuffer/CMFormatDescription: VideoToolbox's
+# encoded output comes back as a CMSampleBuffer (AVCC H.264 in a
+# CMBlockBuffer, SPS/PPS in its CMFormatDescription) that encode::videotoolbox
+# converts to this crate's Annex-B `EncodedFrame`.
+objc2-core-media = { version = "0.3", default-features = false, features = [
+    "std",
+    "CMBase",
+    "CMTime",
+    "CMBlockBuffer",
+    "CMFormatDescription",
+    "CMSampleBuffer",
+    "objc2-core-video",
+] }
+# The hardware H.264 encoder itself (VTCompressionSession) -- see
+# docs/host-libs-api-notes.md's VideoToolbox section for the API notes this
+# module (encode::videotoolbox) was written against.
+objc2-video-toolbox = { version = "0.3", default-features = false, features = [
+    "std",
+    "VTBase",
+    "VTErrors",
+    "VTSession",
+    "VTCompressionSession",
+    "VTCompressionProperties",
+    "objc2-core-media",
+    "objc2-core-video",
+] }

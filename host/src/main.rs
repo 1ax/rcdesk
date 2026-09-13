@@ -42,15 +42,14 @@ enum CaptureBackend {
 /// Which H.264 encoder backend to use.
 #[derive(Clone, Copy, ValueEnum)]
 enum EncoderBackend {
-    /// The platform's hardware encoder if available (VideoToolbox on macOS,
-    /// Media Foundation on Windows), openh264 otherwise. Right now the
-    /// hardware backends aren't implemented yet, so this always resolves to
-    /// openh264 (see `encode::build_encoder`'s doc comment).
+    /// The platform's hardware encoder if available (VideoToolbox on macOS;
+    /// Media Foundation on Windows once 2.2d lands), openh264 otherwise --
+    /// see `encode::build_encoder`'s doc comment.
     Auto,
     /// Software encoder, built from source. Works on every platform.
     Openh264,
-    /// macOS hardware encoder. Not implemented yet (lands in slice 2.2c) --
-    /// selecting it explicitly fails with an "not available" error.
+    /// macOS hardware encoder (VideoToolbox). Selecting it on another OS
+    /// fails with a "not available" error.
     Videotoolbox,
     /// Windows hardware encoder. Not implemented yet (lands in slice 2.2d)
     /// -- selecting it explicitly fails with an "not available" error.

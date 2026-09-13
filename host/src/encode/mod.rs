@@ -6,6 +6,8 @@ use crate::capture::RawFrame;
 
 pub mod convert;
 pub mod openh264;
+#[cfg(target_os = "macos")]
+pub mod videotoolbox;
 
 pub use convert::{to_i420, I420Frame};
 
@@ -36,10 +38,12 @@ pub trait Encoder: Send {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncoderKind {
     /// Software encoder, built from source (see `openh264.rs`). Available on
-    /// all platforms; the only backend actually implemented so far.
+    /// all platforms; used everywhere except macOS, and as the fallback
+    /// there when VideoToolbox fails to initialize.
     OpenH264,
-    /// macOS hardware encoder (VideoToolbox). Not implemented yet -- lands in
-    /// slice 2.2c.
+    /// macOS hardware encoder (see `videotoolbox.rs`). Only available when
+    /// `target_os = "macos"`; `build_encoder` rejects it with
+    /// `EncodeError::Unsupported` everywhere else.
     VideoToolbox,
     /// Windows hardware encoder (Media Foundation). Not implemented yet --
     /// lands in slice 2.2d.
@@ -59,17 +63,37 @@ impl EncoderKind {
 /// Builds an `Encoder` for the requested backend, returning the `EncoderKind`
 /// actually chosen alongside it (useful when `kind` is `None`, i.e. "auto").
 ///
-/// `Some(EncoderKind::VideoToolbox)` / `Some(EncoderKind::MediaFoundation)`
-/// always fail with `EncodeError::Unsupported` in this slice: the hardware
-/// backends themselves land in 2.2c (VideoToolbox) / 2.2d (Media Foundation).
+/// `Some(EncoderKind::VideoToolbox)` builds the macOS hardware encoder on
+/// macOS, and fails with `EncodeError::Unsupported` everywhere else.
+/// `Some(EncoderKind::MediaFoundation)` always fails with
+/// `EncodeError::Unsupported` in this slice: the Windows hardware backend
+/// lands in 2.2d.
 ///
-/// `None` ("auto") always picks openh264 for now; once the hardware backends
-/// exist, auto will try the platform's hardware encoder first and fall back
-/// to openh264 with a `tracing::warn!` if building it fails.
+/// `None` ("auto") tries the platform's hardware encoder first on macOS,
+/// falling back to openh264 with a `tracing::warn!` if building it fails;
+/// on every other platform it goes straight to openh264 (there is no
+/// hardware backend to try there yet).
 pub fn build_encoder(
     kind: Option<EncoderKind>,
     cfg: EncoderConfig,
 ) -> Result<(Box<dyn Encoder>, EncoderKind), EncodeError> {
+    #[cfg(target_os = "macos")]
+    if kind.is_none() {
+        // Auto: try the hardware encoder first, fall back to openh264 (with
+        // a warning) if it fails to initialize -- e.g. no hardware encoder
+        // available at all, which happens on some CI/VM configurations.
+        tracing::info!(encoder = EncoderKind::VideoToolbox.name(), "video encoder");
+        match videotoolbox::VideoToolboxEncoder::new(cfg) {
+            Ok(encoder) => return Ok((Box::new(encoder), EncoderKind::VideoToolbox)),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "videotoolbox encoder unavailable, falling back to openh264"
+                );
+            }
+        }
+    }
+
     let kind = kind.unwrap_or(EncoderKind::OpenH264);
     tracing::info!(encoder = kind.name(), "video encoder");
 
@@ -78,9 +102,14 @@ pub fn build_encoder(
             let encoder = openh264::OpenH264Encoder::new(cfg)?;
             Ok((Box::new(encoder), EncoderKind::OpenH264))
         }
-        EncoderKind::VideoToolbox | EncoderKind::MediaFoundation => {
-            Err(EncodeError::Unsupported(kind))
+        #[cfg(target_os = "macos")]
+        EncoderKind::VideoToolbox => {
+            let encoder = videotoolbox::VideoToolboxEncoder::new(cfg)?;
+            Ok((Box::new(encoder), EncoderKind::VideoToolbox))
         }
+        #[cfg(not(target_os = "macos"))]
+        EncoderKind::VideoToolbox => Err(EncodeError::Unsupported(kind)),
+        EncoderKind::MediaFoundation => Err(EncodeError::Unsupported(kind)),
     }
 }
 
@@ -179,16 +208,32 @@ mod tests {
 
     #[test]
     fn build_encoder_rejects_backends_not_built_in() {
-        assert!(matches!(
-            build_encoder(Some(EncoderKind::VideoToolbox), test_cfg()),
-            Err(EncodeError::Unsupported(_))
-        ));
+        // Media Foundation isn't implemented on any platform yet (lands in
+        // 2.2d).
         assert!(matches!(
             build_encoder(Some(EncoderKind::MediaFoundation), test_cfg()),
             Err(EncodeError::Unsupported(_))
         ));
 
-        let (_, kind) = build_encoder(None, test_cfg()).expect("auto must build openh264");
-        assert_eq!(kind, EncoderKind::OpenH264);
+        #[cfg(target_os = "macos")]
+        {
+            let (_, kind) = build_encoder(Some(EncoderKind::VideoToolbox), test_cfg())
+                .expect("videotoolbox must build on macOS");
+            assert_eq!(kind, EncoderKind::VideoToolbox);
+
+            let (_, kind) = build_encoder(None, test_cfg()).expect("auto must build on macOS");
+            assert_eq!(kind, EncoderKind::VideoToolbox);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(matches!(
+                build_encoder(Some(EncoderKind::VideoToolbox), test_cfg()),
+                Err(EncodeError::Unsupported(_))
+            ));
+
+            let (_, kind) = build_encoder(None, test_cfg()).expect("auto must build openh264");
+            assert_eq!(kind, EncoderKind::OpenH264);
+        }
     }
 }

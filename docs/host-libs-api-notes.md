@@ -187,3 +187,82 @@
   (`is_extended_key` в `win_impl.rs`); префикс `E0` в самом скан-коде не принимает и не понимает.
   Поэтому клавиши на Windows шлём напрямую через `SendInput`
   (`host/src/platform/windows/keyboard.rs`), `enigo` остаётся только для мыши и колеса.
+
+## VideoToolbox (objc2-video-toolbox 0.3.2)
+
+Реализация: `host/src/encode/videotoolbox.rs` (весь файл за
+`#[cfg(target_os = "macos")]` в `encode/mod.rs`, не поэлементно).
+
+- **Крейты/фичи** (`host/Cargo.toml`, секция macOS): `objc2-core-foundation`
+  (`CFBase, CFString, CFNumber, CFDictionary, CFArray`) для CF-контейнеров свойств/
+  словарей; `objc2-core-video` (`CVBase, CVBuffer, CVImageBuffer, CVPixelBuffer,
+  CVReturn`) для `CVPixelBuffer`, которым кодер кормится; `objc2-core-media`
+  (`CMBase, CMTime, CMBlockBuffer, CMFormatDescription, CMSampleBuffer,
+  objc2-core-video`) для входного/выходного контейнера сэмпла; `objc2-video-toolbox`
+  (`VTBase, VTErrors, VTSession, VTCompressionSession, VTCompressionProperties,
+  objc2-core-media, objc2-core-video`) — сама сессия. Версии совпадают с тем, что уже
+  тянет `enigo`/`objc2-app-kit` для macOS (`cargo tree -p rcdesk-host -i objc2 -e
+  features` подтверждает единственную версию `objc2`/`objc2-core-foundation` в графе).
+  Никакой фичи `objc2` (классы Objective-C) у них не включено — всё через чистые
+  CF-типы, `.deref()`-цепочка `VTCompressionSession -> CFType` встроена в сам
+  `cf_type!`-макрос objc2-core-foundation (нет явного `AsRef`/каста нужно).
+- **Порядок инициализации** (`VideoToolboxEncoder::new`): `VTCompressionSession::create`
+  (unsafe, `encoder_specification` = `{EnableHardwareAcceleratedVideoEncoder: true}` —
+  именно `Enable`, не `Require`: на CI/VM без аппаратного кодера VT должен молча выдать
+  программный) → цепочка `VTSessionSetProperty` (RealTime, ProfileLevel=
+  ConstrainedBaseline_AutoLevel, AverageBitRate, DataRateLimits, AllowFrameReordering=false,
+  MaxKeyFrameInterval, ExpectedFrameRate, опционально MaxAllowedFrameQP) →
+  `VTCompressionSessionPrepareToEncodeFrames` → диагностическое чтение
+  `UsingHardwareAcceleratedVideoEncoder` через `VTSessionCopyProperty` для лог-строки
+  `hardware=true/false`. Любая ошибка в этой цепочке зовёт `VTCompressionSessionInvalidate`
+  перед возвратом `Err` — иначе течёт сама сессия (CFRetained сам по себе только
+  release'ит объект, `Invalidate` — отдельный шаг по документации Apple).
+- ⚠️ **Найдено на реальном железе (Apple M4, macOS 26.6):** `VTSessionSetProperty` для
+  `kVTCompressionPropertyKey_MaxFrameDelayCount = 0` возвращает `kVTPropertyNotSupportedErr`
+  (`OSStatus -12900`) несмотря на то, что промпт/документация предполагали её как
+  обязательную. Обработано мягко (`soft_set_property`, как `MaxAllowedFrameQP`) —
+  `tracing::warn!` и продолжение без неё; сессия по-прежнему кодирует нормально
+  (`encode()`'s call-and-drain и так не предполагает ровно один выход на кадр).
+- **Выход — AVCC, а не Annex-B.** Кодер эмитит `CMSampleBuffer` с `CMBlockBuffer`, где
+  каждый NAL предварён 4-байтовой big-endian длиной вместо старт-кода (размер префикса —
+  `nal_unit_header_length_out` из `CMVideoFormatDescriptionGetH264ParameterSetAtIndex`,
+  на практике 4, но код его не захардкоживает). Конвертация в Annex-B — построчный проход
+  по AVCC с заменой длины на `00 00 00 01` (`avcc_to_annexb`). Данные блока читаются
+  копированием (`CMBlockBufferCopyDataBytes`) — `CMBlockBuffer` может быть несмежным,
+  указателя напрямую в общем случае нет.
+- **SPS/PPS** достаются не из самого сэмпла, а из его `CMFormatDescription`
+  (`CMSampleBufferGetFormatDescription` → `CMVideoFormatDescriptionGetH264ParameterSetAtIndex`,
+  индекс 0 = SPS, 1 = PPS) и приписываются перед кадром вручную (`00 00 00 01`+SPS,
+  `00 00 00 01`+PPS, затем сам кадр) только когда сэмпл ключевой — на дельта-кадрах их нет.
+- **Определение ключевого кадра:** `CMSampleBufferGetSampleAttachmentsArray(sbuf, false)`
+  → элемент 0 (если массив вообще есть) — это `CFDictionary`, но приходит как непараметризованный
+  `CFArray`/`Opaque`-элемент; переинтерпретация в `CFArray<CFDictionary<CFString, CFType>>` через
+  `CFRetained::cast_unchecked` безопасна, т.к. представление `CFArray<T>`/`CFDictionary<K,V>` не
+  зависит от параметров типа (только `Opaque`-заглушка для дефолтного параметра). Ключевой кадр —
+  **отсутствие** ключа `kCMSampleAttachmentKey_NotSync` в словаре ИЛИ его значение `false`
+  (значение всегда `CFBoolean`, тот же `cast_unchecked` трюк). Отсутствие самого массива
+  attachments тоже трактуется как ключевой кадр (по документации Apple он есть только когда
+  сэмпл несинхронный).
+- **`VTCompressionSessionCompleteFrames(session, kCMTimeInvalid)`** вызывается сразу после
+  каждого `EncodeFrame` — это и есть механизм, которым `encode()` вытягивает результат
+  синхронно в рамках одного вызова вместо отдельной очереди/потока: при `RealTime=true` и
+  `MaxFrameDelayCount=0` (когда он принят) VT почти всегда успевает вызвать колбэк с готовым
+  сэмплом до возврата из `CompleteFrames`. Колбэк складывает результат в `Mutex<Vec<..>>`
+  внутри `Box<CallbackState>` (стабильный адрес, на который указывает
+  `output_callback_ref_con`), `encode()` сразу же забирает содержимое `mem::take`'ом.
+- **Колбэк — `unsafe extern "C-unwind" fn`.** VT может звать его на своём внутреннем потоке;
+  никакой `unwrap()`/`expect()`/паники внутри — размотка стека через границу C-колбэка не
+  определена. Любой сбой конвертации (нулевой указатель, `OSStatus != 0`, `FrameDropped`)
+  превращается в `None`/`Err(status)`, а не в панику.
+- **CFDictionary для разнотипных значений:** ключ/значение словаря свойств должны быть одного
+  статического типа (`CFDictionary<CFString, CFType>::from_slices`), поэтому каждое реальное
+  значение (`CFBoolean`, `CFNumber`, `CFArray<CFNumber>`, `&'static CFString` для ProfileLevel)
+  приводится к `&CFType` через `.as_ref()` — тип выбирается компилятором по ожидаемому типу
+  аргумента (`Option<&CFType>`/`Option<&CFDictionary>`), без ручных каст-функций.
+- **Владение (`CFRetained`)**: `VTCompressionSessionCreate`/`CVPixelBufferCreate`/
+  `VTSessionCopyProperty` отдают ссылку с +1 (обёрнуто `CFRetained::from_raw`); держать
+  их в `CFRetained` и просто ронять — этого достаточно для `CVPixelBuffer`, но для самой
+  сессии Apple явно требует `Invalidate` до релиза (см. выше). `CFDictionary::from_slices`/
+  `CFArray::from_objects` ретейнят переданные элементы сами — временные `CFNumber`/`CFBoolean`,
+  созданные прямо в вызове, безопасно живут только до конца выражения (стандартное
+  Rust-правило temporary lifetime extension на весь оператор).
