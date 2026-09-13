@@ -11,18 +11,19 @@
 > Всё, что НИЖЕ разделителя `---`, — append-only история. Архитектор при старте
 > чата читает сначала голову, в тело ныряет по ссылке на слайс.
 
-**Состояние на 2026-09-13 (конец третьего чата, слайс 2.2 в коде закрыт, ждёт CI Windows и стенда):**
+**Состояние на 2026-09-13 (конец третьего чата, слайс 2.2 закрыт, ждёт проверки на стенде):**
 - ✅ **Фаза 1 в проде** (https://rcdesk.app), ✅ **2.1 Windows-хост** на стенде владельца (GDI-захват, см. историю).
-- ✅ **Слайс 2.2 аппаратные кодеры — код в `main` (локально, не запушен):** `3d2ff33` потолок QP `--max-qp`
+- ✅ **Слайс 2.2 аппаратные кодеры — в `main`, Deploy `34777760519` зелёный на трёх ОС:** `3d2ff33` потолок QP `--max-qp`
   (D15: openh264 сбрасывает диапазон QP, если `iMinQp == 0`; дельта-кадры при QP ≤ 30 растут с 0.3 до ~6 КБ);
   `63dc4b9` трейт `Encoder` на `RawFrame` + `--encoder auto|openh264|videotoolbox|mediafoundation`;
   `20f8287` **VideoToolbox** на macOS (M4: hardware=true, захват→кодер 11.7 мс против 18 у openh264, дельта
   1.8 КБ против 0.3 при том же битрейте); `322605d` **Media Foundation** на Windows (sync/async MFT,
   ICodecAPI, `auto` = только аппаратный MFT, иначе openh264; программный MFT Microsoft — по явному флагу).
   Доки: `docs/dev-run.md`, `docs/host-windows.md` («Кодеры»), `docs/host-libs-api-notes.md` (VT, MF).
-- ⚠️ **Windows-часть 2.2 проверена только типами** (scratch-крейт под `x86_64-pc-windows-msvc`): сборка
-  и тесты с программным MFT — в CI `windows-latest`, который запускается только для веток/PR (push в
-  `main` сразу деплоит). Ждёт решения владельца: разрешить архитектору push служебных веток для CI.
+- ✅ **Windows-часть 2.2 собрана и протестирована в CI** (`windows-latest`, host lib 39 passed, три теста
+  `encode::mediafoundation` на программном «H264 Encoder MFT» Microsoft). Вживую на стенде не проверена:
+  инструкция владельцу выдана (bench трёх вариантов, `auto`, `serve --max-qp 30`). Push в `main` делает
+  владелец сам (CI отдельно для веток не используем).
 - ▶️ **Следующий слайс — 2.3 адаптивный битрейт/fps** по RTCP RR и TWCC (ARCHITECTURE §5, §13). Перед ним
   снять D15 на стенде (дефолт `--max-qp`). Новый чат — на слайс.
 - Как запустить: `docs/dev-run.md` (локально), `docs/host-windows.md` (стенд), `infra/README.md` (прод).
@@ -33,9 +34,7 @@
   экрана; `git add` только явными путями, пока работает исполнитель.
 
 **За владельцем:**
-- Разрешить push служебных веток для CI (или запушить `main` самому: Deploy прогонит гейты на трёх ОС и
-  соберёт артефакты; риск — красный Windows-CI на `main`).
-- Стенд: `bench --seconds 5 --encoder mediafoundation` против `--encoder openh264` (цифры в журнал);
+- Стенд (exe из Artifacts запуска `34777760519`): `bench --seconds 5 --encoder mediafoundation` против `--encoder openh264` (цифры в журнал);
   `serve … --max-qp 30` — текст при наборе; по итогу дефолт `--max-qp` (D15).
 - Развилка D14: монитор на встроенную графику Ivy Bridge (даст WGC + Quick Sync для `auto`).
 - ✅ TLS 1.3 на nginx включён (2026-09-13, `/etc/nginx/conf.d/ssl.conf`, файл не принадлежит пакету).
@@ -327,6 +326,7 @@
   `x86_64-pc-windows-msvc` чисто; тесты на Windows компилируются только в CI (там программный MFT Microsoft).
 - **2.2e Доки** (этот коммит): ARCHITECTURE §2/§4.1/§13/§14, `docs/dev-run.md`, `docs/host-windows.md`.
 - Гейты на закрытии (Mac): host lib **39 passed; 1 ignored**, loopback 1, proto 16, server 8 + 7,
-  web `Tests 39 passed (39)`, build ✓. Windows CI — не прогнан (см. голову).
+  web `Tests 39 passed (39)`, build ✓. Deploy `34777760519` (после push владельца): все три ОС зелёные,
+  на `windows-latest` host lib 39 passed, включая три теста Media Foundation на программном MFT.
 - Попутно: TLS 1.3 на nginx VPS включён (`/etc/nginx/conf.d/ssl.conf`, панель этот параметр в UI не
   показывает; файл не принадлежит пакету fastpanel2), рукопожатие 1.3 и `/ws` 101 проверены с Mac.
