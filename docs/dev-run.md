@@ -63,6 +63,24 @@ Connect. Vite dev-сервер проксирует `/ws` на `ws://127.0.0.1:8
 Chrome. Safari требует, чтобы `video.play()` вызывался в рамках жеста
 пользователя (клик по Connect) — это уже учтено в `web/src/app.ts`.
 
+## Кодер видео
+
+`--encoder auto|openh264|videotoolbox|mediafoundation` и `--max-qp N` у `bench`
+и `serve`. На macOS `auto` берёт аппаратный VideoToolbox (в логе
+`initializing videotoolbox encoder … hardware=true`), при ошибке создания —
+openh264 с предупреждением. Сравнить кодеры без сети:
+
+```
+cargo run -p rcdesk-host --release -- bench --seconds 5 --encoder videotoolbox
+cargo run -p rcdesk-host --release -- bench --seconds 5 --encoder openh264
+```
+
+`bench` печатает `encoder=…`, размеры ключевых/дельта-кадров и задержку
+захват→кодер (`avg_capture_to_encoded_ms`). `--max-qp 30` ставит потолок QP
+(резче текст, выше битрейт); для VideoToolbox это `MaxAllowedFrameQP`, на
+старых macOS ключ может быть отклонён — тогда в логе `warn` и работа без него.
+Windows-кодер Media Foundation описан в `docs/host-windows.md`.
+
 ## Ввод (мышь и клавиатура)
 
 **⚠️ Без `--no-input` подключившийся клиент управляет настоящими мышью и

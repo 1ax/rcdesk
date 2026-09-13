@@ -1,7 +1,7 @@
 # rcdesk — Архитектура
 
 > Документ решений. Меняется только осознанно, с записью в SLICES_LOG.md.
-> Актуально на 2026-09-13.
+> Актуально на 2026-09-13 (слайс 2.2).
 
 ## 1. Цель и границы
 
@@ -21,8 +21,8 @@ fps, аппаратное кодирование. Ориентир — Chrome Re
 |---|---|---|
 | Хост-агент | **Rust**, один код для macOS и Windows | Единственный вариант «один бинарник, нативная скорость, без рантайма» с живыми крейтами под захват, кодек, WebRTC и ввод. Go требует cgo под ScreenCaptureKit/DirectX; Electron — 200 МБ и лишний слой. |
 | Захват экрана | `scap` (ScreenCaptureKit на macOS, Windows Graphics Capture на Windows); на Windows запасной **GDI** (`BitBlt`) | Единый API поверх нативных zero-copy захватов. Используется в проде (Cap.so). Если упрёмся — прямые `screencapturekit` / `windows-capture`. WGC требует Direct3D 11 у драйвера; на легаси-драйверах и в ВМ хост сам уходит на GDI (`--capture auto`, слайс 2.1). |
-| Кодек, MVP | `openh264` (Cisco, программный) | Портативно, лицензионно чисто, достаточно для 1080p30 на M4/современном x64. |
-| Кодек, цель | VideoToolbox (macOS) через `objc2-video-toolbox`; Media Foundation H.264 MFT (Windows) через `windows` | Аппаратное кодирование без зависимости от ffmpeg. `openh264` остаётся запасным путём. |
+| Кодек, запасной | `openh264` (Cisco, программный) | Портативно, лицензионно чисто, достаточно для 1080p30 на M4/современном x64. Единственный путь на железе без аппаратного кодера (стенд владельца). Потолок QP (`--max-qp`) против размытого текста. |
+| Кодек, аппаратный | VideoToolbox (macOS) через `objc2-video-toolbox`; Media Foundation H.264 MFT (Windows) через `windows` (слайс 2.2) | Аппаратное кодирование без зависимости от ffmpeg. `--encoder auto`: VT на macOS; на Windows — только аппаратный MFT, программный MFT Microsoft лишь по явному `--encoder mediafoundation`; при ошибке создания — откат на openh264. Кодер сам конвертирует `RawFrame` в свой вход (VT и MF — NV12, openh264 — I420). |
 | WebRTC на хосте | `webrtc` (webrtc-rs, порт pion) | Полный стек (ICE/DTLS/SRTP/SCTP), interceptors NACK/TWCC, API знаком по pion. Развилка на будущее: `str0m` (sans-IO, встроенный BWE), если упрёмся в управление битрейтом. |
 | Ввод | `enigo` (CGEvent на macOS, SendInput на Windows) | Живой, кроссплатформенный. |
 | Буфер обмена | `arboard` | Текст и изображения на обеих платформах. |
@@ -72,8 +72,9 @@ rcdesk/
 Держит WS-соединение с сигнальным сервером, по запросу клиента поднимает
 `RTCPeerConnection`, публикует видеотрек и принимает data channels.
 
-Конвейер видео: `FrameSource` → (конверсия BGRA→I420 при необходимости) →
-`Encoder` → RTP-пакетизатор webrtc-rs → сеть. Один рабочий поток на захват, один
+Конвейер видео: `FrameSource` → `Encoder` (принимает `RawFrame`, конверсию в
+свой входной формат делает сам и ставит `captured_at` из времени захвата) →
+RTP-пакетизатор webrtc-rs → сеть. Один рабочий поток на захват, один
 на кодирование, транспорт на tokio. Между ними — ограниченные каналы с политикой
 «держать только последний кадр» (старый кадр важнее сбросить, чем доставить).
 
@@ -236,7 +237,8 @@ VPS владельца (FastVPS, Эстония), отдельный польз�
 ### Фаза 2 — Windows и производительность
 - 2.1 Сборка и запуск на Windows 10 (WGC + SendInput), инструкция установки. ✅ Стенд без D3D 11 → GDI-фоллбэк;
   клавиатура через свой `SendInput` (E0-префикс); RTP-время по захвату (jitter-буфер 850 → ~0–120 мс).
-- 2.2 Аппаратные кодеры: VideoToolbox, Media Foundation; выбор в рантайме, фоллбэк.
+- 2.2 Аппаратные кодеры: VideoToolbox, Media Foundation; выбор в рантайме, фоллбэк. ✅ `--encoder auto|…`, `--max-qp`;
+  VT на M4: захват→кодер 11.7 мс против 18 у openh264. MF проверен типами и CI, вживую — за стендом (аппаратного MFT там нет).
 - 2.3 Адаптивный битрейт/fps по RTCP и TWCC; измерения до/после.
 - 2.4 Мультимонитор: список, переключение, выбор при подключении.
 - 2.5 Буфер обмена: текст в обе стороны (Chrome фоново, Safari по жесту).
@@ -282,7 +284,8 @@ VPS владельца (FastVPS, Эстония), отдельный польз�
 | windows-capture =1.4.4 (пин) | host (Windows) | совместимость scap 0.0.8, см. docs/host-libs-api-notes.md |
 | base64 0.22 | host | RGBA курсора в JSON |
 | objc2 0.6, objc2-foundation 0.3, objc2-app-kit 0.3 | host (macOS) | NSCursor → NSBitmapImageRep (те же версии, что тянет enigo) |
-| windows 0.61 | host (Windows) | курсор (GetCursorInfo/GetIconInfo/GetDIBits), клавиатура (`SendInput`, `MapVirtualKeyW`), GDI-захват (`BitBlt`, `CreateDIBSection`), проба D3D 11 (`D3D11CreateDevice`; фича Dxgi нужна из-за cfg-гейта), DPI (`SetProcessDpiAwarenessContext`). Та же версия, что у windows-capture |
+| windows 0.61 | host (Windows) | курсор (GetCursorInfo/GetIconInfo/GetDIBits), клавиатура (`SendInput`, `MapVirtualKeyW`), GDI-захват (`BitBlt`, `CreateDIBSection`), проба D3D 11 (`D3D11CreateDevice`; фича Dxgi нужна из-за cfg-гейта), DPI (`SetProcessDpiAwarenessContext`), Media Foundation H.264 MFT (`Win32_Media_MediaFoundation`; `Win32_System_{Com,Ole,Variant}` — COM-инициализация и `VARIANT` для `ICodecAPI::SetValue`). Та же версия, что у windows-capture |
 | enigo 0.6 | host (macOS/Windows) | инъекция ввода: macOS — `raw()` = CGKeyCode; Windows — только мышь/колесо (`raw()` не принимает E0-префикс, клавиши идут через свой `SendInput`); `main_display()` для масштаба координат |
+| objc2-core-foundation, objc2-core-video, objc2-core-media, objc2-video-toolbox 0.3 | host (macOS) | VideoToolbox: `VTCompressionSession`, `CVPixelBuffer` (NV12 без конверсии), `CMSampleBuffer`/`CMBlockBuffer` (AVCC → Annex-B), CF-словари свойств. Минимальные фичи, без objc2-классов; сидят на тех же objc2 0.6 / core-foundation 0.3, что enigo |
 | arboard | host | буфер обмена (фаза 2) |
 | vite 8, typescript 7, vitest 5 | web | сборка, типы, тесты; `vite.config.ts` использует `defineConfig` из `vitest/config` |

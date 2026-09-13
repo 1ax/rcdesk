@@ -47,6 +47,17 @@ rcdesk-host.exe bench --seconds 5 --capture gdi
 замер на железе/ВМ, где WGC недоступен.
 
 ```
+rcdesk-host.exe bench --seconds 5 --encoder mediafoundation
+rcdesk-host.exe bench --seconds 5 --encoder openh264
+rcdesk-host.exe bench --seconds 5 --max-qp 30
+```
+
+Сравнение кодеров (см. «Кодеры» ниже). Первая строка вывода — `encoder=…`,
+последняя — `avg_capture_to_encoded_ms`/`p95_…` (задержка от захвата кадра до
+готового H.264). Отдельно печатаются средние размеры ключевых и дельта-кадров
+(`avg_keyframe_bytes`/`avg_delta_bytes`).
+
+```
 rcdesk-host.exe serve --server wss://rcdesk.app/ws --no-input
 ```
 
@@ -95,6 +106,27 @@ rcdesk-host.exe serve ...
 
 `--capture wgc`/`--capture gdi` форсируют бэкенд вне зависимости от того, что
 показала проверка.
+
+## Кодеры
+
+`--encoder auto|openh264|videotoolbox|mediafoundation` у `bench` и `serve`
+(по умолчанию `auto`):
+
+- **openh264** — программный кодер, есть везде; на стенде это основной путь.
+- **mediafoundation** — H.264 MFT Media Foundation. `auto` берёт его **только
+  если найден аппаратный** MFT (Quick Sync, NVENC, AMF), иначе тихо уходит на
+  openh264 (`info` в логе). Явный `--encoder mediafoundation` допускает и
+  программный «H264 Encoder MFT» Microsoft — так его можно сравнить с openh264
+  на стенде через `bench`. На стенде с ATI Radeon HD 4600 аппаратного MFT нет;
+  он появится, если монитор переключить на встроенную графику Ivy Bridge
+  (Quick Sync, долг D14).
+- **videotoolbox** — только macOS, на Windows отвечает ошибкой «not available».
+
+`--max-qp N` (0..=51) — потолок QP кодера: ограничивает худшее качество кадра
+(текст при наборе перестаёт размываться), битрейт при этом может превышать
+целевой. Без флага потолка нет. Для openh264 замер на Mac показал, что
+дельта-кадры при `--max-qp 30` растут с 0.3 до ~6 КБ, битрейт до ~1 Мбит/с
+при цели 6. На стенде проверяется вживую: `serve … --max-qp 30`.
 
 ## Брандмауэр Windows
 
