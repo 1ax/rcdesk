@@ -45,6 +45,9 @@ const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(33);
 pub struct HostContext {
     pub session: SessionConfig,
     pub bitrate_kbps: u32,
+    /// Hard ceiling on encoder QP (0..=51); `None` leaves the encoder's own
+    /// default. See `EncoderConfig::max_qp`.
+    pub max_qp: Option<u8>,
     /// Builds a fresh frame source for a new session. A closure (rather than
     /// a `FrameSource` directly baked in here) because a platform-specific
     /// `scap` source is only constructible behind `cfg(...)`, and this
@@ -433,6 +436,7 @@ async fn start_session(
         fps,
         bitrate_kbps: ctx.bitrate_kbps,
         keyframe_interval_frames: fps * 10,
+        max_qp: ctx.max_qp,
     };
     let encoder: Box<dyn Encoder> = Box::new(OpenH264Encoder::new(encoder_cfg)?);
     let handle = Pipeline::start(source, encoder);

@@ -236,6 +236,7 @@ mod tests {
             fps: 30,
             bitrate_kbps: 2000,
             keyframe_interval_frames: 60,
+            max_qp: None,
         };
         let encoder: Box<dyn Encoder> = Box::new(OpenH264Encoder::new(cfg).expect("encoder init"));
 

@@ -6,13 +6,17 @@ use std::time::Instant;
 
 use ::openh264::encoder::{
     BitRate, Encoder as Oh264Encoder, EncoderConfig as Oh264Config, FrameRate, FrameType,
-    IntraFramePeriod, Profile, RateControlMode, SpsPpsStrategy, UsageType,
+    IntraFramePeriod, Profile, QpRange, RateControlMode, SpsPpsStrategy, UsageType,
 };
 use ::openh264::formats::YUVSlices;
 use ::openh264::OpenH264API;
 use ::openh264::Timestamp;
 
 use super::{EncodeError, EncodedFrame, Encoder, EncoderConfig, I420Frame};
+
+/// Lower QP bound passed to openh264 alongside `EncoderConfig::max_qp`; see
+/// the comment at the call site for why it can't be 0.
+const MIN_QP: u8 = 1;
 
 pub struct OpenH264Encoder {
     inner: Oh264Encoder,
@@ -31,11 +35,12 @@ impl OpenH264Encoder {
             height = cfg.height,
             fps = cfg.fps,
             bitrate_kbps = cfg.bitrate_kbps,
+            max_qp = ?cfg.max_qp,
             "initializing openh264 encoder"
         );
 
         let api = OpenH264API::from_source();
-        let oh264_cfg = Oh264Config::new()
+        let mut oh264_cfg = Oh264Config::new()
             .bitrate(BitRate::from_bps(cfg.bitrate_kbps.saturating_mul(1000)))
             .max_frame_rate(FrameRate::from_hz(cfg.fps as f32))
             .usage_type(UsageType::ScreenContentRealTime)
@@ -47,6 +52,15 @@ impl OpenH264Encoder {
             ))
             .skip_frames(false)
             .num_threads(0);
+        if let Some(max) = cfg.max_qp {
+            // The lower bound must be >= 1: openh264's `ParamValidationExt`
+            // (`encoder_ext.cpp`, "Change QP Range") throws the *whole*
+            // range away and reinstates its screen-content defaults when
+            // either bound is <= 0, so `QpRange::new(0, max)` would
+            // silently disable the cap. It clips the minimum up to its own
+            // floor anyway, so 1 is never actually reached.
+            oh264_cfg = oh264_cfg.qp(QpRange::new(MIN_QP, max.clamp(MIN_QP, 51)));
+        }
 
         let inner = Oh264Encoder::with_api_config(api, oh264_cfg)
             .map_err(|err| EncodeError::Backend(err.to_string()))?;
@@ -114,6 +128,7 @@ mod tests {
             fps: 30,
             bitrate_kbps: 2000,
             keyframe_interval_frames: 60,
+            max_qp: None,
         }
     }
 
@@ -177,6 +192,42 @@ mod tests {
         assert!(
             total_size < 200 * 1024,
             "total encoded size too large: {total_size} bytes"
+        );
+    }
+
+    #[test]
+    fn max_qp_cap_encodes_keyframe_and_deltas() {
+        let mut cfg = test_cfg();
+        cfg.max_qp = Some(30);
+
+        let mut source = SyntheticSource::new(64, 64, 1000);
+        let mut encoder = OpenH264Encoder::new(cfg).expect("encoder init");
+
+        let mut outputs = Vec::new();
+        for i in 0..30u32 {
+            let raw = source.next_frame().expect("frame");
+            let i420 = to_i420(&raw);
+            let encoded = encoder.encode(&i420, false).expect("encode");
+            if let Some(encoded) = encoded {
+                outputs.push((i, encoded));
+            }
+        }
+
+        assert!(!outputs.is_empty());
+        assert!(outputs[0].1.keyframe);
+        let types = nal_types(&outputs[0].1.data);
+        assert!(types.contains(&7), "missing SPS: {types:?}");
+        assert!(types.contains(&8), "missing PPS: {types:?}");
+        assert!(types.contains(&5), "missing IDR: {types:?}");
+
+        let has_delta = outputs
+            .iter()
+            .skip(1)
+            .take(10)
+            .any(|(_, f)| nal_types(&f.data).contains(&1));
+        assert!(
+            has_delta,
+            "expected at least one non-keyframe (NAL 1) among the next 10 frames"
         );
     }
 }

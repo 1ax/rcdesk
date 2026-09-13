@@ -59,6 +59,10 @@ enum Command {
         bitrate: u32,
         #[arg(long, default_value_t = 5)]
         seconds: u32,
+        /// Hard ceiling on encoder QP (0..=51); unset leaves the encoder's
+        /// own default.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=51))]
+        max_qp: Option<u8>,
         /// Optional path to dump the raw Annex-B stream to.
         #[arg(long)]
         dump: Option<PathBuf>,
@@ -89,6 +93,10 @@ enum Command {
         fps: u32,
         #[arg(long, default_value_t = 6000)]
         bitrate: u32,
+        /// Hard ceiling on encoder QP (0..=51); unset leaves the encoder's
+        /// own default.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=51))]
+        max_qp: Option<u8>,
         /// Extra STUN/TURN server URL, added on top of whatever the
         /// signaling server sends in `Registered` (see `docs/dev-run.md`).
         /// Repeatable. Empty by default: with no `--stun`, ICE servers come
@@ -137,9 +145,12 @@ async fn main() -> anyhow::Result<()> {
             fps,
             bitrate,
             seconds,
+            max_qp,
             dump,
             capture,
-        } => run_bench(synthetic, display, fps, bitrate, seconds, dump, capture),
+        } => run_bench(
+            synthetic, display, fps, bitrate, seconds, max_qp, dump, capture,
+        ),
         Command::Serve {
             server,
             name,
@@ -147,12 +158,13 @@ async fn main() -> anyhow::Result<()> {
             display,
             fps,
             bitrate,
+            max_qp,
             stun,
             no_input,
             capture,
         } => {
             run_serve(
-                server, name, synthetic, display, fps, bitrate, stun, no_input, capture,
+                server, name, synthetic, display, fps, bitrate, max_qp, stun, no_input, capture,
             )
             .await
         }
@@ -255,12 +267,14 @@ fn build_real_cursor_source() -> Box<dyn CursorSource> {
     Box::new(rcdesk_host::cursor::NoopCursorSource::new())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_bench(
     synthetic: bool,
     display: Option<u32>,
     fps: u32,
     bitrate_kbps: u32,
     seconds: u32,
+    max_qp: Option<u8>,
     dump: Option<PathBuf>,
     capture: CaptureBackend,
 ) -> anyhow::Result<()> {
@@ -277,6 +291,7 @@ fn run_bench(
         fps,
         bitrate_kbps,
         keyframe_interval_frames: fps.max(1) * 2,
+        max_qp,
     };
     let encoder: Box<dyn Encoder> = Box::new(OpenH264Encoder::new(cfg)?);
 
@@ -284,6 +299,8 @@ fn run_bench(
     let mut dump_file = dump.as_ref().map(std::fs::File::create).transpose()?;
 
     let mut sizes: Vec<usize> = Vec::new();
+    let mut keyframe_sizes: Vec<usize> = Vec::new();
+    let mut delta_sizes: Vec<usize> = Vec::new();
     let start = Instant::now();
     let run_for = Duration::from_secs(u64::from(seconds));
     // Exercise request_keyframe() (mirrors a PLI/FIR from a client, see
@@ -303,6 +320,11 @@ fn run_bench(
                     file.write_all(&frame.data)?;
                 }
                 sizes.push(frame.data.len());
+                if frame.keyframe {
+                    keyframe_sizes.push(frame.data.len());
+                } else {
+                    delta_sizes.push(frame.data.len());
+                }
             }
             Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
             Err(TryRecvError::Disconnected) => break,
@@ -315,6 +337,11 @@ fn run_bench(
             file.write_all(&frame.data)?;
         }
         sizes.push(frame.data.len());
+        if frame.keyframe {
+            keyframe_sizes.push(frame.data.len());
+        } else {
+            delta_sizes.push(frame.data.len());
+        }
     }
 
     handle.stop();
@@ -338,6 +365,18 @@ fn run_bench(
     println!("captured={captured} encoded={encoded} dropped={dropped} keyframes={keyframes}");
     println!("avg_fps={avg_fps:.2} avg_bitrate_kbps={avg_kbps:.1}");
     println!("avg_frame_size_bytes={avg_size:.1} p95_frame_size_bytes={p95_size}");
+
+    let avg_keyframe_bytes = if keyframe_sizes.is_empty() {
+        0.0
+    } else {
+        keyframe_sizes.iter().sum::<usize>() as f64 / keyframe_sizes.len() as f64
+    };
+    let avg_delta_bytes = if delta_sizes.is_empty() {
+        0.0
+    } else {
+        delta_sizes.iter().sum::<usize>() as f64 / delta_sizes.len() as f64
+    };
+    println!("avg_keyframe_bytes={avg_keyframe_bytes:.1} avg_delta_bytes={avg_delta_bytes:.1}");
 
     if let Some(path) = dump.as_ref() {
         println!("dumped Annex-B stream to {}", path.display());
@@ -364,6 +403,7 @@ async fn run_serve(
     display: Option<u32>,
     fps: u32,
     bitrate: u32,
+    max_qp: Option<u8>,
     stun: Vec<String>,
     no_input: bool,
     capture: CaptureBackend,
@@ -418,6 +458,7 @@ async fn run_serve(
             fps,
         },
         bitrate_kbps: bitrate,
+        max_qp,
         build_source,
         build_injector,
         build_cursor_source: Box::new(build_real_cursor_source),

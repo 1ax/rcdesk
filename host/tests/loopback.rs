@@ -166,6 +166,7 @@ async fn run() -> anyhow::Result<()> {
         // signaling::start_session) -- high enough that the loop's own
         // periodic keyframes don't hide whether the PLI-forced one worked.
         keyframe_interval_frames: 300,
+        max_qp: None,
     };
     let encoder: Box<dyn Encoder> = Box::new(OpenH264Encoder::new(encoder_cfg)?);
     let pipeline_handle = Pipeline::start(source, encoder);

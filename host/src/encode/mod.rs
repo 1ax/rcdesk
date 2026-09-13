@@ -39,6 +39,13 @@ pub struct EncoderConfig {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub keyframe_interval_frames: u32,
+    /// Hard ceiling on the encoder's QP (quantization parameter), 0..=51.
+    /// `None` leaves the encoder's own default (QP allowed up to 51, i.e.
+    /// no extra cap beyond what the bitrate/rate control already produces).
+    /// `Some(n)` caps the worst-case QP at `n`, putting a floor under frame
+    /// quality on hard-to-compress content at the cost of the encoder
+    /// possibly exceeding the target bitrate to hold that quality.
+    pub max_qp: Option<u8>,
 }
 
 #[derive(Debug, thiserror::Error)]
