@@ -127,7 +127,11 @@ impl Pipeline {
                 let force_keyframe = request_keyframe.swap(false, Ordering::AcqRel);
 
                 match encoder.encode(&i420, force_keyframe) {
-                    Ok(Some(encoded)) => {
+                    Ok(Some(mut encoded)) => {
+                        // The encoder only sees converted I420 data, not the
+                        // raw frame, so it can't fill this in itself (see
+                        // `EncodedFrame::captured_at`'s doc comment).
+                        encoded.captured_at = captured_at;
                         stats.encoded.fetch_add(1, Ordering::Relaxed);
                         if encoded.keyframe {
                             stats.keyframes.fetch_add(1, Ordering::Relaxed);

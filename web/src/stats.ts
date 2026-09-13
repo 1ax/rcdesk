@@ -25,6 +25,14 @@ export interface RTCStatsLike {
   currentRoundTripTime?: number;
   mimeType?: string;
   codecId?: string;
+  /** Cumulative seconds all emitted frames spent in the jitter buffer
+   * (`RTCInboundRtpStreamStats.jitterBufferDelay`). Paired with
+   * `jitterBufferEmittedCount` to compute an average per-frame delay over
+   * an interval -- see `jitterBufferMs` below. */
+  jitterBufferDelay?: number;
+  /** Cumulative count of frames emitted from the jitter buffer
+   * (`RTCInboundRtpStreamStats.jitterBufferEmittedCount`). */
+  jitterBufferEmittedCount?: number;
 }
 
 /** The minimal state carried from one `summarizeStats` call to the next, so
@@ -35,6 +43,8 @@ export interface Snapshot {
   timestampMs: number;
   bytesReceived?: number;
   framesDecoded?: number;
+  jitterBufferDelay?: number;
+  jitterBufferEmittedCount?: number;
 }
 
 export interface StatsSummary {
@@ -44,6 +54,14 @@ export interface StatsSummary {
   height?: number;
   packetsLost?: number;
   jitterMs?: number;
+  /** Average time each frame spent in the client's jitter buffer since the
+   * previous `summarizeStats` call, in milliseconds -- distinct from
+   * `jitterMs` (the RTP-level packet arrival jitter estimate). Computed
+   * from the delta of two cumulative counters
+   * (`jitterBufferDelay`/`jitterBufferEmittedCount`), so it needs `prev`;
+   * `undefined` on the first call or when the browser doesn't report those
+   * fields. */
+  jitterBufferMs?: number;
   rttMs?: number;
   codec?: string;
   framesDecoded?: number;
@@ -61,6 +79,8 @@ export function takeSnapshot(report: Iterable<RTCStatsLike>, nowMs: number): Sna
     timestampMs: nowMs,
     bytesReceived: inbound?.bytesReceived,
     framesDecoded: inbound?.framesDecoded,
+    jitterBufferDelay: inbound?.jitterBufferDelay,
+    jitterBufferEmittedCount: inbound?.jitterBufferEmittedCount,
   };
 }
 
@@ -115,6 +135,19 @@ export function summarizeStats(
   ) {
     const deltaBytes = inbound.bytesReceived - prev.bytesReceived;
     summary.kbps = (deltaBytes * 8) / 1000 / elapsedSec;
+  }
+
+  if (
+    prev?.jitterBufferDelay !== undefined &&
+    prev.jitterBufferEmittedCount !== undefined &&
+    inbound?.jitterBufferDelay !== undefined &&
+    inbound?.jitterBufferEmittedCount !== undefined
+  ) {
+    const deltaCount = inbound.jitterBufferEmittedCount - prev.jitterBufferEmittedCount;
+    if (deltaCount > 0) {
+      const deltaDelay = inbound.jitterBufferDelay - prev.jitterBufferDelay;
+      summary.jitterBufferMs = (deltaDelay / deltaCount) * 1000;
+    }
   }
 
   return summary;

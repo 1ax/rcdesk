@@ -118,6 +118,35 @@ describe("summarizeStats", () => {
     expect(summary.fps).toBeUndefined();
     expect(summary.kbps).toBeUndefined();
   });
+
+  it("computes jitterBufferMs from the delta between two snapshots", () => {
+    const t0 = 1_000;
+    const first = [
+      inboundRtp({ jitterBufferDelay: 2.0, jitterBufferEmittedCount: 20 }),
+      CODEC,
+      candidatePair(),
+    ];
+    const snapshot = takeSnapshot(first, t0);
+
+    const t1 = t0 + 1000;
+    const second = [
+      inboundRtp({ jitterBufferDelay: 2.0 + 0.85, jitterBufferEmittedCount: 20 + 10 }),
+      CODEC,
+      candidatePair(),
+    ];
+
+    const summary = summarizeStats(second, snapshot, t1);
+
+    // 0.85s of buffering added over 10 newly emitted frames = 85ms/frame.
+    expect(summary.jitterBufferMs).toBeCloseTo(85, 5);
+  });
+
+  it("leaves jitterBufferMs undefined when the browser doesn't report those fields", () => {
+    const t0 = 1_000;
+    const snapshot = takeSnapshot([inboundRtp(), CODEC, candidatePair()], t0);
+    const summary = summarizeStats([inboundRtp(), CODEC, candidatePair()], snapshot, t0 + 1000);
+    expect(summary.jitterBufferMs).toBeUndefined();
+  });
 });
 
 describe("takeSnapshot", () => {

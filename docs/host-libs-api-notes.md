@@ -56,6 +56,42 @@
   let ssrc = *track.ssrcs().await.first().unwrap();
   track.sample_writer(ssrc, pt).write_sample(&Sample { data: bytes, duration, ..Default::default() }).await?;
   ```
+- **`TrackLocalStaticSample::write_sample`'s `duration` is not "how long this frame
+  took", it's "how long until the next one"** (найдено при разборе слайса 2.1d: Chrome
+  держал ~850 мс в jitter-буфере при цели 83 мс). Внутри `write_sample` вызывает
+  `packetizer.packetize(data, samples)` (`samples = duration * clock_rate`,
+  `static_sample.rs:147-159`), а `PacketizerImpl::packetize` (`rtc-rtp-0.20.5/src/
+  packetizer/mod.rs:152-160`) сначала штампует пакеты ТЕКУЩИМ `self.timestamp`, и
+  только ПОСЛЕ прибавляет `samples`. То есть RTP-время кадра k = сумма `duration`
+  всех предыдущих кадров, а не момент захвата этого кадра. Для источника с
+  постоянным fps это неотличимо от wall-clock; для экрана, где кадры идут только
+  при изменении содержимого (SCK/GDI-дедуп), `duration = 1/fps` даёт часы потока,
+  систематически отстающие от реального времени — и клиентский jitter-buffer
+  (Chrome) расписывает показ по этим часам, а не по фактическому приходу пакетов.
+  **Фикс:** пакетизировать самому через низкоуровневый API вместо `TrackLocalStaticSample`:
+  ```rust
+  use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP; // не *Sample
+  use rtc::rtp::codec::h264::H264Payloader;
+  use rtc::rtp::packetizer::{new_packetizer, Packetizer};
+  use rtc::rtp::sequence::new_random_sequencer;
+
+  let track = Arc::new(TrackLocalStaticRTP::new(media_stream_track)); // не Result, в отличие от *Sample::new
+  // ssrc/pt уже известны (после негоциации) -> создаём пакетизатор сразу с ними,
+  // не с payload_type=0 как это делает *Sample::new для всех ssrc заранее.
+  let mut packetizer = new_packetizer(1200 /* MTU, `RTP_OUTBOUND_MTU` в static_sample.rs не pub */,
+      pt, ssrc, Box::new(H264Payloader::default()), Box::new(new_random_sequencer()), 90_000);
+  packetizer.skip_samples(((captured_at - prev_captured_at).as_secs_f64() * 90_000.0) as u32); // 0 на первом кадре
+  for pkt in packetizer.packetize(&payload, 0)? { // samples=0: время уже сдвинуто выше
+      track.write_rtp_with_extensions(pkt, &[]).await?;
+  }
+  ```
+  `skip_samples` (`packetizer/mod.rs:184`) двигает только `timestamp`, sequencer не
+  трогает — корректно для гэпа между кадрами. `Packetizer`/`PacketizerImpl` не дают
+  сменить `payload_type` после создания, поэтому пакетизатор создаётся не сразу
+  (как для `*Sample`), а в момент, когда ssrc/pt уже известны из
+  `RtpSender::get_parameters()`. `TrackLocalStaticRTP` реализует тот же `Track`/
+  `TrackLocal` (`poll()` → `TrackLocalEvent::OnRtcpPacket`, `ssrcs()`, `codec()`) —
+  PLI/FIR-приём ниже не меняется.
 - **PLI/FIR от браузера** приходят на трек: `while let Some(ev) = track.poll().await {
   match ev { TrackLocalEvent::OnRtcpPacket(pkts) => … } }` — пакеты `rtc::rtcp`,
   проверять `pkt.as_any().downcast_ref::<PictureLossIndication>()` / `FullIntraRequest`.

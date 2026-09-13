@@ -36,6 +36,7 @@ function formatOverlay(s: StatsSummary, appRttMs?: number): string {
   if (s.packetsLost !== undefined) parts.push(`loss ${s.packetsLost}`);
   if (s.codec !== undefined) parts.push(s.codec.replace(/^video\//, "").toUpperCase());
   if (appRttMs !== undefined) parts.push(`app ${appRttMs.toFixed(0)} ms`);
+  if (s.jitterBufferMs !== undefined) parts.push(`jb ${s.jitterBufferMs.toFixed(0)} ms`);
   return parts.join(" · ");
 }
 

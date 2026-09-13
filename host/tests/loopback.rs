@@ -268,9 +268,16 @@ async fn run() -> anyhow::Result<()> {
     // exercised concurrently with packet collection.
     let packet_count = Arc::new(AtomicUsize::new(0));
     let saw_sps = Arc::new(AtomicBool::new(false));
+    // RTP timestamps of marker-bit packets (the last packet of each encoded
+    // frame, RFC 6184 -- see `Header::marker`'s doc comment), collected for
+    // the timestamp-pacing check (e) below. Capped so a long-running test
+    // doesn't grow this unboundedly.
+    let marker_timestamps = Arc::new(Mutex::new(Vec::<u32>::new()));
+    const MAX_MARKER_TIMESTAMPS: usize = 60;
     {
         let packet_count = Arc::clone(&packet_count);
         let saw_sps = Arc::clone(&saw_sps);
+        let marker_timestamps = Arc::clone(&marker_timestamps);
         let track = Arc::clone(&track);
         tokio::spawn(async move {
             while let Some(event) = track.poll().await {
@@ -278,6 +285,12 @@ async fn run() -> anyhow::Result<()> {
                     packet_count.fetch_add(1, Ordering::Relaxed);
                     if rtp_payload_nal_types(&pkt.payload).contains(&7) {
                         saw_sps.store(true, Ordering::Relaxed);
+                    }
+                    if pkt.header.marker {
+                        let mut timestamps = marker_timestamps.lock().await;
+                        if timestamps.len() < MAX_MARKER_TIMESTAMPS {
+                            timestamps.push(pkt.header.timestamp);
+                        }
                     }
                 }
             }
@@ -299,6 +312,43 @@ async fn run() -> anyhow::Result<()> {
     assert!(
         saw_sps.load(Ordering::Relaxed),
         "expected an SPS (NAL 7) among the received RTP payloads"
+    );
+
+    // (e) RTP timestamps track each frame's real capture time rather than a
+    // fixed 1/fps step (the bug fixed in slice 2.1d, see
+    // `docs/host-libs-api-notes.md`'s webrtc section): the median gap
+    // between consecutive marker-bit (frame-boundary) timestamps should sit
+    // near 33ms at the 90kHz RTP clock for this 30fps synthetic source
+    // (1500..=6000 allows for pacing slack), and no gap may go backward
+    // (checked via wrapping subtraction, since RTP timestamps wrap at
+    // u32::MAX).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while marker_timestamps.lock().await.len() < 20 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let timestamps = marker_timestamps.lock().await.clone();
+    assert!(
+        timestamps.len() >= 20,
+        "expected >= 20 marker-bit RTP timestamps within 10s, got {}",
+        timestamps.len()
+    );
+    let mut diffs: Vec<u32> = timestamps
+        .windows(2)
+        .map(|w| w[1].wrapping_sub(w[0]))
+        .collect();
+    for &diff in &diffs {
+        assert!(
+            diff < 90_000 * 10,
+            "RTP timestamp went backward (or jumped implausibly far) between \
+             consecutive frames: wrapping diff {diff}"
+        );
+    }
+    diffs.sort_unstable();
+    let median = diffs[diffs.len() / 2];
+    assert!(
+        (1_500..=6_000).contains(&median),
+        "expected median inter-frame RTP timestamp gap in 1500..=6000 \
+         (33ms @ 90kHz +/- pacing slack), got {median}"
     );
 
     // (d) the receiver sends a PLI; the host must notice within 3s

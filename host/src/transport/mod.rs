@@ -11,17 +11,19 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
 use rtc::interceptor::{Interceptor, Packet as InterceptorPacket, TaggedPacket};
-use rtc::media::Sample;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::media_engine::MIME_TYPE_H264;
 use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use rtc::rtp::codec::h264::H264Payloader;
+use rtc::rtp::packetizer::{new_packetizer, Packetizer};
+use rtc::rtp::sequence::new_random_sequencer;
 use rtc::rtp_transceiver::rtp_sender::{
     RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
     RTCRtpEncodingParameters, RtpCodecKind,
@@ -32,7 +34,7 @@ use rtc::shared::error::Error;
 use webrtc::data_channel::{
     DataChannel, DataChannelEvent, RTCDataChannelInit, RTCDataChannelState,
 };
-use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
+use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
 use webrtc::media_stream::track_local::{TrackLocal, TrackLocalEvent};
 use webrtc::media_stream::Track;
 use webrtc::peer_connection::{
@@ -48,6 +50,25 @@ use crate::encode::EncodedFrame;
 /// Payload type for the (only) negotiated video codec. Fixed rather than
 /// negotiated because the media engine registers exactly one video codec.
 const VIDEO_PAYLOAD_TYPE: u8 = 102;
+
+/// RTP outbound MTU, matching `TrackLocalStaticSample`'s private
+/// `RTP_OUTBOUND_MTU` (`static_sample.rs`, not `pub`) -- this transport
+/// packetizes by hand (see `PeerSession::start_video`) instead of using that
+/// type, precisely to control RTP timestamps.
+const RTP_MTU: usize = 1200;
+
+/// RTP clock rate for the (only) negotiated video codec, matching
+/// `H264_FMTP_LINE`'s codec registration (`clock_rate: 90000` below).
+const VIDEO_CLOCK_RATE: u32 = 90_000;
+
+/// Upper bound on how far an inter-frame capture gap may advance the RTP
+/// timestamp (see `PeerSession::start_video`). Screen capture only produces
+/// frames when the screen changes, so a long idle stretch (nobody touching
+/// the remote desktop) can leave a multi-minute gap between two captured
+/// frames; feeding that raw gap to `skip_samples` would jump the RTP clock
+/// minutes ahead in one step; capped well above any realistic inter-frame
+/// gap during active use.
+const MAX_CAPTURE_GAP: Duration = Duration::from_secs(10);
 
 /// Constrained Baseline `42e01f`: the one profile both Safari and Chrome are
 /// guaranteed to decode in hardware (see ARCHITECTURE.md §5).
@@ -159,7 +180,11 @@ pub struct SessionConfig {
     /// Local UDP addresses to bind (see `with_udp_addrs`); `["0.0.0.0:0"]` in
     /// production, `["127.0.0.1:0"]` for the loopback test.
     pub udp_addrs: Vec<String>,
-    /// Target video frame rate, used to stamp sample durations.
+    /// Target video frame rate. No longer used by this module directly
+    /// (RTP timestamps now come from each frame's real capture time, see
+    /// `PeerSession::start_video`); kept here because callers build this
+    /// `SessionConfig` alongside the encoder's `EncoderConfig`, which still
+    /// needs it (see `crate::signaling::start_session`).
     pub fps: u32,
 }
 
@@ -240,11 +265,10 @@ impl PeerConnectionEventHandler for Handler {
 /// the four fixed data channels.
 pub struct PeerSession {
     pc: Box<dyn PeerConnection>,
-    video_track: Arc<TrackLocalStaticSample>,
+    video_track: Arc<TrackLocalStaticRTP>,
     video_sender: Arc<dyn RtpSender>,
     events: mpsc::Sender<SessionEvent>,
     connected: Arc<AtomicBool>,
-    fps: u32,
     /// The `control` data channel (cursor shape, app-level ping/pong; see
     /// ARCHITECTURE.md §5), kept aside from the other three so
     /// `send_control` can write to it directly.
@@ -400,7 +424,7 @@ impl PeerSession {
         );
 
         let ssrc = rand::random::<u32>();
-        let video_track = Arc::new(TrackLocalStaticSample::new(MediaStreamTrack::new(
+        let video_track = Arc::new(TrackLocalStaticRTP::new(MediaStreamTrack::new(
             "rcdesk-stream".to_owned(),
             "rcdesk-video".to_owned(),
             "screen".to_owned(),
@@ -413,7 +437,7 @@ impl PeerSession {
                 codec: video_codec.rtp_codec.clone(),
                 ..Default::default()
             }],
-        ))?);
+        )));
 
         let video_sender = pc
             .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal>)
@@ -427,7 +451,6 @@ impl PeerSession {
             video_sender,
             events: events.clone(),
             connected,
-            fps: cfg.fps.max(1),
             control_channel,
         });
 
@@ -513,6 +536,13 @@ impl PeerSession {
         tokio::spawn(async move {
             let request_keyframe = request_keyframe_on_connect;
             let mut negotiated: Option<(u32, u8)> = None;
+            // Built lazily once `negotiated` is known (the payload type
+            // can't be changed on an existing `Packetizer`), then lives for
+            // the rest of this task -- see `docs/host-libs-api-notes.md`'s
+            // webrtc section for why this transport packetizes by hand
+            // instead of using `TrackLocalStaticSample`.
+            let mut packetizer: Option<Box<dyn Packetizer>> = None;
+            let mut prev_captured_at: Option<Instant> = None;
             while let Some(frame) = frames.recv().await {
                 // Wait for the connection to actually be up (DTLS/SRTP
                 // ready), not just SDP-negotiated: `get_parameters()` below
@@ -532,19 +562,50 @@ impl PeerSession {
                     // frame to.
                     continue;
                 };
+                let packetizer = packetizer.get_or_insert_with(|| {
+                    Box::new(new_packetizer(
+                        RTP_MTU,
+                        pt,
+                        ssrc,
+                        Box::new(H264Payloader::default()),
+                        Box::new(new_random_sequencer()),
+                        VIDEO_CLOCK_RATE,
+                    ))
+                });
 
-                let sample = Sample {
-                    data: Bytes::from(frame.data),
-                    duration: Duration::from_micros(1_000_000 / u64::from(session.fps)),
-                    ..Default::default()
+                // Real inter-frame gap (screen capture only produces frames
+                // when the screen changes, so this varies -- it is not
+                // `1/fps`), converted to RTP clock ticks and applied via
+                // `skip_samples` *before* packetizing so the RTP timestamp
+                // tracks wall-clock capture time instead of a fixed step.
+                // `skip_samples` only advances the packetizer's timestamp,
+                // it does not touch the sequencer (`packetizer/mod.rs`).
+                let gap = prev_captured_at
+                    .map(|prev| frame.captured_at.duration_since(prev))
+                    .unwrap_or_default()
+                    .min(MAX_CAPTURE_GAP);
+                prev_captured_at = Some(frame.captured_at);
+                let skip_samples = (gap.as_secs_f64() * f64::from(VIDEO_CLOCK_RATE)) as u32;
+                if skip_samples > 0 {
+                    packetizer.skip_samples(skip_samples);
+                }
+
+                let packets = match packetizer.packetize(&Bytes::from(frame.data), 0) {
+                    Ok(packets) => packets,
+                    Err(err) => {
+                        tracing::warn!(?err, "failed to packetize video frame");
+                        continue;
+                    }
                 };
-                if let Err(err) = session
-                    .video_track
-                    .sample_writer(ssrc, pt)
-                    .write_sample(&sample)
-                    .await
-                {
-                    tracing::warn!(?err, "failed to write video sample");
+                for mut pkt in packets {
+                    pkt.header.payload_type = pt;
+                    if let Err(err) = session
+                        .video_track
+                        .write_rtp_with_extensions(pkt, &[])
+                        .await
+                    {
+                        tracing::warn!(?err, "failed to write video packet");
+                    }
                 }
             }
         });

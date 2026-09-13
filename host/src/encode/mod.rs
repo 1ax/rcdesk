@@ -14,6 +14,14 @@ pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub keyframe: bool,
     pub ts: Instant,
+    /// Wall-clock time the *source* frame was captured (`RawFrame::ts()`),
+    /// as opposed to `ts` (when encoding finished). The encoder doesn't see
+    /// the raw frame, so it fills this with a placeholder; `pipeline::start`
+    /// overwrites it with the real value right after `encode()` returns.
+    /// The transport uses it to stamp RTP timestamps from real capture
+    /// gaps rather than a fixed `1/fps` step (see
+    /// `docs/host-libs-api-notes.md`'s webrtc section).
+    pub captured_at: Instant,
 }
 
 pub trait Encoder: Send {

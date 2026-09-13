@@ -16,8 +16,12 @@ use super::{EncodeError, EncodedFrame, Encoder, EncoderConfig, I420Frame};
 
 pub struct OpenH264Encoder {
     inner: Oh264Encoder,
-    fps: u32,
-    frame_count: u64,
+    /// Wall-clock reference for `Timestamp::from_millis` below: the encoder
+    /// needs monotonically increasing millisecond timestamps for its rate
+    /// control, not frame-count-derived ones (see
+    /// `docs/host-libs-api-notes.md`'s webrtc section for why `frame_count *
+    /// 1000 / fps` drifted from real time for a variable-rate source).
+    started: Instant,
 }
 
 impl OpenH264Encoder {
@@ -49,8 +53,7 @@ impl OpenH264Encoder {
 
         Ok(Self {
             inner,
-            fps: cfg.fps.max(1),
-            frame_count: 0,
+            started: Instant::now(),
         })
     }
 }
@@ -70,13 +73,11 @@ impl Encoder for OpenH264Encoder {
         let cw = w.div_ceil(2);
         let source = YUVSlices::new((&frame.y, &frame.u, &frame.v), (w, h), (w, cw, cw));
 
-        let ts_ms = (self.frame_count * 1000) / u64::from(self.fps);
+        let ts_ms = self.started.elapsed().as_millis() as u64;
         let bitstream = self
             .inner
             .encode_at(&source, Timestamp::from_millis(ts_ms))
             .map_err(|err| EncodeError::Backend(err.to_string()))?;
-
-        self.frame_count += 1;
 
         let data = bitstream.to_vec();
         if data.is_empty() {
@@ -90,6 +91,11 @@ impl Encoder for OpenH264Encoder {
             data,
             keyframe,
             ts: Instant::now(),
+            // Placeholder: the encoder never sees the raw frame, so it
+            // doesn't know when it was captured. `pipeline::start`
+            // overwrites this with the real value right after `encode()`
+            // returns (see `EncodedFrame::captured_at`'s doc comment).
+            captured_at: Instant::now(),
         }))
     }
 }
