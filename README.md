@@ -4,8 +4,9 @@ Remote desktop in the browser. A Rust host agent for macOS and Windows streams t
 screen over WebRTC (H.264) to a web client that works in Safari and Chrome, with
 mouse, keyboard, clipboard and file transfer over data channels.
 
-**Status:** bootstrap. See `ARCHITECTURE.md` for design and roadmap,
-`SLICES_LOG.md` for current state.
+**Status:** phase 1 (MVP) deployed at https://rcdesk.app; phase 2 in progress (Windows host works,
+including a GDI capture fallback for machines without Direct3D 11). See `ARCHITECTURE.md` for design
+and roadmap, `SLICES_LOG.md` for current state, `docs/host-windows.md` to run the host on Windows.
 
 ## Layout
 

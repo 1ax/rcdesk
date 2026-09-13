@@ -1,7 +1,7 @@
 # rcdesk — Архитектура
 
 > Документ решений. Меняется только осознанно, с записью в SLICES_LOG.md.
-> Актуально на 2026-09-11.
+> Актуально на 2026-09-13.
 
 ## 1. Цель и границы
 
@@ -20,7 +20,7 @@ fps, аппаратное кодирование. Ориентир — Chrome Re
 | Слой | Выбор | Почему |
 |---|---|---|
 | Хост-агент | **Rust**, один код для macOS и Windows | Единственный вариант «один бинарник, нативная скорость, без рантайма» с живыми крейтами под захват, кодек, WebRTC и ввод. Go требует cgo под ScreenCaptureKit/DirectX; Electron — 200 МБ и лишний слой. |
-| Захват экрана | `scap` (ScreenCaptureKit на macOS, Windows Graphics Capture на Windows) | Единый API поверх нативных zero-copy захватов. Используется в проде (Cap.so). Если упрёмся — прямые `screencapturekit` / `windows-capture`. |
+| Захват экрана | `scap` (ScreenCaptureKit на macOS, Windows Graphics Capture на Windows); на Windows запасной **GDI** (`BitBlt`) | Единый API поверх нативных zero-copy захватов. Используется в проде (Cap.so). Если упрёмся — прямые `screencapturekit` / `windows-capture`. WGC требует Direct3D 11 у драйвера; на легаси-драйверах и в ВМ хост сам уходит на GDI (`--capture auto`, слайс 2.1). |
 | Кодек, MVP | `openh264` (Cisco, программный) | Портативно, лицензионно чисто, достаточно для 1080p30 на M4/современном x64. |
 | Кодек, цель | VideoToolbox (macOS) через `objc2-video-toolbox`; Media Foundation H.264 MFT (Windows) через `windows` | Аппаратное кодирование без зависимости от ffmpeg. `openh264` остаётся запасным путём. |
 | WebRTC на хосте | `webrtc` (webrtc-rs, порт pion) | Полный стек (ICE/DTLS/SRTP/SCTP), interceptors NACK/TWCC, API знаком по pion. Развилка на будущее: `str0m` (sans-IO, встроенный BWE), если упрёмся в управление битрейтом. |
@@ -32,7 +32,7 @@ fps, аппаратное кодирование. Ориентир — Chrome Re
 | Сигнальный сервер | **Rust**, `axum` + `tokio-tungstenite` | Один язык с хостом, общие типы из `proto`. Нагрузка ничтожна. |
 | TURN/STUN | `coturn` в Docker | Стандарт де-факто. |
 | Реверс-прокси/TLS | nginx из FastPanel на VPS владельца (как в crewtally) | Порты 80/443 на VPS уже за FastPanel; LE-сертификат выпускает панель. `.app` — зона с принудительным HTTPS (HSTS preload), что нам и нужно. Caddy — запасной вариант для чистого сервера. |
-| CI | GitHub Actions: `macos-latest`, `windows-latest`, `ubuntu-latest` (web, server) | Публичный репо — без лимита минут. |
+| CI | GitHub Actions: `macos-latest`, `windows-latest`, `ubuntu-latest` (web, server) | Публичный репо — без лимита минут. Deploy собирает release-бинарники хоста как артефакты (`rcdesk-host-windows-x64`, `rcdesk-host-macos-arm64`): кросс-компиляции нет, openh264 собирается под MSVC. |
 
 Версии крейтов на момент выбора (crates.io, 2026-09-11): `webrtc` 0.20.5, `str0m`
 0.23.1, `scap` 0.0.8, `enigo` 0.6.1, `openh264` 0.9.8, `windows-capture` 2.0.1,
@@ -48,13 +48,13 @@ rcdesk/
 ├── host/                 # хост-агент (бинарник rcdesk-host)
 │   └── src/
 │       ├── main.rs       # CLI, конфиг, запуск
-│       ├── capture/      # трейт FrameSource + адаптер scap
+│       ├── capture/      # трейт FrameSource + адаптеры scap, gdi (Windows), synthetic
 │       ├── encode/       # трейт Encoder + openh264 / videotoolbox / mediafoundation
 │       ├── pipeline/     # capture → encode → RTP; пейсинг, пропуск кадров
 │       ├── transport/    # webrtc-rs: PeerConnection, треки, data channels
 │       ├── input/        # события ввода → enigo; раскладка клавиш
 │       ├── signaling/    # клиент WS к серверу
-│       └── platform/     # macos/, windows/ — всё, что за cfg
+│       └── platform/     # macos/, windows/{keyboard,d3d,dpi} — всё, что за cfg
 ├── server/               # сигнальный сервер (бинарник rcdesk-server)
 ├── web/                  # веб-клиент (Vite + TS)
 │   └── src/generated/    # TS-типы из proto (ts-rs), коммитятся
@@ -117,6 +117,9 @@ Keyboard Lock в Chrome в полноэкранном режиме. Оверле
     движение не важно, следующее его заменит).
   - `control` — надёжный: буфер обмена, смена монитора, качество, курсор, пинг.
   - `file` — надёжный, чанки 64 КБ с backpressure по `bufferedAmount`.
+- **RTP-время видео:** отметка кадра = реальное время захвата (транспорт пакетизирует сам:
+  `TrackLocalStaticRTP` + `Packetizer`, `skip_samples` на интервал между захватами). Фиксированный
+  шаг `1/fps` недопустим: кадры идут только при изменении экрана, и Chrome копил ~850 мс в jitter-буфере.
 - **Кодирование сообщений:** JSON (MVP; типы из `proto`). Если измерение покажет
   накладные расходы на `pointer` — компактный бинарный формат, решение фазы 2.
 - **Управление битрейтом:** MVP — фиксированный целевой битрейт по настройке.
@@ -231,7 +234,8 @@ VPS владельца (FastVPS, Эстония), отдельный польз�
   измерена (долг D9).
 
 ### Фаза 2 — Windows и производительность
-- 2.1 Сборка и запуск на Windows 10 (WGC + SendInput), инструкция установки.
+- 2.1 Сборка и запуск на Windows 10 (WGC + SendInput), инструкция установки. ✅ Стенд без D3D 11 → GDI-фоллбэк;
+  клавиатура через свой `SendInput` (E0-префикс); RTP-время по захвату (jitter-буфер 850 → ~0–120 мс).
 - 2.2 Аппаратные кодеры: VideoToolbox, Media Foundation; выбор в рантайме, фоллбэк.
 - 2.3 Адаптивный битрейт/fps по RTCP и TWCC; измерения до/после.
 - 2.4 Мультимонитор: список, переключение, выбор при подключении.
@@ -278,7 +282,7 @@ VPS владельца (FastVPS, Эстония), отдельный польз�
 | windows-capture =1.4.4 (пин) | host (Windows) | совместимость scap 0.0.8, см. docs/host-libs-api-notes.md |
 | base64 0.22 | host | RGBA курсора в JSON |
 | objc2 0.6, objc2-foundation 0.3, objc2-app-kit 0.3 | host (macOS) | NSCursor → NSBitmapImageRep (те же версии, что тянет enigo) |
-| windows 0.61 | host (Windows) | GetCursorInfo/GetIconInfo/GetDIBits (та же версия, что у windows-capture) |
-| enigo 0.6 | host (macOS/Windows) | инъекция ввода: `raw()` = CGKeyCode / scan-код, `main_display()` для масштаба координат |
+| windows 0.61 | host (Windows) | курсор (GetCursorInfo/GetIconInfo/GetDIBits), клавиатура (`SendInput`, `MapVirtualKeyW`), GDI-захват (`BitBlt`, `CreateDIBSection`), проба D3D 11 (`D3D11CreateDevice`; фича Dxgi нужна из-за cfg-гейта), DPI (`SetProcessDpiAwarenessContext`). Та же версия, что у windows-capture |
+| enigo 0.6 | host (macOS/Windows) | инъекция ввода: macOS — `raw()` = CGKeyCode; Windows — только мышь/колесо (`raw()` не принимает E0-префикс, клавиши идут через свой `SendInput`); `main_display()` для масштаба координат |
 | arboard | host | буфер обмена (фаза 2) |
 | vite 8, typescript 7, vitest 5 | web | сборка, типы, тесты; `vite.config.ts` использует `defineConfig` из `vitest/config` |
