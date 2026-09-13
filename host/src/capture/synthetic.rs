@@ -4,15 +4,14 @@
 //! `scap` backend is exercised manually by whoever has screen-recording
 //! permission on their machine.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use super::{CaptureError, FrameSource, RawFrame};
+use super::{CaptureError, FramePacer, FrameSource, RawFrame};
 
 pub struct SyntheticSource {
     width: u32,
     height: u32,
-    frame_interval: Duration,
-    next_tick: Instant,
+    pacer: FramePacer,
     frame_index: u64,
 }
 
@@ -24,8 +23,7 @@ impl SyntheticSource {
         Self {
             width,
             height,
-            frame_interval: Duration::from_secs_f64(1.0 / f64::from(fps)),
-            next_tick: Instant::now(),
+            pacer: FramePacer::new(fps),
             frame_index: 0,
         }
     }
@@ -63,13 +61,12 @@ impl SyntheticSource {
 
 impl FrameSource for SyntheticSource {
     fn next_frame(&mut self) -> Result<RawFrame, CaptureError> {
-        let now = Instant::now();
-        if now < self.next_tick {
-            std::thread::sleep(self.next_tick - now);
-        }
-        // Fixed-rate pacing: advance the schedule by one interval regardless
-        // of how long this call took, so timing doesn't drift over time.
-        self.next_tick += self.frame_interval;
+        // Fixed-rate pacing without catch-up bursts: if this source was
+        // created well before its capture thread started (the loopback test
+        // builds it before the WebRTC handshake), a naive `next_tick +=
+        // interval` schedule would emit a burst of back-to-back frames to
+        // "catch up" -- `FramePacer` snaps the schedule forward instead.
+        self.pacer.wait();
 
         let (y, uv) = self.render();
         self.frame_index += 1;
