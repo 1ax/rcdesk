@@ -7,6 +7,20 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+/// A single capturable display, as shown in the client's display picker
+/// (slice 2.4). `width`/`height` are the display's size in its own
+/// OS-global units (points on macOS, physical pixels on Windows) -- for
+/// labelling in the UI only, not a frame/pixel size.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DisplayEntry {
+    pub id: u32,
+    pub title: String,
+    pub width: u32,
+    pub height: u32,
+    pub primary: bool,
+}
+
 /// A single `control`-channel message, JSON-encoded on the wire (see
 /// ARCHITECTURE.md §5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -43,6 +57,15 @@ pub enum ControlMessage {
         fps: u32,
         reason: String,
     },
+    /// host -> client: the list of displays the host can capture, and the id
+    /// of the one currently being streamed (slice 2.4). Sent when the
+    /// `control` channel opens and again after every display switch.
+    Displays {
+        displays: Vec<DisplayEntry>,
+        current: u32,
+    },
+    /// client -> host: switch the streamed display to `id`.
+    SelectDisplay { id: u32 },
 }
 
 #[cfg(test)]
@@ -116,6 +139,40 @@ mod tests {
             json,
             r#"{"type":"quality","bitrate_kbps":3200,"fps":20,"reason":"remb"}"#
         );
+
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, msg);
+    }
+
+    #[test]
+    fn displays_round_trips_through_json_with_exact_shape() {
+        let msg = ControlMessage::Displays {
+            displays: vec![DisplayEntry {
+                id: 1,
+                title: "Built-in".to_string(),
+                width: 1728,
+                height: 1117,
+                primary: true,
+            }],
+            current: 1,
+        };
+
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"displays","displays":[{"id":1,"title":"Built-in","width":1728,"height":1117,"primary":true}],"current":1}"#
+        );
+
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, msg);
+    }
+
+    #[test]
+    fn select_display_round_trips_through_json_with_exact_shape() {
+        let msg = ControlMessage::SelectDisplay { id: 2 };
+
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(json, r#"{"type":"select_display","id":2}"#);
 
         let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, msg);

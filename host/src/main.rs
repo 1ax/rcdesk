@@ -79,7 +79,7 @@ enum Command {
         /// Use the synthetic frame source instead of real screen capture.
         #[arg(long)]
         synthetic: bool,
-        /// Display id to capture (scap only); defaults to the first display.
+        /// Display id to capture (see `list-displays`); defaults to the primary display.
         #[arg(long)]
         display: Option<u32>,
         #[arg(long, default_value_t = 30)]
@@ -119,7 +119,7 @@ enum Command {
         /// Use the synthetic frame source instead of real screen capture.
         #[arg(long)]
         synthetic: bool,
-        /// Display id to capture (scap only); defaults to the first display.
+        /// Display id to capture (see `list-displays`); defaults to the primary display.
         #[arg(long)]
         display: Option<u32>,
         #[arg(long, default_value_t = 30)]
@@ -223,9 +223,31 @@ fn run_list_displays() -> anyhow::Result<()> {
         println!("no capturable displays found");
     }
     for display in displays {
-        println!("{}\t{}", display.id, display.title);
+        let primary = if display.primary { "primary" } else { "-" };
+        println!(
+            "{}\t{}\t{}x{}@{},{}\t{}",
+            display.id, display.title, display.width, display.height, display.x, display.y, primary
+        );
     }
     Ok(())
+}
+
+/// Resolves `--display` to a concrete display id before it reaches a
+/// backend's `new`: an explicit `--display N` passes through unchanged
+/// (an id that turns out not to exist is still that backend's error to
+/// report), `None` picks `capture::default_display` out of
+/// `capture::list_displays()` (propagating a `list_displays` error, e.g. no
+/// screen-recording permission, as-is) and logs which display was picked.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn resolve_display(display: Option<u32>) -> anyhow::Result<u32> {
+    if let Some(id) = display {
+        return Ok(id);
+    }
+    let displays = capture::list_displays()?;
+    let chosen = capture::default_display(&displays)
+        .ok_or_else(|| anyhow::anyhow!("no capturable display found"))?;
+    tracing::info!(display_id = chosen.id, title = %chosen.title, "capturing display");
+    Ok(chosen.id)
 }
 
 /// Builds the real screen-capture source. On Windows this is where
@@ -240,6 +262,7 @@ fn build_screen_source(
     fps: u32,
     backend: CaptureBackend,
 ) -> anyhow::Result<Box<dyn FrameSource>> {
+    let display = Some(resolve_display(display)?);
     let use_wgc = match backend {
         CaptureBackend::Wgc => true,
         CaptureBackend::Gdi => false,
@@ -265,6 +288,7 @@ fn build_screen_source(
             "--capture gdi is a Windows-only fallback, not supported on macOS"
         )),
         CaptureBackend::Auto | CaptureBackend::Wgc => {
+            let display = Some(resolve_display(display)?);
             Ok(Box::new(capture::scap::ScapSource::new(display, fps)?))
         }
     }
@@ -326,7 +350,7 @@ fn run_bench(
     encoder: EncoderBackend,
 ) -> anyhow::Result<()> {
     let source: Box<dyn FrameSource> = if synthetic {
-        Box::new(capture::synthetic::SyntheticSource::new(1280, 720, fps))
+        Box::new(capture::synthetic::for_display(display.unwrap_or(1), fps)?)
     } else {
         build_screen_source(display, fps, capture)?
     };
@@ -493,7 +517,7 @@ async fn run_serve(
         if synthetic {
             Box::new(move || {
                 Ok(
-                    Box::new(capture::synthetic::SyntheticSource::new(1280, 720, fps))
+                    Box::new(capture::synthetic::for_display(display.unwrap_or(1), fps)?)
                         as Box<dyn FrameSource>,
                 )
             })

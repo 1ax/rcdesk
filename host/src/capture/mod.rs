@@ -57,10 +57,32 @@ pub trait FrameSource: Send {
 }
 
 /// A capturable display, as reported by the OS.
+///
+/// `x`/`y`/`width`/`height` describe the display's rectangle in the OS's
+/// global coordinate system, in the same units input injection uses
+/// (`CGEvent` points on macOS, physical pixels of the virtual screen on
+/// Windows; the process is DPI-aware, see `platform::windows::dpi`). This is
+/// *not* the size of the captured frame, which can be larger on a Retina
+/// display.
 #[derive(Debug, Clone)]
 pub struct DisplayInfo {
     pub id: u32,
     pub title: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub primary: bool,
+}
+
+/// The display a session should capture when the caller didn't ask for a
+/// specific one: the primary display, or the first one if none is marked
+/// primary.
+pub fn default_display(displays: &[DisplayInfo]) -> Option<&DisplayInfo> {
+    displays
+        .iter()
+        .find(|d| d.primary)
+        .or_else(|| displays.first())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -79,7 +101,7 @@ pub enum CaptureError {
 /// permission to be granted already: this never prompts (there is nobody to
 /// click the dialog on a headless/CI/terminal session), it just reports the
 /// permission is missing.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "macos")]
 pub fn list_displays() -> Result<Vec<DisplayInfo>, CaptureError> {
     if !::scap::is_supported() {
         return Err(CaptureError::Unsupported);
@@ -91,13 +113,28 @@ pub fn list_displays() -> Result<Vec<DisplayInfo>, CaptureError> {
     Ok(::scap::get_all_targets()
         .into_iter()
         .filter_map(|target| match target {
-            ::scap::Target::Display(display) => Some(DisplayInfo {
-                id: display.id,
-                title: display.title,
-            }),
+            ::scap::Target::Display(display) => {
+                let bounds = display.raw_handle.bounds();
+                Some(DisplayInfo {
+                    id: display.id,
+                    title: display.title,
+                    x: bounds.origin.x as i32,
+                    y: bounds.origin.y as i32,
+                    width: bounds.size.width as u32,
+                    height: bounds.size.height as u32,
+                    primary: display.raw_handle.is_main(),
+                })
+            }
             ::scap::Target::Window(_) => None,
         })
         .collect())
+}
+
+/// Lists capturable displays via `EnumDisplayMonitors` (see
+/// `platform::windows::monitors` for why not `scap`).
+#[cfg(target_os = "windows")]
+pub fn list_displays() -> Result<Vec<DisplayInfo>, CaptureError> {
+    crate::platform::windows::monitors::list()
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -159,6 +196,40 @@ impl FramePacer {
 /// "unchanged".
 pub fn frame_unchanged(prev: Option<&[u8]>, cur: &[u8]) -> bool {
     matches!(prev, Some(p) if p == cur)
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    fn display(id: u32, primary: bool) -> DisplayInfo {
+        DisplayInfo {
+            id,
+            title: format!("Display {id}"),
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+            primary,
+        }
+    }
+
+    #[test]
+    fn default_display_is_none_for_an_empty_list() {
+        assert!(default_display(&[]).is_none());
+    }
+
+    #[test]
+    fn default_display_picks_primary_even_when_not_first() {
+        let displays = [display(1, false), display(2, true)];
+        assert_eq!(default_display(&displays).unwrap().id, 2);
+    }
+
+    #[test]
+    fn default_display_falls_back_to_first_when_none_primary() {
+        let displays = [display(1, false), display(2, false)];
+        assert_eq!(default_display(&displays).unwrap().id, 1);
+    }
 }
 
 #[cfg(test)]
