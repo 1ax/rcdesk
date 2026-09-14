@@ -11,7 +11,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -21,6 +21,8 @@ use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::media_engine::MIME_TYPE_H264;
 use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use rtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
+use rtc::rtcp::receiver_report::ReceiverReport as RtcpReceiverReport;
 use rtc::rtp::codec::h264::H264Payloader;
 use rtc::rtp::packetizer::{new_packetizer, Packetizer};
 use rtc::rtp::sequence::new_random_sequencer;
@@ -203,6 +205,23 @@ pub enum SessionEvent {
     },
     /// The remote peer asked for a keyframe (PLI or FIR).
     KeyframeRequested,
+    /// Receiver Estimated Maximum Bitrate (REMB, draft-alvestrand-rmcat-remb) from the
+    /// browser's receive-side bandwidth estimator: its current estimate of what the path
+    /// can carry, in bits per second. Chrome sends one every ~200 ms alongside its RR
+    /// (verified live in slice 2.3 -- see docs/host-libs-api-notes.md).
+    Remb { bitrate_bps: u64 },
+    /// One reception report block about our video SSRC from an RTCP Receiver Report.
+    ReceiverReport {
+        /// Fraction of packets lost since the previous report, 0.0..=1.0 (`fraction_lost / 256`).
+        fraction_lost: f32,
+        /// Cumulative packets lost.
+        total_lost: u32,
+        /// Interarrival jitter in RTP clock ticks (90 kHz).
+        jitter: u32,
+        /// Round-trip time computed from LSR/DLSR against our NTP clock, `None` if the
+        /// report carries no LSR yet (no SR received on the far side) or the result is implausible.
+        rtt: Option<Duration>,
+    },
 }
 
 fn ice_candidate_from_rtc(c: RTCIceCandidateInit) -> proto::signal::IceCandidate {
@@ -612,18 +631,50 @@ impl PeerSession {
 
         let session = Arc::clone(self);
         tokio::spawn(async move {
+            // The video track's SSRC is assigned explicitly at track creation
+            // (see `PeerSession::new`'s `RTCRtpCodingParameters { ssrc: Some(ssrc),
+            // .. }`), not negotiated, so it is already available before the
+            // connection is up; fetched once here rather than per packet.
+            let video_ssrc = session.video_track.ssrcs().await.first().copied();
             while let Some(event) = session.video_track.poll().await {
                 match event {
                     TrackLocalEvent::OnRtcpPacket(packets) => {
                         let mut keyframe_requested = false;
                         for pkt in &packets {
-                            if pkt
-                                .as_any()
-                                .downcast_ref::<PictureLossIndication>()
-                                .is_some()
-                                || pkt.as_any().downcast_ref::<FullIntraRequest>().is_some()
+                            let pkt_any = pkt.as_any();
+                            if pkt_any.downcast_ref::<PictureLossIndication>().is_some()
+                                || pkt_any.downcast_ref::<FullIntraRequest>().is_some()
                             {
                                 keyframe_requested = true;
+                            } else if let Some(remb) =
+                                pkt_any.downcast_ref::<ReceiverEstimatedMaximumBitrate>()
+                            {
+                                let _ = session
+                                    .events
+                                    .send(SessionEvent::Remb {
+                                        bitrate_bps: remb.bitrate as u64,
+                                    })
+                                    .await;
+                            } else if let Some(rr) = pkt_any.downcast_ref::<RtcpReceiverReport>() {
+                                for report in &rr.reports {
+                                    if Some(report.ssrc) != video_ssrc {
+                                        continue;
+                                    }
+                                    let rtt = rtt_from_report(
+                                        ntp_mid32_now(),
+                                        report.last_sender_report,
+                                        report.delay,
+                                    );
+                                    let _ = session
+                                        .events
+                                        .send(SessionEvent::ReceiverReport {
+                                            fraction_lost: f32::from(report.fraction_lost) / 256.0,
+                                            total_lost: report.total_lost,
+                                            jitter: report.jitter,
+                                            rtt,
+                                        })
+                                        .await;
+                                }
                             } else {
                                 tracing::trace!(packet = %pkt, "video track rtcp feedback");
                             }
@@ -677,4 +728,81 @@ fn spawn_data_channel_reader(
             }
         }
     });
+}
+
+/// Round-trip time computed from an RTCP receiver report's LSR/DLSR fields
+/// against our own NTP clock (RFC 3550 §6.4.1): `now - LSR - DLSR`, all in
+/// units of 1/65536 s (the middle 32 bits of the 64-bit NTP timestamp).
+/// `None` when the report carries no LSR yet (no SR seen on the far side, so
+/// `last_sender_report == 0`) or the result is implausible (more than 10s,
+/// which for a report sent roughly once a second means a clock jump or a
+/// wraparound rather than a real RTT).
+fn rtt_from_report(now_ntp_mid32: u32, last_sender_report: u32, delay: u32) -> Option<Duration> {
+    if last_sender_report == 0 {
+        return None;
+    }
+    let diff = now_ntp_mid32
+        .wrapping_sub(last_sender_report)
+        .wrapping_sub(delay);
+    if diff > 65536 * 10 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(f64::from(diff) / 65536.0))
+}
+
+/// The middle 32 bits of the current 64-bit NTP timestamp (seconds since
+/// 1900-01-01 plus a binary fraction of a second, RFC 3550 §4), as used by
+/// RTCP SR/RR LSR/DLSR fields.
+fn ntp_mid32_now() -> u32 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs() + 2_208_988_800;
+    let nanos_fraction = (u64::from(now.subsec_nanos()) * (1u64 << 32) / 1_000_000_000) as u32;
+    (((secs & 0xFFFF) as u32) << 16) | (nanos_fraction >> 16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rtt_from_report_computes_expected_round_trip() {
+        let lsr: u32 = 0x1234_5678;
+        let delay: u32 = 655;
+        let now = lsr.wrapping_add(3277).wrapping_add(delay);
+        let rtt = rtt_from_report(now, lsr, delay).expect("expected Some(rtt)");
+        let expected = Duration::from_secs_f64(3277.0 / 65536.0);
+        let diff = rtt.abs_diff(expected);
+        assert!(
+            diff <= Duration::from_millis(1),
+            "expected ~{expected:?}, got {rtt:?} (diff {diff:?})"
+        );
+    }
+
+    #[test]
+    fn rtt_from_report_none_without_lsr() {
+        assert_eq!(rtt_from_report(12345, 0, 0), None);
+    }
+
+    #[test]
+    fn rtt_from_report_none_when_implausible() {
+        // `now` is far earlier than `last_sender_report + delay`: the
+        // wrapping subtraction produces a huge value, well past the 10s
+        // sanity bound.
+        assert_eq!(rtt_from_report(0, 1_000_000, 0), None);
+    }
+
+    #[test]
+    fn ntp_mid32_now_advances_with_wall_clock() {
+        let first = ntp_mid32_now();
+        std::thread::sleep(Duration::from_millis(10));
+        let second = ntp_mid32_now();
+        let diff = second.wrapping_sub(first);
+        assert_ne!(diff, 0, "ntp_mid32_now should advance after a 10ms sleep");
+        assert!(
+            diff < 65536,
+            "10ms should advance the mid32 clock by less than a second's worth of units, got {diff}"
+        );
+    }
 }

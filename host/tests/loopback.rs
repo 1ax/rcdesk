@@ -13,6 +13,7 @@ use tokio::time::timeout;
 
 use rtc::peer_connection::configuration::media_engine::MIME_TYPE_H264;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use rtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
 use rtc::rtp_transceiver::rtp_sender::{
     RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind,
 };
@@ -234,6 +235,8 @@ async fn run() -> anyhow::Result<()> {
     }
 
     let (keyframe_requested_tx, mut keyframe_requested_rx) = mpsc::channel::<()>(4);
+    let (remb_tx, mut remb_rx) = mpsc::channel::<u64>(4);
+    let (receiver_report_tx, mut receiver_report_rx) = mpsc::channel::<(f32, Option<Duration>)>(64);
     {
         let browser_pc = Arc::clone(&browser_pc);
         tokio::spawn(async move {
@@ -246,6 +249,14 @@ async fn run() -> anyhow::Result<()> {
                     }
                     SessionEvent::KeyframeRequested => {
                         let _ = keyframe_requested_tx.try_send(());
+                    }
+                    SessionEvent::Remb { bitrate_bps } => {
+                        let _ = remb_tx.try_send(bitrate_bps);
+                    }
+                    SessionEvent::ReceiverReport {
+                        fraction_lost, rtt, ..
+                    } => {
+                        let _ = receiver_report_tx.try_send((fraction_lost, rtt));
                     }
                     _ => {}
                 }
@@ -268,6 +279,11 @@ async fn run() -> anyhow::Result<()> {
         .await
         .expect("on_track timed out after 10s")
         .expect("browser handler dropped the track sender");
+    let media_ssrc = *track
+        .ssrcs()
+        .await
+        .first()
+        .expect("remote track should expose an SSRC");
 
     // A dedicated reader task continuously drains the track (only one
     // caller should poll a given TrackRemote) and updates shared counters
@@ -365,11 +381,6 @@ async fn run() -> anyhow::Result<()> {
     // (d) the receiver sends a PLI; the host must notice within 3s
     // (SessionEvent::KeyframeRequested) and the pipeline's keyframe counter
     // must increase.
-    let media_ssrc = *track
-        .ssrcs()
-        .await
-        .first()
-        .expect("remote track should expose an SSRC");
     let keyframes_before = stats.keyframes.load(Ordering::Relaxed);
     track
         .write_rtcp(vec![Box::new(PictureLossIndication {
@@ -392,6 +403,60 @@ async fn run() -> anyhow::Result<()> {
     assert!(
         stats.keyframes.load(Ordering::Relaxed) > keyframes_before,
         "expected the pipeline's keyframe counter to increase after the PLI"
+    );
+
+    // (f) the receiver sends a REMB; the host must decode it into a
+    // `SessionEvent::Remb` within 3s. REMB encodes the bitrate as a
+    // mantissa/exponent pair, so exact equality with the value sent isn't
+    // guaranteed -- checked against a tolerance instead.
+    track
+        .write_rtcp(vec![Box::new(ReceiverEstimatedMaximumBitrate {
+            sender_ssrc: 0,
+            bitrate: 1_500_000.0,
+            ssrcs: vec![media_ssrc],
+        })])
+        .await?;
+    let bitrate_bps = timeout(Duration::from_secs(3), remb_rx.recv())
+        .await
+        .expect("SessionEvent::Remb timed out after 3s")
+        .expect("remb event channel closed");
+    assert!(
+        (1_490_000..=1_510_000).contains(&bitrate_bps),
+        "expected REMB bitrate near 1_500_000 bps, got {bitrate_bps}"
+    );
+
+    // (g) + (h) the browser's report interceptor sends an RTCP Receiver
+    // Report about our video SSRC roughly once a second; drain those events
+    // for up to 10s looking for one with no loss (g) and, separately, one
+    // that carries a plausible RTT (h) -- the latter only appears once the
+    // browser has received at least one Sender Report from the host's own
+    // once-a-second SR interceptor, so it may take a little longer than the
+    // first RR.
+    let mut saw_zero_loss = false;
+    let mut saw_rtt: Option<Duration> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && (!saw_zero_loss || saw_rtt.is_none()) {
+        match receiver_report_rx.try_recv() {
+            Ok((fraction_lost, rtt)) => {
+                if fraction_lost == 0.0 {
+                    saw_zero_loss = true;
+                }
+                if let Some(rtt) = rtt {
+                    if rtt < Duration::from_secs(2) {
+                        saw_rtt = Some(rtt);
+                    }
+                }
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    assert!(
+        saw_zero_loss,
+        "expected a ReceiverReport with fraction_lost == 0.0 within 10s"
+    );
+    assert!(
+        saw_rtt.is_some(),
+        "expected a ReceiverReport with a plausible RTT (< 2s) within 10s"
     );
 
     host_session.close().await;

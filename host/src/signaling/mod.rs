@@ -412,6 +412,14 @@ async fn handle_session_event(
         SessionEvent::KeyframeRequested => {
             tracing::debug!("keyframe requested by remote peer (PLI/FIR)");
         }
+        SessionEvent::Remb { bitrate_bps } => {
+            tracing::debug!(bitrate_bps, "remb from peer");
+        }
+        SessionEvent::ReceiverReport {
+            fraction_lost, rtt, ..
+        } => {
+            tracing::debug!(fraction_lost, ?rtt, "receiver report from peer");
+        }
     }
 }
 
