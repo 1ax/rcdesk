@@ -165,6 +165,9 @@ pub struct Controller {
     target: RateTarget,
     last_remb_kbps: Option<f64>,
     last_remb_at: Option<Instant>,
+    /// The fresh REMB seen by the previous `tick()`, to tell a rising
+    /// estimate (still ramping, not congestion) from a falling one.
+    prev_tick_remb_kbps: Option<f64>,
     last_loss: f32,
     window: Window,
     /// Consecutive ticks the loaded-link REMB signal has said "congested"
@@ -189,6 +192,7 @@ impl Controller {
             target,
             last_remb_kbps: None,
             last_remb_at: None,
+            prev_tick_remb_kbps: None,
             last_loss: 0.0,
             window: Window::default(),
             congested_ticks: 0,
@@ -263,10 +267,23 @@ impl Controller {
         };
 
         // REMB says "congested" only on a loaded link (see
-        // `REMB_LOADED_RATIO`) and only when it undercuts what we sent.
+        // `REMB_LOADED_RATIO`), only when it undercuts what we sent, and
+        // only while it is *not rising*: the browser's estimate ramps at
+        // ~8 %/s, so right after the content gets heavier (a video starts)
+        // it trails our sent rate for many seconds while the network is
+        // fine -- seen on the bench as a spurious 4.0 -> 2.6 Mbit/s cut at
+        // the start of a video. Real overuse makes the receive-side
+        // estimator *lower* its estimate (multiplicative decrease), which
+        // is what this looks for.
         let link_loaded = sent_kbps >= REMB_LOADED_RATIO * old_b;
-        let remb_congested =
-            link_loaded && remb_kbps.is_some_and(|remb| remb < sent_kbps * REMB_CONGESTION_RATIO);
+        let remb_rising = match (remb_kbps, self.prev_tick_remb_kbps) {
+            (Some(now), Some(prev)) => now > prev,
+            _ => false,
+        };
+        self.prev_tick_remb_kbps = remb_kbps;
+        let remb_congested = link_loaded
+            && !remb_rising
+            && remb_kbps.is_some_and(|remb| remb < sent_kbps * REMB_CONGESTION_RATIO);
         if remb_congested {
             self.congested_ticks += 1;
         } else {
@@ -492,6 +509,38 @@ mod tests {
         }
         assert_eq!(c.target().bitrate_kbps, 6000);
         assert_eq!(c.target().fps, 30);
+    }
+
+    #[test]
+    fn rising_remb_below_sent_rate_is_ramping_not_congestion() {
+        // The bench's false positive: a video starts, 6000 kbps go out, and
+        // the browser's estimate trails behind while climbing 8 %/s. While
+        // it rises no cut happens even though it undercuts the sent rate
+        // for many ticks in a row.
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0;
+        let mut estimate = 2_000_000u64;
+        for _ in 0..6 {
+            now += TICK;
+            frames(&mut c, now, 750_000);
+            remb(&mut c, now, estimate);
+            assert_eq!(c.tick(now), None);
+            estimate = estimate * 108 / 100;
+        }
+        assert_eq!(c.target().bitrate_kbps, 6000);
+
+        // The estimate then *falls* two ticks in a row: that is overuse.
+        now += TICK;
+        frames(&mut c, now, 750_000);
+        remb(&mut c, now, 2_500_000);
+        assert_eq!(c.tick(now), None);
+        now += TICK;
+        frames(&mut c, now, 750_000);
+        remb(&mut c, now, 2_400_000);
+        let decision = c.tick(now).expect("expected a remb cut");
+        assert_eq!(decision.reason, "remb");
+        assert_eq!(decision.target.bitrate_kbps, 2400);
     }
 
     #[test]
