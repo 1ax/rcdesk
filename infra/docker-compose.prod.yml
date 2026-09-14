@@ -3,6 +3,12 @@
 # server публикуется ТОЛЬКО на 127.0.0.1 -- внешний FastPanel-Nginx на этом же
 # сервере проксирует /ws и /healthz на 127.0.0.1:8100 (см. ARCHITECTURE.md §11).
 # Образ тянется из ghcr.io (публикуется .github/workflows/deploy.yml).
+#
+# Имя проекта задано явно: без него compose берёт имя каталога (`app`), а на этом
+# VPS так же называется проект crewtally -- первый деплой rcdesk с --remove-orphans
+# снёс её контейнеры (инцидент 2026-09-11, долг D25).
+
+name: rcdesk
 
 services:
   server:
