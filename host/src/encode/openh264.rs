@@ -20,6 +20,13 @@ use super::{to_i420, EncodeError, EncodedFrame, Encoder, EncoderConfig};
 /// the comment at the call site for why it can't be 0.
 const MIN_QP: u8 = 1;
 
+/// QP ceiling used when `EncoderConfig::max_qp` is `None`. Chosen on the
+/// owner's Windows 10 bench (GDI 1080p, slice 2.2): without a ceiling
+/// openh264's delta frames sit at QP > 34 and typed text is visibly blurred;
+/// at 30 the text is crisp and bitrate under a playing video stays at
+/// 2–3.5 Mbit/s of the 6 Mbit/s target. `--max-qp` overrides it.
+const DEFAULT_MAX_QP: u8 = 30;
+
 pub struct OpenH264Encoder {
     inner: Oh264Encoder,
     /// Wall-clock reference for `Timestamp::from_millis` below: the encoder
@@ -37,12 +44,12 @@ impl OpenH264Encoder {
             height = cfg.height,
             fps = cfg.fps,
             bitrate_kbps = cfg.bitrate_kbps,
-            max_qp = ?cfg.max_qp,
+            max_qp = cfg.max_qp.unwrap_or(DEFAULT_MAX_QP),
             "initializing openh264 encoder"
         );
 
         let api = OpenH264API::from_source();
-        let mut oh264_cfg = Oh264Config::new()
+        let oh264_cfg = Oh264Config::new()
             .bitrate(BitRate::from_bps(cfg.bitrate_kbps.saturating_mul(1000)))
             .max_frame_rate(FrameRate::from_hz(cfg.fps as f32))
             .usage_type(UsageType::ScreenContentRealTime)
@@ -54,15 +61,14 @@ impl OpenH264Encoder {
             ))
             .skip_frames(false)
             .num_threads(0);
-        if let Some(max) = cfg.max_qp {
-            // The lower bound must be >= 1: openh264's `ParamValidationExt`
-            // (`encoder_ext.cpp`, "Change QP Range") throws the *whole*
-            // range away and reinstates its screen-content defaults when
-            // either bound is <= 0, so `QpRange::new(0, max)` would
-            // silently disable the cap. It clips the minimum up to its own
-            // floor anyway, so 1 is never actually reached.
-            oh264_cfg = oh264_cfg.qp(QpRange::new(MIN_QP, max.clamp(MIN_QP, 51)));
-        }
+        // The lower bound must be >= 1: openh264's `ParamValidationExt`
+        // (`encoder_ext.cpp`, "Change QP Range") throws the *whole* range
+        // away and reinstates its screen-content defaults when either bound
+        // is <= 0, so `QpRange::new(0, max)` would silently disable the cap.
+        // It clips the minimum up to its own floor anyway, so 1 is never
+        // actually reached.
+        let max_qp = cfg.max_qp.unwrap_or(DEFAULT_MAX_QP).clamp(MIN_QP, 51);
+        let oh264_cfg = oh264_cfg.qp(QpRange::new(MIN_QP, max_qp));
 
         let inner = Oh264Encoder::with_api_config(api, oh264_cfg)
             .map_err(|err| EncodeError::Backend(err.to_string()))?;

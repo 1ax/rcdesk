@@ -42,17 +42,19 @@ enum CaptureBackend {
 /// Which H.264 encoder backend to use.
 #[derive(Clone, Copy, ValueEnum)]
 enum EncoderBackend {
-    /// The platform's hardware encoder if available (VideoToolbox on macOS;
-    /// Media Foundation on Windows once 2.2d lands), openh264 otherwise --
-    /// see `encode::build_encoder`'s doc comment.
+    /// The platform's native encoder (VideoToolbox on macOS; Media
+    /// Foundation on Windows, hardware MFT preferred, Microsoft's software
+    /// one otherwise), openh264 if that fails -- see
+    /// `encode::build_encoder`'s doc comment.
     Auto,
     /// Software encoder, built from source. Works on every platform.
     Openh264,
     /// macOS hardware encoder (VideoToolbox). Selecting it on another OS
     /// fails with a "not available" error.
     Videotoolbox,
-    /// Windows hardware encoder. Not implemented yet (lands in slice 2.2d)
-    /// -- selecting it explicitly fails with an "not available" error.
+    /// Windows Media Foundation H.264 MFT (hardware if present, otherwise
+    /// Microsoft's software encoder). Selecting it on another OS fails with
+    /// a "not available" error.
     Mediafoundation,
 }
 
@@ -87,7 +89,7 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         seconds: u32,
         /// Hard ceiling on encoder QP (0..=51); unset leaves the encoder's
-        /// own default.
+        /// own default (openh264: 30; VideoToolbox/Media Foundation: none).
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=51))]
         max_qp: Option<u8>,
         /// Optional path to dump the raw Annex-B stream to.
@@ -125,7 +127,7 @@ enum Command {
         #[arg(long, default_value_t = 6000)]
         bitrate: u32,
         /// Hard ceiling on encoder QP (0..=51); unset leaves the encoder's
-        /// own default.
+        /// own default (openh264: 30; VideoToolbox/Media Foundation: none).
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=51))]
         max_qp: Option<u8>,
         /// Extra STUN/TURN server URL, added on top of whatever the

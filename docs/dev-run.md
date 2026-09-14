@@ -76,10 +76,12 @@ cargo run -p rcdesk-host --release -- bench --seconds 5 --encoder openh264
 ```
 
 `bench` печатает `encoder=…`, размеры ключевых/дельта-кадров и задержку
-захват→кодер (`avg_capture_to_encoded_ms`). `--max-qp 30` ставит потолок QP
-(резче текст, выше битрейт); для VideoToolbox это `MaxAllowedFrameQP`, на
-старых macOS ключ может быть отклонён — тогда в логе `warn` и работа без него.
-Windows-кодер Media Foundation описан в `docs/host-windows.md`.
+захват→кодер (`avg_capture_to_encoded_ms`). `--max-qp N` ставит потолок QP
+(резче текст, выше битрейт); без флага у openh264 потолок 30, у VideoToolbox
+и Media Foundation потолка нет. Для VideoToolbox флаг задаёт
+`MaxAllowedFrameQP`, на старых macOS ключ может быть отклонён — тогда в логе
+`warn` и работа без него. Windows-кодер Media Foundation описан в
+`docs/host-windows.md`.
 
 ## Ввод (мышь и клавиатура)
 
