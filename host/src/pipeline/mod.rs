@@ -40,6 +40,11 @@ pub struct PipelineStats {
     /// `dropped`, which counts frames the encoder produced but the output
     /// channel couldn't take.
     pub paced_out: AtomicU64,
+    /// Captured frames the encode thread never took because the capture
+    /// thread replaced them in the slot first -- i.e. frames arrived faster
+    /// than the encoder consumed them. Distinct from `paced_out` (skipped on
+    /// purpose, cheaply) and `dropped` (encoded but not delivered).
+    pub overwritten: AtomicU64,
 }
 
 /// Runtime bitrate/fps target shared between whoever drives adaptation
@@ -128,7 +133,14 @@ impl Pipeline {
                             // to recover into, so surface the panic instead
                             // of masking it.
                             let mut guard = slot.frame.lock().expect("frame slot mutex poisoned");
-                            *guard = Some(frame);
+                            if guard.replace(frame).is_some() {
+                                // The encode thread never took the previous
+                                // frame: it is still busy encoding the one
+                                // before -- the "encoder can't keep up"
+                                // signal the adaptation controller reads
+                                // (see `crate::adapt`).
+                                stats.overwritten.fetch_add(1, Ordering::Relaxed);
+                            }
                             slot.condvar.notify_one();
                         }
                         Err(_) => break,

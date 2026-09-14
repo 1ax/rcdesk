@@ -1,13 +1,31 @@
 //! Bitrate/fps adaptation controller (slice 2.3): watches REMB/loss feedback
-//! from the peer and the encoder's own capture-to-encode latency, and
-//! decides the `encode::RateTarget` the pipeline's `pipeline::RateControl`
-//! should be driving the encoder at.
+//! from the peer and the capture pipeline's own overrun signal, and decides
+//! the `encode::RateTarget` the pipeline's `pipeline::RateControl` should be
+//! driving the encoder at.
 //!
 //! Deliberately free of tokio/async and any I/O: `signaling/mod.rs` owns the
 //! task that feeds this controller `Feedback` and calls `tick()` once a
 //! second, and applies the resulting `Decision` to `RateControl` and the
 //! `control` data channel. Time is always an explicit `Instant` argument so
 //! the whole thing is deterministic and unit-testable without sleeping.
+//!
+//! Lessons from the first live run on the owner's Windows bench (slice 2.3,
+//! 2026-09-14), which drove the rules below:
+//! - The browser's REMB is a *receive-side* estimate capped at ~1.5x what it
+//!   actually received, and it only grows ~8 %/s. On a mostly static screen
+//!   it therefore sits far below the encoder's target, and any burst of
+//!   changes (typing, a window opening) sends more than REMB "allows". A
+//!   naive "REMB < sent means congestion" spiralled the target down to the
+//!   floor (0.3 Mbit/s @ 5 fps) on an idle LAN. REMB is only meaningful when
+//!   the link is actually loaded -- the encoder is sending close to its
+//!   target -- and only when it stays below the sent rate for a while.
+//! - Absolute capture-to-encode latency is a poor "encoder can't keep up"
+//!   signal: Media Foundation on the bench sits at 30-50 ms per frame under
+//!   load and kept up fine at 20 fps, yet a fixed multiple of the target
+//!   frame interval read that as overload. The honest signal is the capture
+//!   thread overwriting a frame the encoder hasn't taken yet
+//!   (`pipeline::PipelineStats::overwritten`): that is exactly "frames arrive
+//!   faster than they are encoded".
 
 use std::time::{Duration, Instant};
 
@@ -33,11 +51,22 @@ pub const MIN_FPS: u32 = 5;
 pub const REMB_FRESH: Duration = Duration::from_secs(3);
 
 /// A REMB below this fraction of what we actually sent last tick signals
-/// congestion (the browser's receive-side estimate is capped at roughly
-/// 1.5x what it actually received -- see `docs/host-libs-api-notes.md` --
-/// so it is only a trustworthy *down* signal, and only once it falls
-/// meaningfully short of what we pushed).
+/// congestion -- but only while the link is loaded (`REMB_LOADED_RATIO`)
+/// and only after `REMB_CONGESTION_TICKS` ticks in a row (see the module
+/// doc comment for why a single tick is not enough).
 pub const REMB_CONGESTION_RATIO: f64 = 0.9;
+
+/// REMB is only trusted as a congestion signal when the sent rate is at
+/// least this fraction of the current target: below that the encoder is
+/// content-limited (static screen, typing), the browser's estimate is
+/// capped by the tiny received rate, and comparing the two says nothing
+/// about the network.
+pub const REMB_LOADED_RATIO: f64 = 0.8;
+
+/// How many consecutive ticks the loaded-link REMB signal must persist
+/// before the bitrate is cut to it -- filters the burst at session start
+/// (a 300 KB IDR in the first second) and one-off REMB dips.
+pub const REMB_CONGESTION_TICKS: u32 = 2;
 
 /// Packet loss fraction above which we cut bitrate aggressively regardless
 /// of what REMB says.
@@ -62,20 +91,15 @@ pub const HYSTERESIS: f64 = 0.05;
 /// it isn't already one of these (see `Controller::ladder`).
 pub const FPS_LADDER: [u32; 8] = [60, 30, 24, 20, 15, 12, 10, 8];
 
-/// If the average capture-to-encode latency over a tick exceeds this
-/// multiple of the frame interval at the *current* fps, the encoder isn't
-/// keeping up and fps should step down.
-pub const ENCODER_SLOW_RATIO: f64 = 1.2;
+/// If the capture thread overwrote at least this many not-yet-encoded
+/// frames during a tick (`Feedback::Overrun`), the encoder isn't keeping up
+/// with the source and fps steps down.
+pub const ENCODER_OVERRUN_FRAMES: u64 = 2;
 
-/// If the average capture-to-encode latency over a tick is below this
-/// multiple of the frame interval at the fps *one rung up*, the encoder has
-/// headroom to spare.
-pub const ENCODER_FAST_RATIO: f64 = 0.5;
-
-/// How many consecutive "encoder has headroom" ticks (see
-/// `ENCODER_FAST_RATIO`) are required before stepping fps back up -- avoids
-/// flapping on a single lucky frame.
-pub const ENCODER_FAST_TICKS: u32 = 3;
+/// How many consecutive ticks with encoded frames and no overruns are
+/// required before stepping fps back up -- avoids flapping between two
+/// rungs every couple of seconds.
+pub const ENCODER_FAST_TICKS: u32 = 5;
 
 /// Minimum bits-per-pixel-per-frame the target bitrate/fps combination must
 /// afford. Below this, more fps just spreads the same bits over more (worse)
@@ -105,10 +129,11 @@ pub enum Feedback {
     Loss { fraction: f32 },
     /// One encoded frame, reported by the forward task in `signaling/mod.rs`
     /// for every frame the pipeline produces.
-    Frame {
-        bytes: usize,
-        capture_to_encoded: Duration,
-    },
+    Frame { bytes: usize },
+    /// Captured frames the encoder never got to see because the next one
+    /// overwrote them first (`pipeline::PipelineStats::overwritten`, delta
+    /// since the previous tick) -- the "encoder can't keep up" signal.
+    Overrun { frames: u64 },
 }
 
 /// A change to the encoder's rate target the controller decided on, with the
@@ -123,21 +148,13 @@ pub struct Decision {
 #[derive(Debug, Default)]
 struct Window {
     bytes: u64,
-    latency_sum: Duration,
-    latency_count: u32,
+    frames: u32,
+    overruns: u64,
 }
 
 impl Window {
     fn reset(&mut self) {
         *self = Window::default();
-    }
-
-    fn avg_latency(&self) -> Option<Duration> {
-        if self.latency_count == 0 {
-            None
-        } else {
-            Some(self.latency_sum / self.latency_count)
-        }
     }
 }
 
@@ -150,8 +167,11 @@ pub struct Controller {
     last_remb_at: Option<Instant>,
     last_loss: f32,
     window: Window,
-    /// Consecutive ticks the encoder has shown headroom at the next rung up
-    /// (see `ENCODER_FAST_TICKS`).
+    /// Consecutive ticks the loaded-link REMB signal has said "congested"
+    /// (see `REMB_CONGESTION_TICKS`).
+    congested_ticks: u32,
+    /// Consecutive ticks the encoder has kept up (frames encoded, no
+    /// overruns) at the current rung (see `ENCODER_FAST_TICKS`).
     fast_ticks: u32,
     last_tick_at: Instant,
 }
@@ -171,6 +191,7 @@ impl Controller {
             last_remb_at: None,
             last_loss: 0.0,
             window: Window::default(),
+            congested_ticks: 0,
             fast_ticks: 0,
             last_tick_at: now,
         }
@@ -191,13 +212,12 @@ impl Controller {
             Feedback::Loss { fraction } => {
                 self.last_loss = fraction;
             }
-            Feedback::Frame {
-                bytes,
-                capture_to_encoded,
-            } => {
+            Feedback::Frame { bytes } => {
                 self.window.bytes += bytes as u64;
-                self.window.latency_sum += capture_to_encoded;
-                self.window.latency_count += 1;
+                self.window.frames += 1;
+            }
+            Feedback::Overrun { frames } => {
+                self.window.overruns += frames;
             }
         }
     }
@@ -221,8 +241,7 @@ impl Controller {
 
     /// Called once per `TICK`. Returns the new target if it changed enough
     /// to be worth publishing (see `HYSTERESIS`), `None` otherwise -- in
-    /// which case the controller's committed target is left untouched (see
-    /// this function's body for why that matters for `PROBE_UP`).
+    /// which case the controller's committed target is left untouched.
     pub fn tick(&mut self, now: Instant) -> Option<Decision> {
         let elapsed = now
             .saturating_duration_since(self.last_tick_at)
@@ -232,7 +251,6 @@ impl Controller {
         } else {
             0.0
         };
-        let avg_latency = self.window.avg_latency();
 
         let old_b = self.target.bitrate_kbps as f64;
         let remb_fresh = self
@@ -244,14 +262,31 @@ impl Controller {
             None
         };
 
+        // REMB says "congested" only on a loaded link (see
+        // `REMB_LOADED_RATIO`) and only when it undercuts what we sent.
+        let link_loaded = sent_kbps >= REMB_LOADED_RATIO * old_b;
+        let remb_congested =
+            link_loaded && remb_kbps.is_some_and(|remb| remb < sent_kbps * REMB_CONGESTION_RATIO);
+        if remb_congested {
+            self.congested_ticks += 1;
+        } else {
+            self.congested_ticks = 0;
+        }
+
         let (mut b, bitrate_reason) = if self.last_loss > LOSS_HIGH {
             (old_b * (1.0 - 0.5 * self.last_loss as f64), Some("loss"))
-        } else if let Some(remb) = remb_kbps.filter(|&r| r < sent_kbps * REMB_CONGESTION_RATIO) {
+        } else if remb_congested && self.congested_ticks >= REMB_CONGESTION_TICKS {
+            // `remb_congested` implies `remb_kbps` is `Some`.
+            let remb = remb_kbps.unwrap_or(old_b);
             (old_b.min(remb), Some("remb"))
-        } else if self.last_loss < LOSS_LOW
-            && (remb_kbps.is_none_or(|r| r > old_b))
+        } else if !remb_congested
+            && self.last_loss < LOSS_LOW
             && old_b < self.cfg.max_bitrate_kbps as f64
         {
+            // Nothing says the path is short of bandwidth: probe upward.
+            // REMB itself can't tell us to go up (it is capped by what it
+            // received, i.e. by our own content), so this is the only way
+            // the target ever recovers after a cut.
             (old_b * PROBE_UP, Some("probe"))
         } else {
             (old_b, None)
@@ -264,32 +299,27 @@ impl Controller {
         let steps = self.ladder();
         let current_fps = self.target.fps;
 
-        let (encoder_fps, encoder_fired) = match avg_latency {
-            None => (current_fps, false),
-            Some(avg) => {
-                let avg_secs = avg.as_secs_f64();
-                let current_interval = 1.0 / current_fps as f64;
-                if avg_secs > ENCODER_SLOW_RATIO * current_interval {
-                    let stepped = step_down(&steps, current_fps);
+        let (encoder_fps, encoder_fired) = if self.window.overruns >= ENCODER_OVERRUN_FRAMES {
+            self.fast_ticks = 0;
+            let stepped = step_down(&steps, current_fps);
+            (stepped, stepped != current_fps)
+        } else if self.window.frames > 0 && self.window.overruns == 0 {
+            let higher = step_up(&steps, current_fps);
+            if higher != current_fps {
+                self.fast_ticks += 1;
+                if self.fast_ticks >= ENCODER_FAST_TICKS {
                     self.fast_ticks = 0;
-                    (stepped, stepped != current_fps)
+                    (higher, true)
                 } else {
-                    let higher = step_up(&steps, current_fps);
-                    let higher_interval = 1.0 / higher as f64;
-                    if higher != current_fps && avg_secs < ENCODER_FAST_RATIO * higher_interval {
-                        self.fast_ticks += 1;
-                        if self.fast_ticks >= ENCODER_FAST_TICKS {
-                            self.fast_ticks = 0;
-                            (higher, true)
-                        } else {
-                            (current_fps, false)
-                        }
-                    } else {
-                        self.fast_ticks = 0;
-                        (current_fps, false)
-                    }
+                    (current_fps, false)
                 }
+            } else {
+                (current_fps, false)
             }
+        } else {
+            // No frames this tick (static screen) or a stray overrun below
+            // the threshold: no evidence either way, keep the streak.
+            (current_fps, false)
         };
 
         let bitrate_fps = self.bitrate_fps_step(&steps, b);
@@ -387,14 +417,15 @@ mod tests {
         }
     }
 
-    fn frame(c: &mut Controller, now: Instant, bytes: usize, latency: Duration) {
-        c.feedback(
-            Feedback::Frame {
-                bytes,
-                capture_to_encoded: latency,
-            },
-            now,
-        );
+    /// One tick's worth of encoded frames totalling `bytes` -- fed as a
+    /// single `Frame` since only the byte sum and "any frames at all" matter
+    /// to the controller.
+    fn frames(c: &mut Controller, now: Instant, bytes: usize) {
+        c.feedback(Feedback::Frame { bytes }, now);
+    }
+
+    fn remb(c: &mut Controller, now: Instant, bitrate_bps: u64) {
+        c.feedback(Feedback::Remb { bitrate_bps }, now);
     }
 
     #[test]
@@ -410,12 +441,11 @@ mod tests {
         );
 
         let mut now = t0;
-        for _ in 0..3 {
+        for _ in 0..6 {
             now += TICK;
-            // A fast encoder (low capture-to-encode latency) every tick --
-            // already at the top fps rung, so this must never turn into a
-            // step up (there's nowhere higher to go).
-            frame(&mut c, now, 25_000, Duration::from_millis(2));
+            // Frames and no overruns every tick -- already at the top fps
+            // rung and the max bitrate, so nothing can step or probe up.
+            frames(&mut c, now, 25_000);
             assert_eq!(c.tick(now), None);
         }
         assert_eq!(c.target().bitrate_kbps, 6000);
@@ -423,24 +453,45 @@ mod tests {
     }
 
     #[test]
-    fn remb_below_sent_rate_caps_bitrate() {
+    fn remb_below_sent_rate_on_loaded_link_caps_bitrate_after_two_ticks() {
         let t0 = Instant::now();
         let mut c = Controller::new(cfg(), t0);
-        let now = t0 + TICK;
 
-        // 30 frames * 25_000 bytes = 750_000 bytes/s = 6000 kbps sent.
-        frame(&mut c, now, 750_000, Duration::from_millis(5));
-        c.feedback(
-            Feedback::Remb {
-                bitrate_bps: 2_000_000,
-            },
-            now,
-        );
+        // 750_000 bytes/s = 6000 kbps sent (>= 0.8 * 6000: loaded), REMB
+        // 2000 kbps < 0.9 * 6000: congested. First tick only counts.
+        let mut now = t0 + TICK;
+        frames(&mut c, now, 750_000);
+        remb(&mut c, now, 2_000_000);
+        assert_eq!(c.tick(now), None);
+        assert_eq!(c.target().bitrate_kbps, 6000);
 
+        // Second consecutive congested tick: cut to REMB.
+        now += TICK;
+        frames(&mut c, now, 750_000);
+        remb(&mut c, now, 2_000_000);
         let decision = c.tick(now).expect("expected a decision");
         assert_eq!(decision.reason, "remb");
         assert_eq!(decision.target.bitrate_kbps, 2000);
         assert_eq!(decision.target.fps, 30);
+    }
+
+    #[test]
+    fn remb_below_sent_rate_on_unloaded_link_is_ignored() {
+        // The bench scenario: static screen with typing bursts. 1000 kbps
+        // sent is far below 0.8 * 6000, so REMB (300 kbps, capped by the
+        // tiny received rate) says nothing about the network -- and since
+        // b is already at max there's nothing to probe either: hold.
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0;
+        for _ in 0..4 {
+            now += TICK;
+            frames(&mut c, now, 125_000);
+            remb(&mut c, now, 300_000);
+            assert_eq!(c.tick(now), None);
+        }
+        assert_eq!(c.target().bitrate_kbps, 6000);
+        assert_eq!(c.target().fps, 30);
     }
 
     #[test]
@@ -449,16 +500,10 @@ mod tests {
         let mut c = Controller::new(cfg(), t0);
         let now = t0 + TICK;
 
-        // 500 kbps sent, REMB 700 kbps: REMB >= 0.9 * sent (450) and REMB <
-        // b (6000), so neither congestion nor probing applies -- hold.
-        frame(&mut c, now, 62_500, Duration::from_millis(5));
-        c.feedback(
-            Feedback::Remb {
-                bitrate_bps: 700_000,
-            },
-            now,
-        );
-
+        // 6000 kbps sent, REMB 9000 >= 0.9 * sent: not congestion, and b is
+        // already at max: hold.
+        frames(&mut c, now, 750_000);
+        remb(&mut c, now, 9_000_000);
         assert_eq!(c.tick(now), None);
         assert_eq!(c.target().bitrate_kbps, 6000);
     }
@@ -467,45 +512,66 @@ mod tests {
     fn probe_ramps_up_after_remb_cap() {
         let t0 = Instant::now();
         let mut c = Controller::new(cfg(), t0);
-        // Reach the same state as `remb_below_sent_rate_caps_bitrate`:
-        // b = 2000 after a REMB cap.
-        let mut now = t0 + TICK;
-        frame(&mut c, now, 750_000, Duration::from_millis(5));
-        c.feedback(
-            Feedback::Remb {
-                bitrate_bps: 2_000_000,
-            },
-            now,
-        );
-        assert_eq!(c.tick(now).unwrap().target.bitrate_kbps, 2000);
+        let mut now = t0;
+        for _ in 0..2 {
+            now += TICK;
+            frames(&mut c, now, 750_000);
+            remb(&mut c, now, 2_000_000);
+            c.tick(now);
+        }
+        assert_eq!(c.target().bitrate_kbps, 2000);
 
-        // Now sending only 2000 kbps, but REMB says the path can carry
-        // 5000: not congestion (2000 < 0.9*2000 is false), and REMB > b, so
-        // probe.
+        // Now sending 2000 kbps and REMB says 5000: not congested, so
+        // probe +10 % per tick.
         now += TICK;
-        frame(&mut c, now, 250_000, Duration::from_millis(5));
-        c.feedback(
-            Feedback::Remb {
-                bitrate_bps: 5_000_000,
-            },
-            now,
-        );
+        frames(&mut c, now, 250_000);
+        remb(&mut c, now, 5_000_000);
         let d1 = c.tick(now).expect("expected a probe decision");
         assert_eq!(d1.reason, "probe");
         assert_eq!(d1.target.bitrate_kbps, 2200);
 
         now += TICK;
-        frame(&mut c, now, 250_000, Duration::from_millis(5));
-        c.feedback(
-            Feedback::Remb {
-                bitrate_bps: 5_000_000,
-            },
-            now,
-        );
+        frames(&mut c, now, 275_000);
+        remb(&mut c, now, 5_000_000);
         let d2 = c.tick(now).expect("expected a probe decision");
         assert_eq!(d2.reason, "probe");
         assert_eq!(d2.target.bitrate_kbps, 2420);
         assert!(d2.target.bitrate_kbps <= 6000);
+    }
+
+    #[test]
+    fn probe_continues_on_static_screen_regardless_of_remb() {
+        // After a cut, a mostly static screen (100 kbps sent, REMB 50 kbps
+        // -- below 0.9 * sent, but the link isn't loaded) must not pin the
+        // target: without probing here the target could never recover
+        // until the user happened to produce enough motion.
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        c.target = RateTarget {
+            bitrate_kbps: 2000,
+            fps: 30,
+        };
+        let now = t0 + TICK;
+        frames(&mut c, now, 12_500);
+        remb(&mut c, now, 50_000);
+        let decision = c.tick(now).expect("expected a probe decision");
+        assert_eq!(decision.reason, "probe");
+        assert_eq!(decision.target.bitrate_kbps, 2200);
+    }
+
+    #[test]
+    fn probe_without_any_remb() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        c.target = RateTarget {
+            bitrate_kbps: 2000,
+            fps: 30,
+        };
+        let now = t0 + TICK;
+        frames(&mut c, now, 250_000);
+        let decision = c.tick(now).expect("expected a probe decision");
+        assert_eq!(decision.reason, "probe");
+        assert_eq!(decision.target.bitrate_kbps, 2200);
     }
 
     #[test]
@@ -522,56 +588,72 @@ mod tests {
     }
 
     #[test]
-    fn slow_encoder_steps_fps_down() {
+    fn encoder_overruns_step_fps_down() {
         let t0 = Instant::now();
         let mut c = Controller::new(cfg(), t0);
         let mut now = t0;
-        let expected_fps = [24u32, 20, 15];
 
-        for expected in expected_fps {
+        for expected in [24u32, 20, 15] {
             now += TICK;
-            frame(&mut c, now, 25_000, Duration::from_millis(67));
+            frames(&mut c, now, 25_000);
+            c.feedback(Feedback::Overrun { frames: 5 }, now);
             let decision = c.tick(now).expect("expected an encoder step down");
             assert_eq!(decision.reason, "encoder");
             assert_eq!(decision.target.fps, expected);
         }
 
-        // At fps=15 the frame interval is 66.7ms; 1.2x that is 80ms, and
-        // 67ms no longer exceeds it -- holds.
+        // A single stray overrun is below the threshold: hold.
         now += TICK;
-        frame(&mut c, now, 25_000, Duration::from_millis(67));
+        frames(&mut c, now, 25_000);
+        c.feedback(Feedback::Overrun { frames: 1 }, now);
         assert_eq!(c.tick(now), None);
         assert_eq!(c.target().fps, 15);
     }
 
     #[test]
-    fn fast_encoder_steps_fps_back_up_after_three_ticks() {
+    fn clean_ticks_step_fps_back_up_after_five() {
         let t0 = Instant::now();
         let mut c = Controller::new(cfg(), t0);
         let mut now = t0;
 
-        // Walk fps down to 15 first (see `slow_encoder_steps_fps_down`).
         for _ in 0..3 {
             now += TICK;
-            frame(&mut c, now, 25_000, Duration::from_millis(67));
+            frames(&mut c, now, 25_000);
+            c.feedback(Feedback::Overrun { frames: 5 }, now);
             c.tick(now);
         }
         assert_eq!(c.target().fps, 15);
 
-        // Fast encoder (10ms << 0.5 * 1/20 = 25ms) for three ticks in a row.
+        // Frames and no overruns: four ticks hold, the fifth steps up.
+        for _ in 0..4 {
+            now += TICK;
+            frames(&mut c, now, 25_000);
+            assert_eq!(c.tick(now), None);
+        }
         now += TICK;
-        frame(&mut c, now, 25_000, Duration::from_millis(10));
-        assert_eq!(c.tick(now), None);
-
-        now += TICK;
-        frame(&mut c, now, 25_000, Duration::from_millis(10));
-        assert_eq!(c.tick(now), None);
-
-        now += TICK;
-        frame(&mut c, now, 25_000, Duration::from_millis(10));
+        frames(&mut c, now, 25_000);
         let decision = c.tick(now).expect("expected an encoder step up");
         assert_eq!(decision.reason, "encoder");
         assert_eq!(decision.target.fps, 20);
+    }
+
+    #[test]
+    fn static_screen_does_not_count_toward_step_up() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0 + TICK;
+        frames(&mut c, now, 25_000);
+        c.feedback(Feedback::Overrun { frames: 5 }, now);
+        c.tick(now);
+        assert_eq!(c.target().fps, 24);
+
+        // Ten ticks with no frames at all: no evidence the encoder keeps
+        // up, so no step up.
+        for _ in 0..10 {
+            now += TICK;
+            assert_eq!(c.tick(now), None);
+        }
+        assert_eq!(c.target().fps, 24);
     }
 
     #[test]
@@ -587,17 +669,16 @@ mod tests {
         };
         let t0 = Instant::now();
         let mut c = Controller::new(cfg, t0);
-        let now = t0 + TICK;
+        let mut now = t0;
 
-        // 6000 kbps sent, REMB caps it to 300 kbps.
-        frame(&mut c, now, 750_000, Duration::from_millis(5));
-        c.feedback(
-            Feedback::Remb {
-                bitrate_bps: 300_000,
-            },
-            now,
-        );
-
+        // 6000 kbps sent on a loaded link, REMB 300 kbps for two ticks.
+        now += TICK;
+        frames(&mut c, now, 750_000);
+        remb(&mut c, now, 300_000);
+        assert_eq!(c.tick(now), None);
+        now += TICK;
+        frames(&mut c, now, 750_000);
+        remb(&mut c, now, 300_000);
         let decision = c.tick(now).expect("expected a decision");
         // 300_000 bits/s / 41_472 bits/frame = 7.23: no ladder step
         // (30/24/20/15/12/10/8) fits -- even the smallest, 8, needs
@@ -609,15 +690,8 @@ mod tests {
 
     #[test]
     fn bitrate_change_under_hysteresis_is_not_published() {
-        // The prompt's own illustrative numbers (b=6000, sent=6000, REMB
-        // 5800/5500) don't actually cross the REMB_CONGESTION_RATIO
-        // threshold (0.9*6000=5400 > both), so neither would enter the
-        // "remb" branch at all under the algorithm as specified -- the
-        // congestion check compares REMB against *sent*, not against the
-        // current target. Using a target already sitting near that
-        // threshold (5400) exercises the same hysteresis boundary the
-        // prompt intended: a small REMB-driven drop (1.85%) held, a bigger
-        // one (7.4%) published.
+        // Target already at 5400 with 6000 kbps sent (loaded). REMB 5300
+        // is a 1.85 % drop: congested but held; REMB 5000 (7.4 %) publishes.
         let t0 = Instant::now();
         let mut c = Controller::new(cfg(), t0);
         c.target = RateTarget {
@@ -625,28 +699,18 @@ mod tests {
             fps: 30,
         };
 
-        let mut now = t0 + TICK;
-        // 6000 kbps sent; congestion threshold = 0.9*6000 = 5400.
-        frame(&mut c, now, 750_000, Duration::from_millis(5));
-        c.feedback(
-            Feedback::Remb {
-                bitrate_bps: 5_300_000,
-            },
-            now,
-        );
-        // (5400-5300)/5400 = 1.85% < 5%: held.
-        assert_eq!(c.tick(now), None);
+        let mut now = t0;
+        for _ in 0..2 {
+            now += TICK;
+            frames(&mut c, now, 750_000);
+            remb(&mut c, now, 5_300_000);
+            assert_eq!(c.tick(now), None);
+        }
         assert_eq!(c.target().bitrate_kbps, 5400);
 
         now += TICK;
-        frame(&mut c, now, 750_000, Duration::from_millis(5));
-        c.feedback(
-            Feedback::Remb {
-                bitrate_bps: 5_000_000,
-            },
-            now,
-        );
-        // (5400-5000)/5400 = 7.4% >= 5%: published.
+        frames(&mut c, now, 750_000);
+        remb(&mut c, now, 5_000_000);
         let decision = c.tick(now).expect("expected a decision");
         assert_eq!(decision.reason, "remb");
         assert_eq!(decision.target.bitrate_kbps, 5000);
@@ -656,14 +720,12 @@ mod tests {
     fn clamps_to_min_bitrate() {
         // Sustained loss halves-ish b every tick (x0.55) until the *clamped*
         // candidate lands within HYSTERESIS of the last published value, at
-        // which point it stops being published at all (see `tick`'s doc
-        // comment: an unpublished tick doesn't move the committed target) --
-        // so the sequence settles just above MIN_BITRATE_KBPS rather than
-        // exactly on it: 6000 -> 3300 -> 1815 -> 998 -> 549 -> 302, then
-        // 302*0.55=166.1 clamps to 300, but (302-300)/302 = 0.66% < 5% is
-        // never published, so it freezes at 302. The invariant that matters
-        // (and that the encoder/pipeline actually depend on) is the floor
-        // itself: never below MIN_BITRATE_KBPS.
+        // which point it stops being published at all (an unpublished tick
+        // doesn't move the committed target) -- so the sequence settles
+        // just above MIN_BITRATE_KBPS rather than exactly on it:
+        // 6000 -> 3300 -> 1815 -> 998 -> 549 -> 302, then 302*0.55=166.1
+        // clamps to 300, but (302-300)/302 = 0.66% < 5% is never published.
+        // The invariant that matters is the floor itself.
         let t0 = Instant::now();
         let mut c = Controller::new(cfg(), t0);
         let mut now = t0;

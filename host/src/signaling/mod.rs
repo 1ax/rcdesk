@@ -520,13 +520,13 @@ async fn start_session(
     // handed wholesale to this forwarding task, which relays frames into a
     // fresh channel that `start_video` takes by value.
     let (video_tx, video_rx) = mpsc::channel(4);
+    let pipeline_stats = Arc::clone(&handle.stats);
     let forward_task = tokio::spawn(async move {
         let mut handle = handle;
         while let Some(frame) = handle.frames.recv().await {
             if let Some(tx) = &frame_feedback_tx {
                 let _ = tx.send(Feedback::Frame {
                     bytes: frame.data.len(),
-                    capture_to_encoded: frame.ts.saturating_duration_since(frame.captured_at),
                 });
             }
             if video_tx.send(frame).await.is_err() {
@@ -548,7 +548,13 @@ async fn start_session(
             width,
             height,
         };
-        tokio::spawn(run_adapt_task(adapt_cfg, rx, rate_control, adapt_peer))
+        tokio::spawn(run_adapt_task(
+            adapt_cfg,
+            rx,
+            rate_control,
+            Arc::clone(&pipeline_stats),
+            adapt_peer,
+        ))
     });
 
     let injector = (ctx.build_injector)()?;
@@ -593,10 +599,16 @@ async fn run_adapt_task(
     cfg: AdaptConfig,
     mut rx: mpsc::UnboundedReceiver<Feedback>,
     rate_control: Arc<crate::pipeline::RateControl>,
+    pipeline_stats: Arc<crate::pipeline::PipelineStats>,
     peer: Arc<PeerSession>,
 ) {
     let now = Instant::now();
     let mut controller = Controller::new(cfg, now);
+    // Capture-slot overwrites are read off the pipeline's counter as a delta
+    // per tick (see `Feedback::Overrun`), not pushed per event.
+    let mut overwritten_seen = pipeline_stats
+        .overwritten
+        .load(std::sync::atomic::Ordering::Relaxed);
     // `interval` would fire immediately; the first tick must wait a full
     // `TICK` so it sees a real window of frames/REMB instead of deciding on
     // nothing at session start.
@@ -621,6 +633,14 @@ async fn run_adapt_task(
                 }
             }
             _ = ticker.tick() => {
+                let overwritten_now = pipeline_stats
+                    .overwritten
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let overrun = overwritten_now.saturating_sub(overwritten_seen);
+                overwritten_seen = overwritten_now;
+                if overrun > 0 {
+                    controller.feedback(Feedback::Overrun { frames: overrun }, Instant::now());
+                }
                 if let Some(decision) = controller.tick(Instant::now()) {
                     rate_control.set(decision.target);
                     tracing::info!(
