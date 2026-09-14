@@ -22,6 +22,13 @@ const FRAME_CHANNEL_CAPACITY: usize = 4;
 /// stop flag, so `stop()` doesn't have to wait for a whole frame interval.
 const SLOT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Burst capacity of the fps pacer's token bucket (see the encode thread in
+/// `Pipeline::start`): how many frames may pass back to back after a stall
+/// before the target fps applies again. Three is enough to absorb a
+/// catch-up burst from a source that oversleeps by a couple of intervals,
+/// small enough not to matter for the rate the encoder sees.
+const PACER_BURST: f64 = 3.0;
+
 #[derive(Debug, Default)]
 pub struct PipelineStats {
     pub captured: AtomicU64,
@@ -137,12 +144,19 @@ impl Pipeline {
             let request_keyframe = Arc::clone(&request_keyframe);
             let rate_control = Arc::clone(&rate_control);
             std::thread::spawn(move || {
-                // When the next frame is "due" for encoding, at the pacer's
-                // current fps -- `None` until the first frame has been
-                // encoded. Deliberately not reset when fps changes: the next
-                // frame simply becomes due sooner or later, which is the
-                // whole point of re-pacing.
-                let mut next_due: Option<Instant> = None;
+                // Token bucket for the fps pacer: tokens accrue at the
+                // target fps along the *capture* clock (`RawFrame::ts`), one
+                // token per encoded frame, capped at `PACER_BURST`. The cap
+                // is what lets a source that stalled and then caught up in a
+                // burst (the synthetic source on a loaded CI VM, see slice
+                // 2.1d; a real capture after a hiccup) still deliver the
+                // frames it "owes" instead of losing them -- a plain
+                // next-due deadline threw those away and starved a 30 fps
+                // test down to 15 frames/s on `macos-latest`. Steady-state
+                // throughput is still capped at the target fps. Starts full
+                // so the first frames go straight through.
+                let mut tokens: f64 = PACER_BURST;
+                let mut last_captured_at: Option<Instant> = None;
 
                 loop {
                     if stop.load(Ordering::Relaxed) {
@@ -187,21 +201,20 @@ impl Pipeline {
                         }
                     }
 
-                    // (b) Pace to the target fps: a frame is due if there was
-                    // no previous one, or this frame's capture time (plus a
-                    // 25% tolerance on the pacing interval, for capture
-                    // jitter) has reached the last-computed due time.
+                    // (b) Pace to the target fps (see `tokens` above): top
+                    // the bucket up by the capture-clock time elapsed since
+                    // the previous frame, then spend one token or skip.
                     let fps = rate_control.fps().max(1);
-                    let interval = Duration::from_secs_f64(1.0 / f64::from(fps));
-                    let due = match next_due {
-                        Some(due) => captured_at + interval / 4 >= due,
-                        None => true,
-                    };
-                    if !due {
+                    if let Some(last) = last_captured_at {
+                        let elapsed = captured_at.saturating_duration_since(last).as_secs_f64();
+                        tokens = (tokens + elapsed * f64::from(fps)).min(PACER_BURST);
+                    }
+                    last_captured_at = Some(captured_at);
+                    if tokens < 1.0 {
                         stats.paced_out.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    next_due = Some(next_due.unwrap_or(captured_at).max(captured_at) + interval);
+                    tokens -= 1.0;
 
                     // Never encode a frame nobody can take: dropping an
                     // already encoded P-frame would break the decoder's
