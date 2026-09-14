@@ -106,6 +106,19 @@
   `register_default_interceptors`, `RTCConfigurationBuilder`, `RTCIceServer`,
   `RTCSessionDescription`, `RTCIceCandidateInit`, `RTCPeerConnectionState`. Через `rtc::` нужны
   `MIME_TYPE_H264`, `RTCRtpCodec*`, `RtpCodecKind`, `RTCPFeedback`, `Sample`, rtcp-пакеты.
+- **REMB и RR от браузера (слайс 2.3, проверено вживую с Chrome 153):** тем же путём
+  (`RtcpForwarder` → `TrackLocalEvent::OnRtcpPacket`) приходят
+  `rtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate`
+  (`bitrate: f32` бит/с, `ssrcs` — наш SSRC) каждые ~200 мс и `rtc::rtcp::receiver_report::ReceiverReport`
+  (`reports: Vec<ReceptionReport { ssrc, fraction_lost: u8, total_lost, jitter, last_sender_report, delay }>`).
+  Маршрутизация в `webrtc` `driver.rs`: RTCP про *наш* трек идёт в `TrackLocal` по `destination_ssrc()`
+  пакета. **TWCC-фидбека нет:** `register_default_interceptors` зовёт `configure_twcc_receiver_only`
+  (расширение `transport-cc` объявляется в SDP, но `TwccSender` не регистрируется — исходящие пакеты
+  без transport-wide seq), поэтому Chrome считает receive-side оценку и шлёт REMB. Особенность REMB:
+  оценка ограничена сверху ~1.5× фактически принятого битрейта (AIMD в libwebrtc), поэтому REMB меньше
+  цели кодера — норма при статичном экране; сигнал перегрузки — только REMB ниже реально отправленного.
+  RTT из RR: `now_ntp_mid32 − last_sender_report − delay` в 1/65536 с (SR шлёт report-интерцептор хоста
+  раз в секунду; до первого SR `last_sender_report == 0`).
 - Отправлять сэмплы можно только после `RTCPeerConnectionState::Connected`: до готовности
   DTLS/SRTP `write_sample` молча дропает данные (`local_srtp_context is not set yet`),
   и форсированный стартовый ключевой кадр теряется.
@@ -172,6 +185,13 @@
 - Источники YUV: `YUVBuffer::from_vec(i420, w, h)`, `YUVBuffer::new(w,h)`,
   `YUVSlices::new((y,u,v), (w,h), (sy,su,sv))` — без копии, реализует `YUVSource`.
   Ширина/высота должны быть чётными.
+- **Битрейт/fps на лету (слайс 2.3):** `EncoderConfig` крейта применяется только при создании;
+  на живом кодере — `unsafe { encoder.raw_api() }.set_option(ENCODER_OPTION_BITRATE, &mut SBitrateInfo
+  { iLayer: SPATIAL_LAYER_ALL, iBitrate })` (плюс `ENCODER_OPTION_MAX_BITRATE` и
+  `ENCODER_OPTION_FRAME_RATE` с `f32`). Типы/константы — из `openh264-sys2` (крейт `openh264`
+  реэкспортирует только `DynamicAPI as OpenH264API`), отсюда прямая зависимость. Ключевой кадр
+  не форсируется, SPS/PPS не меняются. Осторожно: `encode_at` при смене размера кадра делает
+  `reinit` с исходным `EncoderConfig` — цель битрейта откатится (у нас размер фиксирован).
 
 ## enigo 0.6.1
 
@@ -223,6 +243,12 @@
   обязательную. Обработано мягко (`soft_set_property`, как `MaxAllowedFrameQP`) —
   `tracing::warn!` и продолжение без неё; сессия по-прежнему кодирует нормально
   (`encode()`'s call-and-drain и так не предполагает ровно один выход на кадр).
+- **Смена битрейта/fps на живой сессии (слайс 2.3):** `AverageBitRate`, `DataRateLimits`,
+  `ExpectedFrameRate` принимаются `VTSessionSetProperty` после `PrepareToEncodeFrames`
+  без пересоздания сессии и без принудительного ключевого кадра (проверено на M4 тестом
+  `set_rate_mid_stream_keeps_encoding_without_new_keyframe`); `ProfileLevel` и размеры —
+  нет. У Media Foundation на лету меняется только `CODECAPI_AVEncCommonMeanBitRate` через
+  `ICodecAPI`; `MF_MT_FRAME_RATE` — часть media type, fps там не трогаем (пейсинг в конвейере).
 - **Выход — AVCC, а не Annex-B.** Кодер эмитит `CMSampleBuffer` с `CMBlockBuffer`, где
   каждый NAL предварён 4-байтовой big-endian длиной вместо старт-кода (размер префикса —
   `nal_unit_header_length_out` из `CMVideoFormatDescriptionGetH264ParameterSetAtIndex`,
