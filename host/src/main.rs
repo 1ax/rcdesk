@@ -142,6 +142,11 @@ enum Command {
         /// macOS "Universal Access" permission granted.
         #[arg(long)]
         no_input: bool,
+        /// Disable the bitrate/fps adaptation controller (slice 2.3): the
+        /// encoder keeps `--bitrate`/`--fps` for the whole session. For
+        /// before/after measurements.
+        #[arg(long)]
+        no_adapt: bool,
         /// Windows only: which screen-capture backend to use. `auto` picks
         /// Windows Graphics Capture when the video driver reports Direct3D
         /// 11 support, GDI otherwise; `gdi`/`wgc` force one or the other.
@@ -199,12 +204,13 @@ async fn main() -> anyhow::Result<()> {
             max_qp,
             stun,
             no_input,
+            no_adapt,
             capture,
             encoder,
         } => {
             run_serve(
-                server, name, synthetic, display, fps, bitrate, max_qp, stun, no_input, capture,
-                encoder,
+                server, name, synthetic, display, fps, bitrate, max_qp, stun, no_input, no_adapt,
+                capture, encoder,
             )
             .await
         }
@@ -464,6 +470,7 @@ async fn run_serve(
     max_qp: Option<u8>,
     stun: Vec<String>,
     no_input: bool,
+    no_adapt: bool,
     capture: CaptureBackend,
     encoder: EncoderBackend,
 ) -> anyhow::Result<()> {
@@ -517,6 +524,7 @@ async fn run_serve(
             fps,
         },
         bitrate_kbps: bitrate,
+        adapt: !no_adapt,
         max_qp,
         encoder: encoder.kind(),
         build_source,

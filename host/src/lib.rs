@@ -3,6 +3,7 @@
 //! this crate so the video/transport path is unit- and integration-testable
 //! without the binary (see `tests/loopback.rs`).
 
+pub mod adapt;
 pub mod capture;
 pub mod cursor;
 pub mod encode;

@@ -36,6 +36,13 @@ pub enum ControlMessage {
     Ping { ts: f64 },
     /// host -> client, in reply to `Ping`.
     Pong { ts: f64 },
+    /// host -> client: the adaptation controller changed the encoder's rate target
+    /// (slice 2.3). Shown in the client's stats overlay; informational only.
+    Quality {
+        bitrate_kbps: u32,
+        fps: u32,
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -91,6 +98,24 @@ mod tests {
 
         let json = serde_json::to_string(&msg).expect("serialize");
         assert_eq!(json, r#"{"type":"pong","ts":42.0}"#);
+
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, msg);
+    }
+
+    #[test]
+    fn quality_round_trips_through_json_with_exact_shape() {
+        let msg = ControlMessage::Quality {
+            bitrate_kbps: 3200,
+            fps: 20,
+            reason: "remb".to_string(),
+        };
+
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"quality","bitrate_kbps":3200,"fps":20,"reason":"remb"}"#
+        );
 
         let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, msg);

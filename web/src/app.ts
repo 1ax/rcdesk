@@ -24,10 +24,21 @@ function signalUrl(): string {
   return `${scheme}://${location.host}/ws`;
 }
 
+/** The adaptation controller's current rate target (slice 2.3), from the
+ * host's `ControlMessage::Quality` -- informational only, shown in the
+ * overlay as `target N.N Mbit/s @ N fps (reason)`. */
+interface Quality {
+  bitrateKbps: number;
+  fps: number;
+  reason: string;
+}
+
 /** `appRttMs`, when given, is the application-level ping/pong round trip
  * measured over the `control` channel (see `startPingLoop`) -- distinct
- * from `rttMs`, the WebRTC-level candidate-pair RTT from `getStats()`. */
-function formatOverlay(s: StatsSummary, appRttMs?: number): string {
+ * from `rttMs`, the WebRTC-level candidate-pair RTT from `getStats()`.
+ * `quality`, when given, is the adaptation controller's last `Quality`
+ * message (see the `Quality` interface above). */
+function formatOverlay(s: StatsSummary, appRttMs?: number, quality?: Quality): string {
   const parts: string[] = [];
   if (s.fps !== undefined) parts.push(`${s.fps.toFixed(0)} fps`);
   if (s.width !== undefined && s.height !== undefined) parts.push(`${s.width}x${s.height}`);
@@ -37,6 +48,11 @@ function formatOverlay(s: StatsSummary, appRttMs?: number): string {
   if (s.codec !== undefined) parts.push(s.codec.replace(/^video\//, "").toUpperCase());
   if (appRttMs !== undefined) parts.push(`app ${appRttMs.toFixed(0)} ms`);
   if (s.jitterBufferMs !== undefined) parts.push(`jb ${s.jitterBufferMs.toFixed(0)} ms`);
+  if (quality !== undefined) {
+    parts.push(
+      `target ${(quality.bitrateKbps / 1000).toFixed(1)} Mbit/s @ ${quality.fps} fps (${quality.reason})`,
+    );
+  }
   return parts.join(" · ");
 }
 
@@ -107,6 +123,11 @@ export function mount(root: Element | null): void {
   // `startPingLoop`), shown in the overlay as `app N ms` -- `undefined`
   // until the first `pong` arrives.
   let appRttMs: number | undefined;
+  // The adaptation controller's last rate target (see `setupControlChannel`
+  // and `formatOverlay`'s `Quality` interface) -- `undefined` until the
+  // first `quality` message arrives (slice 2.3 -- `--no-adapt` sessions
+  // never send one, so the overlay simply never grows this segment).
+  let quality: Quality | undefined;
 
   // `input` and `pointer` arrive via `onDataChannel` in whatever order the
   // host happened to open them in, independent of the connection state
@@ -152,6 +173,10 @@ export function mount(root: Element | null): void {
         appRttMs = performance.now() - msg.ts;
         return;
       }
+      if (msg.type === "quality") {
+        quality = { bitrateKbps: msg.bitrate_kbps, fps: msg.fps, reason: msg.reason };
+        return;
+      }
       applyCursor(video, msg);
     });
   }
@@ -189,7 +214,7 @@ export function mount(root: Element | null): void {
           const now = Date.now();
           const summary = summarizeStats(report.values(), prevSnapshot, now);
           prevSnapshot = takeSnapshot(report.values(), now);
-          overlay.textContent = formatOverlay(summary, appRttMs);
+          overlay.textContent = formatOverlay(summary, appRttMs, quality);
         })
         .catch((err: unknown) => {
           console.error("failed to read stats", err);
@@ -205,6 +230,7 @@ export function mount(root: Element | null): void {
     inputChannel = null;
     pointerChannel = null;
     appRttMs = undefined;
+    quality = undefined;
     session?.close();
     session = null;
     signaling?.close();

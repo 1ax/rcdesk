@@ -8,7 +8,7 @@
 //! command) exits.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
@@ -24,6 +24,7 @@ use proto::signal::{Role, SignalMessage};
 use webrtc::peer_connection::RTCPeerConnectionState;
 use webrtc::runtime::Runtime;
 
+use crate::adapt::{AdaptConfig, Controller, Feedback};
 use crate::capture::FrameSource;
 use crate::cursor::{self, CursorSource, CursorState};
 use crate::encode::{build_encoder, EncoderConfig, EncoderKind, RateTarget};
@@ -44,6 +45,10 @@ const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(33);
 pub struct HostContext {
     pub session: SessionConfig,
     pub bitrate_kbps: u32,
+    /// Whether the bitrate/fps adaptation controller (slice 2.3) runs for
+    /// each session. `false` (`serve --no-adapt`) keeps the encoder pinned
+    /// to `--bitrate`/`--fps` for the whole session -- see `docs/dev-run.md`.
+    pub adapt: bool,
     /// Hard ceiling on encoder QP (0..=51); `None` leaves the encoder's own
     /// default. See `EncoderConfig::max_qp`.
     pub max_qp: Option<u8>,
@@ -235,6 +240,13 @@ struct ActiveSession {
     /// the task (below) drops that future, which drops the watcher, which
     /// stops the thread.
     cursor_task: tokio::task::JoinHandle<()>,
+    /// Feeds `SessionEvent::Remb`/`ReceiverReport` into the adaptation
+    /// controller (see `handle_session_event`). `None` when the session was
+    /// started with `HostContext::adapt` false (`serve --no-adapt`).
+    adapt_tx: Option<mpsc::UnboundedSender<Feedback>>,
+    /// The task running the adaptation controller's tick loop (see
+    /// `start_session`). `None` alongside `adapt_tx`.
+    adapt_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ActiveSession {
@@ -242,6 +254,9 @@ impl ActiveSession {
         self.peer.close().await;
         self.forward_task.abort();
         self.cursor_task.abort();
+        if let Some(adapt_task) = self.adapt_task {
+            adapt_task.abort();
+        }
     }
 }
 
@@ -262,7 +277,7 @@ async fn handle_signal_message(
             *current_session_id = None;
 
             match start_session(ctx, event_tx).await {
-                Ok((peer, forward_task, router, cursor_task)) => match peer.create_offer().await {
+                Ok(parts) => match parts.peer.create_offer().await {
                     Ok(sdp) => {
                         let _ = out_tx.send(SignalMessage::Offer {
                             session_id: session_id.clone(),
@@ -270,16 +285,21 @@ async fn handle_signal_message(
                         });
                         *current_session_id = Some(session_id);
                         *active = Some(ActiveSession {
-                            peer,
-                            forward_task,
-                            router,
-                            cursor_task,
+                            peer: parts.peer,
+                            forward_task: parts.forward_task,
+                            router: parts.router,
+                            cursor_task: parts.cursor_task,
+                            adapt_tx: parts.adapt_tx,
+                            adapt_task: parts.adapt_task,
                         });
                     }
                     Err(err) => {
                         tracing::warn!(?err, "failed to create offer");
-                        forward_task.abort();
-                        cursor_task.abort();
+                        parts.forward_task.abort();
+                        parts.cursor_task.abort();
+                        if let Some(adapt_task) = parts.adapt_task {
+                            adapt_task.abort();
+                        }
                     }
                 },
                 Err(err) => {
@@ -414,28 +434,47 @@ async fn handle_session_event(
         }
         SessionEvent::Remb { bitrate_bps } => {
             tracing::debug!(bitrate_bps, "remb from peer");
+            if let Some(active) = active.as_ref() {
+                if let Some(adapt_tx) = &active.adapt_tx {
+                    let _ = adapt_tx.send(Feedback::Remb { bitrate_bps });
+                }
+            }
         }
         SessionEvent::ReceiverReport {
             fraction_lost, rtt, ..
         } => {
             tracing::debug!(fraction_lost, ?rtt, "receiver report from peer");
+            if let Some(active) = active.as_ref() {
+                if let Some(adapt_tx) = &active.adapt_tx {
+                    let _ = adapt_tx.send(Feedback::Loss {
+                        fraction: fraction_lost,
+                    });
+                }
+            }
         }
     }
+}
+
+/// What `start_session` hands back to `handle_signal_message` for one
+/// joining peer: the `PeerSession` plus every background task/resource that
+/// makes up the running session (see `ActiveSession`, which this gets moved
+/// into once the offer is sent).
+struct SessionParts {
+    peer: Arc<PeerSession>,
+    forward_task: tokio::task::JoinHandle<()>,
+    router: InputRouter,
+    cursor_task: tokio::task::JoinHandle<()>,
+    adapt_tx: Option<mpsc::UnboundedSender<Feedback>>,
+    adapt_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Builds the video pipeline and the `PeerSession` for one joining peer, and
 /// starts the task that feeds encoded frames from the pipeline into the
 /// session's video track.
-#[allow(clippy::type_complexity)]
 async fn start_session(
     ctx: &HostContext,
     events: mpsc::Sender<SessionEvent>,
-) -> anyhow::Result<(
-    Arc<PeerSession>,
-    tokio::task::JoinHandle<()>,
-    InputRouter,
-    tokio::task::JoinHandle<()>,
-)> {
+) -> anyhow::Result<SessionParts> {
     let source = (ctx.build_source)()?;
     let (width, height) = source.size();
     let fps = ctx.session.fps.max(1);
@@ -459,8 +498,22 @@ async fn start_session(
         },
     );
     let keyframe_flag = handle.keyframe_flag();
+    let rate_control = handle.rate_control();
 
     let peer = PeerSession::new(ctx.session.clone(), events, Arc::clone(&ctx.runtime)).await?;
+
+    // `Some` only when `HostContext::adapt` is set (`serve` without
+    // `--no-adapt`, see `docs/dev-run.md`); `adapt_tx` is cloned into the
+    // forward task below so it can report every encoded frame, and the
+    // original is handed back in `SessionParts` for `handle_session_event`
+    // to feed REMB/loss into (see `ActiveSession::adapt_tx`).
+    let (adapt_tx, adapt_rx) = if ctx.adapt {
+        let (tx, rx) = mpsc::unbounded_channel::<Feedback>();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let frame_feedback_tx = adapt_tx.clone();
 
     // `PipelineHandle` implements `Drop` (joins its capture/encode threads),
     // so its `frames` receiver can't be moved out directly; instead it's
@@ -470,6 +523,12 @@ async fn start_session(
     let forward_task = tokio::spawn(async move {
         let mut handle = handle;
         while let Some(frame) = handle.frames.recv().await {
+            if let Some(tx) = &frame_feedback_tx {
+                let _ = tx.send(Feedback::Frame {
+                    bytes: frame.data.len(),
+                    capture_to_encoded: frame.ts.saturating_duration_since(frame.captured_at),
+                });
+            }
             if video_tx.send(frame).await.is_err() {
                 break;
             }
@@ -478,6 +537,19 @@ async fn start_session(
     });
 
     peer.start_video(video_rx, keyframe_flag);
+
+    let adapt_task = adapt_rx.map(|rx| {
+        let adapt_peer = Arc::clone(&peer);
+        let adapt_cfg = AdaptConfig {
+            max_bitrate_kbps: ctx.bitrate_kbps,
+            min_bitrate_kbps: crate::adapt::MIN_BITRATE_KBPS,
+            max_fps: fps,
+            min_fps: crate::adapt::MIN_FPS,
+            width,
+            height,
+        };
+        tokio::spawn(run_adapt_task(adapt_cfg, rx, rate_control, adapt_peer))
+    });
 
     let injector = (ctx.build_injector)()?;
     let router = InputRouter::new(injector);
@@ -501,7 +573,61 @@ async fn start_session(
         }
     });
 
-    Ok((peer, forward_task, router, cursor_task))
+    Ok(SessionParts {
+        peer,
+        forward_task,
+        router,
+        cursor_task,
+        adapt_tx,
+        adapt_task,
+    })
+}
+
+/// Drives the adaptation controller for one session: applies every
+/// `Feedback` as it arrives, ticks the controller once a second, and on
+/// every `Decision` updates the encoder's rate (via `rate_control`) and
+/// tells the client (`ControlMessage::Quality`, see `proto/src/control.rs`).
+/// Runs until its `Feedback` channel closes or `ActiveSession::shutdown`
+/// aborts the task.
+async fn run_adapt_task(
+    cfg: AdaptConfig,
+    mut rx: mpsc::UnboundedReceiver<Feedback>,
+    rate_control: Arc<crate::pipeline::RateControl>,
+    peer: Arc<PeerSession>,
+) {
+    let mut controller = Controller::new(cfg, Instant::now());
+    let mut ticker = tokio::time::interval(crate::adapt::TICK);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            fb = rx.recv() => {
+                match fb {
+                    Some(fb) => controller.feedback(fb, Instant::now()),
+                    None => break,
+                }
+            }
+            _ = ticker.tick() => {
+                if let Some(decision) = controller.tick(Instant::now()) {
+                    rate_control.set(decision.target);
+                    tracing::info!(
+                        bitrate_kbps = decision.target.bitrate_kbps,
+                        fps = decision.target.fps,
+                        reason = decision.reason,
+                        "adapt: new rate target"
+                    );
+                    let msg = ControlMessage::Quality {
+                        bitrate_kbps: decision.target.bitrate_kbps,
+                        fps: decision.target.fps,
+                        reason: decision.reason.to_string(),
+                    };
+                    if let Err(err) = peer.send_control(&msg).await {
+                        tracing::warn!(?err, "failed to send quality control message");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Converts a cursor-shape change into the wire message `send_control`
