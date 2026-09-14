@@ -146,12 +146,27 @@ pub struct Pipeline;
 
 impl Pipeline {
     pub fn start(
+        source: Box<dyn FrameSource>,
+        encoder: Box<dyn Encoder>,
+        initial: RateTarget,
+    ) -> PipelineHandle {
+        Self::start_with_keyframe_flag(source, encoder, initial, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Same as `start`, but takes the keyframe-request flag instead of
+    /// creating a fresh one. The flag is shared across every pipeline in a
+    /// session: the transport's PLI/FIR handler (`PeerSession::start_video`)
+    /// holds one `Arc` for the whole session, while the pipeline itself gets
+    /// torn down and rebuilt whenever the transmitted display changes
+    /// (slice 2.4) -- rebuilding it would lose a keyframe request that
+    /// arrived mid-switch.
+    pub fn start_with_keyframe_flag(
         mut source: Box<dyn FrameSource>,
         mut encoder: Box<dyn Encoder>,
         initial: RateTarget,
+        request_keyframe: Arc<AtomicBool>,
     ) -> PipelineHandle {
         let stop = Arc::new(AtomicBool::new(false));
-        let request_keyframe = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(PipelineStats::default());
         let rate_control = Arc::new(RateControl::new(initial));
         let slot = Arc::new(FrameSlot {

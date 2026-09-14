@@ -513,16 +513,20 @@ async fn run_serve(
     let runtime = webrtc::runtime::default_runtime()
         .ok_or_else(|| anyhow::anyhow!("no webrtc runtime available"))?;
 
-    let build_source: Box<dyn Fn() -> anyhow::Result<Box<dyn FrameSource>> + Send + Sync> =
+    let build_source: Box<dyn Fn(u32) -> anyhow::Result<Box<dyn FrameSource>> + Send + Sync> =
         if synthetic {
-            Box::new(move || {
-                Ok(
-                    Box::new(capture::synthetic::for_display(display.unwrap_or(1), fps)?)
-                        as Box<dyn FrameSource>,
-                )
+            Box::new(move |id| {
+                Ok(Box::new(capture::synthetic::for_display(id, fps)?) as Box<dyn FrameSource>)
             })
         } else {
-            Box::new(move || build_screen_source(display, fps, capture))
+            Box::new(move |id| build_screen_source(Some(id), fps, capture))
+        };
+
+    let list_displays: Box<dyn Fn() -> anyhow::Result<Vec<capture::DisplayInfo>> + Send + Sync> =
+        if synthetic {
+            Box::new(|| Ok(capture::synthetic::list_displays()))
+        } else {
+            Box::new(|| Ok(capture::list_displays()?))
         };
 
     let build_injector: Box<dyn Fn() -> anyhow::Result<Box<dyn Injector>> + Send + Sync> =
@@ -552,6 +556,8 @@ async fn run_serve(
         max_qp,
         encoder: encoder.kind(),
         build_source,
+        list_displays,
+        display,
         build_injector,
         build_cursor_source: Box::new(build_real_cursor_source),
         runtime,

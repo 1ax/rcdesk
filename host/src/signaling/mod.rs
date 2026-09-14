@@ -7,6 +7,7 @@
 //! this slice: `run()` returns an error and the caller (the `serve` CLI
 //! command) exits.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,19 +16,20 @@ use base64::Engine as _;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use proto::control::ControlMessage;
+use proto::control::{ControlMessage, DisplayEntry};
 use proto::signal::{Role, SignalMessage};
 use webrtc::peer_connection::RTCPeerConnectionState;
 use webrtc::runtime::Runtime;
 
 use crate::adapt::{AdaptConfig, Controller, Feedback};
-use crate::capture::FrameSource;
+use crate::capture::{self, DisplayInfo, FrameSource};
 use crate::cursor::{self, CursorSource, CursorState};
-use crate::encode::{build_encoder, EncoderConfig, EncoderKind, RateTarget};
+use crate::encode::{build_encoder, EncodedFrame, EncoderConfig, EncoderKind, RateTarget};
 use crate::input::{Injector, InputRouter};
 use crate::pipeline::Pipeline;
 use crate::transport::{PeerSession, SessionConfig, SessionEvent};
@@ -55,11 +57,24 @@ pub struct HostContext {
     /// Which H.264 encoder backend to use. `None` means "auto" -- see
     /// `encode::build_encoder`.
     pub encoder: Option<EncoderKind>,
-    /// Builds a fresh frame source for a new session. A closure (rather than
+    /// Builds a fresh frame source for the display `id` (one of
+    /// `list_displays`' entries) for a new pipeline. A closure (rather than
     /// a `FrameSource` directly baked in here) because a platform-specific
     /// `scap` source is only constructible behind `cfg(...)`, and this
     /// module stays platform-agnostic; `main.rs` supplies the closure.
-    pub build_source: Box<dyn Fn() -> anyhow::Result<Box<dyn FrameSource>> + Send + Sync>,
+    /// Called once per pipeline, i.e. again on every `SelectDisplay`
+    /// (slice 2.4), not just once per session.
+    pub build_source: Box<dyn Fn(u32) -> anyhow::Result<Box<dyn FrameSource>> + Send + Sync>,
+    /// Lists the displays capturable right now, for the initial
+    /// `ControlMessage::Displays` announcement and to resolve
+    /// `ControlMessage::SelectDisplay` ids (slice 2.4). `main.rs` supplies
+    /// either `capture::list_displays` or the synthetic backend's fixed
+    /// two-display list.
+    pub list_displays: Box<dyn Fn() -> anyhow::Result<Vec<DisplayInfo>> + Send + Sync>,
+    /// The display to capture at session start, from CLI `--display`.
+    /// `None` means "use `capture::default_display` over `list_displays`'s
+    /// result".
+    pub display: Option<u32>,
     /// Builds a fresh input injector for a new session, the same way as
     /// `build_source` (and for the same reason: the real, `enigo`-backed
     /// implementation only exists behind `cfg(...)`). `main.rs` supplies
@@ -205,7 +220,7 @@ impl SignalingClient {
                     .await;
                 }
                 Some(event) = event_rx.recv() => {
-                    handle_session_event(event, &out_tx, &mut active, &mut current_session_id).await;
+                    handle_session_event(event, &ctx, &out_tx, &mut active, &mut current_session_id).await;
                 }
             }
         }
@@ -220,11 +235,172 @@ impl SignalingClient {
     }
 }
 
+/// The video pipeline (capture + encode) for one displayed screen, plus the
+/// task forwarding its encoded frames into the session's video track and
+/// (when `HostContext::adapt`) the adaptation controller task. Rebuilt from
+/// scratch by `switch_display` on every `ControlMessage::SelectDisplay` --
+/// the `PeerConnection`/`PeerSession` are not touched, only this piece (see
+/// slice 2.4's plan: switching displays does not recreate the
+/// `PeerConnection`).
+struct VideoPipeline {
+    display: DisplayInfo,
+    /// Tells the forward task (spawned detached in `start`: dropping a tokio
+    /// `JoinHandle` does not cancel the task) to stop reading frames and hand
+    /// the pipeline off to `spawn_blocking` -- see `start`.
+    stop_tx: Option<oneshot::Sender<()>>,
+    adapt_tx: Option<mpsc::UnboundedSender<Feedback>>,
+    adapt_task: Option<JoinHandle<()>>,
+}
+
+impl VideoPipeline {
+    /// Builds the encoder/pipeline for `display` and starts forwarding its
+    /// encoded frames into `video_tx` (the channel `PeerSession::start_video`
+    /// reads from). `keyframe_flag` is the *session's* shared flag (set by
+    /// `start_session`, not created here): `PeerSession::start_video` is
+    /// called once per session, so the flag it was given must keep being the
+    /// one this pipeline's encode thread honors even after a display switch.
+    async fn start(
+        ctx: &HostContext,
+        display: DisplayInfo,
+        peer: Arc<PeerSession>,
+        video_tx: mpsc::Sender<EncodedFrame>,
+        keyframe_flag: Arc<AtomicBool>,
+    ) -> anyhow::Result<VideoPipeline> {
+        let source = (ctx.build_source)(display.id)?;
+        let (width, height) = source.size();
+        let fps = ctx.session.fps.max(1);
+
+        let encoder_cfg = EncoderConfig {
+            width,
+            height,
+            fps,
+            bitrate_kbps: ctx.bitrate_kbps,
+            keyframe_interval_frames: fps * 10,
+            max_qp: ctx.max_qp,
+        };
+        let (encoder, encoder_kind) = build_encoder(ctx.encoder, encoder_cfg)?;
+        let display_id = display.id;
+        let display_title = display.title.clone();
+        tracing::info!(
+            display_id,
+            title = %display_title,
+            width,
+            height,
+            encoder = encoder_kind.name(),
+            "starting video pipeline"
+        );
+        let handle = Pipeline::start_with_keyframe_flag(
+            source,
+            encoder,
+            RateTarget {
+                bitrate_kbps: ctx.bitrate_kbps,
+                fps,
+            },
+            keyframe_flag,
+        );
+        let rate_control = handle.rate_control();
+
+        // `Some` only when `HostContext::adapt` is set (`serve` without
+        // `--no-adapt`, see `docs/dev-run.md`); `adapt_tx` is cloned into the
+        // forward task below so it can report every encoded frame, and the
+        // original is handed back for `handle_session_event` to feed
+        // REMB/loss into (see `ActiveSession::video`/`VideoPipeline::adapt_tx`).
+        let (adapt_tx, adapt_rx) = if ctx.adapt {
+            let (tx, rx) = mpsc::unbounded_channel::<Feedback>();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let frame_feedback_tx = adapt_tx.clone();
+
+        let pipeline_stats = Arc::clone(&handle.stats);
+        let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut handle = handle;
+            loop {
+                tokio::select! {
+                    frame = handle.frames.recv() => {
+                        let Some(frame) = frame else { break };
+                        if let Some(tx) = &frame_feedback_tx {
+                            let _ = tx.send(Feedback::Frame {
+                                bytes: frame.data.len(),
+                            });
+                        }
+                        if video_tx.send(frame).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ = &mut stop_rx => {
+                        break;
+                    }
+                }
+            }
+            // `PipelineHandle::stop` joins the capture/encode threads, and
+            // the capture thread may be blocked inside a live source's
+            // blocking `get_next_frame()` call -- run it off the tokio
+            // worker thread rather than stalling it, and don't wait for it
+            // here: this task's job is done once it stops reading frames.
+            tokio::task::spawn_blocking(move || handle.stop());
+        });
+
+        let adapt_task = adapt_rx.map(|rx| {
+            let adapt_peer = Arc::clone(&peer);
+            let adapt_cfg = AdaptConfig {
+                max_bitrate_kbps: ctx.bitrate_kbps,
+                min_bitrate_kbps: crate::adapt::MIN_BITRATE_KBPS,
+                max_fps: fps,
+                min_fps: crate::adapt::MIN_FPS,
+                width,
+                height,
+            };
+            tokio::spawn(run_adapt_task(
+                adapt_cfg,
+                rx,
+                rate_control,
+                Arc::clone(&pipeline_stats),
+                adapt_peer,
+            ))
+        });
+
+        Ok(VideoPipeline {
+            display,
+            stop_tx: Some(stop_tx),
+            adapt_tx,
+            adapt_task,
+        })
+    }
+
+    /// Stops the forward task (which in turn stops the pipeline's
+    /// capture/encode threads, see `start`'s doc comment) and the adapt
+    /// task. The forward task exits on its own once `stop_tx` fires and
+    /// hands the pipeline off to `spawn_blocking`.
+    fn stop(self) {
+        if let Some(tx) = self.stop_tx {
+            let _ = tx.send(());
+        }
+        if let Some(task) = self.adapt_task {
+            task.abort();
+        }
+    }
+}
+
 /// A running `PeerSession` plus the task feeding it encoded frames from the
 /// video pipeline.
 struct ActiveSession {
     peer: Arc<PeerSession>,
-    forward_task: tokio::task::JoinHandle<()>,
+    video: VideoPipeline,
+    /// Channel `VideoPipeline::forward_task` writes into and
+    /// `PeerSession::start_video` reads from; kept here so `switch_display`
+    /// can start a replacement pipeline feeding the same channel.
+    video_tx: mpsc::Sender<EncodedFrame>,
+    /// The session-wide keyframe-request flag handed to `PeerSession::start_video`
+    /// once at session start; every `VideoPipeline` (including ones built by
+    /// `switch_display`) shares it (see `Pipeline::start_with_keyframe_flag`'s
+    /// doc comment).
+    keyframe_flag: Arc<AtomicBool>,
+    /// The most recently listed set of displays, sent to the client in
+    /// `ControlMessage::Displays` (see `displays_message`).
+    displays: Vec<DisplayInfo>,
     /// Routes `input`/`pointer` data channel messages to the platform
     /// injector. Dropped at the end of `shutdown` (ordinary field drop),
     /// which -- per `InputRouter`'s own `Drop` impl -- releases any
@@ -240,23 +416,13 @@ struct ActiveSession {
     /// the task (below) drops that future, which drops the watcher, which
     /// stops the thread.
     cursor_task: tokio::task::JoinHandle<()>,
-    /// Feeds `SessionEvent::Remb`/`ReceiverReport` into the adaptation
-    /// controller (see `handle_session_event`). `None` when the session was
-    /// started with `HostContext::adapt` false (`serve --no-adapt`).
-    adapt_tx: Option<mpsc::UnboundedSender<Feedback>>,
-    /// The task running the adaptation controller's tick loop (see
-    /// `start_session`). `None` alongside `adapt_tx`.
-    adapt_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ActiveSession {
     async fn shutdown(self) {
         self.peer.close().await;
-        self.forward_task.abort();
+        self.video.stop();
         self.cursor_task.abort();
-        if let Some(adapt_task) = self.adapt_task {
-            adapt_task.abort();
-        }
     }
 }
 
@@ -286,20 +452,18 @@ async fn handle_signal_message(
                         *current_session_id = Some(session_id);
                         *active = Some(ActiveSession {
                             peer: parts.peer,
-                            forward_task: parts.forward_task,
+                            video: parts.video,
+                            video_tx: parts.video_tx,
+                            keyframe_flag: parts.keyframe_flag,
+                            displays: parts.displays,
                             router: parts.router,
                             cursor_task: parts.cursor_task,
-                            adapt_tx: parts.adapt_tx,
-                            adapt_task: parts.adapt_task,
                         });
                     }
                     Err(err) => {
                         tracing::warn!(?err, "failed to create offer");
-                        parts.forward_task.abort();
+                        parts.video.stop();
                         parts.cursor_task.abort();
-                        if let Some(adapt_task) = parts.adapt_task {
-                            adapt_task.abort();
-                        }
                     }
                 },
                 Err(err) => {
@@ -352,6 +516,7 @@ async fn handle_signal_message(
 
 async fn handle_session_event(
     event: SessionEvent,
+    ctx: &HostContext,
     out_tx: &mpsc::UnboundedSender<SignalMessage>,
     active: &mut Option<ActiveSession>,
     current_session_id: &mut Option<String>,
@@ -416,6 +581,11 @@ async fn handle_session_event(
                                 }
                             }
                         }
+                        Ok(ControlMessage::SelectDisplay { id }) => {
+                            if let Some(active) = active.as_mut() {
+                                switch_display(ctx, active, id).await;
+                            }
+                        }
                         Ok(other) => {
                             tracing::trace!(label, ?other, "unexpected control message, ignoring");
                         }
@@ -435,7 +605,7 @@ async fn handle_session_event(
         SessionEvent::Remb { bitrate_bps } => {
             tracing::debug!(bitrate_bps, "remb from peer");
             if let Some(active) = active.as_ref() {
-                if let Some(adapt_tx) = &active.adapt_tx {
+                if let Some(adapt_tx) = &active.video.adapt_tx {
                     let _ = adapt_tx.send(Feedback::Remb { bitrate_bps });
                 }
             }
@@ -445,12 +615,108 @@ async fn handle_session_event(
         } => {
             tracing::debug!(fraction_lost, ?rtt, "receiver report from peer");
             if let Some(active) = active.as_ref() {
-                if let Some(adapt_tx) = &active.adapt_tx {
+                if let Some(adapt_tx) = &active.video.adapt_tx {
                     let _ = adapt_tx.send(Feedback::Loss {
                         fraction: fraction_lost,
                     });
                 }
             }
+        }
+        SessionEvent::DataChannelOpen { label } => match (label.as_str(), active.as_ref()) {
+            ("control", Some(active)) => {
+                let msg = displays_message(&active.displays, active.video.display.id);
+                match active.peer.send_control(&msg).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!(
+                            "control channel not open yet, dropped initial displays list"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, "failed to send initial displays list");
+                    }
+                }
+            }
+            _ => {
+                tracing::trace!(label, "data channel open");
+            }
+        },
+    }
+}
+
+/// Builds the `ControlMessage::Displays` announcement for `displays`/`current`.
+fn displays_message(displays: &[DisplayInfo], current: u32) -> ControlMessage {
+    ControlMessage::Displays {
+        displays: displays
+            .iter()
+            .map(|d| DisplayEntry {
+                id: d.id,
+                title: d.title.clone(),
+                width: d.width,
+                height: d.height,
+                primary: d.primary,
+            })
+            .collect(),
+        current,
+    }
+}
+
+/// Handles `ControlMessage::SelectDisplay { id }`: builds a fresh
+/// `VideoPipeline` for the requested display *before* stopping the current
+/// one, so a failure (unknown id, or the new pipeline fails to start) leaves
+/// the session streaming exactly what it was streaming before -- no black
+/// gap, no dropped session. Always re-announces the (possibly refreshed)
+/// display list afterwards, since the client is waiting on a reply either
+/// way.
+async fn switch_display(ctx: &HostContext, active: &mut ActiveSession, id: u32) {
+    let list = match (ctx.list_displays)() {
+        Ok(list) => list,
+        Err(err) => {
+            // Still answer: the client resets its picker from `Displays`.
+            tracing::warn!(?err, "failed to list displays for switch");
+            let msg = displays_message(&active.displays, active.video.display.id);
+            let _ = active.peer.send_control(&msg).await;
+            return;
+        }
+    };
+    let Some(display) = list.iter().find(|d| d.id == id).cloned() else {
+        tracing::warn!(id, "select_display: unknown display id");
+        let msg = displays_message(&active.displays, active.video.display.id);
+        let _ = active.peer.send_control(&msg).await;
+        return;
+    };
+    if id == active.video.display.id {
+        active.displays = list;
+        let msg = displays_message(&active.displays, active.video.display.id);
+        let _ = active.peer.send_control(&msg).await;
+        return;
+    }
+    match VideoPipeline::start(
+        ctx,
+        display,
+        Arc::clone(&active.peer),
+        active.video_tx.clone(),
+        Arc::clone(&active.keyframe_flag),
+    )
+    .await
+    {
+        Ok(new) => {
+            let from = active.video.display.id;
+            let old = std::mem::replace(&mut active.video, new);
+            old.stop();
+            active.displays = list;
+            tracing::info!(from, to = active.video.display.id, "switched display");
+            let msg = displays_message(&active.displays, active.video.display.id);
+            let _ = active.peer.send_control(&msg).await;
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                id,
+                "failed to start pipeline for new display, keeping current"
+            );
+            let msg = displays_message(&active.displays, active.video.display.id);
+            let _ = active.peer.send_control(&msg).await;
         }
     }
 }
@@ -461,11 +727,12 @@ async fn handle_session_event(
 /// into once the offer is sent).
 struct SessionParts {
     peer: Arc<PeerSession>,
-    forward_task: tokio::task::JoinHandle<()>,
+    video: VideoPipeline,
+    video_tx: mpsc::Sender<EncodedFrame>,
+    keyframe_flag: Arc<AtomicBool>,
+    displays: Vec<DisplayInfo>,
     router: InputRouter,
     cursor_task: tokio::task::JoinHandle<()>,
-    adapt_tx: Option<mpsc::UnboundedSender<Feedback>>,
-    adapt_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Builds the video pipeline and the `PeerSession` for one joining peer, and
@@ -475,87 +742,35 @@ async fn start_session(
     ctx: &HostContext,
     events: mpsc::Sender<SessionEvent>,
 ) -> anyhow::Result<SessionParts> {
-    let source = (ctx.build_source)()?;
-    let (width, height) = source.size();
-    let fps = ctx.session.fps.max(1);
-
-    let encoder_cfg = EncoderConfig {
-        width,
-        height,
-        fps,
-        bitrate_kbps: ctx.bitrate_kbps,
-        keyframe_interval_frames: fps * 10,
-        max_qp: ctx.max_qp,
+    let displays = (ctx.list_displays)()?;
+    let start_display = match ctx.display {
+        Some(id) => displays
+            .iter()
+            .find(|d| d.id == id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("display {id} not found"))?,
+        None => capture::default_display(&displays)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no capturable display found"))?,
     };
-    let (encoder, encoder_kind) = build_encoder(ctx.encoder, encoder_cfg)?;
-    tracing::info!(encoder = encoder_kind.name(), "starting session pipeline");
-    let handle = Pipeline::start(
-        source,
-        encoder,
-        RateTarget {
-            bitrate_kbps: ctx.bitrate_kbps,
-            fps,
-        },
-    );
-    let keyframe_flag = handle.keyframe_flag();
-    let rate_control = handle.rate_control();
+
+    let keyframe_flag = Arc::new(AtomicBool::new(false));
+    let (video_tx, video_rx) = mpsc::channel(4);
 
     let peer = PeerSession::new(ctx.session.clone(), events, Arc::clone(&ctx.runtime)).await?;
+    // Called once per session: every `VideoPipeline` (including ones built
+    // later by `switch_display`) feeds frames into the same `video_tx`/
+    // `video_rx` pair and shares `keyframe_flag` -- see their doc comments.
+    peer.start_video(video_rx, Arc::clone(&keyframe_flag));
 
-    // `Some` only when `HostContext::adapt` is set (`serve` without
-    // `--no-adapt`, see `docs/dev-run.md`); `adapt_tx` is cloned into the
-    // forward task below so it can report every encoded frame, and the
-    // original is handed back in `SessionParts` for `handle_session_event`
-    // to feed REMB/loss into (see `ActiveSession::adapt_tx`).
-    let (adapt_tx, adapt_rx) = if ctx.adapt {
-        let (tx, rx) = mpsc::unbounded_channel::<Feedback>();
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-    let frame_feedback_tx = adapt_tx.clone();
-
-    // `PipelineHandle` implements `Drop` (joins its capture/encode threads),
-    // so its `frames` receiver can't be moved out directly; instead it's
-    // handed wholesale to this forwarding task, which relays frames into a
-    // fresh channel that `start_video` takes by value.
-    let (video_tx, video_rx) = mpsc::channel(4);
-    let pipeline_stats = Arc::clone(&handle.stats);
-    let forward_task = tokio::spawn(async move {
-        let mut handle = handle;
-        while let Some(frame) = handle.frames.recv().await {
-            if let Some(tx) = &frame_feedback_tx {
-                let _ = tx.send(Feedback::Frame {
-                    bytes: frame.data.len(),
-                });
-            }
-            if video_tx.send(frame).await.is_err() {
-                break;
-            }
-        }
-        handle.stop();
-    });
-
-    peer.start_video(video_rx, keyframe_flag);
-
-    let adapt_task = adapt_rx.map(|rx| {
-        let adapt_peer = Arc::clone(&peer);
-        let adapt_cfg = AdaptConfig {
-            max_bitrate_kbps: ctx.bitrate_kbps,
-            min_bitrate_kbps: crate::adapt::MIN_BITRATE_KBPS,
-            max_fps: fps,
-            min_fps: crate::adapt::MIN_FPS,
-            width,
-            height,
-        };
-        tokio::spawn(run_adapt_task(
-            adapt_cfg,
-            rx,
-            rate_control,
-            Arc::clone(&pipeline_stats),
-            adapt_peer,
-        ))
-    });
+    let video = VideoPipeline::start(
+        ctx,
+        start_display,
+        Arc::clone(&peer),
+        video_tx.clone(),
+        Arc::clone(&keyframe_flag),
+    )
+    .await?;
 
     let injector = (ctx.build_injector)()?;
     let router = InputRouter::new(injector);
@@ -581,11 +796,12 @@ async fn start_session(
 
     Ok(SessionParts {
         peer,
-        forward_task,
+        video,
+        video_tx,
+        keyframe_flag,
+        displays,
         router,
         cursor_task,
-        adapt_tx,
-        adapt_task,
     })
 }
 
@@ -710,5 +926,174 @@ async fn next_message(read: &mut SplitStream<WsStream>) -> Option<SignalMessage>
                 return None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn display(id: u32, title: &str, primary: bool) -> DisplayInfo {
+        DisplayInfo {
+            id,
+            title: title.to_string(),
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+            primary,
+        }
+    }
+
+    #[test]
+    fn displays_message_builds_the_expected_control_message() {
+        let displays = vec![display(1, "Built-in", true), display(2, "External", false)];
+
+        let msg = displays_message(&displays, 2);
+
+        assert_eq!(
+            msg,
+            ControlMessage::Displays {
+                displays: vec![
+                    DisplayEntry {
+                        id: 1,
+                        title: "Built-in".to_string(),
+                        width: 100,
+                        height: 100,
+                        primary: true,
+                    },
+                    DisplayEntry {
+                        id: 2,
+                        title: "External".to_string(),
+                        width: 100,
+                        height: 100,
+                        primary: false,
+                    },
+                ],
+                current: 2,
+            }
+        );
+    }
+
+    fn test_ctx() -> HostContext {
+        HostContext {
+            session: SessionConfig {
+                ice_servers: vec![],
+                udp_addrs: vec!["127.0.0.1:0".to_string()],
+                fps: 30,
+            },
+            bitrate_kbps: 2000,
+            adapt: false,
+            max_qp: None,
+            encoder: Some(EncoderKind::OpenH264),
+            build_source: Box::new(|id| {
+                Ok(Box::new(capture::synthetic::for_display(id, 30)?) as Box<dyn FrameSource>)
+            }),
+            list_displays: Box::new(|| Ok(capture::synthetic::list_displays())),
+            display: None,
+            build_injector: Box::new(|| {
+                Ok(Box::new(crate::input::NoopInjector::new()) as Box<dyn Injector>)
+            }),
+            build_cursor_source: Box::new(|| {
+                Box::new(crate::cursor::NoopCursorSource::new()) as Box<dyn CursorSource>
+            }),
+            runtime: webrtc::runtime::default_runtime()
+                .expect("runtime-tokio feature must be enabled"),
+        }
+    }
+
+    /// Collects frames from `rx` until either `n` arrive or `timeout` elapses,
+    /// panicking on timeout (the synthetic source delivers frames regularly,
+    /// so a stall means the pipeline broke).
+    async fn collect_frames(
+        rx: &mut mpsc::Receiver<EncodedFrame>,
+        n: usize,
+        timeout: Duration,
+    ) -> Vec<EncodedFrame> {
+        let mut frames = Vec::with_capacity(n);
+        tokio::time::timeout(timeout, async {
+            while frames.len() < n {
+                match rx.recv().await {
+                    Some(frame) => frames.push(frame),
+                    None => break,
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for frames");
+        frames
+    }
+
+    /// Reads frames from `rx` until a keyframe is seen or `timeout` elapses,
+    /// panicking on timeout.
+    async fn wait_for_keyframe(
+        rx: &mut mpsc::Receiver<EncodedFrame>,
+        timeout: Duration,
+    ) -> EncodedFrame {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let frame = rx.recv().await.expect("video channel closed");
+                if frame.keyframe {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for a keyframe")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn switching_display_restarts_pipeline_and_keeps_frames_flowing() {
+        let ctx = test_ctx();
+        let (events_tx, _events_rx) = mpsc::channel(64);
+        let peer = PeerSession::new(ctx.session.clone(), events_tx, Arc::clone(&ctx.runtime))
+            .await
+            .unwrap();
+
+        let (video_tx, mut video_rx) = mpsc::channel(4);
+        let keyframe_flag = Arc::new(AtomicBool::new(false));
+
+        let displays = capture::synthetic::list_displays();
+        let display1 = displays.iter().find(|d| d.id == 1).unwrap().clone();
+        let display2 = displays.iter().find(|d| d.id == 2).unwrap().clone();
+
+        let mut current = VideoPipeline::start(
+            &ctx,
+            display1,
+            Arc::clone(&peer),
+            video_tx.clone(),
+            Arc::clone(&keyframe_flag),
+        )
+        .await
+        .unwrap();
+
+        let first_batch = collect_frames(&mut video_rx, 5, Duration::from_secs(5)).await;
+        assert!(
+            first_batch[0].keyframe,
+            "first frame of a fresh pipeline must be a keyframe"
+        );
+
+        let next = VideoPipeline::start(
+            &ctx,
+            display2,
+            Arc::clone(&peer),
+            video_tx.clone(),
+            Arc::clone(&keyframe_flag),
+        )
+        .await
+        .unwrap();
+        let old = std::mem::replace(&mut current, next);
+        old.stop();
+
+        // The new pipeline forces a keyframe on start; frames from the old
+        // one may still be interleaved briefly, so look for the first
+        // keyframe after the switch rather than assuming the very next
+        // frame is it.
+        let _keyframe_after_switch = wait_for_keyframe(&mut video_rx, Duration::from_secs(5)).await;
+
+        // Frames keep flowing after the switch.
+        let _more = collect_frames(&mut video_rx, 5, Duration::from_secs(5)).await;
+
+        current.stop();
     }
 }

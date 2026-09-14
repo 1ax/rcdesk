@@ -222,6 +222,11 @@ pub enum SessionEvent {
         /// report carries no LSR yet (no SR received on the far side) or the result is implausible.
         rtt: Option<Duration>,
     },
+    /// One of the four fixed data channels finished its WebRTC handshake and
+    /// is now open. The signaling layer uses this to know when it is safe to
+    /// send the client its initial state over `control` (e.g. the display
+    /// list, slice 2.4).
+    DataChannelOpen { label: String },
 }
 
 fn ice_candidate_from_rtc(c: RTCIceCandidateInit) -> proto::signal::IceCandidate {
@@ -712,6 +717,11 @@ fn spawn_data_channel_reader(
             match event {
                 DataChannelEvent::OnOpen => {
                     tracing::info!(label, "data channel open");
+                    let _ = events
+                        .send(SessionEvent::DataChannelOpen {
+                            label: label.to_owned(),
+                        })
+                        .await;
                 }
                 DataChannelEvent::OnClose => {
                     tracing::info!(label, "data channel closed");
