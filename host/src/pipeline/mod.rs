@@ -3,15 +3,15 @@
 //! come out through a bounded channel. No network/transport here (that is
 //! slice 1.2b) -- this just proves the video path end to end.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
 use crate::capture::{FrameSource, RawFrame};
-use crate::encode::{EncodedFrame, Encoder};
+use crate::encode::{EncodedFrame, Encoder, RateTarget};
 
 /// How many encoded frames may sit in the output channel before new ones get
 /// dropped. Keeps memory/latency bounded when nothing is draining the
@@ -28,6 +28,48 @@ pub struct PipelineStats {
     pub encoded: AtomicU64,
     pub dropped: AtomicU64,
     pub keyframes: AtomicU64,
+    /// Raw frames skipped by the fps pacer (see `RateControl`/`Pipeline`'s
+    /// encode loop) before they ever reached the encoder -- distinct from
+    /// `dropped`, which counts frames the encoder produced but the output
+    /// channel couldn't take.
+    pub paced_out: AtomicU64,
+}
+
+/// Runtime bitrate/fps target shared between whoever drives adaptation
+/// (slice 2.3's controller, or a test) and the pipeline's encode thread:
+/// `set()` stages a `RateTarget` for the encode thread to pick up and apply
+/// on its next iteration (`encoder.set_rate`), and records the fps so the
+/// encode thread's pacer can budget capture-to-encode at that rate without
+/// waiting for the encoder to actually apply it.
+#[derive(Debug, Default)]
+pub struct RateControl {
+    pending: Mutex<Option<RateTarget>>,
+    fps: AtomicU32,
+}
+
+impl RateControl {
+    fn new(initial: RateTarget) -> Self {
+        Self {
+            pending: Mutex::new(None),
+            fps: AtomicU32::new(initial.fps),
+        }
+    }
+
+    /// Stages `target` for the encode thread to apply, and updates the fps
+    /// the pacer uses immediately (it doesn't need to wait for the encoder
+    /// to actually pick up the new rate).
+    pub fn set(&self, target: RateTarget) {
+        *self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(target);
+        self.fps.store(target.fps, Ordering::Release);
+    }
+
+    /// The fps the pacer is currently budgeting frames at.
+    pub fn fps(&self) -> u32 {
+        self.fps.load(Ordering::Acquire)
+    }
 }
 
 /// Single-slot mailbox from the capture thread to the encode thread: only
@@ -42,6 +84,7 @@ pub struct PipelineHandle {
     request_keyframe: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     pub stats: Arc<PipelineStats>,
+    rate_control: Arc<RateControl>,
     capture_thread: Option<JoinHandle<()>>,
     encode_thread: Option<JoinHandle<()>>,
 }
@@ -52,10 +95,12 @@ impl Pipeline {
     pub fn start(
         mut source: Box<dyn FrameSource>,
         mut encoder: Box<dyn Encoder>,
+        initial: RateTarget,
     ) -> PipelineHandle {
         let stop = Arc::new(AtomicBool::new(false));
         let request_keyframe = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(PipelineStats::default());
+        let rate_control = Arc::new(RateControl::new(initial));
         let slot = Arc::new(FrameSlot {
             frame: Mutex::new(None),
             condvar: Condvar::new(),
@@ -90,63 +135,109 @@ impl Pipeline {
             let slot = Arc::clone(&slot);
             let stats = Arc::clone(&stats);
             let request_keyframe = Arc::clone(&request_keyframe);
-            std::thread::spawn(move || loop {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
+            let rate_control = Arc::clone(&rate_control);
+            std::thread::spawn(move || {
+                // When the next frame is "due" for encoding, at the pacer's
+                // current fps -- `None` until the first frame has been
+                // encoded. Deliberately not reset when fps changes: the next
+                // frame simply becomes due sooner or later, which is the
+                // whole point of re-pacing.
+                let mut next_due: Option<Instant> = None;
 
-                let raw = {
-                    let mut guard = slot.frame.lock().expect("frame slot mutex poisoned");
-                    loop {
-                        if let Some(frame) = guard.take() {
-                            break Some(frame);
-                        }
-                        if stop.load(Ordering::Relaxed) {
-                            break None;
-                        }
-                        let (next_guard, _timeout) = slot
-                            .condvar
-                            .wait_timeout(guard, SLOT_WAIT_TIMEOUT)
-                            .expect("frame slot mutex poisoned");
-                        guard = next_guard;
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
                     }
-                };
 
-                let Some(raw) = raw else { continue };
-                let captured_at = raw.ts();
-
-                // Never encode a frame nobody can take: dropping an already
-                // encoded P-frame would break the decoder's reference chain
-                // until the next keyframe. Skip the raw frame instead.
-                if tx.capacity() == 0 {
-                    stats.dropped.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-
-                let force_keyframe = request_keyframe.swap(false, Ordering::AcqRel);
-
-                match encoder.encode(&raw, force_keyframe) {
-                    Ok(Some(encoded)) => {
-                        stats.encoded.fetch_add(1, Ordering::Relaxed);
-                        if encoded.keyframe {
-                            stats.keyframes.fetch_add(1, Ordering::Relaxed);
+                    let raw = {
+                        let mut guard = slot.frame.lock().expect("frame slot mutex poisoned");
+                        loop {
+                            if let Some(frame) = guard.take() {
+                                break Some(frame);
+                            }
+                            if stop.load(Ordering::Relaxed) {
+                                break None;
+                            }
+                            let (next_guard, _timeout) = slot
+                                .condvar
+                                .wait_timeout(guard, SLOT_WAIT_TIMEOUT)
+                                .expect("frame slot mutex poisoned");
+                            guard = next_guard;
                         }
-                        tracing::trace!(
-                            convert_encode_latency_us =
-                                (encoded.ts - captured_at).as_micros() as u64,
-                            keyframe = encoded.keyframe,
-                            "encoded frame"
-                        );
-                        if tx.try_send(encoded).is_err() {
-                            // Channel closed (receiver gone) or a race with
-                            // the capacity check: the stream is now missing a
-                            // reference frame, so recover with a keyframe.
-                            stats.dropped.fetch_add(1, Ordering::Relaxed);
-                            request_keyframe.store(true, Ordering::Release);
+                    };
+
+                    let Some(raw) = raw else { continue };
+                    let captured_at = raw.ts();
+
+                    // (a) Apply any pending rate-control target before this
+                    // frame, whether or not pacing ends up encoding it.
+                    let pending = rate_control
+                        .pending
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some(target) = pending {
+                        if let Err(err) = encoder.set_rate(target) {
+                            tracing::warn!(
+                                error = %err,
+                                bitrate_kbps = target.bitrate_kbps,
+                                fps = target.fps,
+                                "failed to apply rate target, continuing at previous rate"
+                            );
                         }
                     }
-                    Ok(None) => {}
-                    Err(_) => break,
+
+                    // (b) Pace to the target fps: a frame is due if there was
+                    // no previous one, or this frame's capture time (plus a
+                    // 25% tolerance on the pacing interval, for capture
+                    // jitter) has reached the last-computed due time.
+                    let fps = rate_control.fps().max(1);
+                    let interval = Duration::from_secs_f64(1.0 / f64::from(fps));
+                    let due = match next_due {
+                        Some(due) => captured_at + interval / 4 >= due,
+                        None => true,
+                    };
+                    if !due {
+                        stats.paced_out.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    next_due = Some(next_due.unwrap_or(captured_at).max(captured_at) + interval);
+
+                    // Never encode a frame nobody can take: dropping an
+                    // already encoded P-frame would break the decoder's
+                    // reference chain until the next keyframe. Skip the raw
+                    // frame instead.
+                    if tx.capacity() == 0 {
+                        stats.dropped.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+
+                    let force_keyframe = request_keyframe.swap(false, Ordering::AcqRel);
+
+                    match encoder.encode(&raw, force_keyframe) {
+                        Ok(Some(encoded)) => {
+                            stats.encoded.fetch_add(1, Ordering::Relaxed);
+                            if encoded.keyframe {
+                                stats.keyframes.fetch_add(1, Ordering::Relaxed);
+                            }
+                            tracing::trace!(
+                                convert_encode_latency_us =
+                                    (encoded.ts - captured_at).as_micros() as u64,
+                                keyframe = encoded.keyframe,
+                                "encoded frame"
+                            );
+                            if tx.try_send(encoded).is_err() {
+                                // Channel closed (receiver gone) or a race
+                                // with the capacity check: the stream is now
+                                // missing a reference frame, so recover with
+                                // a keyframe.
+                                stats.dropped.fetch_add(1, Ordering::Relaxed);
+                                request_keyframe.store(true, Ordering::Release);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => break,
+                    }
                 }
             })
         };
@@ -156,6 +247,7 @@ impl Pipeline {
             request_keyframe,
             stop,
             stats,
+            rate_control,
             capture_thread: Some(capture_thread),
             encode_thread: Some(encode_thread),
         }
@@ -173,6 +265,13 @@ impl PipelineHandle {
     /// directly, the same way `request_keyframe()` does.
     pub fn keyframe_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.request_keyframe)
+    }
+
+    /// Shares the rate-control handle a caller (the slice 2.3 adaptation
+    /// controller, or a test) uses to push new bitrate/fps targets into the
+    /// running encoder via `RateControl::set`.
+    pub fn rate_control(&self) -> Arc<RateControl> {
+        Arc::clone(&self.rate_control)
     }
 
     /// Stops both threads and waits for them to finish.
@@ -235,7 +334,14 @@ mod tests {
         let (encoder, _kind) =
             build_encoder(Some(EncoderKind::OpenH264), cfg).expect("encoder init");
 
-        let mut handle = Pipeline::start(source, encoder);
+        let mut handle = Pipeline::start(
+            source,
+            encoder,
+            RateTarget {
+                bitrate_kbps: 2000,
+                fps: 30,
+            },
+        );
 
         let received = drain_for(&mut handle, Duration::from_secs(1));
         assert!(
@@ -256,5 +362,81 @@ mod tests {
         );
 
         handle.stop();
+    }
+
+    #[test]
+    fn pacing_caps_encoded_fps() {
+        let source: Box<dyn FrameSource> = Box::new(SyntheticSource::new(64, 64, 60));
+        let cfg = EncoderConfig {
+            width: 64,
+            height: 64,
+            fps: 10,
+            bitrate_kbps: 2000,
+            keyframe_interval_frames: 60,
+            max_qp: None,
+        };
+        let (encoder, _kind) =
+            build_encoder(Some(EncoderKind::OpenH264), cfg).expect("encoder init");
+
+        let mut handle = Pipeline::start(
+            source,
+            encoder,
+            RateTarget {
+                bitrate_kbps: 2000,
+                fps: 10,
+            },
+        );
+
+        let received = drain_for(&mut handle, Duration::from_secs(2));
+        let paced_out = handle.stats.paced_out.load(Ordering::Relaxed);
+        handle.stop();
+
+        assert!(
+            (15..=26).contains(&received.len()),
+            "expected roughly 10fps over 2s (15..=26 frames), got {}",
+            received.len()
+        );
+        assert!(
+            paced_out > 40,
+            "expected the 60fps source to be paced down heavily, got paced_out={paced_out}"
+        );
+    }
+
+    #[test]
+    fn rate_control_applies_pending_target() {
+        let source: Box<dyn FrameSource> = Box::new(SyntheticSource::new(64, 64, 30));
+        let cfg = EncoderConfig {
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_kbps: 2000,
+            keyframe_interval_frames: 60,
+            max_qp: None,
+        };
+        let (encoder, _kind) =
+            build_encoder(Some(EncoderKind::OpenH264), cfg).expect("encoder init");
+
+        let mut handle = Pipeline::start(
+            source,
+            encoder,
+            RateTarget {
+                bitrate_kbps: 2000,
+                fps: 30,
+            },
+        );
+
+        handle.rate_control().set(RateTarget {
+            bitrate_kbps: 500,
+            fps: 30,
+        });
+
+        let received = drain_for(&mut handle, Duration::from_secs(1));
+        handle.stop();
+
+        assert!(
+            received.len() >= 10,
+            "expected pipeline to keep producing frames after set_rate, got {}",
+            received.len()
+        );
     }
 }

@@ -8,7 +8,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use rcdesk_host::capture::{self, FrameSource};
 use rcdesk_host::cursor::CursorSource;
-use rcdesk_host::encode::{build_encoder, EncoderConfig, EncoderKind};
+use rcdesk_host::encode::{build_encoder, EncoderConfig, EncoderKind, RateTarget};
 use rcdesk_host::input::{Injector, NoopInjector};
 use rcdesk_host::pipeline::Pipeline;
 use rcdesk_host::platform;
@@ -337,7 +337,7 @@ fn run_bench(
     let (encoder, encoder_kind) = build_encoder(encoder.kind(), cfg)?;
     println!("encoder={}", encoder_kind.name());
 
-    let mut handle = Pipeline::start(source, encoder);
+    let mut handle = Pipeline::start(source, encoder, RateTarget { bitrate_kbps, fps });
     let mut dump_file = dump.as_ref().map(std::fs::File::create).transpose()?;
 
     let mut sizes: Vec<usize> = Vec::new();

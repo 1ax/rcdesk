@@ -26,7 +26,7 @@ use webrtc::runtime::Runtime;
 
 use crate::capture::FrameSource;
 use crate::cursor::{self, CursorSource, CursorState};
-use crate::encode::{build_encoder, EncoderConfig, EncoderKind};
+use crate::encode::{build_encoder, EncoderConfig, EncoderKind, RateTarget};
 use crate::input::{Injector, InputRouter};
 use crate::pipeline::Pipeline;
 use crate::transport::{PeerSession, SessionConfig, SessionEvent};
@@ -442,7 +442,14 @@ async fn start_session(
     };
     let (encoder, encoder_kind) = build_encoder(ctx.encoder, encoder_cfg)?;
     tracing::info!(encoder = encoder_kind.name(), "starting session pipeline");
-    let handle = Pipeline::start(source, encoder);
+    let handle = Pipeline::start(
+        source,
+        encoder,
+        RateTarget {
+            bitrate_kbps: ctx.bitrate_kbps,
+            fps,
+        },
+    );
     let keyframe_flag = handle.keyframe_flag();
 
     let peer = PeerSession::new(ctx.session.clone(), events, Arc::clone(&ctx.runtime)).await?;

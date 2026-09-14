@@ -38,7 +38,7 @@ use objc2_video_toolbox::{
 
 use crate::capture::RawFrame;
 
-use super::{EncodeError, EncodedFrame, Encoder, EncoderConfig};
+use super::{EncodeError, EncodedFrame, Encoder, EncoderConfig, RateTarget};
 
 /// Annex-B start code every emitted NAL unit is prefixed with.
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
@@ -201,24 +201,7 @@ fn configure_session(
             kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel.as_ref(),
         )?;
 
-        let bitrate_bps = cfg.bitrate_kbps.saturating_mul(1000);
-        set_property(
-            session,
-            "AverageBitRate",
-            kVTCompressionPropertyKey_AverageBitRate,
-            CFNumber::new_i32(bitrate_bps as i32).as_ref(),
-        )?;
-
-        let data_rate_limits = CFArray::<CFNumber>::from_objects(&[
-            &CFNumber::new_i32((bitrate_bps / 8) as i32),
-            &CFNumber::new_i32(1),
-        ]);
-        set_property(
-            session,
-            "DataRateLimits",
-            kVTCompressionPropertyKey_DataRateLimits,
-            data_rate_limits.as_ref(),
-        )?;
+        apply_rate(session, cfg.bitrate_kbps, cfg.fps)?;
 
         set_property(
             session,
@@ -231,12 +214,6 @@ fn configure_session(
             "MaxKeyFrameInterval",
             kVTCompressionPropertyKey_MaxKeyFrameInterval,
             CFNumber::new_i32(cfg.keyframe_interval_frames as i32).as_ref(),
-        )?;
-        set_property(
-            session,
-            "ExpectedFrameRate",
-            kVTCompressionPropertyKey_ExpectedFrameRate,
-            CFNumber::new_i32(cfg.fps as i32).as_ref(),
         )?;
         // Soft failure: found on real hardware (Apple M4, macOS 26.6) that
         // this encoder rejects `MaxFrameDelayCount = 0` with
@@ -265,6 +242,55 @@ fn configure_session(
                 CFNumber::new_i32(max_qp as i32).as_ref(),
             );
         }
+    }
+
+    Ok(())
+}
+
+/// Sets the session properties that control output rate: the average
+/// bitrate ceiling, the hard data-rate limit derived from it, and the frame
+/// rate VT budgets that bitrate over. Split out of `configure_session` so
+/// `set_rate` can call it again on a live session -- Apple documents these
+/// three as changeable mid-stream via `VTSessionSetProperty`, unlike e.g.
+/// `ProfileLevel`.
+///
+/// # Safety
+///
+/// Caller must ensure `session` is a valid, live `VTCompressionSession`.
+unsafe fn apply_rate(
+    session: &VTCompressionSession,
+    bitrate_kbps: u32,
+    fps: u32,
+) -> Result<(), EncodeError> {
+    let bitrate_bps = bitrate_kbps.saturating_mul(1000);
+    // SAFETY: forwarded from this function's own safety contract; every key
+    // is an extern immutable static of the documented `&'static CFString`
+    // type.
+    unsafe {
+        set_property(
+            session,
+            "AverageBitRate",
+            kVTCompressionPropertyKey_AverageBitRate,
+            CFNumber::new_i32(bitrate_bps as i32).as_ref(),
+        )?;
+
+        let data_rate_limits = CFArray::<CFNumber>::from_objects(&[
+            &CFNumber::new_i32((bitrate_bps / 8) as i32),
+            &CFNumber::new_i32(1),
+        ]);
+        set_property(
+            session,
+            "DataRateLimits",
+            kVTCompressionPropertyKey_DataRateLimits,
+            data_rate_limits.as_ref(),
+        )?;
+
+        set_property(
+            session,
+            "ExpectedFrameRate",
+            kVTCompressionPropertyKey_ExpectedFrameRate,
+            CFNumber::new_i32(fps as i32).as_ref(),
+        )?;
     }
 
     Ok(())
@@ -445,6 +471,12 @@ impl Encoder for VideoToolboxEncoder {
                 "VideoToolbox encode callback reported OSStatus {status}"
             ))),
         }
+    }
+
+    fn set_rate(&mut self, target: RateTarget) -> Result<(), EncodeError> {
+        // SAFETY: `self.session` was successfully created and configured in
+        // `new()` and stays valid until `Drop::drop` invalidates it.
+        unsafe { apply_rate(&self.session, target.bitrate_kbps, target.fps) }
     }
 }
 
@@ -949,5 +981,44 @@ mod tests {
         }
         let encoded = first.expect("expected at least one output within 30 attempts");
         assert!(encoded.keyframe);
+    }
+
+    #[test]
+    fn set_rate_mid_stream_keeps_encoding_without_new_keyframe() {
+        let mut cfg = test_cfg();
+        cfg.width = 64;
+        cfg.height = 64;
+
+        let mut source = SyntheticSource::new(64, 64, 1000);
+        let mut encoder = VideoToolboxEncoder::new(cfg).expect("encoder init");
+
+        for _ in 0..20u32 {
+            let raw = source.next_frame().expect("frame");
+            encoder.encode(&raw, false).expect("encode");
+        }
+
+        encoder
+            .set_rate(RateTarget {
+                bitrate_kbps: 300,
+                fps: 15,
+            })
+            .expect("set_rate");
+
+        let mut outputs = Vec::new();
+        for _ in 0..20u32 {
+            let raw = source.next_frame().expect("frame");
+            if let Some(encoded) = encoder.encode(&raw, false).expect("encode") {
+                outputs.push(encoded);
+            }
+        }
+
+        assert!(
+            !outputs.is_empty(),
+            "expected at least one output after set_rate"
+        );
+        assert!(
+            !outputs[0].keyframe,
+            "set_rate must not force a new keyframe"
+        );
     }
 }

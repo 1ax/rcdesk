@@ -34,6 +34,21 @@ pub trait Encoder: Send {
         frame: &RawFrame,
         force_keyframe: bool,
     ) -> Result<Option<EncodedFrame>, EncodeError>;
+
+    /// Changes bitrate/fps of a running encoder without recreating it (no
+    /// keyframe, no SPS/PPS change). Backends that can't change a field
+    /// ignore it and say so in their doc comment.
+    fn set_rate(&mut self, target: RateTarget) -> Result<(), EncodeError>;
+}
+
+/// Runtime rate target the adaptation controller (slice 2.3) pushes into a
+/// running encoder: bitrate and the frame rate the pipeline will actually
+/// feed it (openh264's rate control budgets each frame as bitrate/fps, so
+/// the fps it is told must match what it gets -- see slice 2.2a in SLICES_LOG).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateTarget {
+    pub bitrate_kbps: u32,
+    pub fps: u32,
 }
 
 /// Which H.264 encoder backend to use.

@@ -2,6 +2,7 @@
 //! `source` feature, on by default) so it compiles the same way on all three
 //! target OSes without needing a system-provided shared library.
 
+use std::ffi::c_int;
 use std::time::Instant;
 
 use ::openh264::encoder::{
@@ -11,10 +12,14 @@ use ::openh264::encoder::{
 use ::openh264::formats::YUVSlices;
 use ::openh264::OpenH264API;
 use ::openh264::Timestamp;
+use openh264_sys2::{
+    SBitrateInfo, ENCODER_OPTION_BITRATE, ENCODER_OPTION_FRAME_RATE, ENCODER_OPTION_MAX_BITRATE,
+    SPATIAL_LAYER_ALL,
+};
 
 use crate::capture::RawFrame;
 
-use super::{to_i420, EncodeError, EncodedFrame, Encoder, EncoderConfig};
+use super::{to_i420, EncodeError, EncodedFrame, Encoder, EncoderConfig, RateTarget};
 
 /// Lower QP bound passed to openh264 alongside `EncoderConfig::max_qp`; see
 /// the comment at the call site for why it can't be 0.
@@ -118,6 +123,69 @@ impl Encoder for OpenH264Encoder {
             ts: Instant::now(),
             captured_at,
         }))
+    }
+
+    /// Changes bitrate and frame rate on the live encoder via openh264's raw
+    /// `SetOption` API (`openh264`'s own `EncoderConfig` builder only applies
+    /// at construction time, so slice 2.3's runtime rate control has to go
+    /// through `openh264_sys2` directly). No keyframe is forced and SPS/PPS
+    /// are untouched -- only the rate-control budget changes.
+    fn set_rate(&mut self, target: RateTarget) -> Result<(), EncodeError> {
+        tracing::debug!(
+            bitrate_kbps = target.bitrate_kbps,
+            fps = target.fps,
+            "openh264 rate target"
+        );
+
+        let bitrate_bps = target.bitrate_kbps.saturating_mul(1000);
+        let mut bitrate_info = SBitrateInfo {
+            iLayer: SPATIAL_LAYER_ALL,
+            iBitrate: bitrate_bps as c_int,
+        };
+        let mut frame_rate = target.fps as f32;
+
+        // SAFETY: `raw_api()` requires a live encoder, which `self.inner` is
+        // for the whole lifetime of this `&mut self` call; each `set_option`
+        // call passes a pointer to a value of the type that
+        // `ENCODER_OPTION`'s documentation (openh264's `codec_api.h`) pairs
+        // with that option -- `SBitrateInfo` for both bitrate options, `f32`
+        // for the frame rate -- and each pointer stays valid (its local
+        // points at a stack value) for the duration of its call.
+        unsafe {
+            let raw = self.inner.raw_api();
+
+            let status = raw.set_option(
+                ENCODER_OPTION_BITRATE,
+                (&mut bitrate_info as *mut SBitrateInfo).cast(),
+            );
+            if status != 0 {
+                return Err(EncodeError::Backend(format!(
+                    "openh264 SetOption(ENCODER_OPTION_BITRATE): {status}"
+                )));
+            }
+
+            let status = raw.set_option(
+                ENCODER_OPTION_MAX_BITRATE,
+                (&mut bitrate_info as *mut SBitrateInfo).cast(),
+            );
+            if status != 0 {
+                return Err(EncodeError::Backend(format!(
+                    "openh264 SetOption(ENCODER_OPTION_MAX_BITRATE): {status}"
+                )));
+            }
+
+            let status = raw.set_option(
+                ENCODER_OPTION_FRAME_RATE,
+                (&mut frame_rate as *mut f32).cast(),
+            );
+            if status != 0 {
+                return Err(EncodeError::Backend(format!(
+                    "openh264 SetOption(ENCODER_OPTION_FRAME_RATE): {status}"
+                )));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -232,6 +300,67 @@ mod tests {
         assert!(
             has_delta,
             "expected at least one non-keyframe (NAL 1) among the next 10 frames"
+        );
+    }
+
+    #[test]
+    fn set_rate_lowers_delta_frame_size() {
+        let mut cfg = test_cfg();
+        cfg.width = 320;
+        cfg.height = 240;
+        cfg.fps = 30;
+        cfg.bitrate_kbps = 4000;
+
+        let mut source = SyntheticSource::new(320, 240, 1000);
+        let mut encoder = OpenH264Encoder::new(cfg).expect("encoder init");
+
+        let mut before = Vec::new();
+        for _ in 0..40u32 {
+            let raw = source.next_frame().expect("frame");
+            let encoded = encoder
+                .encode(&raw, false)
+                .expect("encode")
+                .expect("output for every frame in this run");
+            before.push(encoded);
+        }
+        assert!(before[0].keyframe, "first frame must be a keyframe");
+        let before_avg: f64 = before[10..40]
+            .iter()
+            .map(|f| f.data.len() as f64)
+            .sum::<f64>()
+            / 30.0;
+
+        encoder
+            .set_rate(RateTarget {
+                bitrate_kbps: 200,
+                fps: 30,
+            })
+            .expect("set_rate");
+
+        let mut after = Vec::new();
+        for _ in 0..40u32 {
+            let raw = source.next_frame().expect("frame");
+            let encoded = encoder
+                .encode(&raw, false)
+                .expect("encode")
+                .expect("output for every frame in this run");
+            after.push(encoded);
+        }
+        // set_rate must not recreate the encoder (no new IDR right after the
+        // change).
+        assert!(
+            !nal_types(&after[0].data).contains(&5),
+            "set_rate must not force a new IDR"
+        );
+        let after_avg: f64 = after[10..40]
+            .iter()
+            .map(|f| f.data.len() as f64)
+            .sum::<f64>()
+            / 30.0;
+
+        assert!(
+            after_avg < before_avg,
+            "expected smaller delta frames after lowering bitrate: before={before_avg}, after={after_avg}"
         );
     }
 }

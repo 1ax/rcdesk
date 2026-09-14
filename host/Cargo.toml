@@ -19,6 +19,11 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 openh264 = { workspace = true }
+# Direct dependency for the raw FFI types `openh264` doesn't reexport
+# (ENCODER_OPTION_BITRATE, SBitrateInfo, ...) that encode::openh264::set_rate
+# needs to change bitrate on a live encoder via `Encoder::raw_api`. Same
+# 0.9.8 already pulled in transitively through `openh264`'s own dependency.
+openh264-sys2 = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

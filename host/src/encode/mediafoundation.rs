@@ -47,7 +47,7 @@ use crate::capture::RawFrame;
 use crate::encode::convert::i420_to_nv12;
 use crate::encode::{nal_types, to_i420};
 
-use super::{EncodeError, EncodedFrame, Encoder, EncoderConfig};
+use super::{EncodeError, EncodedFrame, Encoder, EncoderConfig, RateTarget};
 
 pub struct MediaFoundationEncoder {
     transform: IMFTransform,
@@ -80,6 +80,9 @@ pub struct MediaFoundationEncoder {
     /// recovery (see `encode_sync`) can likewise produce an output that
     /// belongs to a previous call.
     pending: VecDeque<EncodedFrame>,
+    /// Set once `set_rate` has warned that this MFT has no `ICodecAPI` (see
+    /// `configure_codec_api`), so repeated calls don't spam the log.
+    rate_warned: bool,
 }
 
 // SAFETY: like `VideoToolboxEncoder`/`OpenH264Encoder`, `MediaFoundationEncoder`
@@ -226,6 +229,7 @@ impl MediaFoundationEncoder {
             output_buffer_size,
             credits: 0,
             pending: VecDeque::new(),
+            rate_warned: false,
         };
 
         if is_async {
@@ -580,6 +584,41 @@ impl Encoder for MediaFoundationEncoder {
         } else {
             self.encode_sync(sample)
         }
+    }
+
+    /// Changes bitrate only: fps is part of the MFT's negotiated media type
+    /// (`MF_MT_FRAME_RATE`, set once in `set_input_type`/`set_output_type`),
+    /// and Media Foundation has no supported way to change a media type
+    /// attribute on a streaming MFT without a full re-negotiation (tearing
+    /// down and rebuilding the transform) -- out of scope for a same-encoder
+    /// rate change, so `target.fps` is ignored here.
+    fn set_rate(&mut self, target: RateTarget) -> Result<(), EncodeError> {
+        let Some(codec_api) = &self.codec_api else {
+            if !self.rate_warned {
+                tracing::warn!(
+                    "MediaFoundation encoder has no ICodecAPI, cannot change bitrate at runtime"
+                );
+                self.rate_warned = true;
+            }
+            return Ok(());
+        };
+
+        let bitrate_bps = target.bitrate_kbps.saturating_mul(1000);
+        // SAFETY: `codec_api` is a live `ICodecAPI` obtained at construction
+        // time; `CODECAPI_AVEncCommonMeanBitRate` is an extern immutable
+        // static of the documented `GUID` type; `variant_u32` builds a live
+        // `VARIANT` kept alive through the call.
+        unsafe {
+            codec_api
+                .SetValue(&CODECAPI_AVEncCommonMeanBitRate, &variant_u32(bitrate_bps))
+                .map_err(|err| {
+                    EncodeError::Backend(format!(
+                        "MediaFoundation CODECAPI_AVEncCommonMeanBitRate (set_rate): {err}"
+                    ))
+                })?;
+        }
+
+        Ok(())
     }
 }
 
@@ -1161,5 +1200,28 @@ mod tests {
         }
         let encoded = first.expect("expected at least one output within 30 attempts");
         assert!(encoded.keyframe);
+    }
+
+    #[test]
+    fn set_rate_mid_stream_keeps_encoding() {
+        let mut source = SyntheticSource::new(64, 64, 1000);
+        let mut encoder = MediaFoundationEncoder::new(test_cfg(), true).expect("encoder init");
+
+        for _ in 0..20u32 {
+            let raw = source.next_frame().expect("frame");
+            encoder.encode(&raw, false).expect("encode");
+        }
+
+        encoder
+            .set_rate(RateTarget {
+                bitrate_kbps: 300,
+                fps: 30,
+            })
+            .expect("set_rate");
+
+        for _ in 0..20u32 {
+            let raw = source.next_frame().expect("frame");
+            encoder.encode(&raw, false).expect("encode");
+        }
     }
 }
