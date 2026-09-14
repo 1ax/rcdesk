@@ -66,3 +66,49 @@ curl -s http://127.0.0.1:8100/healthz   # ok
 `msg.ice_servers` из сигналинга) и подставить `urls`/`username`/`credential`
 в https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/ --
 относительно TURN-сервера должны появиться `relay`-кандидаты.
+
+## Монитор трафика
+
+`traffic-monitor.sh` считает исходящий трафик VPS за месяц и уведомляет в
+Telegram при пересечении порогов бюджета (ARCHITECTURE.md §11, D22):
+
+- **TURN-релей** -- сумма метрик `turn_total_traffic_sentb` +
+  `turn_total_traffic_peer_sentb` из Prometheus-эндпойнта coturn
+  (`127.0.0.1:9641/metrics`, включается `--prometheus` в
+  `docker-compose.prod.yml`).
+- **Исходящий VPS целиком** -- `tx_bytes` внешнего интерфейса (`ens3`,
+  `/sys/class/net/ens3/statistics/tx_bytes`).
+
+Состояние -- помесячный накопитель `~/app/traffic/<YYYY-MM>.state`
+(счётчики coturn/интерфейса сбрасываются при рестарте, скрипт хранит
+последнее снятое значение и накопленную сумму). Пороги: 50/80/100 % от
+`TRAFFIC_RELAY_BUDGET` (5 ТБ по умолчанию) для релея и 90 % от
+`TRAFFIC_IFACE_BUDGET` (10 ТБ) для интерфейса; уведомление на порог уходит
+один раз (метка пишется в state только при успешной отправке).
+
+Деплой (`.github/workflows/deploy.yml`) копирует скрипт в `~/app/` и делает
+его исполняемым при каждом деплое. Crontab деплой не трогает -- ставится
+один раз вручную под пользователем `rcdesk`:
+
+```bash
+mkdir -p ~/app/traffic
+crontab -e
+# добавить строку:
+*/10 * * * * $HOME/app/traffic-monitor.sh >> $HOME/app/traffic/monitor.log 2>&1
+```
+
+Ручная проверка:
+
+```bash
+bash ~/app/traffic-monitor.sh
+cat ~/app/traffic/$(date -u +%Y-%m).state
+```
+
+Проверка отправки в Telegram -- на копии state во временном каталоге (в
+пустом каталоге первый запуск лишь фиксирует счётчики, итог равен нулю и
+порог не сработает; на боевом state метка `relay50` осталась бы навсегда):
+
+```bash
+mkdir -p /tmp/t && cp ~/app/traffic/$(date -u +%Y-%m).state /tmp/t/
+TRAFFIC_DIR=/tmp/t TRAFFIC_RELAY_BUDGET=1 bash ~/app/traffic-monitor.sh
+```

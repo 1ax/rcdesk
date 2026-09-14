@@ -123,10 +123,11 @@ jobs:
           SSHOPTS="-i $HOME/.ssh/deploy_key -p $SSH_PORT -o StrictHostKeyChecking=accept-new"
           ssh $SSHOPTS "$SSH_USER@$SSH_HOST" 'mkdir -p ~/app'
           scp -i "$HOME/.ssh/deploy_key" -P "$SSH_PORT" -o StrictHostKeyChecking=accept-new \
-            infra/docker-compose.prod.yml "$SSH_USER@$SSH_HOST:~/app/"
+            infra/docker-compose.prod.yml infra/traffic-monitor.sh "$SSH_USER@$SSH_HOST:~/app/"
           scp -i "$HOME/.ssh/deploy_key" -P "$SSH_PORT" -o StrictHostKeyChecking=accept-new -r \
             dist/. "$SSH_USER@$SSH_HOST:~/www/rcdesk.app/"
           ssh $SSHOPTS "$SSH_USER@$SSH_HOST" 'set -e
+            chmod +x ~/app/traffic-monitor.sh
             cd ~/app
             C="docker compose -f docker-compose.prod.yml"
             $C pull

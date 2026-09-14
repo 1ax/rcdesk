@@ -60,3 +60,12 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: npm run build
+
+  infra-shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck infra/*.sh
+        run: shellcheck infra/*.sh
+      - name: bash infra/traffic-monitor.test.sh
+        run: bash infra/traffic-monitor.test.sh

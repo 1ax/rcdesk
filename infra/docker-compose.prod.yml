@@ -43,3 +43,7 @@ services:
       - "--fingerprint"
       - "--log-file=stdout"
       - "--no-multicast-peers"
+      # Метрики только на localhost (host-сеть), порт 9641 по умолчанию --
+      # читает infra/traffic-monitor.sh (ARCHITECTURE.md §11).
+      - "--prometheus"
+      - "--prometheus-address=127.0.0.1"
