@@ -15,7 +15,9 @@ import { summarizeStats, takeSnapshot } from "./stats";
 import type { Snapshot, StatsSummary } from "./stats";
 import { attachInput } from "./input";
 import { applyCursor } from "./cursor";
+import { displayOptions, parseDisplayId, shouldShowPicker } from "./displays";
 import type { ControlMessage } from "./generated/ControlMessage";
+import type { DisplayEntry } from "./generated/DisplayEntry";
 
 type SessionStatus = "connecting" | "connected" | "disconnected" | "error";
 
@@ -89,6 +91,7 @@ export function mount(root: Element | null): void {
       <video id="video" autoplay playsinline muted></video>
       <div class="overlay" id="stats-overlay"></div>
       <div class="controls">
+        <select id="display-select" class="display-select" hidden></select>
         <span id="session-status" class="status"></span>
         <button id="disconnect-btn" class="btn btn-secondary">Disconnect</button>
       </div>
@@ -109,6 +112,7 @@ export function mount(root: Element | null): void {
   const overlay = root.querySelector<HTMLDivElement>("#stats-overlay")!;
   const sessionStatus = root.querySelector<HTMLSpanElement>("#session-status")!;
   const disconnectBtn = root.querySelector<HTMLButtonElement>("#disconnect-btn")!;
+  const displaySelect = root.querySelector<HTMLSelectElement>("#display-select")!;
 
   let signaling: SignalingClient | null = null;
   let session: PeerSession | null = null;
@@ -128,6 +132,32 @@ export function mount(root: Element | null): void {
   // first `quality` message arrives (slice 2.3 -- `--no-adapt` sessions
   // never send one, so the overlay simply never grows this segment).
   let quality: Quality | undefined;
+  // The host's display list and the id of the one currently streamed (slice
+  // 2.4d), from `ControlMessage::Displays` -- drives `renderDisplayPicker`.
+  // `currentDisplay` is `undefined` until the first `displays` message.
+  let displays: DisplayEntry[] = [];
+  let currentDisplay: number | undefined;
+  // The `control` data channel, kept around so the picker's `change`
+  // handler can send `ControlMessage::SelectDisplay` on it directly.
+  let controlChannel: RTCDataChannel | null = null;
+
+  /** Rebuilds `#display-select`'s options from `displays`/`currentDisplay`
+   * and shows/hides it (only worth showing with 2+ displays, see
+   * `shouldShowPicker`). Re-enables the select, since a fresh `displays`
+   * message means any pending switch has resolved (see the `change`
+   * listener below, which disables it while a switch is in flight). */
+  function renderDisplayPicker(): void {
+    displaySelect.innerHTML = "";
+    for (const option of displayOptions(displays, currentDisplay ?? -1)) {
+      const el = document.createElement("option");
+      el.value = option.value;
+      el.textContent = option.label;
+      el.selected = option.selected;
+      displaySelect.appendChild(el);
+    }
+    displaySelect.hidden = !shouldShowPicker(displays);
+    displaySelect.disabled = false;
+  }
 
   // `input` and `pointer` arrive via `onDataChannel` in whatever order the
   // host happened to open them in, independent of the connection state
@@ -158,6 +188,7 @@ export function mount(root: Element | null): void {
   }
 
   function setupControlChannel(dc: RTCDataChannel): void {
+    controlChannel = dc;
     if (dc.readyState === "open") startPingLoop(dc);
     else dc.addEventListener("open", () => startPingLoop(dc));
     dc.addEventListener("message", (event: MessageEvent<unknown>) => {
@@ -175,6 +206,12 @@ export function mount(root: Element | null): void {
       }
       if (msg.type === "quality") {
         quality = { bitrateKbps: msg.bitrate_kbps, fps: msg.fps, reason: msg.reason };
+        return;
+      }
+      if (msg.type === "displays") {
+        displays = msg.displays;
+        currentDisplay = msg.current;
+        renderDisplayPicker();
         return;
       }
       applyCursor(video, msg);
@@ -231,6 +268,11 @@ export function mount(root: Element | null): void {
     pointerChannel = null;
     appRttMs = undefined;
     quality = undefined;
+    displays = [];
+    currentDisplay = undefined;
+    controlChannel = null;
+    displaySelect.hidden = true;
+    displaySelect.innerHTML = "";
     session?.close();
     session = null;
     signaling?.close();
@@ -344,6 +386,21 @@ export function mount(root: Element | null): void {
       signaling.send({ type: "bye", session_id: sessionId });
     }
     teardown("Disconnected");
+  });
+
+  displaySelect.addEventListener("change", () => {
+    const id = parseDisplayId(displaySelect.value);
+    if (id !== null && controlChannel?.readyState === "open") {
+      const msg: ControlMessage = { type: "select_display", id };
+      controlChannel.send(JSON.stringify(msg));
+      displaySelect.disabled = true;
+    } else if (currentDisplay !== undefined) {
+      displaySelect.value = String(currentDisplay);
+    }
+    // Give focus back to the video so keyboard input keeps going to the
+    // session (see the `click` listener above, which does the same after a
+    // user gesture on the video itself).
+    video.focus();
   });
 
   showPinScreen();
