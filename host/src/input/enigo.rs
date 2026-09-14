@@ -13,9 +13,18 @@
 //! incomplete virtual-key table and doesn't accept that prefix (see
 //! `docs/host-libs-api-notes.md`). `crate::platform::windows::keyboard`
 //! sends the scancode as-is via `SendInput` instead.
+//!
+//! On Windows, absolute pointer moves bypass `enigo::Mouse::move_mouse` too:
+//! it normalizes against `main_display()` (`GetSystemMetrics(SM_CXSCREEN)`),
+//! the *primary* monitor only, without `MOUSEEVENTF_VIRTUALDESK` -- unusable
+//! once the captured display isn't the primary one.
+//! `crate::platform::windows::mouse` sends `SendInput` itself instead.
 
-use ::enigo::{Axis, Button, Coordinate, Direction, Enigo, Mouse, Settings};
-// `Keyboard` (`raw()`) is only used by the non-Windows `key()` below.
+use ::enigo::{Axis, Button, Direction, Enigo, Mouse, Settings};
+// `Keyboard` (`raw()`) and `Coordinate` (`move_mouse`) are only used by the
+// non-Windows implementations below.
+#[cfg(not(target_os = "windows"))]
+use ::enigo::Coordinate;
 #[cfg(not(target_os = "windows"))]
 use ::enigo::Keyboard;
 
@@ -59,6 +68,14 @@ fn direction(pressed: bool) -> Direction {
 }
 
 impl Injector for EnigoInjector {
+    #[cfg(target_os = "windows")]
+    fn pointer_move(&mut self, x: i32, y: i32) {
+        if let Err(err) = crate::platform::windows::mouse::move_to(x, y) {
+            tracing::warn!(?err, x, y, "failed to move pointer");
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
     fn pointer_move(&mut self, x: i32, y: i32) {
         if let Err(err) = self.enigo.move_mouse(x, y, Coordinate::Abs) {
             tracing::warn!(?err, x, y, "failed to move pointer");

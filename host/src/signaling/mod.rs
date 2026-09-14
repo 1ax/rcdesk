@@ -704,6 +704,9 @@ async fn switch_display(ctx: &HostContext, active: &mut ActiveSession, id: u32) 
             let from = active.video.display.id;
             let old = std::mem::replace(&mut active.video, new);
             old.stop();
+            active
+                .router
+                .set_capture_rect(crate::input::CaptureRect::from(&active.video.display));
             active.displays = list;
             tracing::info!(from, to = active.video.display.id, "switched display");
             let msg = displays_message(&active.displays, active.video.display.id);
@@ -774,6 +777,7 @@ async fn start_session(
 
     let injector = (ctx.build_injector)()?;
     let router = InputRouter::new(injector);
+    router.set_capture_rect(crate::input::CaptureRect::from(&video.display));
 
     // The watcher's background thread is polled by this task, not directly
     // by `ActiveSession` -- see `ActiveSession::cursor_task`'s doc comment

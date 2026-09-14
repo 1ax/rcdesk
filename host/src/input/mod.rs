@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use proto::input::{InputMessage, PointerButton};
@@ -95,19 +96,54 @@ fn scale_and_clamp(value: f64, size: i32) -> i32 {
     scaled.clamp(0, size - 1)
 }
 
+/// The rectangle, in the same global coordinate units `Injector::pointer_move`
+/// expects, of the display currently being captured/streamed. Normalized
+/// `[0,1]` pointer coordinates from the client are scaled against this rect
+/// (not the whole screen) so a click lands on the right monitor when the
+/// captured display isn't the primary one -- see `to_pixel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl From<&crate::capture::DisplayInfo> for CaptureRect {
+    fn from(display: &crate::capture::DisplayInfo) -> Self {
+        CaptureRect {
+            x: display.x,
+            y: display.y,
+            width: display.width as i32,
+            height: display.height as i32,
+        }
+    }
+}
+
+/// Scales a normalized `[0,1]` point to an absolute pixel position within
+/// `rect`, by offsetting `scale_and_clamp`'s result by the rect's origin.
+fn to_pixel(x: f64, y: f64, rect: CaptureRect) -> (i32, i32) {
+    (
+        rect.x + scale_and_clamp(x, rect.width),
+        rect.y + scale_and_clamp(y, rect.height),
+    )
+}
+
 /// Applies one `InputMessage` to `injector`, keeping `pressed_keys` and
 /// `pressed_buttons` in sync so `release_all` can undo exactly what's
-/// currently held.
+/// currently held. `rect` is the currently captured display's rectangle (see
+/// `CaptureRect`), used to place normalized pointer coordinates.
 fn apply(
     msg: &InputMessage,
     injector: &mut dyn Injector,
     pressed_keys: &mut HashSet<u16>,
     pressed_buttons: &mut HashSet<PointerButton>,
+    rect: CaptureRect,
 ) {
     match msg {
         InputMessage::PointerMove { x, y } => {
-            let (w, h) = injector.screen_size();
-            injector.pointer_move(scale_and_clamp(*x, w), scale_and_clamp(*y, h));
+            let (px, py) = to_pixel(*x, *y, rect);
+            injector.pointer_move(px, py);
         }
         InputMessage::PointerButton {
             button,
@@ -118,8 +154,8 @@ fn apply(
             // Move first: `pointer` and `input` are independent, unordered
             // channels, so the last `PointerMove` the host applied may be
             // stale relative to this click's position.
-            let (w, h) = injector.screen_size();
-            injector.pointer_move(scale_and_clamp(*x, w), scale_and_clamp(*y, h));
+            let (px, py) = to_pixel(*x, *y, rect);
+            injector.pointer_move(px, py);
             injector.button(*button, *pressed);
             if *pressed {
                 pressed_buttons.insert(*button);
@@ -128,8 +164,8 @@ fn apply(
             }
         }
         InputMessage::Wheel { dx, dy, x, y } => {
-            let (w, h) = injector.screen_size();
-            injector.pointer_move(scale_and_clamp(*x, w), scale_and_clamp(*y, h));
+            let (px, py) = to_pixel(*x, *y, rect);
+            injector.pointer_move(px, py);
             injector.wheel(dx.round() as i32, dy.round() as i32);
         }
         InputMessage::Key { code, pressed } => match keymap::to_keycode(code) {
@@ -208,16 +244,41 @@ pub struct InputRouter {
     // duration of a single `send` call -- see `crate::signaling`).
     sender: Option<std_mpsc::Sender<InputMessage>>,
     thread: Option<thread::JoinHandle<()>>,
+    /// The currently captured display's rectangle, read fresh by
+    /// `router_loop` on every message. Shared (rather than passed once at
+    /// construction) so `set_capture_rect` can update it live when
+    /// `crate::signaling::switch_display` changes which display is streamed,
+    /// without restarting the router/injector thread.
+    capture_rect: Arc<Mutex<CaptureRect>>,
 }
 
 impl InputRouter {
     pub fn new(injector: Box<dyn Injector>) -> InputRouter {
+        let (w, h) = injector.screen_size();
+        let capture_rect = Arc::new(Mutex::new(CaptureRect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        }));
         let (tx, rx) = std_mpsc::channel::<InputMessage>();
-        let thread = thread::spawn(move || router_loop(injector, rx));
+        let thread_rect = Arc::clone(&capture_rect);
+        let thread = thread::spawn(move || router_loop(injector, rx, thread_rect));
         InputRouter {
             sender: Some(tx),
             thread: Some(thread),
+            capture_rect,
         }
+    }
+
+    /// Updates the rect normalized pointer coordinates are scaled against
+    /// (see `CaptureRect`), taking effect for every message the router
+    /// applies from this point on.
+    pub fn set_capture_rect(&self, rect: CaptureRect) {
+        *self
+            .capture_rect
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = rect;
     }
 
     /// A sender for feeding messages to the router's worker thread. Cheap to
@@ -244,7 +305,11 @@ impl Drop for InputRouter {
     }
 }
 
-fn router_loop(mut injector: Box<dyn Injector>, rx: std_mpsc::Receiver<InputMessage>) {
+fn router_loop(
+    mut injector: Box<dyn Injector>,
+    rx: std_mpsc::Receiver<InputMessage>,
+    capture_rect: Arc<Mutex<CaptureRect>>,
+) {
     let mut pressed_keys: HashSet<u16> = HashSet::new();
     let mut pressed_buttons: HashSet<PointerButton> = HashSet::new();
     let mut pending: Option<InputMessage> = None;
@@ -258,11 +323,17 @@ fn router_loop(mut injector: Box<dyn Injector>, rx: std_mpsc::Receiver<InputMess
             },
         };
         let msg = coalesce_pointer_move(msg, &rx, &mut pending);
+        // Locked synchronously and released immediately: cheap, and this
+        // thread never awaits anything (see the module doc comment).
+        let rect = *capture_rect
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         apply(
             &msg,
             injector.as_mut(),
             &mut pressed_keys,
             &mut pressed_buttons,
+            rect,
         );
     }
 
@@ -373,6 +444,51 @@ mod tests {
 
         wait_for_calls(&calls, 1);
         assert_eq!(calls.lock().unwrap()[0], Call::PointerMove(999, 0));
+    }
+
+    #[test]
+    fn pointer_move_uses_capture_rect_offset_and_size() {
+        let (injector, calls, _gate) = FakeInjector::new((1000, 500));
+        let router = InputRouter::new(Box::new(injector));
+        router.set_capture_rect(CaptureRect {
+            x: 1920,
+            y: -100,
+            width: 1000,
+            height: 500,
+        });
+        router
+            .sender()
+            .send(InputMessage::PointerMove { x: 0.5, y: 0.5 })
+            .unwrap();
+
+        wait_for_calls(&calls, 1);
+        assert_eq!(calls.lock().unwrap()[0], Call::PointerMove(2420, 150));
+    }
+
+    #[test]
+    fn pointer_button_uses_capture_rect() {
+        let (injector, calls, _gate) = FakeInjector::new((1000, 500));
+        let router = InputRouter::new(Box::new(injector));
+        router.set_capture_rect(CaptureRect {
+            x: 1920,
+            y: -100,
+            width: 1000,
+            height: 500,
+        });
+        router
+            .sender()
+            .send(InputMessage::PointerButton {
+                button: PointerButton::Left,
+                pressed: true,
+                x: 1.0,
+                y: 0.0,
+            })
+            .unwrap();
+
+        wait_for_calls(&calls, 2);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls[0], Call::PointerMove(2919, -100));
+        assert_eq!(calls[1], Call::Button(PointerButton::Left, true));
     }
 
     #[test]
