@@ -740,18 +740,39 @@ fn spawn_data_channel_reader(
 /// `last_sender_report == 0`) or the result is implausible (more than 10s,
 /// which for a report sent roughly once a second means a clock jump or a
 /// wraparound rather than a real RTT).
+///
+/// A *slightly* negative result (down to `-RTT_SKEW_TOLERANCE`) is reported
+/// as zero rather than rejected: `now` comes from `SystemTime`, while the
+/// SR's NTP stamp comes from `rtc`'s `SystemInstant` (a `SystemTime`/
+/// `Instant` pair captured once per stream, then advanced by `Instant`), and
+/// the two drift apart by fractions of a millisecond as the wall clock is
+/// disciplined. On a real network the RTT dwarfs that; in the in-process
+/// loopback test (true RTT ~0.1 ms) it made the RTT come out as garbage on
+/// roughly one run in eight.
 fn rtt_from_report(now_ntp_mid32: u32, last_sender_report: u32, delay: u32) -> Option<Duration> {
     if last_sender_report == 0 {
         return None;
     }
+    // Interpreted as signed: a `now` slightly *before* `LSR + DLSR` (see the
+    // doc comment) shows up as a small negative number rather than a huge
+    // unsigned one.
     let diff = now_ntp_mid32
         .wrapping_sub(last_sender_report)
-        .wrapping_sub(delay);
-    if diff > 65536 * 10 {
+        .wrapping_sub(delay) as i32;
+    if !(-RTT_SKEW_TOLERANCE..=RTT_MAX_PLAUSIBLE).contains(&diff) {
         return None;
     }
-    Some(Duration::from_secs_f64(f64::from(diff) / 65536.0))
+    Some(Duration::from_secs_f64(f64::from(diff.max(0)) / 65536.0))
 }
+
+/// Largest negative `now - LSR - DLSR` (in 1/65536 s; 100 ms) still
+/// attributed to clock skew between `SystemTime` and the SR's NTP stamp
+/// rather than to a bogus report -- see `rtt_from_report`.
+const RTT_SKEW_TOLERANCE: i32 = 65536 / 10;
+
+/// Largest `now - LSR - DLSR` (in 1/65536 s; 10 s) still taken as a real
+/// round trip -- see `rtt_from_report`.
+const RTT_MAX_PLAUSIBLE: i32 = 65536 * 10;
 
 /// The middle 32 bits of the current 64-bit NTP timestamp (seconds since
 /// 1900-01-01 plus a binary fraction of a second, RFC 3550 §4), as used by
@@ -794,6 +815,19 @@ mod tests {
         // wrapping subtraction produces a huge value, well past the 10s
         // sanity bound.
         assert_eq!(rtt_from_report(0, 1_000_000, 0), None);
+    }
+
+    #[test]
+    fn rtt_from_report_treats_small_negative_skew_as_zero() {
+        // `now` 5 ms (328 units) before LSR + DLSR: clock skew, not a bogus
+        // report -- RTT 0.
+        let lsr: u32 = 0x1234_5678;
+        let delay: u32 = 655;
+        let now = lsr.wrapping_add(delay).wrapping_sub(328);
+        assert_eq!(rtt_from_report(now, lsr, delay), Some(Duration::ZERO));
+        // 200 ms before: beyond the tolerance -- None.
+        let now = lsr.wrapping_add(delay).wrapping_sub(13_107);
+        assert_eq!(rtt_from_report(now, lsr, delay), None);
     }
 
     #[test]

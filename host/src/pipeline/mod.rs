@@ -29,6 +29,47 @@ const SLOT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 /// small enough not to matter for the rate the encoder sees.
 const PACER_BURST: f64 = 3.0;
 
+/// Token-bucket fps pacer for the encode thread: tokens accrue at the
+/// target fps along the *capture* clock (`RawFrame::ts`), one token per
+/// encoded frame, capped at `PACER_BURST`. The cap is what lets a source
+/// that stalled and then caught up in a burst (the synthetic source on a
+/// loaded CI VM, see slice 2.1d; a real capture after a hiccup) still
+/// deliver the frames it "owes" instead of losing them, while steady-state
+/// throughput stays capped at the target fps. Starts full so the first
+/// frames go straight through. Pure (time is the frame's own timestamp), so
+/// it is unit-tested with synthetic instants rather than by racing real
+/// threads against the wall clock.
+struct Pacer {
+    tokens: f64,
+    last_ts: Option<Instant>,
+}
+
+impl Pacer {
+    fn new() -> Self {
+        Self {
+            tokens: PACER_BURST,
+            last_ts: None,
+        }
+    }
+
+    /// Whether a frame captured at `ts` should be encoded at `fps`: tops
+    /// the bucket up by the capture-clock time since the previous frame,
+    /// then spends one token if there is one.
+    fn admit(&mut self, ts: Instant, fps: u32) -> bool {
+        let fps = fps.max(1);
+        if let Some(last) = self.last_ts {
+            let elapsed = ts.saturating_duration_since(last).as_secs_f64();
+            self.tokens = (self.tokens + elapsed * f64::from(fps)).min(PACER_BURST);
+        }
+        self.last_ts = Some(ts);
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct PipelineStats {
     pub captured: AtomicU64,
@@ -156,19 +197,7 @@ impl Pipeline {
             let request_keyframe = Arc::clone(&request_keyframe);
             let rate_control = Arc::clone(&rate_control);
             std::thread::spawn(move || {
-                // Token bucket for the fps pacer: tokens accrue at the
-                // target fps along the *capture* clock (`RawFrame::ts`), one
-                // token per encoded frame, capped at `PACER_BURST`. The cap
-                // is what lets a source that stalled and then caught up in a
-                // burst (the synthetic source on a loaded CI VM, see slice
-                // 2.1d; a real capture after a hiccup) still deliver the
-                // frames it "owes" instead of losing them -- a plain
-                // next-due deadline threw those away and starved a 30 fps
-                // test down to 15 frames/s on `macos-latest`. Steady-state
-                // throughput is still capped at the target fps. Starts full
-                // so the first frames go straight through.
-                let mut tokens: f64 = PACER_BURST;
-                let mut last_captured_at: Option<Instant> = None;
+                let mut pacer = Pacer::new();
 
                 loop {
                     if stop.load(Ordering::Relaxed) {
@@ -213,20 +242,11 @@ impl Pipeline {
                         }
                     }
 
-                    // (b) Pace to the target fps (see `tokens` above): top
-                    // the bucket up by the capture-clock time elapsed since
-                    // the previous frame, then spend one token or skip.
-                    let fps = rate_control.fps().max(1);
-                    if let Some(last) = last_captured_at {
-                        let elapsed = captured_at.saturating_duration_since(last).as_secs_f64();
-                        tokens = (tokens + elapsed * f64::from(fps)).min(PACER_BURST);
-                    }
-                    last_captured_at = Some(captured_at);
-                    if tokens < 1.0 {
+                    // (b) Pace to the target fps (see `Pacer`).
+                    if !pacer.admit(captured_at, rate_control.fps()) {
                         stats.paced_out.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    tokens -= 1.0;
 
                     // Never encode a frame nobody can take: dropping an
                     // already encoded P-frame would break the decoder's
@@ -332,6 +352,98 @@ mod tests {
     use std::time::Instant;
     use tokio::sync::mpsc::error::TryRecvError;
 
+    /// The three pipeline tests below each spin up a capture thread and an
+    /// encoder; run concurrently on a small CI VM (`macos-latest`, 3 vCPU)
+    /// they starve each other and the wall-clock frame counts they assert
+    /// on come out short (15 frames/s from a 30 fps source, a 60 fps source
+    /// managing 25). Serialize them; the pacer's own logic is covered by the
+    /// deterministic `pacer_*` tests, which don't need this.
+    static PIPELINE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serialized() -> std::sync::MutexGuard<'static, ()> {
+        PIPELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn at(base: Instant, ms: u64) -> Instant {
+        base + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn pacer_passes_a_steady_source_at_target_fps() {
+        let base = Instant::now();
+        let mut pacer = Pacer::new();
+        // 30 fps source with ±3 ms capture jitter, target 30: every frame
+        // must pass -- the bucket absorbs the jitter.
+        let jitter = [0i64, 3, -2, 1, -3, 2, 0, -1, 3, -2];
+        let mut admitted = 0;
+        for i in 0..60u64 {
+            let ts = base
+                + Duration::from_micros(
+                    (i as i64 * 33_333 + jitter[i as usize % jitter.len()] * 1000) as u64,
+                );
+            if pacer.admit(ts, 30) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 60);
+    }
+
+    #[test]
+    fn pacer_caps_a_fast_source_at_target_fps() {
+        let base = Instant::now();
+        let mut pacer = Pacer::new();
+        // 60 fps source, target 10, over 2 s: 20 frames' worth of tokens
+        // plus the initial burst of 3.
+        let admitted = (0..120u64)
+            .filter(|&i| pacer.admit(at(base, i * 1000 / 60), 10))
+            .count();
+        // ±1 for the integer-millisecond timestamps (the last frame lands
+        // at 1983 ms, not 2000).
+        let expected = 20 + PACER_BURST as usize;
+        assert!(
+            (expected - 1..=expected).contains(&admitted),
+            "expected ~{expected} admitted frames, got {admitted}"
+        );
+    }
+
+    #[test]
+    fn pacer_lets_a_catch_up_burst_through_after_a_stall() {
+        let base = Instant::now();
+        let mut pacer = Pacer::new();
+        // Drain the initial burst with a steady 30 fps run.
+        for i in 0..30u64 {
+            assert!(pacer.admit(at(base, i * 1000 / 30), 30));
+        }
+        // 200 ms stall, then three frames 1 ms apart (a source catching up
+        // on its schedule): all three pass on the tokens accrued during the
+        // stall; the fourth, 1 ms later, doesn't.
+        let stall_end = at(base, 1000 + 200);
+        assert!(pacer.admit(stall_end, 30));
+        assert!(pacer.admit(stall_end + Duration::from_millis(1), 30));
+        assert!(pacer.admit(stall_end + Duration::from_millis(2), 30));
+        assert!(!pacer.admit(stall_end + Duration::from_millis(3), 30));
+    }
+
+    #[test]
+    fn pacer_follows_fps_changes_immediately() {
+        let base = Instant::now();
+        let mut pacer = Pacer::new();
+        for i in 0..30u64 {
+            assert!(pacer.admit(at(base, i * 1000 / 30), 30));
+        }
+        // Same 30 fps source, target dropped to 15: half the frames pass
+        // (+1 for the fraction of a token left over from the 30 fps run).
+        let admitted = (30..90u64)
+            .filter(|&i| pacer.admit(at(base, i * 1000 / 30), 15))
+            .count();
+        assert!(
+            (30..=31).contains(&admitted),
+            "expected ~30 of 60 frames admitted at 15 fps, got {admitted}"
+        );
+    }
+
     fn drain_for(handle: &mut PipelineHandle, duration: Duration) -> Vec<EncodedFrame> {
         let deadline = Instant::now() + duration;
         let mut out = Vec::new();
@@ -347,6 +459,7 @@ mod tests {
 
     #[test]
     fn synthetic_pipeline_produces_frames_and_honours_keyframe_requests() {
+        let _guard = serialized();
         let source: Box<dyn FrameSource> = Box::new(SyntheticSource::new(64, 64, 30));
         let cfg = EncoderConfig {
             width: 64,
@@ -391,6 +504,7 @@ mod tests {
 
     #[test]
     fn pacing_caps_encoded_fps() {
+        let _guard = serialized();
         let source: Box<dyn FrameSource> = Box::new(SyntheticSource::new(64, 64, 60));
         let cfg = EncoderConfig {
             width: 64,
@@ -414,21 +528,30 @@ mod tests {
 
         let received = drain_for(&mut handle, Duration::from_secs(2));
         let paced_out = handle.stats.paced_out.load(Ordering::Relaxed);
+        let captured = handle.stats.captured.load(Ordering::Relaxed);
         handle.stop();
 
+        // Wall-clock bounds only in the direction a slow machine can't
+        // break: at most 10 fps * ~2 s plus the pacer's burst (the exact
+        // rate is covered by `pacer_caps_a_fast_source_at_target_fps`), and
+        // the pacer must have skipped something, however few frames the
+        // 60 fps source actually managed.
         assert!(
-            (15..=26).contains(&received.len()),
-            "expected roughly 10fps over 2s (15..=26 frames), got {}",
+            received.len() <= 26,
+            "expected at most ~10 fps over 2 s, got {} frames",
             received.len()
         );
         assert!(
-            paced_out > 40,
-            "expected the 60fps source to be paced down heavily, got paced_out={paced_out}"
+            paced_out >= 1,
+            "expected the pacer to skip frames of a 60fps source \
+             (captured={captured}, encoded={}), got paced_out=0",
+            received.len()
         );
     }
 
     #[test]
     fn rate_control_applies_pending_target() {
+        let _guard = serialized();
         let source: Box<dyn FrameSource> = Box::new(SyntheticSource::new(64, 64, 30));
         let cfg = EncoderConfig {
             width: 64,
