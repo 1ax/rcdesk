@@ -24,7 +24,8 @@
   GCC (REMB пропадёт). Смена разрешения — долг D20.
 - ⏳ **Стенд владельца — не проверен.** Что смотреть: под видео на стенде (openh264 или MFT) должны
   появиться строки `adapt: new rate target … reason="encoder"` и/или `"remb"`, jb в оверлее не должен
-  расти до 80 мс, как в 2.2f; для сравнения «до» — `serve --no-adapt`. Push `main` + Deploy — за владельцем.
+  расти до 80 мс, как в 2.2f; для сравнения «до» — `serve --no-adapt`. `main` запушен, Deploy `34820127376`
+  зелёный (артефакт `rcdesk-host-windows-x64` для стенда — из него).
 - Локально проверено (Mac, синтетика 720p, Chrome 153): `--bitrate 300` → решение `bitrate`, fps 15,
   оверлей `target 0.3 Mbit/s @ 15 fps (bitrate)`; дефолт 6000 → 0 решений за 16 с при REMB 0.79–1.36 Мбит/с
   (поток 0.8), 116 RR. Реальный захват release-бинарником не проверен: у `target/release/rcdesk-host` нет
@@ -414,3 +415,4 @@
 - Гейты на закрытии (Mac): host lib **57 passed; 1 ignored**, loopback 1, proto 17, server 8 + 7,
   web `Tests 39 passed (39)`, build ✓. Первый Deploy `34819646587`: web/ubuntu/windows зелёные (на
   `windows-latest` собрался и прошёл MF `set_rate`), macOS красный из-за пейсера — см. фикс выше.
+  Второй Deploy `34820127376` (`5554685`) — все три ОС, build-host и deploy зелёные; прод обновлён.
