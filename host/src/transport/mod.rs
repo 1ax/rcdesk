@@ -514,8 +514,11 @@ impl PeerSession {
     /// any more) is not an error -- there is nobody to receive the message,
     /// and the caller (see `crate::cursor`'s watcher task in
     /// `crate::signaling`) has no queue to retry into; the next state change
-    /// will be sent once the channel does open.
-    pub async fn send_control(&self, msg: &proto::control::ControlMessage) -> anyhow::Result<()> {
+    /// will be sent once the channel does open. Returns `Ok(false)` in that
+    /// case so a caller that *does* want to retry (the adaptation task's
+    /// `Quality` announcement, see `crate::signaling::run_adapt_task`) can
+    /// tell "dropped" from "delivered" (`Ok(true)`).
+    pub async fn send_control(&self, msg: &proto::control::ControlMessage) -> anyhow::Result<bool> {
         let ready_state = self
             .control_channel
             .ready_state()
@@ -523,11 +526,11 @@ impl PeerSession {
             .unwrap_or(RTCDataChannelState::Closed);
         if ready_state != RTCDataChannelState::Open {
             tracing::trace!(?ready_state, "control channel not open, dropping message");
-            return Ok(());
+            return Ok(false);
         }
         let json = serde_json::to_string(msg)?;
         self.control_channel.send_text(&json).await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Starts the two tasks that drive the video track:

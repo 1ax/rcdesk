@@ -595,9 +595,22 @@ async fn run_adapt_task(
     rate_control: Arc<crate::pipeline::RateControl>,
     peer: Arc<PeerSession>,
 ) {
-    let mut controller = Controller::new(cfg, Instant::now());
-    let mut ticker = tokio::time::interval(crate::adapt::TICK);
+    let now = Instant::now();
+    let mut controller = Controller::new(cfg, now);
+    // `interval` would fire immediately; the first tick must wait a full
+    // `TICK` so it sees a real window of frames/REMB instead of deciding on
+    // nothing at session start.
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::from_std(now + crate::adapt::TICK),
+        crate::adapt::TICK,
+    );
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The last decision the client hasn't been told about yet: the first
+    // decisions often land before the `control` channel is open (the
+    // controller runs from session start, the channel opens after DTLS), and
+    // `send_control` drops messages into a closed channel -- so the
+    // announcement is retried on every tick until it is actually delivered.
+    let mut unannounced: Option<ControlMessage> = None;
 
     loop {
         tokio::select! {
@@ -616,13 +629,19 @@ async fn run_adapt_task(
                         reason = decision.reason,
                         "adapt: new rate target"
                     );
-                    let msg = ControlMessage::Quality {
+                    unannounced = Some(ControlMessage::Quality {
                         bitrate_kbps: decision.target.bitrate_kbps,
                         fps: decision.target.fps,
                         reason: decision.reason.to_string(),
-                    };
-                    if let Err(err) = peer.send_control(&msg).await {
-                        tracing::warn!(?err, "failed to send quality control message");
+                    });
+                }
+                if let Some(msg) = &unannounced {
+                    match peer.send_control(msg).await {
+                        Ok(true) => unannounced = None,
+                        Ok(false) => {}
+                        Err(err) => {
+                            tracing::warn!(?err, "failed to send quality control message");
+                        }
                     }
                 }
             }
