@@ -97,6 +97,15 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "objc2-core-foundation",
     "NSGeometry",
     "NSData",
+    # NSHost::currentHost().localizedName() (platform::macos::computer_name,
+    # slice 2.6a). NSHost's own feature gate is just "NSHost", but
+    # `localizedName()` returns `Option<Retained<NSString>>`, and the
+    # NSString type itself lives behind objc2-foundation's separate
+    # "NSString" feature (see src/generated/mod.rs in the crate source) --
+    # without it NSString doesn't exist in this crate at all, so both are
+    # needed together for this one new call.
+    "NSHost",
+    "NSString",
 ] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",

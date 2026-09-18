@@ -4,6 +4,7 @@
 //! without the binary (see `tests/loopback.rs`).
 
 pub mod adapt;
+pub mod app;
 pub mod capture;
 pub mod clipboard;
 pub mod cursor;

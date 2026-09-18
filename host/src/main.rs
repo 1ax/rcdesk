@@ -3,74 +3,22 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::watch;
 
+use rcdesk_host::app::{self, CaptureBackend, EncoderBackend, ReconnectPolicy, ServeOptions};
 use rcdesk_host::capture::{self, FrameSource};
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use rcdesk_host::clipboard::ClipboardBackend;
-use rcdesk_host::cursor::CursorSource;
-use rcdesk_host::encode::{build_encoder, EncoderConfig, EncoderKind, RateTarget};
-use rcdesk_host::input::Injector;
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-use rcdesk_host::input::NoopInjector;
+use rcdesk_host::encode::{build_encoder, EncoderConfig, RateTarget};
 use rcdesk_host::pipeline::Pipeline;
 use rcdesk_host::platform;
-use rcdesk_host::signaling::{BuildClipboard, HostContext, SignalingClient};
-use rcdesk_host::transport::SessionConfig;
+use rcdesk_host::signaling::{AgentStatus, Keepalive};
 
 #[derive(Parser)]
 #[command(name = "rcdesk-host", version, about = "rcdesk host agent")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
-}
-
-/// Which screen-capture backend to use on Windows. No effect on
-/// macOS/other (there is only `scap`/synthetic there) beyond `Gdi` being
-/// rejected -- see `build_screen_source`.
-#[derive(Clone, Copy, ValueEnum)]
-enum CaptureBackend {
-    /// Windows Graphics Capture (`scap`) if the video driver reports
-    /// Direct3D 11 support, GDI (`BitBlt`) otherwise.
-    Auto,
-    /// Force Windows Graphics Capture (`scap`), even if the driver looks
-    /// like it can't do Direct3D 11 -- for comparing against `gdi` on
-    /// hardware where `auto` already falls back.
-    Wgc,
-    /// Force GDI (`BitBlt`): works on any driver/VM, higher CPU cost, no
-    /// "yellow border" capture indicator.
-    Gdi,
-}
-
-/// Which H.264 encoder backend to use.
-#[derive(Clone, Copy, ValueEnum)]
-enum EncoderBackend {
-    /// The platform's native encoder (VideoToolbox on macOS; Media
-    /// Foundation on Windows, hardware MFT preferred, Microsoft's software
-    /// one otherwise), openh264 if that fails -- see
-    /// `encode::build_encoder`'s doc comment.
-    Auto,
-    /// Software encoder, built from source. Works on every platform.
-    Openh264,
-    /// macOS hardware encoder (VideoToolbox). Selecting it on another OS
-    /// fails with a "not available" error.
-    Videotoolbox,
-    /// Windows Media Foundation H.264 MFT (hardware if present, otherwise
-    /// Microsoft's software encoder). Selecting it on another OS fails with
-    /// a "not available" error.
-    Mediafoundation,
-}
-
-impl EncoderBackend {
-    fn kind(self) -> Option<EncoderKind> {
-        match self {
-            EncoderBackend::Auto => None,
-            EncoderBackend::Openh264 => Some(EncoderKind::OpenH264),
-            EncoderBackend::Videotoolbox => Some(EncoderKind::VideoToolbox),
-            EncoderBackend::Mediafoundation => Some(EncoderKind::MediaFoundation),
-        }
-    }
 }
 
 #[derive(Subcommand)]
@@ -111,13 +59,14 @@ enum Command {
         encoder: EncoderBackend,
     },
     /// Connect to a signaling server, register as a host, and serve
-    /// incoming WebRTC sessions.
+    /// incoming WebRTC sessions. Reconnects with backoff if the connection
+    /// is lost or never comes up -- see `docs/dev-run.md`.
     Serve {
         /// Signaling server WebSocket URL.
         #[arg(long, default_value = "ws://127.0.0.1:8080/ws")]
         server: String,
-        /// Host name shown to clients. Defaults to $HOSTNAME, or
-        /// "rcdesk-host" if that isn't set.
+        /// Host name shown to clients. Defaults to this computer's own name,
+        /// then $HOSTNAME, then "rcdesk-host" -- see `docs/dev-run.md`.
         #[arg(long)]
         name: Option<String>,
         /// Use the synthetic frame source instead of real screen capture.
@@ -218,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
             capture,
             encoder,
         } => {
-            run_serve(
+            let opts = ServeOptions {
                 server,
                 name,
                 synthetic,
@@ -232,8 +181,8 @@ async fn main() -> anyhow::Result<()> {
                 no_adapt,
                 capture,
                 encoder,
-            )
-            .await
+            };
+            run_serve(opts).await
         }
     }
 }
@@ -253,134 +202,6 @@ fn run_list_displays() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolves `--display` to a concrete display id before it reaches a
-/// backend's `new`: an explicit `--display N` passes through unchanged
-/// (an id that turns out not to exist is still that backend's error to
-/// report), `None` picks `capture::default_display` out of
-/// `capture::list_displays()` (propagating a `list_displays` error, e.g. no
-/// screen-recording permission, as-is) and logs which display was picked.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-fn resolve_display(display: Option<u32>) -> anyhow::Result<u32> {
-    if let Some(id) = display {
-        return Ok(id);
-    }
-    let displays = capture::list_displays()?;
-    let chosen = capture::default_display(&displays)
-        .ok_or_else(|| anyhow::anyhow!("no capturable display found"))?;
-    tracing::info!(display_id = chosen.id, title = %chosen.title, "capturing display");
-    Ok(chosen.id)
-}
-
-/// Builds the real screen-capture source. On Windows this is where
-/// `--capture auto` decides between Windows Graphics Capture (`scap`) and
-/// the GDI fallback (`capture::gdi`) by probing Direct3D 11 support first
-/// (`platform::windows::d3d::wgc_supported`) -- see that module and
-/// `capture::gdi` for why: `scap` 0.0.8 panics outright on drivers below
-/// feature level 11_0 instead of returning an error.
-#[cfg(target_os = "windows")]
-fn build_screen_source(
-    display: Option<u32>,
-    fps: u32,
-    backend: CaptureBackend,
-) -> anyhow::Result<Box<dyn FrameSource>> {
-    let display = Some(resolve_display(display)?);
-    let use_wgc = match backend {
-        CaptureBackend::Wgc => true,
-        CaptureBackend::Gdi => false,
-        CaptureBackend::Auto => rcdesk_host::platform::windows::d3d::wgc_supported(),
-    };
-    if use_wgc {
-        tracing::info!(backend = "wgc", "screen capture backend");
-        Ok(Box::new(capture::scap::ScapSource::new(display, fps)?))
-    } else {
-        tracing::info!(backend = "gdi", "screen capture backend");
-        Ok(Box::new(capture::gdi::GdiSource::new(display, fps)?))
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn build_screen_source(
-    display: Option<u32>,
-    fps: u32,
-    backend: CaptureBackend,
-) -> anyhow::Result<Box<dyn FrameSource>> {
-    match backend {
-        CaptureBackend::Gdi => Err(anyhow::anyhow!(
-            "--capture gdi is a Windows-only fallback, not supported on macOS"
-        )),
-        CaptureBackend::Auto | CaptureBackend::Wgc => {
-            let display = Some(resolve_display(display)?);
-            Ok(Box::new(capture::scap::ScapSource::new(display, fps)?))
-        }
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn build_screen_source(
-    _display: Option<u32>,
-    _fps: u32,
-    _backend: CaptureBackend,
-) -> anyhow::Result<Box<dyn FrameSource>> {
-    Err(capture::CaptureError::Unsupported.into())
-}
-
-/// The real, platform-backed injector (see `rcdesk_host::input::enigo`).
-/// Falls back to `NoopInjector` on platforms with no such backend, exactly
-/// like `build_screen_source` falls back to an error for capture -- except
-/// here a no-op is the correct behavior rather than a failure, since a host
-/// with no way to inject input isn't a broken host, just one that can only
-/// be watched.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-fn build_real_injector() -> anyhow::Result<Box<dyn Injector>> {
-    Ok(Box::new(rcdesk_host::input::enigo::EnigoInjector::new()?))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn build_real_injector() -> anyhow::Result<Box<dyn Injector>> {
-    Ok(Box::new(NoopInjector::new()))
-}
-
-/// The real, platform-backed cursor-shape source (see
-/// `rcdesk_host::cursor::macos`/`::windows`), the same fallback pattern as
-/// `build_real_injector`.
-#[cfg(target_os = "macos")]
-fn build_real_cursor_source() -> Box<dyn CursorSource> {
-    Box::new(rcdesk_host::cursor::macos::MacCursorSource::new())
-}
-
-#[cfg(target_os = "windows")]
-fn build_real_cursor_source() -> Box<dyn CursorSource> {
-    Box::new(rcdesk_host::cursor::windows::WinCursorSource::new())
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn build_real_cursor_source() -> Box<dyn CursorSource> {
-    Box::new(rcdesk_host::cursor::NoopCursorSource::new())
-}
-
-/// The real, platform-backed clipboard backend (slice 2.5b, see
-/// `rcdesk_host::clipboard::macos`/`::windows`). Unlike
-/// `build_real_cursor_source`/`build_real_injector` there is no no-op
-/// fallback on other platforms: `run_serve` passes `None` for
-/// `HostContext::build_clipboard` there instead, since "no clipboard sync"
-/// (not "sync that always fails") is the correct behavior when there's no
-/// backend at all.
-#[cfg(target_os = "macos")]
-fn build_real_clipboard_backend() -> anyhow::Result<Box<dyn ClipboardBackend>> {
-    Ok(
-        Box::new(rcdesk_host::clipboard::macos::MacClipboardBackend::new()?)
-            as Box<dyn ClipboardBackend>,
-    )
-}
-
-#[cfg(target_os = "windows")]
-fn build_real_clipboard_backend() -> anyhow::Result<Box<dyn ClipboardBackend>> {
-    Ok(
-        Box::new(rcdesk_host::clipboard::windows::WinClipboardBackend::new()?)
-            as Box<dyn ClipboardBackend>,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_bench(
     synthetic: bool,
@@ -396,7 +217,7 @@ fn run_bench(
     let source: Box<dyn FrameSource> = if synthetic {
         Box::new(capture::synthetic::for_display(display.unwrap_or(1), fps)?)
     } else {
-        build_screen_source(display, fps, capture)?
+        app::build_screen_source(display, fps, capture)?
     };
 
     let (width, height) = source.size();
@@ -527,105 +348,41 @@ fn percentile(sizes: &[usize], pct: f64) -> usize {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_serve(
-    server: String,
-    name: Option<String>,
-    synthetic: bool,
-    display: Option<u32>,
-    fps: u32,
-    bitrate: u32,
-    max_qp: Option<u8>,
-    stun: Vec<String>,
-    no_input: bool,
-    no_clipboard: bool,
-    no_adapt: bool,
-    capture: CaptureBackend,
-    encoder: EncoderBackend,
-) -> anyhow::Result<()> {
-    let name = name
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .unwrap_or_else(|| "rcdesk-host".to_string());
+/// Builds the long-lived `HostContext` once, then hands it to
+/// `app::run_agent`, which connects, registers, serves sessions and
+/// reconnects with backoff for as long as the process runs -- see
+/// `docs/dev-run.md`. A second task prints `PIN: NNNNNN` (same format as
+/// before slice 2.6a) whenever the agent reports a `Registered` status whose
+/// PIN differs from the last one printed -- a session ending drops the
+/// status back to `Registered` with the *same* PIN it already had (see
+/// `signaling::run`), which must not print again; a real reconnect gets a
+/// fresh PIN from the server and does.
+async fn run_serve(opts: ServeOptions) -> anyhow::Result<()> {
+    let name = app::resolve_host_name(opts.name.as_deref());
+    let ctx = app::build_host_context(&opts)?;
 
-    let client = SignalingClient::connect(&server, &name).await?;
-    println!("PIN: {}", client.pin());
-    tracing::info!(
-        pin = client.pin(),
-        host_id = client.host_id(),
-        "registered with signaling server"
-    );
-
-    let runtime = webrtc::runtime::default_runtime()
-        .ok_or_else(|| anyhow::anyhow!("no webrtc runtime available"))?;
-
-    let build_source: Box<dyn Fn(u32) -> anyhow::Result<Box<dyn FrameSource>> + Send + Sync> =
-        if synthetic {
-            Box::new(move |id| {
-                Ok(Box::new(capture::synthetic::for_display(id, fps)?) as Box<dyn FrameSource>)
-            })
-        } else {
-            Box::new(move |id| build_screen_source(Some(id), fps, capture))
-        };
-
-    let list_displays: Box<dyn Fn() -> anyhow::Result<Vec<capture::DisplayInfo>> + Send + Sync> =
-        if synthetic {
-            Box::new(|| Ok(capture::synthetic::list_displays()))
-        } else {
-            Box::new(|| Ok(capture::list_displays()?))
-        };
-
-    let build_injector: Box<dyn Fn() -> anyhow::Result<Box<dyn Injector>> + Send + Sync> =
-        if no_input {
-            // `Err`, not a `NoopInjector` directly: `start_session` already
-            // falls back to one on any `build_injector` failure and reports
-            // the reason to the client over `ControlMessage::InputStatus`
-            // (slice 2.5a, debt D26) -- this way `--no-input` gets a clear,
-            // specific reason instead of a generic one.
-            Box::new(|| Err(anyhow::anyhow!("disabled by --no-input")))
-        } else {
-            Box::new(build_real_injector)
-        };
-
-    let build_clipboard: Option<BuildClipboard> = if no_clipboard {
-        None
-    } else {
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        {
-            Some(Box::new(build_real_clipboard_backend) as BuildClipboard)
+    let (status_tx, mut status_rx) = watch::channel(AgentStatus::Connecting);
+    let print_task = tokio::spawn(async move {
+        let mut last_printed: Option<String> = None;
+        while status_rx.changed().await.is_ok() {
+            if let AgentStatus::Registered { pin } = &*status_rx.borrow() {
+                if last_printed.as_deref() != Some(pin.as_str()) {
+                    println!("PIN: {pin}");
+                    last_printed = Some(pin.clone());
+                }
+            }
         }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            None
-        }
-    };
+    });
 
-    // Server-provided ICE servers (STUN, and TURN when configured -- see
-    // `server/src/ice.rs`) plus any `--stun` overrides from the CLI.
-    let mut ice_servers: Vec<proto::signal::IceServer> = client.ice_servers().to_vec();
-    ice_servers.extend(stun.into_iter().map(|url| proto::signal::IceServer {
-        urls: vec![url],
-        username: None,
-        credential: None,
-    }));
-
-    let ctx = HostContext {
-        session: SessionConfig {
-            ice_servers,
-            udp_addrs: vec!["0.0.0.0:0".to_string()],
-            fps,
-        },
-        bitrate_kbps: bitrate,
-        adapt: !no_adapt,
-        max_qp,
-        encoder: encoder.kind(),
-        build_source,
-        list_displays,
-        display,
-        build_injector,
-        build_cursor_source: Box::new(build_real_cursor_source),
-        build_clipboard,
-        runtime,
-    };
-
-    client.run(ctx).await
+    let never = app::run_agent(
+        &ctx,
+        &opts.server,
+        &name,
+        ReconnectPolicy::default(),
+        Keepalive::default(),
+        status_tx,
+    )
+    .await?;
+    print_task.abort();
+    match never {}
 }

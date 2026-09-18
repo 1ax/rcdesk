@@ -3,9 +3,10 @@
 //! the one active session, wires a `transport::PeerSession` and video
 //! pipeline together and forwards SDP/ICE between them and the wire.
 //!
-//! Reconnecting to the signaling server after a drop is out of scope for
-//! this slice: `run()` returns an error and the caller (the `serve` CLI
-//! command) exits.
+//! Reconnecting after a drop is handled one layer up, by `crate::app::run_agent`,
+//! which loops `SignalingClient::connect` + `run()` with backoff (slice
+//! 2.6a): `run()` itself still just returns an `Err` the moment the
+//! connection is lost, same as before.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -16,7 +17,7 @@ use base64::Engine as _;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -51,6 +52,11 @@ pub type BuildClipboard = Box<dyn Fn() -> anyhow::Result<Box<dyn ClipboardBacken
 /// What the signaling client needs to build a fresh `PeerSession` and video
 /// pipeline for each joining peer.
 pub struct HostContext {
+    /// Template session config, built once by `app::build_host_context` and
+    /// reused for every reconnect. `ice_servers` here holds only the extra
+    /// `--stun` servers from the CLI -- the signaling server's own
+    /// per-registration credentials (fresh on every `Registered`) are merged
+    /// in per-session by `session_ice_servers`, not baked into this template.
     pub session: SessionConfig,
     pub bitrate_kbps: u32,
     /// Whether the bitrate/fps adaptation controller (slice 2.3) runs for
@@ -106,6 +112,45 @@ pub struct HostContext {
     /// never take the session down).
     pub build_clipboard: Option<BuildClipboard>,
     pub runtime: Arc<dyn Runtime>,
+}
+
+/// One host agent's current phase, as reported through the `watch` channel
+/// `app::run_agent` passes to `SignalingClient::run` (slice 2.6a). Consumed
+/// today by `serve`'s PIN-printing task; the reason this lives as a proper
+/// type (not just a log line) is a future tray UI (slice 2.6c), which needs
+/// to show live status rather than parse logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentStatus {
+    /// Attempting to connect/register with the signaling server.
+    Connecting,
+    /// Registered with the server, `pin` is current, but no session is
+    /// active right now.
+    Registered { pin: String },
+    /// A session's `RTCPeerConnection` has reached `Connected`.
+    InSession { pin: String },
+    /// The connection was lost (or never established); `error` is the
+    /// failure and `retry_in` how long before the next attempt.
+    Reconnecting { error: String, retry_in: Duration },
+}
+
+/// How often `SignalingClient::run` pings the signaling server, and how long
+/// it tolerates silence (no incoming frame of any kind) before deciding the
+/// connection is dead -- see `run`'s doc comment for why a plain
+/// `read.next()` alone isn't enough. `app::run_agent` owns the value and
+/// passes it through on every reconnect; `Default` is 20s/45s.
+#[derive(Debug, Clone, Copy)]
+pub struct Keepalive {
+    pub interval: Duration,
+    pub timeout: Duration,
+}
+
+impl Default for Keepalive {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(20),
+            timeout: Duration::from_secs(45),
+        }
+    }
 }
 
 /// A registered signaling connection, holding the PIN the owner reads out to
@@ -180,24 +225,59 @@ impl SignalingClient {
 
     /// Drives the signaling connection: forwards SDP/ICE between the wire
     /// and a `PeerSession`, one session at a time. Returns once the
-    /// connection is lost (an error -- no reconnect in this slice).
-    pub async fn run(self, ctx: HostContext) -> anyhow::Result<()> {
+    /// connection is lost (an error) -- reconnecting is `app::run_agent`'s
+    /// job, one layer up. `ctx` is a shared reference (see that function's
+    /// doc comment for why) so it survives every reconnect; `status` is
+    /// updated to `InSession`/`Registered` as the one active session's
+    /// `RTCPeerConnection` connects/disconnects.
+    ///
+    /// `keepalive` guards against a *quiet* drop -- laptop sleep, a NAT
+    /// mapping expiring, a half-open TCP connection -- none of which fail a
+    /// plain `read.next()` on their own, so without this a dead connection
+    /// would never surface as an `Err` and `run_agent` would never
+    /// reconnect. A background task pings the server every
+    /// `keepalive.interval`; the main loop tracks the time of the last
+    /// *any* incoming frame (text, ping, pong -- traffic in either direction
+    /// proves the socket is alive) and bails out once that's older than
+    /// `keepalive.timeout`.
+    pub async fn run(
+        self,
+        ctx: &HostContext,
+        status: &watch::Sender<AgentStatus>,
+        keepalive: Keepalive,
+    ) -> anyhow::Result<()> {
         let SignalingClient {
             host_id,
+            pin,
+            ice_servers: registered_ice_servers,
             mut read,
             write,
-            ..
         } = self;
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
         let writer = tokio::spawn(async move {
             let mut write = write;
-            while let Some(msg) = out_rx.recv().await {
-                let Ok(json) = serde_json::to_string(&msg) else {
-                    continue;
-                };
-                if write.send(Message::text(json)).await.is_err() {
-                    break;
+            let mut ping_ticker = tokio::time::interval(keepalive.interval);
+            ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first tick fires immediately; that's fine here (an extra,
+            // harmless ping right after connecting), unlike `adapt`'s ticker
+            // which specifically needs to skip it.
+            loop {
+                tokio::select! {
+                    msg = out_rx.recv() => {
+                        let Some(msg) = msg else { break };
+                        let Ok(json) = serde_json::to_string(&msg) else {
+                            continue;
+                        };
+                        if write.send(Message::text(json)).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ = ping_ticker.tick() => {
+                        if write.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
             let _ = write.close().await;
@@ -207,10 +287,18 @@ impl SignalingClient {
         let mut active: Option<ActiveSession> = None;
         let mut current_session_id: Option<String> = None;
 
+        let mut last_incoming = Instant::now();
+        let mut timeout_checker = tokio::time::interval(keepalive.interval);
+        timeout_checker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut timed_out = false;
+
         loop {
             tokio::select! {
                 incoming = read.next() => {
                     let Some(incoming) = incoming else { break };
+                    if incoming.is_ok() {
+                        last_incoming = Instant::now();
+                    }
                     let msg = match incoming {
                         Ok(Message::Text(text)) => match serde_json::from_str::<SignalMessage>(text.as_str()) {
                             Ok(msg) => msg,
@@ -230,7 +318,10 @@ impl SignalingClient {
 
                     handle_signal_message(
                         msg,
-                        &ctx,
+                        ctx,
+                        &registered_ice_servers,
+                        &pin,
+                        status,
                         &out_tx,
                         event_tx.clone(),
                         &mut active,
@@ -239,7 +330,15 @@ impl SignalingClient {
                     .await;
                 }
                 Some(event) = event_rx.recv() => {
-                    handle_session_event(event, &ctx, &out_tx, &mut active, &mut current_session_id).await;
+                    handle_session_event(event, ctx, &pin, status, &out_tx, &mut active, &mut current_session_id).await;
+                }
+                _ = timeout_checker.tick() => {
+                    let silence = last_incoming.elapsed();
+                    if silence >= keepalive.timeout {
+                        tracing::warn!(?silence, "signaling connection timed out, no traffic");
+                        timed_out = true;
+                        break;
+                    }
                 }
             }
         }
@@ -248,8 +347,22 @@ impl SignalingClient {
             active.shutdown().await;
         }
         drop(out_tx);
-        let _ = writer.await;
+        // On a dead (half-open) connection the writer's close handshake can
+        // block on the socket; don't let that stall the reconnect.
+        let writer_abort = writer.abort_handle();
+        if tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .is_err()
+        {
+            writer_abort.abort();
+        }
 
+        if timed_out {
+            anyhow::bail!(
+                "signaling connection timed out (no traffic for {:?})",
+                keepalive.timeout
+            );
+        }
         anyhow::bail!("signaling connection to server closed (host_id={host_id})")
     }
 }
@@ -472,9 +585,13 @@ impl ActiveSession {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_signal_message(
     msg: SignalMessage,
     ctx: &HostContext,
+    registered_ice_servers: &[proto::signal::IceServer],
+    pin: &str,
+    status: &watch::Sender<AgentStatus>,
     out_tx: &mpsc::UnboundedSender<SignalMessage>,
     event_tx: mpsc::Sender<SessionEvent>,
     active: &mut Option<ActiveSession>,
@@ -485,10 +602,13 @@ async fn handle_signal_message(
             if let Some(old) = active.take() {
                 tracing::info!("new PeerJoined while a session was active; closing the old one");
                 old.shutdown().await;
+                let _ = status.send(AgentStatus::Registered {
+                    pin: pin.to_string(),
+                });
             }
             *current_session_id = None;
 
-            match start_session(ctx, event_tx).await {
+            match start_session(ctx, registered_ice_servers, event_tx).await {
                 Ok(parts) => match parts.peer.create_offer().await {
                     Ok(sdp) => {
                         let _ = out_tx.send(SignalMessage::Offer {
@@ -556,6 +676,9 @@ async fn handle_signal_message(
                 tracing::info!(%session_id, "session ended by peer");
                 if let Some(old) = active.take() {
                     old.shutdown().await;
+                    let _ = status.send(AgentStatus::Registered {
+                        pin: pin.to_string(),
+                    });
                 }
                 *current_session_id = None;
             }
@@ -569,9 +692,12 @@ async fn handle_signal_message(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_session_event(
     event: SessionEvent,
     ctx: &HostContext,
+    pin: &str,
+    status: &watch::Sender<AgentStatus>,
     out_tx: &mpsc::UnboundedSender<SignalMessage>,
     active: &mut Option<ActiveSession>,
     current_session_id: &mut Option<String>,
@@ -587,6 +713,11 @@ async fn handle_session_event(
         }
         SessionEvent::ConnectionState(state) => {
             tracing::info!(?state, "peer connection state changed");
+            if state == RTCPeerConnectionState::Connected && active.is_some() {
+                let _ = status.send(AgentStatus::InSession {
+                    pin: pin.to_string(),
+                });
+            }
             if matches!(
                 state,
                 RTCPeerConnectionState::Failed
@@ -595,6 +726,9 @@ async fn handle_session_event(
             ) {
                 if let Some(old) = active.take() {
                     old.shutdown().await;
+                    let _ = status.send(AgentStatus::Registered {
+                        pin: pin.to_string(),
+                    });
                 }
                 *current_session_id = None;
             }
@@ -872,11 +1006,32 @@ struct SessionParts {
     clipboard_task: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Combines one registration's ICE credentials (from the signaling server's
+/// `Registered` reply) with the extra `--stun` servers baked into
+/// `HostContext::session` at startup, in the order the client has always
+/// used: server-provided first, then CLI overrides. A free function (not
+/// inlined at its one call site) so slice 2.6b -- which swaps `registered`
+/// for the joining peer's own credentials from `PeerJoined` instead of the
+/// host's registration -- has exactly one place to change.
+fn session_ice_servers(
+    registered: &[proto::signal::IceServer],
+    extra: &[proto::signal::IceServer],
+) -> Vec<proto::signal::IceServer> {
+    registered
+        .iter()
+        .cloned()
+        .chain(extra.iter().cloned())
+        .collect()
+}
+
 /// Builds the video pipeline and the `PeerSession` for one joining peer, and
 /// starts the task that feeds encoded frames from the pipeline into the
-/// session's video track.
+/// session's video track. `registered_ice_servers` are this registration's
+/// own ICE credentials from the signaling server's `Registered` reply (see
+/// `session_ice_servers`).
 async fn start_session(
     ctx: &HostContext,
+    registered_ice_servers: &[proto::signal::IceServer],
     events: mpsc::Sender<SessionEvent>,
 ) -> anyhow::Result<SessionParts> {
     let displays = (ctx.list_displays)()?;
@@ -894,7 +1049,11 @@ async fn start_session(
     let keyframe_flag = Arc::new(AtomicBool::new(false));
     let (video_tx, video_rx) = mpsc::channel(4);
 
-    let peer = PeerSession::new(ctx.session.clone(), events, Arc::clone(&ctx.runtime)).await?;
+    let session_config = SessionConfig {
+        ice_servers: session_ice_servers(registered_ice_servers, &ctx.session.ice_servers),
+        ..ctx.session.clone()
+    };
+    let peer = PeerSession::new(session_config, events, Arc::clone(&ctx.runtime)).await?;
     // Called once per session: every `VideoPipeline` (including ones built
     // later by `switch_display`) feeds frames into the same `video_tx`/
     // `video_rx` pair and shares `keyframe_flag` -- see their doc comments.
@@ -1114,6 +1273,39 @@ async fn next_message(read: &mut SplitStream<WsStream>) -> Option<SignalMessage>
     }
 }
 
+/// A `HostContext` wired entirely to synthetic/no-op backends (no real
+/// capture, injector, cursor or clipboard access), for tests that need a
+/// `HostContext` but not the platform underneath it. `pub(crate)` (rather
+/// than nested inside `mod tests`) so `app`'s own reconnect test (slice
+/// 2.6a) can reuse it instead of duplicating this fixture.
+#[cfg(test)]
+pub(crate) fn test_ctx() -> HostContext {
+    HostContext {
+        session: SessionConfig {
+            ice_servers: vec![],
+            udp_addrs: vec!["127.0.0.1:0".to_string()],
+            fps: 30,
+        },
+        bitrate_kbps: 2000,
+        adapt: false,
+        max_qp: None,
+        encoder: Some(EncoderKind::OpenH264),
+        build_source: Box::new(|id| {
+            Ok(Box::new(capture::synthetic::for_display(id, 30)?) as Box<dyn FrameSource>)
+        }),
+        list_displays: Box::new(|| Ok(capture::synthetic::list_displays())),
+        display: None,
+        build_injector: Box::new(|| {
+            Ok(Box::new(crate::input::NoopInjector::new()) as Box<dyn Injector>)
+        }),
+        build_cursor_source: Box::new(|| {
+            Box::new(crate::cursor::NoopCursorSource::new()) as Box<dyn CursorSource>
+        }),
+        build_clipboard: None,
+        runtime: webrtc::runtime::default_runtime().expect("runtime-tokio feature must be enabled"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1128,6 +1320,31 @@ mod tests {
             height: 100,
             primary,
         }
+    }
+
+    #[test]
+    fn session_ice_servers_puts_registered_first_then_extra() {
+        fn server(url: &str) -> proto::signal::IceServer {
+            proto::signal::IceServer {
+                urls: vec![url.to_string()],
+                username: None,
+                credential: None,
+            }
+        }
+
+        let registered = vec![server("stun:server-a"), server("stun:server-b")];
+        let extra = vec![server("stun:cli-extra")];
+
+        let combined = session_ice_servers(&registered, &extra);
+
+        assert_eq!(
+            combined,
+            vec![
+                server("stun:server-a"),
+                server("stun:server-b"),
+                server("stun:cli-extra"),
+            ]
+        );
     }
 
     #[test]
@@ -1158,34 +1375,6 @@ mod tests {
                 current: 2,
             }
         );
-    }
-
-    fn test_ctx() -> HostContext {
-        HostContext {
-            session: SessionConfig {
-                ice_servers: vec![],
-                udp_addrs: vec!["127.0.0.1:0".to_string()],
-                fps: 30,
-            },
-            bitrate_kbps: 2000,
-            adapt: false,
-            max_qp: None,
-            encoder: Some(EncoderKind::OpenH264),
-            build_source: Box::new(|id| {
-                Ok(Box::new(capture::synthetic::for_display(id, 30)?) as Box<dyn FrameSource>)
-            }),
-            list_displays: Box::new(|| Ok(capture::synthetic::list_displays())),
-            display: None,
-            build_injector: Box::new(|| {
-                Ok(Box::new(crate::input::NoopInjector::new()) as Box<dyn Injector>)
-            }),
-            build_cursor_source: Box::new(|| {
-                Box::new(crate::cursor::NoopCursorSource::new()) as Box<dyn CursorSource>
-            }),
-            build_clipboard: None,
-            runtime: webrtc::runtime::default_runtime()
-                .expect("runtime-tokio feature must be enabled"),
-        }
     }
 
     /// Collects frames from `rx` until either `n` arrive or `timeout` elapses,
@@ -1289,7 +1478,7 @@ mod tests {
         ctx.build_injector = Box::new(|| Err(anyhow::anyhow!("no Accessibility permission")));
         let (events_tx, _events_rx) = mpsc::channel(64);
 
-        let parts = start_session(&ctx, events_tx)
+        let parts = start_session(&ctx, &[], events_tx)
             .await
             .expect("a failing injector must not fail session start");
 
@@ -1331,7 +1520,7 @@ mod tests {
         let ctx = test_ctx();
         let (events_tx, _events_rx) = mpsc::channel(64);
 
-        let parts = start_session(&ctx, events_tx).await.unwrap();
+        let parts = start_session(&ctx, &[], events_tx).await.unwrap();
 
         assert!(parts.input_available);
         assert_eq!(parts.input_reason, None);
@@ -1348,12 +1537,16 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(64);
         let mut active: Option<ActiveSession> = None;
         let mut current_session_id: Option<String> = None;
+        let (status_tx, _status_rx) = watch::channel(AgentStatus::Connecting);
 
         handle_signal_message(
             SignalMessage::PeerJoined {
                 session_id: "sess-1".to_string(),
             },
             &ctx,
+            &[],
+            "111111",
+            &status_tx,
             &out_tx,
             event_tx,
             &mut active,
@@ -1389,12 +1582,16 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(64);
         let mut active: Option<ActiveSession> = None;
         let mut current_session_id: Option<String> = None;
+        let (status_tx, _status_rx) = watch::channel(AgentStatus::Connecting);
 
         handle_signal_message(
             SignalMessage::PeerJoined {
                 session_id: "sess-1".to_string(),
             },
             &ctx,
+            &[],
+            "111111",
+            &status_tx,
             &out_tx,
             event_tx,
             &mut active,
@@ -1415,6 +1612,8 @@ mod tests {
                 is_string: true,
             },
             &ctx,
+            "111111",
+            &status_tx,
             &out_tx,
             &mut active,
             &mut current_session_id,
