@@ -50,8 +50,18 @@ pub enum SignalMessage {
         host_name: String,
         ice_servers: Vec<IceServer>,
     },
-    /// server -> host
-    PeerJoined { session_id: String },
+    /// server -> host. `ice_servers` are freshly minted for this session
+    /// (same call as `Joined`'s), so a host that has been running for a
+    /// while (2.6a: it reconnects and stays up) gets un-expired TURN creds
+    /// per session instead of relying on the ones from its own `Registered`,
+    /// which can be up to `RCDESK_TURN_TTL_SECS` old (2.6b). `#[serde(default)]`
+    /// so a new host stays compatible with an older server that doesn't send
+    /// this field: it falls back to an empty vector.
+    PeerJoined {
+        session_id: String,
+        #[serde(default)]
+        ice_servers: Vec<IceServer>,
+    },
     /// forwarded by server to the other side of the session
     Offer { session_id: String, sdp: String },
     /// forwarded by server to the other side of the session
@@ -104,5 +114,35 @@ mod tests {
 
         let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, ice);
+    }
+
+    #[test]
+    fn peer_joined_round_trips_through_json_with_ice_servers() {
+        let peer_joined = SignalMessage::PeerJoined {
+            session_id: "abc123".to_string(),
+            ice_servers: vec![IceServer {
+                urls: vec!["stun:stun.l.google.com:19302".to_string()],
+                username: None,
+                credential: None,
+            }],
+        };
+
+        let json = serde_json::to_string(&peer_joined).expect("serialize");
+        let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, peer_joined);
+    }
+
+    #[test]
+    fn peer_joined_without_ice_servers_field_deserializes_to_empty_vec() {
+        let json = r#"{"type":"peer_joined","session_id":"abc123"}"#;
+
+        let msg: SignalMessage = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            msg,
+            SignalMessage::PeerJoined {
+                session_id: "abc123".to_string(),
+                ice_servers: Vec::new(),
+            }
+        );
     }
 }

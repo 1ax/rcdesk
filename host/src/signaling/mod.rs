@@ -598,7 +598,10 @@ async fn handle_signal_message(
     current_session_id: &mut Option<String>,
 ) {
     match msg {
-        SignalMessage::PeerJoined { session_id } => {
+        SignalMessage::PeerJoined {
+            session_id,
+            ice_servers,
+        } => {
             if let Some(old) = active.take() {
                 tracing::info!("new PeerJoined while a session was active; closing the old one");
                 old.shutdown().await;
@@ -608,7 +611,8 @@ async fn handle_signal_message(
             }
             *current_session_id = None;
 
-            match start_session(ctx, registered_ice_servers, event_tx).await {
+            let chosen_ice_servers = peer_ice_servers(&ice_servers, registered_ice_servers);
+            match start_session(ctx, chosen_ice_servers, event_tx).await {
                 Ok(parts) => match parts.peer.create_offer().await {
                     Ok(sdp) => {
                         let _ = out_tx.send(SignalMessage::Offer {
@@ -1006,13 +1010,9 @@ struct SessionParts {
     clipboard_task: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// Combines one registration's ICE credentials (from the signaling server's
-/// `Registered` reply) with the extra `--stun` servers baked into
-/// `HostContext::session` at startup, in the order the client has always
-/// used: server-provided first, then CLI overrides. A free function (not
-/// inlined at its one call site) so slice 2.6b -- which swaps `registered`
-/// for the joining peer's own credentials from `PeerJoined` instead of the
-/// host's registration -- has exactly one place to change.
+/// Combines one session's ICE credentials with the extra `--stun` servers
+/// baked into `HostContext::session` at startup, in the order the client has
+/// always used: server-provided first, then CLI overrides.
 fn session_ice_servers(
     registered: &[proto::signal::IceServer],
     extra: &[proto::signal::IceServer],
@@ -1024,11 +1024,31 @@ fn session_ice_servers(
         .collect()
 }
 
+/// Picks which ICE credentials to use for a new session: the joining peer's
+/// own, freshly minted credentials from `PeerJoined` when the server sent
+/// them, falling back to the host's `Registered` credentials otherwise (an
+/// older server that predates 2.6b, whose `PeerJoined` has no `ice_servers`
+/// field and deserializes it to an empty vector via `#[serde(default)]`).
+/// A host that has been running for a while (2.6a: it reconnects and stays
+/// up) would otherwise keep offering TURN creds that expired hours ago.
+fn peer_ice_servers<'a>(
+    from_peer_joined: &'a [proto::signal::IceServer],
+    registered: &'a [proto::signal::IceServer],
+) -> &'a [proto::signal::IceServer] {
+    if from_peer_joined.is_empty() {
+        registered
+    } else {
+        from_peer_joined
+    }
+}
+
 /// Builds the video pipeline and the `PeerSession` for one joining peer, and
 /// starts the task that feeds encoded frames from the pipeline into the
-/// session's video track. `registered_ice_servers` are this registration's
-/// own ICE credentials from the signaling server's `Registered` reply (see
-/// `session_ice_servers`).
+/// session's video track. `registered_ice_servers` are this session's own
+/// ICE credentials, chosen by `peer_ice_servers` at the call site (see
+/// `session_ice_servers`) -- despite the name, since 2.6b this is usually
+/// the joining peer's `PeerJoined` credentials, not the host's `Registered`
+/// ones.
 async fn start_session(
     ctx: &HostContext,
     registered_ice_servers: &[proto::signal::IceServer],
@@ -1348,6 +1368,44 @@ mod tests {
     }
 
     #[test]
+    fn peer_ice_servers_prefers_peer_joined_credentials_when_present() {
+        fn server(url: &str) -> proto::signal::IceServer {
+            proto::signal::IceServer {
+                urls: vec![url.to_string()],
+                username: None,
+                credential: None,
+            }
+        }
+
+        let from_peer_joined = vec![server("turn:fresh")];
+        let registered = vec![server("turn:stale")];
+
+        assert_eq!(
+            peer_ice_servers(&from_peer_joined, &registered),
+            &from_peer_joined[..]
+        );
+    }
+
+    #[test]
+    fn peer_ice_servers_falls_back_to_registered_when_peer_joined_is_empty() {
+        fn server(url: &str) -> proto::signal::IceServer {
+            proto::signal::IceServer {
+                urls: vec![url.to_string()],
+                username: None,
+                credential: None,
+            }
+        }
+
+        let from_peer_joined: Vec<proto::signal::IceServer> = vec![];
+        let registered = vec![server("turn:stale")];
+
+        assert_eq!(
+            peer_ice_servers(&from_peer_joined, &registered),
+            &registered[..]
+        );
+    }
+
+    #[test]
     fn displays_message_builds_the_expected_control_message() {
         let displays = vec![display(1, "Built-in", true), display(2, "External", false)];
 
@@ -1542,6 +1600,7 @@ mod tests {
         handle_signal_message(
             SignalMessage::PeerJoined {
                 session_id: "sess-1".to_string(),
+                ice_servers: vec![],
             },
             &ctx,
             &[],
@@ -1587,6 +1646,7 @@ mod tests {
         handle_signal_message(
             SignalMessage::PeerJoined {
                 session_id: "sess-1".to_string(),
+                ice_servers: vec![],
             },
             &ctx,
             &[],

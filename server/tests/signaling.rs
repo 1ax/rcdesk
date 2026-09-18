@@ -161,7 +161,7 @@ async fn client_join_succeeds_and_host_is_notified() {
     hello(&mut client, Role::Client).await;
     send(&mut client, &SignalMessage::Join { pin }).await;
 
-    let session_id_client = match recv(&mut client).await {
+    let (session_id_client, joined_ice_servers) = match recv(&mut client).await {
         SignalMessage::Joined {
             session_id,
             host_name,
@@ -170,13 +170,20 @@ async fn client_join_succeeds_and_host_is_notified() {
             assert_eq!(host_name, "My Mac");
             assert!(!ice_servers.is_empty());
             assert!(ice_servers[0].urls[0].starts_with("stun:"));
-            session_id
+            (session_id, ice_servers)
         }
         other => panic!("expected joined, got {other:?}"),
     };
 
     match recv(&mut host).await {
-        SignalMessage::PeerJoined { session_id } => assert_eq!(session_id, session_id_client),
+        SignalMessage::PeerJoined {
+            session_id,
+            ice_servers,
+        } => {
+            assert_eq!(session_id, session_id_client);
+            assert!(!ice_servers.is_empty());
+            assert_eq!(ice_servers, joined_ice_servers);
+        }
         other => panic!("expected peer_joined, got {other:?}"),
     }
 }

@@ -233,7 +233,10 @@ async fn run_client(
                         host_name,
                         ice_servers: ice.ice_servers(ice::now_unix()),
                     });
-                    let _ = host_tx.send(SignalMessage::PeerJoined { session_id });
+                    let _ = host_tx.send(SignalMessage::PeerJoined {
+                        session_id,
+                        ice_servers: ice.ice_servers(ice::now_unix()),
+                    });
                 }
                 Err(err) => {
                     let _ = tx.send(SignalMessage::Error {
