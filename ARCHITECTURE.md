@@ -32,7 +32,7 @@ fps, аппаратное кодирование. Ориентир — Chrome Re
 | Сигнальный сервер | **Rust**, `axum` + `tokio-tungstenite` | Один язык с хостом, общие типы из `proto`. Нагрузка ничтожна. |
 | TURN/STUN | `coturn` в Docker | Стандарт де-факто. |
 | Реверс-прокси/TLS | nginx из FastPanel на VPS владельца (как в crewtally) | Порты 80/443 на VPS уже за FastPanel; LE-сертификат выпускает панель. `.app` — зона с принудительным HTTPS (HSTS preload), что нам и нужно. Caddy — запасной вариант для чистого сервера. |
-| CI | GitHub Actions: `macos-latest`, `windows-latest`, `ubuntu-latest` (web, server) | Публичный репо — без лимита минут. Deploy собирает release-бинарники хоста как артефакты (`rcdesk-host-windows-x64`, `rcdesk-host-macos-arm64`): кросс-компиляции нет, openh264 собирается под MSVC. |
+| CI | GitHub Actions: `macos-latest`, `windows-latest`, `ubuntu-latest` (web, server) | Публичный репо — без лимита минут. Deploy собирает release-бинарники хоста как артефакты (`rcdesk-host-windows-x64`, `rcdesk-host-macos-arm64`), каждый теперь содержит оба бинарника пакета — `rcdesk-host[.exe]` и `rcdesk-agent[.exe]` (2.6d): кросс-компиляции нет, openh264 собирается под MSVC. |
 
 Версии крейтов на момент выбора (crates.io, 2026-09-11): `webrtc` 0.20.5, `str0m`
 0.23.1, `scap` 0.0.8, `enigo` 0.6.1, `openh264` 0.9.8, `windows-capture` 2.0.1,
@@ -219,6 +219,13 @@ reason }`, клиент не цепляет ввод и показывает `Vi
 процесс и в какой сессии». Полный режим на Windows: служба не захватывает сама,
 а запускает `rcdesk-host --session` в активной консольной сессии через
 `WTSQueryUserToken` + `CreateProcessAsUser` и перезапускает при смене сессии.
+
+Лёгкий режим реализован (2.6d), выключен по умолчанию: LaunchAgent-плист
+`~/Library/LaunchAgents/app.rcdesk.agent.plist` на macOS, значение
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` на Windows —
+`platform::{macos,windows}::autostart`, включается пунктом меню агента «Start
+at login» или `rcdesk-host autostart on`. `launchctl` не вызывается: файл
+только пишется/удаляется, эффект — со следующего входа.
 
 ## 9. Платформы
 

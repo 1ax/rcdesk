@@ -4,9 +4,11 @@
 //! `agent_main.rs`'s job, which is why everything here is plain, unit
 //! testable Rust: menu text/enabled-state derivation (`menu`), the icon
 //! pixels (`icon`), permission probing (`permissions`), per-OS paths
-//! (`paths`), file logging with rotation and a panic hook (`logging`), and
-//! the single-instance lock (`lock`).
+//! (`paths`), file logging with rotation and a panic hook (`logging`), the
+//! single-instance lock (`lock`), and "start at login" path resolution plus
+//! the pure half of each platform's mechanism (`autostart`, slice 2.6d).
 
+pub mod autostart;
 pub mod icon;
 pub mod lock;
 pub mod logging;

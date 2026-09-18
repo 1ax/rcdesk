@@ -35,7 +35,7 @@ mod imp {
 
     use clap::Parser;
     use tokio::sync::{mpsc, watch};
-    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, TrayIconBuilder};
 
     use rcdesk_host::agent::{self, menu_model, probe_permissions, render_icon, IconState};
@@ -196,6 +196,16 @@ mod imp {
         let end_session_item =
             MenuItem::with_id("end_session", "End session", model.can_end_session, None);
         let open_log_item = MenuItem::with_id("open_log", "Open log", true, None);
+        // Initial checked state: best-effort -- if `agent_path`/`is_enabled`
+        // fails (should only happen if `current_exe()` itself fails), show
+        // unchecked rather than block the menu on it; a click still retries
+        // both.
+        let autostart_enabled = agent::autostart::agent_path()
+            .ok()
+            .and_then(|path| platform::autostart::is_enabled(&path).ok())
+            .unwrap_or(false);
+        let autostart_item =
+            CheckMenuItem::with_id("autostart", "Start at login", true, autostart_enabled, None);
         let quit_item = MenuItem::with_id("quit", "Quit rcdesk", true, None);
 
         let menu = Menu::new();
@@ -215,6 +225,8 @@ mod imp {
         menu.append(&PredefinedMenuItem::separator())
             .expect("append separator");
         menu.append(&open_log_item).expect("append open log item");
+        menu.append(&autostart_item)
+            .expect("append start-at-login item");
         menu.append(&PredefinedMenuItem::separator())
             .expect("append separator");
         menu.append(&quit_item).expect("append quit item");
@@ -267,6 +279,7 @@ mod imp {
                         let _ = cmd_tx.send(AgentCommand::EndSession);
                     }
                     "open_log" => open_log(&log_path),
+                    "autostart" => toggle_autostart(&autostart_item),
                     #[cfg(target_os = "macos")]
                     "open_screen_prefs" => open_system_settings_pane(
                         "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
@@ -373,6 +386,41 @@ mod imp {
                 tracing::warn!(error = %err, "failed to open the log file");
             }
         }
+    }
+
+    /// Handles a click on "Start at login": `muda` has already flipped
+    /// `autostart_item`'s `checked` state by the time this runs, so
+    /// `is_checked()` below reads the *requested* new state. Enables or
+    /// disables accordingly, then re-reads the actual on-disk/registry state
+    /// and forces `set_checked` to it -- so a failure (logged via `warn!`,
+    /// never shown to the user otherwise: this menu has no error dialog)
+    /// leaves the checkbox reflecting reality, not the click.
+    fn toggle_autostart(autostart_item: &CheckMenuItem) {
+        let agent_path = match agent::autostart::agent_path() {
+            Ok(path) => Some(path),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to resolve rcdesk-agent's own path for autostart");
+                None
+            }
+        };
+
+        if let Some(path) = &agent_path {
+            let want_enabled = autostart_item.is_checked();
+            let result = if want_enabled {
+                platform::autostart::enable(path)
+            } else {
+                platform::autostart::disable()
+            };
+            if let Err(err) = result {
+                tracing::warn!(error = %err, "failed to change the start-at-login registration");
+            }
+        }
+
+        let actual = agent_path
+            .as_ref()
+            .and_then(|path| platform::autostart::is_enabled(path).ok())
+            .unwrap_or(false);
+        autostart_item.set_checked(actual);
     }
 
     #[cfg(target_os = "macos")]

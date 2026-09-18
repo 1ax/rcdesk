@@ -116,6 +116,25 @@ enum Command {
         #[arg(long, value_enum, default_value_t = EncoderBackend::Auto)]
         encoder: EncoderBackend,
     },
+    /// Manage `rcdesk-agent`'s "start at login" registration (a LaunchAgent
+    /// plist on macOS, an `HKCU\...\Run` value on Windows) -- no admin
+    /// rights needed on either OS. Off by default; this and the agent's own
+    /// "Start at login" menu item are the only two ways to turn it on. See
+    /// docs/dev-run.md / docs/host-windows.md.
+    Autostart {
+        #[command(subcommand)]
+        action: AutostartAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AutostartAction {
+    /// Register `rcdesk-agent` to start automatically at the next login.
+    On,
+    /// Remove the "start at login" registration.
+    Off,
+    /// Print whether autostart is currently on, and for which path.
+    Status,
 }
 
 #[tokio::main]
@@ -184,7 +203,34 @@ async fn main() -> anyhow::Result<()> {
             };
             run_serve(opts).await
         }
+        Command::Autostart { action } => run_autostart(action),
     }
+}
+
+/// Resolves `rcdesk-agent`'s path relative to this `rcdesk-host` binary
+/// (`agent::autostart::agent_path`) and applies `action` to it -- see that
+/// function's doc comment for why `rcdesk-host` and `rcdesk-agent` resolve
+/// the same "which path" question differently.
+fn run_autostart(action: AutostartAction) -> anyhow::Result<()> {
+    let agent = rcdesk_host::agent::autostart::agent_path()?;
+    match action {
+        AutostartAction::On => {
+            rcdesk_host::platform::autostart::enable(&agent)?;
+            println!("autostart: on ({})", agent.display());
+        }
+        AutostartAction::Off => {
+            rcdesk_host::platform::autostart::disable()?;
+            println!("autostart: off");
+        }
+        AutostartAction::Status => {
+            if rcdesk_host::platform::autostart::is_enabled(&agent)? {
+                println!("autostart: on ({})", agent.display());
+            } else {
+                println!("autostart: off");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_list_displays() -> anyhow::Result<()> {

@@ -25,6 +25,20 @@ pub use windows::event_loop;
 #[cfg(target_os = "macos")]
 pub use macos::activity;
 
+/// "Start at login" (slice 2.6d) -- `platform::{macos,windows,other}::autostart`
+/// re-exported under one cfg-free path the same way `event_loop` is above,
+/// so `agent_main`/`rcdesk-host`'s `autostart` CLI subcommand can call
+/// `platform::autostart::{is_enabled,enable,disable}` without their own
+/// per-OS `use`. The `other` (Linux, etc.) implementation always errors --
+/// see its own doc comment -- rather than being absent, so the CLI
+/// subcommand itself doesn't need cfg-gating either.
+#[cfg(target_os = "macos")]
+pub use macos::autostart;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub use other::autostart;
+#[cfg(target_os = "windows")]
+pub use windows::autostart;
+
 #[cfg(target_os = "macos")]
 pub fn name() -> &'static str {
     macos::name()

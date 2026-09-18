@@ -9,8 +9,8 @@ Graphics Capture, ввод — SendInput). Права администратор
 
 GitHub → репозиторий `1ax/rcdesk` → Actions → workflow «Deploy» → последний
 зелёный запуск на `main` → раздел Artifacts → `rcdesk-host-windows-x64` (zip,
-внутри `rcdesk-host.exe`). Нужен вход в GitHub. Распаковать, например, в
-`C:\rcdesk\`.
+внутри `rcdesk-host.exe` и `rcdesk-agent.exe`, слайс 2.6d). Нужен вход в
+GitHub. Распаковать, например, в `C:\rcdesk\`.
 
 ## SmartScreen
 
@@ -181,4 +181,22 @@ Ctrl+C в консоли.
 при размере больше 5 МБ), не консоль. Второй запущенный экземпляр сразу
 завершается (лок-файл `%LOCALAPPDATA%\rcdesk\agent.lock`).
 
-Автозапуск при входе в систему — отдельный слайс (2.6d), сюда не входит.
+## Автозапуск при входе
+
+Выключен по умолчанию, прав администратора не требует. Включить — пунктом
+меню трея «Start at login» либо командой:
+
+```
+rcdesk-host.exe autostart on
+rcdesk-host.exe autostart status
+rcdesk-host.exe autostart off
+```
+
+Механизм — значение `rcdesk` в
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (путь к
+`rcdesk-agent.exe` в кавычках), правит его только сам `rcdesk-host.exe` /
+пункт меню агента. Запись видна в Диспетчере задач → вкладка «Автозагрузка»
+(имя `rcdesk`) — но для полного выключения используйте `autostart off` или
+пункт меню, а не кнопку «Отключить» там: она гасит запуск, не трогая само
+значение в реестре, так что `autostart status` после неё всё ещё покажет
+`on`.

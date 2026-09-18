@@ -94,6 +94,11 @@ windows = { version = "0.61", features = [
     # the display/system awake for the duration of an active session, the
     # Windows equivalent of macOS's NSProcessInfo activity below.
     "Win32_System_Power",
+    # RegOpenKeyExW/RegSetValueExW/RegGetValueW/RegDeleteKeyValueW/RegCloseKey
+    # (platform::windows::autostart, 2.6d) -- the HKCU Run-key "start at
+    # login" registration, the Windows counterpart of macOS's LaunchAgent
+    # plist.
+    "Win32_System_Registry",
 ] }
 # Буфер обмена (2.5b): текст только, default-features=false drops the
 # `image-data` feature (image crate, extra objc2-core-graphics on macOS).

@@ -1,3 +1,4 @@
+pub mod autostart;
 pub mod d3d;
 pub mod dpi;
 pub mod event_loop;
