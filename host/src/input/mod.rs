@@ -39,9 +39,14 @@ pub trait Injector: Send {
 }
 
 /// An `Injector` that only logs what it would have done. Used on platforms
-/// without a real backend (anything but macOS/Windows) and when the host is
-/// started with `serve --no-input` (see `docs/dev-run.md`), so a session can
-/// be exercised end to end without touching the real mouse/keyboard.
+/// without a real backend (anything but macOS/Windows), so a session can be
+/// exercised end to end without touching the real mouse/keyboard, and by
+/// `crate::signaling::start_session` as the fallback when `HostContext::build_injector`
+/// fails (e.g. missing the macOS Accessibility permission, or `serve
+/// --no-input`, which fails on purpose -- see `main.rs` -- so the client
+/// gets a clear `ControlMessage::InputStatus` reason instead of a generic
+/// one; slice 2.5a, debt D26): the session still streams video, just
+/// view-only.
 pub struct NoopInjector {
     screen: (i32, i32),
 }

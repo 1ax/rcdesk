@@ -16,6 +16,7 @@ import type { Snapshot, StatsSummary } from "./stats";
 import { attachInput } from "./input";
 import { applyCursor } from "./cursor";
 import { displayOptions, parseDisplayId, shouldShowPicker } from "./displays";
+import { viewOnlyLabel } from "./inputStatus";
 import type { ControlMessage } from "./generated/ControlMessage";
 import type { DisplayEntry } from "./generated/DisplayEntry";
 
@@ -92,6 +93,7 @@ export function mount(root: Element | null): void {
       <div class="overlay" id="stats-overlay"></div>
       <div class="controls">
         <select id="display-select" class="display-select" hidden></select>
+        <span id="view-only" class="status view-only" hidden></span>
         <span id="session-status" class="status"></span>
         <button id="disconnect-btn" class="btn btn-secondary">Disconnect</button>
       </div>
@@ -113,6 +115,7 @@ export function mount(root: Element | null): void {
   const sessionStatus = root.querySelector<HTMLSpanElement>("#session-status")!;
   const disconnectBtn = root.querySelector<HTMLButtonElement>("#disconnect-btn")!;
   const displaySelect = root.querySelector<HTMLSelectElement>("#display-select")!;
+  const viewOnlyEl = root.querySelector<HTMLSpanElement>("#view-only")!;
 
   let signaling: SignalingClient | null = null;
   let session: PeerSession | null = null;
@@ -140,6 +143,10 @@ export function mount(root: Element | null): void {
   // The `control` data channel, kept around so the picker's `change`
   // handler can send `ControlMessage::SelectDisplay` on it directly.
   let controlChannel: RTCDataChannel | null = null;
+  // Whether the host reported it can't inject input for this session (slice
+  // 2.5a, debt D26), from `ControlMessage::InputStatus`. While true, input
+  // is never attached (see `maybeAttachInput`) and `#view-only` shows why.
+  let inputBlocked = false;
 
   /** Rebuilds `#display-select`'s options from `displays`/`currentDisplay`
    * and shows/hides it (only worth showing with 2+ displays, see
@@ -163,7 +170,7 @@ export function mount(root: Element | null): void {
   // host happened to open them in, independent of the connection state
   // reaching "connected" -- attach as soon as both are in hand.
   function maybeAttachInput(): void {
-    if (detachInput || !inputChannel || !pointerChannel) return;
+    if (detachInput || inputBlocked || !inputChannel || !pointerChannel) return;
     detachInput = attachInput(video, { input: inputChannel, pointer: pointerChannel });
   }
 
@@ -212,6 +219,22 @@ export function mount(root: Element | null): void {
         displays = msg.displays;
         currentDisplay = msg.current;
         renderDisplayPicker();
+        return;
+      }
+      if (msg.type === "input_status") {
+        const label = viewOnlyLabel(msg);
+        if (label !== null) {
+          inputBlocked = true;
+          detachInput?.();
+          detachInput = null;
+          viewOnlyEl.textContent = label;
+          viewOnlyEl.hidden = false;
+        } else {
+          inputBlocked = false;
+          viewOnlyEl.hidden = true;
+          viewOnlyEl.textContent = "";
+          maybeAttachInput();
+        }
         return;
       }
       applyCursor(video, msg);
@@ -273,6 +296,9 @@ export function mount(root: Element | null): void {
     controlChannel = null;
     displaySelect.hidden = true;
     displaySelect.innerHTML = "";
+    inputBlocked = false;
+    viewOnlyEl.hidden = true;
+    viewOnlyEl.textContent = "";
     session?.close();
     session = null;
     signaling?.close();

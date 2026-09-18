@@ -66,6 +66,19 @@ pub enum ControlMessage {
     },
     /// client -> host: switch the streamed display to `id`.
     SelectDisplay { id: u32 },
+    /// host -> client: whether the host can currently inject mouse/keyboard
+    /// input on this session (slice 2.5a, closing debt D26). Sent once,
+    /// right after `Displays`, when the `control` channel opens -- session
+    /// start is the only point input availability is decided, so unlike
+    /// `Displays` this never needs to be re-sent later. `available: false`
+    /// means the session is view-only (e.g. the host is missing the macOS
+    /// Accessibility permission, or was started with `serve --no-input`);
+    /// `reason` is a human-readable explanation for display, or `None` when
+    /// there's nothing to add (`available: true`).
+    InputStatus {
+        available: bool,
+        reason: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -173,6 +186,40 @@ mod tests {
 
         let json = serde_json::to_string(&msg).expect("serialize");
         assert_eq!(json, r#"{"type":"select_display","id":2}"#);
+
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, msg);
+    }
+
+    #[test]
+    fn input_status_unavailable_round_trips_through_json_with_exact_shape() {
+        let msg = ControlMessage::InputStatus {
+            available: false,
+            reason: Some("no Accessibility permission".to_string()),
+        };
+
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"input_status","available":false,"reason":"no Accessibility permission"}"#
+        );
+
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, msg);
+    }
+
+    #[test]
+    fn input_status_available_serializes_reason_as_json_null() {
+        let msg = ControlMessage::InputStatus {
+            available: true,
+            reason: None,
+        };
+
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"input_status","available":true,"reason":null}"#
+        );
 
         let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, msg);

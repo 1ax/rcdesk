@@ -43,8 +43,12 @@ impl EnigoInjector {
             release_keys_when_dropped: true,
             ..Default::default()
         };
-        let enigo =
-            Enigo::new(&settings).map_err(|err| anyhow::anyhow!("failed to init enigo: {err}"))?;
+        let enigo = Enigo::new(&settings).map_err(|err| match err {
+            ::enigo::NewConError::NoPermission => anyhow::anyhow!(
+                "no Accessibility permission (System Settings → Privacy & Security → Accessibility)"
+            ),
+            other => anyhow::anyhow!("failed to init enigo: {other}"),
+        })?;
         Ok(Self { enigo })
     }
 }

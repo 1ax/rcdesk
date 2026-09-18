@@ -9,7 +9,9 @@ use tokio::sync::mpsc::error::TryRecvError;
 use rcdesk_host::capture::{self, FrameSource};
 use rcdesk_host::cursor::CursorSource;
 use rcdesk_host::encode::{build_encoder, EncoderConfig, EncoderKind, RateTarget};
-use rcdesk_host::input::{Injector, NoopInjector};
+use rcdesk_host::input::Injector;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+use rcdesk_host::input::NoopInjector;
 use rcdesk_host::pipeline::Pipeline;
 use rcdesk_host::platform;
 use rcdesk_host::signaling::{HostContext, SignalingClient};
@@ -531,7 +533,12 @@ async fn run_serve(
 
     let build_injector: Box<dyn Fn() -> anyhow::Result<Box<dyn Injector>> + Send + Sync> =
         if no_input {
-            Box::new(|| Ok(Box::new(NoopInjector::new()) as Box<dyn Injector>))
+            // `Err`, not a `NoopInjector` directly: `start_session` already
+            // falls back to one on any `build_injector` failure and reports
+            // the reason to the client over `ControlMessage::InputStatus`
+            // (slice 2.5a, debt D26) -- this way `--no-input` gets a clear,
+            // specific reason instead of a generic one.
+            Box::new(|| Err(anyhow::anyhow!("disabled by --no-input")))
         } else {
             Box::new(build_real_injector)
         };

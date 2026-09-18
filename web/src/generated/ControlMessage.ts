@@ -5,4 +5,4 @@ import type { DisplayEntry } from "./DisplayEntry";
  * A single `control`-channel message, JSON-encoded on the wire (see
  * ARCHITECTURE.md §5).
  */
-export type ControlMessage = { "type": "cursor_shape", width: number, height: number, hotspot_x: number, hotspot_y: number, scale: number, rgba: string, } | { "type": "cursor_hidden" } | { "type": "ping", ts: number, } | { "type": "pong", ts: number, } | { "type": "quality", bitrate_kbps: number, fps: number, reason: string, } | { "type": "displays", displays: Array<DisplayEntry>, current: number, } | { "type": "select_display", id: number, };
+export type ControlMessage = { "type": "cursor_shape", width: number, height: number, hotspot_x: number, hotspot_y: number, scale: number, rgba: string, } | { "type": "cursor_hidden" } | { "type": "ping", ts: number, } | { "type": "pong", ts: number, } | { "type": "quality", bitrate_kbps: number, fps: number, reason: string, } | { "type": "displays", displays: Array<DisplayEntry>, current: number, } | { "type": "select_display", id: number, } | { "type": "input_status", available: boolean, reason: string | null, };

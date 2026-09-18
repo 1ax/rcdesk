@@ -172,6 +172,11 @@ body {
   color: var(--danger);
 }
 
+.view-only {
+  color: var(--danger);
+  text-transform: none;
+}
+
 .display-select {
   font-size: 12px;
   padding: 4px 10px;

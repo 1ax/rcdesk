@@ -30,7 +30,7 @@ use crate::adapt::{AdaptConfig, Controller, Feedback};
 use crate::capture::{self, DisplayInfo, FrameSource};
 use crate::cursor::{self, CursorSource, CursorState};
 use crate::encode::{build_encoder, EncodedFrame, EncoderConfig, EncoderKind, RateTarget};
-use crate::input::{Injector, InputRouter};
+use crate::input::{Injector, InputRouter, NoopInjector};
 use crate::pipeline::Pipeline;
 use crate::transport::{PeerSession, SessionConfig, SessionEvent};
 
@@ -77,9 +77,12 @@ pub struct HostContext {
     pub display: Option<u32>,
     /// Builds a fresh input injector for a new session, the same way as
     /// `build_source` (and for the same reason: the real, `enigo`-backed
-    /// implementation only exists behind `cfg(...)`). `main.rs` supplies
-    /// either that or a `NoopInjector`-returning closure, depending on
-    /// `serve --no-input` (see `docs/dev-run.md`).
+    /// implementation only exists behind `cfg(...)`). `main.rs` supplies the
+    /// real, platform-backed builder, or one that always returns `Err` for
+    /// `serve --no-input` (see `docs/dev-run.md`). Either way, `Err` here
+    /// doesn't fail the session: `start_session` falls back to a
+    /// `NoopInjector` and tells the client over `ControlMessage::InputStatus`
+    /// (slice 2.5a, debt D26).
     pub build_injector: Box<dyn Fn() -> anyhow::Result<Box<dyn Injector>> + Send + Sync>,
     /// Builds a fresh cursor-shape source for a new session, the same way as
     /// `build_source`/`build_injector` (and for the same reason: the real,
@@ -416,6 +419,17 @@ struct ActiveSession {
     /// the task (below) drops that future, which drops the watcher, which
     /// stops the thread.
     cursor_task: tokio::task::JoinHandle<()>,
+    /// Whether `start_session` obtained a real input injector for this
+    /// session (slice 2.5a, debt D26). `false` means the session is
+    /// view-only -- `build_injector` failed (e.g. missing the macOS
+    /// Accessibility permission, or `serve --no-input`) and a `NoopInjector`
+    /// was substituted so the session still streams video instead of dying.
+    /// Sent to the client as `ControlMessage::InputStatus` once the
+    /// `control` channel opens.
+    input_available: bool,
+    /// Human-readable reason for `input_available == false` (the error from
+    /// `build_injector`), or `None` when input is available.
+    input_reason: Option<String>,
 }
 
 impl ActiveSession {
@@ -458,16 +472,20 @@ async fn handle_signal_message(
                             displays: parts.displays,
                             router: parts.router,
                             cursor_task: parts.cursor_task,
+                            input_available: parts.input_available,
+                            input_reason: parts.input_reason,
                         });
                     }
                     Err(err) => {
                         tracing::warn!(?err, "failed to create offer");
                         parts.video.stop();
                         parts.cursor_task.abort();
+                        let _ = out_tx.send(SignalMessage::Bye { session_id });
                     }
                 },
                 Err(err) => {
                     tracing::warn!(?err, "failed to start session pipeline");
+                    let _ = out_tx.send(SignalMessage::Bye { session_id });
                 }
             }
         }
@@ -636,6 +654,21 @@ async fn handle_session_event(
                         tracing::warn!(?err, "failed to send initial displays list");
                     }
                 }
+                let status = ControlMessage::InputStatus {
+                    available: active.input_available,
+                    reason: active.input_reason.clone(),
+                };
+                match active.peer.send_control(&status).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!(
+                            "control channel not open yet, dropped initial input status"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, "failed to send initial input status");
+                    }
+                }
             }
             _ => {
                 tracing::trace!(label, "data channel open");
@@ -736,6 +769,10 @@ struct SessionParts {
     displays: Vec<DisplayInfo>,
     router: InputRouter,
     cursor_task: tokio::task::JoinHandle<()>,
+    /// See `ActiveSession::input_available`.
+    input_available: bool,
+    /// See `ActiveSession::input_reason`.
+    input_reason: Option<String>,
 }
 
 /// Builds the video pipeline and the `PeerSession` for one joining peer, and
@@ -775,7 +812,22 @@ async fn start_session(
     )
     .await?;
 
-    let injector = (ctx.build_injector)()?;
+    // A failed injector (e.g. missing the macOS Accessibility permission, or
+    // `serve --no-input`) must not take the whole session down -- fall back
+    // to a `NoopInjector` and tell the client it's view-only (slice 2.5a,
+    // debt D26) instead of erroring out of `start_session`.
+    let (injector, input_available, input_reason): (Box<dyn Injector>, bool, Option<String>) =
+        match (ctx.build_injector)() {
+            Ok(injector) => (injector, true, None),
+            Err(err) => {
+                tracing::warn!(error = %err, "input unavailable, session is view-only");
+                (
+                    Box::new(NoopInjector::new()) as Box<dyn Injector>,
+                    false,
+                    Some(err.to_string()),
+                )
+            }
+        };
     let router = InputRouter::new(injector);
     router.set_capture_rect(crate::input::CaptureRect::from(&video.display));
 
@@ -806,6 +858,8 @@ async fn start_session(
         displays,
         router,
         cursor_task,
+        input_available,
+        input_reason,
     })
 }
 
@@ -1099,5 +1153,93 @@ mod tests {
         let _more = collect_frames(&mut video_rx, 5, Duration::from_secs(5)).await;
 
         current.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_session_survives_a_failing_injector_and_reports_view_only() {
+        let mut ctx = test_ctx();
+        ctx.build_injector = Box::new(|| Err(anyhow::anyhow!("no Accessibility permission")));
+        let (events_tx, _events_rx) = mpsc::channel(64);
+
+        let parts = start_session(&ctx, events_tx)
+            .await
+            .expect("a failing injector must not fail session start");
+
+        assert!(!parts.input_available);
+        assert_eq!(
+            parts.input_reason.as_deref(),
+            Some("no Accessibility permission")
+        );
+
+        // `parts.video`'s own frame channel is consumed internally by
+        // `PeerSession::start_video`, which only forwards frames once DTLS
+        // has actually negotiated -- unobservable from a unit test with no
+        // real peer. Instead, prove the video path itself (built by
+        // `start_session` the same way, from the same `ctx`/display, before
+        // `build_injector` is ever called) really produces frames, the same
+        // way `switching_display_restarts_pipeline_and_keeps_frames_flowing`
+        // does above.
+        let (video_tx, mut video_rx) = mpsc::channel(4);
+        let keyframe_flag = Arc::new(AtomicBool::new(false));
+        let pipeline = VideoPipeline::start(
+            &ctx,
+            parts.video.display.clone(),
+            Arc::clone(&parts.peer),
+            video_tx,
+            keyframe_flag,
+        )
+        .await
+        .unwrap();
+        let frames = collect_frames(&mut video_rx, 5, Duration::from_secs(5)).await;
+        assert!(frames[0].keyframe, "first frame must be a keyframe");
+        pipeline.stop();
+
+        parts.video.stop();
+        parts.cursor_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_session_reports_input_available_with_a_working_injector() {
+        let ctx = test_ctx();
+        let (events_tx, _events_rx) = mpsc::channel(64);
+
+        let parts = start_session(&ctx, events_tx).await.unwrap();
+
+        assert!(parts.input_available);
+        assert_eq!(parts.input_reason, None);
+
+        parts.video.stop();
+        parts.cursor_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_joined_sends_bye_when_session_start_fails() {
+        let mut ctx = test_ctx();
+        ctx.build_source = Box::new(|_id| anyhow::bail!("synthetic source failure"));
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+            },
+            &ctx,
+            &out_tx,
+            event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+
+        assert!(active.is_none());
+        assert_eq!(current_session_id, None);
+        assert_eq!(
+            out_rx.try_recv().expect("expected a Bye message"),
+            SignalMessage::Bye {
+                session_id: "sess-1".to_string()
+            }
+        );
     }
 }
