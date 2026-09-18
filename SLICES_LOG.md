@@ -11,15 +11,22 @@
 > Всё, что НИЖЕ разделителя `---`, — append-only история. Архитектор при старте
 > чата читает сначала голову, в тело ныряет по ссылке на слайс.
 
-**Состояние на 2026-09-18 (шестой чат: слайс 2.5 закрыт):**
+**Состояние на 2026-09-18 (седьмой чат: слайс 2.6 в `main`, ждёт push и живой проверки владельца):**
+- 🟡 **Слайс 2.6 автозапуск и трей — в `main`, четыре коммита, не запушено** (см. запись 2.6): `dbd3d77` ядро агента
+  в `rcdesk_host::app` + переподключение (backoff 1→30 с, WS keepalive 20/45 с, `AgentStatus`); `f480468` свежие
+  ICE-креды в `PeerJoined`; `ba76691` бинарник `rcdesk-agent` (трей/меню-бар, `tray-icon` 0.25); `aac4f3b`
+  автозапуск (LaunchAgent / `HKCU\…\Run`, меню «Start at login», `rcdesk-host autostart on|off|status`), артефакты
+  CI с двумя бинарниками. Windows-код 2.6c/2.6d локально не компилировался — первая проверка в Deploy (D29).
+- ▶️ **Следующее:** push владельцем → зелёный Deploy → живая проверка 2.6 (инструкция — «За владельцем»), затем
+  закрыть слайс и перейти к фазе 3 (3.1 постоянные устройства). Новый чат — на следующий слайс.
+
+**Предыдущее состояние (шестой чат):**
 - ✅ **Слайс 2.5 буфер обмена — в `main`, проверен вживую** (см. запись 2.5): `509cb6b` режим просмотра без
   разрешения на ввод (D26); `536318a` протокол + хост (`ClipboardText` хост→клиент по `control`, клиент→хост
   по `input` перед Cmd+V; счётчик ОС + `arboard`, лимит 200 000 байт, `--no-clipboard`); `450da18` клиент
   (Chrome — фоново и по `clipboardchange`; Safari — `ClipboardItem`-промис на Ctrl/Cmd+C, кнопка «Вставить»
   на Ctrl/Cmd+V). Deploy `35380995575` зелёный (Windows-сборка буфера — с первого раза). Win10-хост ↔ Mac-клиент
   Chrome и Safari: копирование в обе стороны работает.
-- ▶️ **В работе: 2.6 автозапуск и трей/меню-бар** (седьмой чат, план и решения — запись 2.6): 2.6a ядро агента
-  + переподключение, 2.6b свежие ICE-креды на сеанс, 2.6c `rcdesk-agent` с треем, 2.6d автозапуск.
 - ✅ **2.4e монитор трафика — закрыт полностью** (`a7b5ec0`, Deploy `34889246636`, см. запись 2.4e):
   coturn отдаёт метрики на `127.0.0.1:9641`, `~/app/traffic-monitor.sh` в crontab `rcdesk` раз в 10 минут,
   уведомления в Telegram проверены сквозняком 2026-09-15 (бот `@Rcdesk_bot`, chat_id владельца).
@@ -68,6 +75,16 @@
   экрана; `git add` только явными путями, пока работает исполнитель.
 
 **За владельцем:**
+- **Push `main` и живая проверка 2.6** (после зелёного Deploy, артефакт с `rcdesk-host` + `rcdesk-agent`):
+  1. Стенд Win10: двойной клик `rcdesk-agent.exe` → без консоли, значок в трее (серый монитор), меню: `PIN …`,
+     Copy PIN (вставить в Блокнот), Open log. Подключиться с Mac → значок зелёный, `Session active`; End session
+     рвёт сеанс у клиента. Если значка нет/агент не стартует — `%LOCALAPPDATA%\rcdesk\logs\agent.log`.
+  2. Там же «Start at login» → галочка; Диспетчер задач → Автозагрузка: `rcdesk`; перелогиниться → агент поднялся
+     сам. Снять галочку → запись пропала.
+  3. Переподключение: при следующем деплое (или перезапуске сервера) агент уходит в `Offline — retrying…` и
+     возвращается с НОВЫМ PIN (ожидаемо до 3.1).
+  4. Mac (необязательно, из артефакта или `cargo build`): `rcdesk-agent` в меню-баре, пункты разрешений
+     `Grant … permission…` открывают нужные панели Настроек; разрешения выдаются самому бинарнику (D28).
 - ✅ Mac с реальным захватом после 2.4 — проверен владельцем 2026-09-18 (см. запись 2.5a): картинка
   1920×1080 28 fps VT, плашка `View only` без «Универсального доступа»; с ним — клиент Chrome на стенде Win10
   через прод, клики по Dock Mac попадают. Остаток — второй монитор (D23).
@@ -81,6 +98,16 @@
 - ✅ TLS 1.3 на nginx включён (2026-09-13, `/etc/nginx/conf.d/ssl.conf`, файл не принадлежит пакету).
 
 **Открытые долги:**
+- 🟡 D6 частично закрыт в 2.6a: переподключение к сигнальному серверу с backoff и keepalive есть; PIN при этом
+  меняется (стабильный — с постоянными устройствами, 3.1). Переподключение WebRTC-сеанса — по-прежнему 3.5.
+- ⚪ D28: **TCC на macOS сбрасывается при обновлении бинарника `rcdesk-agent`** — ad-hoc подпись, разрешения
+  привязаны к cdhash; при запуске из launchd разрешения выдаются самому бинарнику. Лечится подписью с постоянным
+  идентификатором и `.app`-бандлом (4.3).
+- ⚪ D29: **Windows-код 2.6c/2.6d не компилировался локально** (ring/assert.h): цикл сообщений, `SetThreadExecutionState`,
+  реестр `Run` сверены с исходниками `windows` 0.61.3 построчно, одна ошибка (`BOOL == 0`) поймана на сверке.
+  Первая сборка — Deploy после push; живое поведение — на стенде.
+- ⚪ D30: **иконка агента простая** (монитор, состояния: macOS — заливка template-иконки, Windows — цвет экрана);
+  на тёмной панели Windows серый может быть малозаметен — оценить на стенде.
 - ✅ D26 закрыт в 2.5a (2026-09-18): без разрешения на ввод сеанс деградирует в «только просмотр»
   (`NoopInjector` + `InputStatus` клиенту), а не гаснет; при провале старта — `Bye` клиенту. Для сессий из
   терминала TCC выдаётся родительскому приложению (PyCharm), «Универсальный доступ» у него по-прежнему нет.
@@ -673,3 +700,53 @@
   `rcdesk-agent`: трей/меню-бар (статус, PIN, «Скопировать PIN», «Завершить сеанс», «Открыть лог», «Выход»),
   лог в файл, один экземпляр, дефолт `wss://rcdesk.app/ws`; **2.6d** автозапуск (LaunchAgent / `HKCU\…\Run`),
   пункт меню и `rcdesk-agent autostart on|off|status`, артефакты CI, docs.
+
+#### 2.6a Ядро агента и переподключение
+
+- **`dbd3d77`** (executor + фикс-промпт + правка архитектора): `rcdesk_host::app` — `ServeOptions`,
+  `build_host_context`, бэкенды и сборщики из `main.rs`; `run_agent` — бесконечный цикл connect → `Registered` →
+  `run` с backoff 1→30 с (сброс после регистрации); `AgentStatus` (`Connecting`/`Registered`/`InSession`/`Reconnecting`)
+  через `watch`; `InSession` по `RTCPeerConnectionState::Connected`. `HostContext.session.ice_servers` — только
+  `--stun`, креды регистрации мёржатся на сеанс (`session_ice_servers`). Имя хоста: `--name` → имя компьютера
+  (`NSHost.localizedName`, `COMPUTERNAME`) → `HOSTNAME` → `rcdesk-host`; фичи `NSHost` + `NSString` у objc2-foundation
+  (без `NSString` тип `localizedName` не существует — принято). Сверка нашла отсутствие keepalive (ни хост, ни сервер
+  не пинговали — «тихий» обрыв висел бы вечно) → фикс: ping 20 с, тишина 45 с → обрыв; `serve` печатает `PIN:` только
+  при смене. Архитектор: ожидание writer-задачи после обрыва ограничено 2 с (close в мёртвый сокет мог висеть).
+- Гейты: host `98 passed; 0 failed; 2 ignored` (было 91), остальное без изменений. Живая проверка локально: убийство
+  сервера → `retry_in=1s,2s,4s,8s` → новый PIN после подъёма.
+
+#### 2.6b Свежие ICE-креды на сеанс
+
+- **`f480468`** (executor, сверка чистая): `PeerJoined { session_id, #[serde(default)] ice_servers }`, сервер кладёт
+  `ice.ice_servers(now)` (как в `Joined`), хост берёт их, пустые → креды регистрации (`peer_ice_servers`). Старые хосты
+  с новым сервером совместимы (в proto нет `deny_unknown_fields`). Гейты: host `100`, proto `26`, web `90 passed` без
+  изменений, generated TS — одно поле.
+
+#### 2.6c Агент в трее
+
+- **`ba76691`** (executor + правки архитектора): бинарник `rcdesk-agent` (`windows_subsystem = "windows"`), `default-run
+  = "rcdesk-host"` (иначе `cargo run -p rcdesk-host` в CI и docs сломался бы). Свой цикл событий без winit
+  (`NSApplication` Accessory + `nextEventMatchingMask` / `MsgWaitForMultipleObjects` + `PeekMessageW`, 100 мс), tokio —
+  отдельный runtime. Модуль `agent`: `menu_model`, `render_icon`, `probe_permissions` (`scap::has_permission` +
+  `EnigoInjector::new`), пути, лог в файл с ротацией 5 МБ и panic hook, один экземпляр через `File::try_lock`.
+  `AgentCommand::EndSession` → `Bye`. На время сеанса — `NSProcessInfo` activity (App Nap) / `SetThreadExecutionState`.
+  Новые крейты: `tray-icon`, `muda`, `png` и их зависимости; новый дубль — только `miniz_oxide` 0.8/0.9.
+  Правки архитектора: `PeekMessageW` возвращает структуру `BOOL` — `== 0` не скомпилировался бы на Windows →
+  `.as_bool()`; иконка 44 px на macOS (tray-icon рисует 18 pt — 22 px мылились бы на Retina) и 32 px на Windows;
+  фильтр лога `info,enigo=warn` (enigo писал info-строку на каждый опрос разрешений, ~8600 строк/сутки).
+- Гейты: host `119 passed; 0 failed; 2 ignored`. Живая проверка (Mac): регистрация и PIN в `agent.log`, второй
+  экземпляр выходит с кодом 0, переподключение; иконка-монитор видна в меню-баре и исчезает вместе с процессом
+  (скриншот архитектора).
+
+#### 2.6d Автозапуск
+
+- **`aac4f3b`** (executor, сверка чистая): `agent::autostart` (plist-XML с экранированием и round-trip разбором,
+  значение `Run` в кавычках, сравнение путей без учёта регистра на Windows, снятие `\\?\`), `platform::autostart`
+  macOS/Windows/other. LaunchAgent `app.rcdesk.agent` (`RunAtLoad`, `KeepAlive.SuccessfulExit=false`,
+  `LimitLoadToSessionType=Aqua`), `launchctl` не вызывается (bootstrap дал бы второй экземпляр, bootout убил бы агент
+  из его же меню). Windows: `RegOpenKeyExW` вместо `RegCreateKeyExW` (последний требует фичу `Win32_Security`; ключ
+  `Run` всегда существует). Меню «Start at login» (muda сам переключает галочку — проверено по исходникам, затем
+  `set_checked(факт)`), `rcdesk-host autostart on|off|status`. Deploy: оба бинарника в артефакте, дымовая
+  `autostart status`.
+- Гейты: host `133 passed; 0 failed; 2 ignored`, loopback `1`, proto `26`, server `8` + `7`; web не затронут.
+  Живая проверка (Mac, CLI): off → on (plist, `plutil -lint` OK) → off, plist удалён.
