@@ -1,3 +1,6 @@
+pub mod activity;
+pub mod event_loop;
+
 pub(super) fn name() -> &'static str {
     "macos"
 }

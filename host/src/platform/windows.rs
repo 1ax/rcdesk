@@ -1,8 +1,10 @@
 pub mod d3d;
 pub mod dpi;
+pub mod event_loop;
 pub mod keyboard;
 pub mod monitors;
 pub mod mouse;
+pub mod power;
 
 pub(super) fn name() -> &'static str {
     "windows"

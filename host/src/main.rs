@@ -361,6 +361,12 @@ async fn run_serve(opts: ServeOptions) -> anyhow::Result<()> {
     let name = app::resolve_host_name(opts.name.as_deref());
     let ctx = app::build_host_context(&opts)?;
 
+    // `serve` has no tray UI to send `AgentCommand`s from -- `_cmd_tx` is
+    // just kept alive so `cmd_rx.recv()` inside `run_agent` parks instead of
+    // seeing a closed channel (see `run_agent`'s doc comment); nothing ever
+    // sends on it.
+    let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
     let (status_tx, mut status_rx) = watch::channel(AgentStatus::Connecting);
     let print_task = tokio::spawn(async move {
         let mut last_printed: Option<String> = None;
@@ -381,6 +387,7 @@ async fn run_serve(opts: ServeOptions) -> anyhow::Result<()> {
         ReconnectPolicy::default(),
         Keepalive::default(),
         status_tx,
+        cmd_rx,
     )
     .await?;
     print_task.abort();

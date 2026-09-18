@@ -3,6 +3,11 @@ name = "rcdesk-host"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+# Two [[bin]]s below (`rcdesk-host`, `rcdesk-agent`) make `cargo run -p
+# rcdesk-host -- ...` ambiguous without a default -- see docs/dev-run.md and
+# the CI deploy smoke test, both of which run the CLI without naming a
+# binary.
+default-run = "rcdesk-host"
 
 [lib]
 name = "rcdesk_host"
@@ -11,6 +16,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "rcdesk-host"
 path = "src/main.rs"
+
+[[bin]]
+name = "rcdesk-agent"
+path = "src/agent_main.rs"
 
 [dependencies]
 tokio = { workspace = true }
@@ -44,6 +53,7 @@ base64 = { workspace = true }
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 scap = { workspace = true }
 enigo = { workspace = true }
+tray-icon = { version = "0.25", default-features = false }
 
 # scap 0.0.8 вызывает пятиаргументный `Settings::new`, который сломан в windows-capture 1.5+
 # (там 8 аргументов). Прямой пин держит lock-файл на совместимой версии даже после
@@ -80,6 +90,10 @@ windows = { version = "0.61", features = [
     # GetClipboardSequenceNumber (clipboard::windows) -- cheap OS change
     # counter, polled instead of reading the clipboard on every tick (2.5b).
     "Win32_System_DataExchange",
+    # SetThreadExecutionState (platform::windows::event_loop, 2.6c) -- keeps
+    # the display/system awake for the duration of an active session, the
+    # Windows equivalent of macOS's NSProcessInfo activity below.
+    "Win32_System_Power",
 ] }
 # Буфер обмена (2.5b): текст только, default-features=false drops the
 # `image-data` feature (image crate, extra objc2-core-graphics on macOS).
@@ -106,6 +120,15 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     # needed together for this one new call.
     "NSHost",
     "NSString",
+    # NSDate/NSRunLoop (platform::macos::event_loop, 2.6c): the `until`
+    # deadline and run-loop mode for `nextEventMatchingMask_untilDate_inMode_dequeue`.
+    "NSDate",
+    "NSRunLoop",
+    # NSProcessInfo.processInfo().beginActivityWithOptions_reason/endActivity
+    # (platform::macos::event_loop, 2.6c) -- keeps the tray agent from being
+    # App Nap-throttled while a session is active (no windows, no user
+    # interaction to otherwise tell macOS the process is doing real work).
+    "NSProcessInfo",
 ] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
@@ -116,6 +139,15 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     # NSPasteboard.generalPasteboard().changeCount() (clipboard::macos): cheap
     # OS change counter, polled instead of reading the clipboard every tick (2.5b).
     "NSPasteboard",
+    # NSApplication/NSResponder/NSEvent (platform::macos::event_loop, 2.6c):
+    # the tray agent's own minimal main-thread run loop --
+    # `sharedApplication`/`finishLaunching`/`nextEventMatchingMask_untilDate_inMode_dequeue`/
+    # `sendEvent`. NSRunningApplication for `setActivationPolicy` (Accessory,
+    # so the agent has no Dock icon).
+    "NSApplication",
+    "NSResponder",
+    "NSEvent",
+    "NSRunningApplication",
 ] }
 # Буфер обмена (2.5b), тот же default-features=false что для Windows выше --
 # нужен только текст.

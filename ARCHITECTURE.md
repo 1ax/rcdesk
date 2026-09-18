@@ -45,16 +45,18 @@ fps, аппаратное кодирование. Ориентир — Chrome Re
 rcdesk/
 ├── Cargo.toml            # workspace: proto, host, server
 ├── proto/                # типы сообщений (serde + ts-rs), без логики
-├── host/                 # хост-агент (бинарник rcdesk-host)
+├── host/                 # хост-агент (бинарники rcdesk-host, rcdesk-agent)
 │   └── src/
-│       ├── main.rs       # CLI, конфиг, запуск
+│       ├── main.rs       # CLI, конфиг, запуск (rcdesk-host)
+│       ├── agent_main.rs # трей/меню-бар агент (rcdesk-agent, 2.6c)
+│       ├── agent/        # меню/иконка/разрешения/пути/лог/лок — кроссплатформенно, без UI-вызовов
 │       ├── capture/      # трейт FrameSource + адаптеры scap, gdi (Windows), synthetic
 │       ├── encode/       # трейт Encoder + openh264 / videotoolbox / mediafoundation
 │       ├── pipeline/     # capture → encode → RTP; пейсинг, пропуск кадров
 │       ├── transport/    # webrtc-rs: PeerConnection, треки, data channels
 │       ├── input/        # события ввода → enigo; раскладка клавиш
 │       ├── signaling/    # клиент WS к серверу
-│       └── platform/     # macos/, windows/{keyboard,mouse,monitors,d3d,dpi} — всё, что за cfg
+│       └── platform/     # macos/{event_loop,activity}, windows/{keyboard,mouse,monitors,d3d,dpi,event_loop,power} — всё, что за cfg
 ├── server/               # сигнальный сервер (бинарник rcdesk-server)
 ├── web/                  # веб-клиент (Vite + TS)
 │   └── src/generated/    # TS-типы из proto (ts-rs), коммитятся
@@ -93,6 +95,17 @@ keyframe. Старый pipeline останавливается через `spawn
 (`control: Displays`, id/название/размер/primary) уходит клиенту при открытии `control`
 и после каждого переключения; без `--display` берётся primary. На Windows список —
 свой `EnumDisplayMonitors` (`platform::windows::monitors`), id = HMONITOR, как у scap.
+
+Агент в трее (2.6c): второй бинарник, `rcdesk-agent` (macOS меню-бар / Windows трей),
+поверх того же `app::run_agent`; `rcdesk-host` не меняется. Главный поток занят
+собственным минимальным циклом событий (`platform::{macos,windows}::event_loop::pump`,
+без winit/tao — см. §14) и меню `tray-icon`/`muda`; `run_agent` крутится на отдельном
+`tokio::runtime::Runtime` (не `#[tokio::main]`), общаются через `watch<AgentStatus>` и
+`mpsc::UnboundedSender<AgentCommand>` (`EndSession`). Лог — файл (`agent::paths::log_dir()`:
+`~/Library/Logs/rcdesk/agent.log` / `%LOCALAPPDATA%\rcdesk\logs\agent.log`, ротация от 5 МБ)
+вместо stderr; один экземпляр — лок-файл в `agent::paths::data_dir()`. На время активной
+сессии хост держит систему от сна: `NSProcessInfo` activity (macOS) / `SetThreadExecutionState`
+(Windows) — иначе App Nap/сон душит фоновый процесс без окон.
 
 ### 4.2 Веб-клиент (`web/`)
 
@@ -356,4 +369,5 @@ Telegram-бот (`TRAFFIC_TG_BOT_TOKEN`/`TRAFFIC_TG_CHAT_ID` в `~/app/.env`); �
 | enigo 0.6 | host (macOS/Windows) | инъекция ввода: macOS — `raw()` = CGKeyCode; Windows — только мышь/колесо (`raw()` не принимает E0-префикс, клавиши идут через свой `SendInput`); `main_display()` для масштаба координат |
 | objc2-core-foundation, objc2-core-video, objc2-core-media, objc2-video-toolbox 0.3 | host (macOS) | VideoToolbox: `VTCompressionSession`, `CVPixelBuffer` (NV12 без конверсии), `CMSampleBuffer`/`CMBlockBuffer` (AVCC → Annex-B), CF-словари свойств. Минимальные фичи, без objc2-классов; сидят на тех же objc2 0.6 / core-foundation 0.3, что enigo |
 | arboard 3.6 (default-features = false) | host (macOS/Windows) | текст буфера обмена (2.5); изменения — по счётчику ОС (NSPasteboard changeCount / GetClipboardSequenceNumber) |
+| tray-icon 0.25 (default-features = false) | host (macOS/Windows) | трей/меню-бар `rcdesk-agent` (2.6c): иконка + меню через реэкспорт `tray_icon::menu` (`muda`, без отдельной зависимости). Без winit/tao — свой минимальный цикл событий (`platform::{macos,windows}::event_loop`) |
 | vite 8, typescript 7, vitest 5 | web | сборка, типы, тесты; `vite.config.ts` использует `defineConfig` из `vitest/config` |

@@ -153,6 +153,23 @@ impl Default for Keepalive {
     }
 }
 
+/// A command sent into `SignalingClient::run`'s event loop from outside it
+/// -- the tray agent's "End session" menu item (slice 2.6c) is the first and
+/// only source today. The same shape as `SessionEvent` but for intent
+/// flowing the other way (UI -> signaling loop instead of transport ->
+/// signaling loop). `app::run_agent` owns the receiving end across every
+/// reconnect and hands `SignalingClient::run` a `&mut` to it each time (see
+/// that function's doc comment) so a command sent while the host is
+/// reconnecting isn't lost, just delayed until the next `run` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentCommand {
+    /// End the current session right now, if one is active: tells the
+    /// server (`SignalMessage::Bye`), tears down local session resources and
+    /// reports `AgentStatus::Registered` again. A no-op (debug-logged) when
+    /// no session is active.
+    EndSession,
+}
+
 /// A registered signaling connection, holding the PIN the owner reads out to
 /// pair a client.
 pub struct SignalingClient {
@@ -240,11 +257,16 @@ impl SignalingClient {
     /// *any* incoming frame (text, ping, pong -- traffic in either direction
     /// proves the socket is alive) and bails out once that's older than
     /// `keepalive.timeout`.
+    ///
+    /// `commands` is the tray agent's "End session" (and any future command,
+    /// slice 2.6c) input, owned by `app::run_agent` across every reconnect
+    /// -- see `AgentCommand`'s doc comment.
     pub async fn run(
         self,
         ctx: &HostContext,
         status: &watch::Sender<AgentStatus>,
         keepalive: Keepalive,
+        commands: &mut mpsc::UnboundedReceiver<AgentCommand>,
     ) -> anyhow::Result<()> {
         let SignalingClient {
             host_id,
@@ -331,6 +353,9 @@ impl SignalingClient {
                 }
                 Some(event) = event_rx.recv() => {
                     handle_session_event(event, ctx, &pin, status, &out_tx, &mut active, &mut current_session_id).await;
+                }
+                Some(cmd) = commands.recv() => {
+                    handle_agent_command(cmd, &pin, status, &out_tx, &mut active, &mut current_session_id).await;
                 }
                 _ = timeout_checker.tick() => {
                     let silence = last_incoming.elapsed();
@@ -692,6 +717,38 @@ async fn handle_signal_message(
         }
         other => {
             tracing::debug!(?other, "unexpected signal message, ignoring");
+        }
+    }
+}
+
+/// Handles an `AgentCommand` from outside the signaling loop (see that
+/// type's doc comment). Mirrors the `SignalMessage::Bye` arm of
+/// `handle_signal_message` above (same shutdown + status update), except
+/// this end is the one telling the server, not the other way around --
+/// hence sending `SignalMessage::Bye` here instead of just reacting to one.
+async fn handle_agent_command(
+    cmd: AgentCommand,
+    pin: &str,
+    status: &watch::Sender<AgentStatus>,
+    out_tx: &mpsc::UnboundedSender<SignalMessage>,
+    active: &mut Option<ActiveSession>,
+    current_session_id: &mut Option<String>,
+) {
+    match cmd {
+        AgentCommand::EndSession => {
+            let Some(old) = active.take() else {
+                tracing::debug!("EndSession command received with no active session, ignoring");
+                return;
+            };
+            let session_id = current_session_id.take();
+            tracing::info!(?session_id, "ending session (End session command)");
+            old.shutdown().await;
+            if let Some(session_id) = session_id {
+                let _ = out_tx.send(SignalMessage::Bye { session_id });
+            }
+            let _ = status.send(AgentStatus::Registered {
+                pin: pin.to_string(),
+            });
         }
     }
 }
@@ -1685,5 +1742,89 @@ mod tests {
         if let Some(active) = active.take() {
             active.shutdown().await;
         }
+    }
+
+    /// `AgentCommand::EndSession` with an active session must tell the
+    /// server (`Bye`), tear the session down and report `Registered` again
+    /// -- the tray agent's "End session" menu item (slice 2.6c).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_session_command_sends_bye_and_reports_registered() {
+        let ctx = test_ctx();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+        let (status_tx, status_rx) = watch::channel(AgentStatus::Connecting);
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+        assert!(active.is_some(), "session must have started successfully");
+        let _ = out_rx.try_recv(); // the Offer
+
+        handle_agent_command(
+            AgentCommand::EndSession,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+
+        assert!(active.is_none());
+        assert_eq!(current_session_id, None);
+        assert_eq!(
+            out_rx.try_recv().expect("expected a Bye message"),
+            SignalMessage::Bye {
+                session_id: "sess-1".to_string()
+            }
+        );
+        assert_eq!(
+            *status_rx.borrow(),
+            AgentStatus::Registered {
+                pin: "111111".to_string()
+            }
+        );
+    }
+
+    /// `AgentCommand::EndSession` with no active session is a no-op: no
+    /// `Bye`, no status change.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_session_command_with_no_active_session_is_a_no_op() {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+        let (status_tx, status_rx) = watch::channel(AgentStatus::Registered {
+            pin: "111111".to_string(),
+        });
+
+        handle_agent_command(
+            AgentCommand::EndSession,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+
+        assert!(out_rx.try_recv().is_err(), "no Bye should have been sent");
+        assert!(
+            !status_rx.has_changed().unwrap(),
+            "status must not change when there was no active session"
+        );
     }
 }

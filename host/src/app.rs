@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use clap::ValueEnum;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::capture::{self, FrameSource};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -19,7 +19,9 @@ use crate::input::Injector;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use crate::input::NoopInjector;
 use crate::platform;
-use crate::signaling::{AgentStatus, BuildClipboard, HostContext, Keepalive, SignalingClient};
+use crate::signaling::{
+    AgentCommand, AgentStatus, BuildClipboard, HostContext, Keepalive, SignalingClient,
+};
 use crate::transport::SessionConfig;
 
 /// Which screen-capture backend to use on Windows. No effect on
@@ -400,6 +402,14 @@ impl Backoff {
 /// across it.
 ///
 /// Never returns; cancel by dropping or aborting whatever task awaits it.
+///
+/// `commands` is the tray agent's "End session" input (slice 2.6c, see
+/// `AgentCommand`): owned here, across every reconnect, and handed to each
+/// `SignalingClient::run` call as a `&mut` borrow so a command that arrives
+/// while disconnected isn't lost, just delayed until the next successful
+/// registration. `serve` (no tray UI) passes a receiver whose sender it just
+/// holds onto for the process lifetime -- nothing ever sends on it, so this
+/// branch simply never fires there.
 pub async fn run_agent(
     ctx: &HostContext,
     server: &str,
@@ -407,6 +417,7 @@ pub async fn run_agent(
     policy: ReconnectPolicy,
     keepalive: Keepalive,
     status: watch::Sender<AgentStatus>,
+    mut commands: mpsc::UnboundedReceiver<AgentCommand>,
 ) -> anyhow::Result<std::convert::Infallible> {
     let mut backoff = Backoff::new(policy);
     loop {
@@ -422,7 +433,7 @@ pub async fn run_agent(
                 let _ = status.send(AgentStatus::Registered { pin: pin.clone() });
                 backoff.reset();
 
-                if let Err(err) = client.run(ctx, &status, keepalive).await {
+                if let Err(err) = client.run(ctx, &status, keepalive, &mut commands).await {
                     let retry_in = backoff.current();
                     tracing::warn!(
                         error = %err,
@@ -556,6 +567,7 @@ mod tests {
             max: Duration::from_millis(200),
         };
 
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let agent = tokio::spawn(async move {
             let ctx = ctx;
             let _ = run_agent(
@@ -565,6 +577,7 @@ mod tests {
                 policy,
                 Keepalive::default(),
                 status_tx,
+                cmd_rx,
             )
             .await;
         });
@@ -641,8 +654,18 @@ mod tests {
             timeout: Duration::from_millis(300),
         };
 
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let agent = tokio::spawn(async move {
-            let _ = run_agent(&ctx, &url, "test-host", policy, keepalive, status_tx).await;
+            let _ = run_agent(
+                &ctx,
+                &url,
+                "test-host",
+                policy,
+                keepalive,
+                status_tx,
+                cmd_rx,
+            )
+            .await;
         });
 
         timeout(Duration::from_secs(5), async {
@@ -692,8 +715,18 @@ mod tests {
             timeout: Duration::from_millis(300),
         };
 
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let agent = tokio::spawn(async move {
-            let _ = run_agent(&ctx, &url, "test-host", policy, keepalive, status_tx).await;
+            let _ = run_agent(
+                &ctx,
+                &url,
+                "test-host",
+                policy,
+                keepalive,
+                status_tx,
+                cmd_rx,
+            )
+            .await;
         });
 
         timeout(Duration::from_secs(2), async {

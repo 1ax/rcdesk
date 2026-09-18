@@ -5,6 +5,26 @@ mod other;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+/// `rcdesk-agent`'s minimal main-thread event loop (slice 2.6c) --
+/// `platform::macos::event_loop`/`platform::windows::event_loop`
+/// re-exported under one cfg-free path so `agent_main` doesn't need its own
+/// per-OS `use`. `macos` itself stays a private module (see `mod macos`
+/// above); this re-export is what makes `pump` (and, on macOS, `init`)
+/// reachable from outside `platform` at all.
+#[cfg(target_os = "macos")]
+pub use macos::event_loop;
+#[cfg(target_os = "windows")]
+pub use windows::event_loop;
+
+/// "Stay awake for this session" (slice 2.6c) -- `platform::macos::activity`
+/// re-exported the same way `event_loop` is above, so `agent_main` can name
+/// it as `platform::activity::SessionActivity` without reaching into the
+/// private `macos` module itself. No Windows re-export here: the Windows
+/// equivalent (`platform::windows::power`) is reachable directly, since
+/// `windows` (unlike `macos`) is already a `pub mod`.
+#[cfg(target_os = "macos")]
+pub use macos::activity;
+
 #[cfg(target_os = "macos")]
 pub fn name() -> &'static str {
     macos::name()
