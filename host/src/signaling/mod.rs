@@ -8,7 +8,7 @@
 //! command) exits.
 
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -28,6 +28,7 @@ use webrtc::runtime::Runtime;
 
 use crate::adapt::{AdaptConfig, Controller, Feedback};
 use crate::capture::{self, DisplayInfo, FrameSource};
+use crate::clipboard::{self, ClipboardBackend, ClipboardSync};
 use crate::cursor::{self, CursorSource, CursorState};
 use crate::encode::{build_encoder, EncodedFrame, EncoderConfig, EncoderKind, RateTarget};
 use crate::input::{Injector, InputRouter, NoopInjector};
@@ -41,6 +42,11 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// plenty for a cursor shape, which changes far less often than the pointer
 /// moves.
 const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(33);
+
+/// See `HostContext::build_clipboard`'s doc comment. Factored out (clippy
+/// `type_complexity`): the `Option<Box<dyn Fn() -> ...>>` nesting is one
+/// level deeper than `build_injector`/`build_cursor_source`'s bare closures.
+pub type BuildClipboard = Box<dyn Fn() -> anyhow::Result<Box<dyn ClipboardBackend>> + Send + Sync>;
 
 /// What the signaling client needs to build a fresh `PeerSession` and video
 /// pipeline for each joining peer.
@@ -89,6 +95,16 @@ pub struct HostContext {
     /// platform-backed implementation only exists behind `cfg(...)`).
     /// `main.rs` supplies either that or `cursor::NoopCursorSource`.
     pub build_cursor_source: Box<dyn Fn() -> Box<dyn CursorSource> + Send + Sync>,
+    /// Builds a fresh clipboard backend for a new session, the same pattern
+    /// as `build_injector`/`build_cursor_source` (slice 2.5b). `None` means
+    /// clipboard sync is disabled for every session (`serve --no-clipboard`);
+    /// `main.rs` supplies either that or the real, platform-backed builder.
+    /// Unlike `build_injector`, a `Some` closure that returns `Err` (e.g. no
+    /// platform clipboard available) doesn't disable input or fail the
+    /// session -- it just means this one session runs without clipboard
+    /// sync (same lesson as debt D26: a missing optional capability must
+    /// never take the session down).
+    pub build_clipboard: Option<BuildClipboard>,
     pub runtime: Arc<dyn Runtime>,
 }
 
@@ -430,6 +446,19 @@ struct ActiveSession {
     /// Human-readable reason for `input_available == false` (the error from
     /// `build_injector`), or `None` when input is available.
     input_reason: Option<String>,
+    /// Clipboard sync state for this session (slice 2.5b), shared between
+    /// `clipboard_task`'s watcher thread and
+    /// `handle_session_event`'s handling of `InputMessage::ClipboardText` on
+    /// the `input` channel. `None` when clipboard sync is disabled
+    /// (`HostContext::build_clipboard` is `None`) or unavailable for this
+    /// session (the builder returned `Err`) -- the session runs without it
+    /// either way, same as a missing input injector (debt D26).
+    clipboard: Option<Arc<Mutex<ClipboardSync>>>,
+    /// The task that reads clipboard text changes and forwards them over
+    /// `control`, mirroring `cursor_task` -- see that field's doc comment
+    /// for why the watcher lives inside the task's future rather than being
+    /// held separately. `None` alongside `clipboard: None`.
+    clipboard_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ActiveSession {
@@ -437,6 +466,9 @@ impl ActiveSession {
         self.peer.close().await;
         self.video.stop();
         self.cursor_task.abort();
+        if let Some(task) = self.clipboard_task {
+            task.abort();
+        }
     }
 }
 
@@ -474,12 +506,17 @@ async fn handle_signal_message(
                             cursor_task: parts.cursor_task,
                             input_available: parts.input_available,
                             input_reason: parts.input_reason,
+                            clipboard: parts.clipboard,
+                            clipboard_task: parts.clipboard_task,
                         });
                     }
                     Err(err) => {
                         tracing::warn!(?err, "failed to create offer");
                         parts.video.stop();
                         parts.cursor_task.abort();
+                        if let Some(task) = parts.clipboard_task {
+                            task.abort();
+                        }
                         let _ = out_tx.send(SignalMessage::Bye { session_id });
                     }
                 },
@@ -572,6 +609,25 @@ async fn handle_session_event(
                     tracing::warn!(label, "non-text message on input channel, ignoring");
                 } else {
                     match serde_json::from_slice::<proto::input::InputMessage>(&data) {
+                        // `ClipboardText` is never routed through
+                        // `InputRouter` like every other input message:
+                        // `handle_session_event` (this function) processes
+                        // one channel event at a time, so applying it here,
+                        // synchronously, guarantees the host's clipboard is
+                        // updated before the very next event (e.g. a Cmd+V
+                        // `Key`) reaches the router (slice 2.5b). Never
+                        // logged with its text -- length only (privacy).
+                        Ok(proto::input::InputMessage::ClipboardText { text }) => {
+                            if label == "pointer" {
+                                tracing::warn!(
+                                    label,
+                                    len = text.len(),
+                                    "clipboard_text on the unordered pointer channel, ignoring"
+                                );
+                            } else if let Some(active) = active.as_ref() {
+                                apply_remote_clipboard_text(active.clipboard.as_ref(), &text);
+                            }
+                        }
                         Ok(msg) => {
                             if let Some(active) = active.as_ref() {
                                 if active.router.sender().send(msg).is_err() {
@@ -603,6 +659,22 @@ async fn handle_session_event(
                             if let Some(active) = active.as_mut() {
                                 switch_display(ctx, active, id).await;
                             }
+                        }
+                        Ok(ControlMessage::ClipboardText { text }) => {
+                            // Wrong direction: `ClipboardText` is host ->
+                            // client only on `control` (see
+                            // `proto::control::ControlMessage::ClipboardText`'s
+                            // doc comment; the client -> host direction is
+                            // `proto::input::InputMessage::ClipboardText` on
+                            // `input`, handled above). Named explicitly
+                            // (rather than falling into the catch-all below)
+                            // so its text never reaches a log line, even at
+                            // `trace` (privacy).
+                            tracing::warn!(
+                                label,
+                                len = text.len(),
+                                "clipboard_text on control channel, ignoring (wrong direction)"
+                            );
                         }
                         Ok(other) => {
                             tracing::trace!(label, ?other, "unexpected control message, ignoring");
@@ -674,6 +746,27 @@ async fn handle_session_event(
                 tracing::trace!(label, "data channel open");
             }
         },
+    }
+}
+
+/// Applies an incoming `InputMessage::ClipboardText` (client -> host) to the
+/// session's clipboard, if clipboard sync is available for it -- see the
+/// call site in `handle_session_event` for why this happens synchronously
+/// rather than through `InputRouter`. `clipboard` is `None` when
+/// `HostContext::build_clipboard` was `None` (`serve --no-clipboard`) or the
+/// builder failed for this session; `text` is never logged (privacy).
+fn apply_remote_clipboard_text(clipboard: Option<&Arc<Mutex<ClipboardSync>>>, text: &str) {
+    match clipboard {
+        Some(sync) => {
+            let mut sync = sync.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            sync.apply_remote(text);
+        }
+        None => {
+            tracing::debug!(
+                len = text.len(),
+                "clipboard sync unavailable for this session, ignoring incoming clipboard text"
+            );
+        }
     }
 }
 
@@ -773,6 +866,10 @@ struct SessionParts {
     input_available: bool,
     /// See `ActiveSession::input_reason`.
     input_reason: Option<String>,
+    /// See `ActiveSession::clipboard`.
+    clipboard: Option<Arc<Mutex<ClipboardSync>>>,
+    /// See `ActiveSession::clipboard_task`.
+    clipboard_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Builds the video pipeline and the `PeerSession` for one joining peer, and
@@ -850,6 +947,34 @@ async fn start_session(
         }
     });
 
+    // A failed/absent clipboard builder must not take the session down
+    // either -- same lesson as the injector fallback above (debt D26): the
+    // session just runs without clipboard sync.
+    let (clipboard, clipboard_task) = match &ctx.build_clipboard {
+        Some(build_clipboard) => match build_clipboard() {
+            Ok(backend) => {
+                let sync = Arc::new(Mutex::new(ClipboardSync::new(backend)));
+                let mut clipboard_watcher =
+                    clipboard::watch(Arc::clone(&sync), clipboard::CLIPBOARD_POLL_INTERVAL);
+                let clipboard_peer = Arc::clone(&peer);
+                let task = tokio::spawn(async move {
+                    while let Some(text) = clipboard_watcher.rx.recv().await {
+                        let msg = ControlMessage::ClipboardText { text };
+                        if let Err(err) = clipboard_peer.send_control(&msg).await {
+                            tracing::warn!(?err, "failed to send clipboard control message");
+                        }
+                    }
+                });
+                (Some(sync), Some(task))
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "clipboard sync unavailable, session runs without it");
+                (None, None)
+            }
+        },
+        None => (None, None),
+    };
+
     Ok(SessionParts {
         peer,
         video,
@@ -860,6 +985,8 @@ async fn start_session(
         cursor_task,
         input_available,
         input_reason,
+        clipboard,
+        clipboard_task,
     })
 }
 
@@ -1055,6 +1182,7 @@ mod tests {
             build_cursor_source: Box::new(|| {
                 Box::new(crate::cursor::NoopCursorSource::new()) as Box<dyn CursorSource>
             }),
+            build_clipboard: None,
             runtime: webrtc::runtime::default_runtime()
                 .expect("runtime-tokio feature must be enabled"),
         }
@@ -1241,5 +1369,62 @@ mod tests {
                 session_id: "sess-1".to_string()
             }
         );
+    }
+
+    /// `InputMessage::ClipboardText` arriving on the `input` channel must be
+    /// applied straight to the session's clipboard backend, not handed to
+    /// `InputRouter` like every other input message (slice 2.5b) -- see
+    /// `apply_remote_clipboard_text`'s doc comment for why (ordering with
+    /// the next `Key`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clipboard_text_on_input_channel_is_applied_directly_not_routed() {
+        let mut ctx = test_ctx();
+        let fake_clipboard = crate::clipboard::FakeClipboardBackend::new();
+        let fake_for_ctx = fake_clipboard.clone();
+        ctx.build_clipboard = Some(Box::new(move || {
+            Ok(Box::new(fake_for_ctx.clone()) as Box<dyn ClipboardBackend>)
+        }));
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+            },
+            &ctx,
+            &out_tx,
+            event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+        assert!(active.is_some(), "session must have started successfully");
+        let _ = out_rx.try_recv(); // the Offer
+
+        let msg = proto::input::InputMessage::ClipboardText {
+            text: "from client".to_string(),
+        };
+        let data = serde_json::to_vec(&msg).unwrap();
+        handle_session_event(
+            SessionEvent::DataChannelMessage {
+                label: "input".to_string(),
+                data: data.into(),
+                is_string: true,
+            },
+            &ctx,
+            &out_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+
+        assert_eq!(fake_clipboard.set_calls(), vec!["from client".to_string()]);
+
+        if let Some(active) = active.take() {
+            active.shutdown().await;
+        }
     }
 }

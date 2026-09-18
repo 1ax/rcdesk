@@ -55,6 +55,18 @@ pub enum InputMessage {
     /// went hidden): release every key/button the host currently thinks is
     /// held, since no matching "up" event will ever arrive for them.
     ReleaseAll,
+    /// channel `input`, deliberately *not* `pointer` or `control` (slice
+    /// 2.5b): client -> host, the client's clipboard text changed. The host
+    /// applies it to its own clipboard synchronously, in-line with the
+    /// reliable, ordered `input` stream (not routed through the same queue
+    /// as `Key`/`PointerButton`, but handled just as sequentially) -- so by
+    /// the time the very next `Key` event (e.g. Cmd+V) arrives, the host's
+    /// clipboard is guaranteed already updated. `text` over
+    /// `host::clipboard::MAX_CLIPBOARD_BYTES` (200_000 UTF-8 bytes) is
+    /// dropped on the host with a `warn` (length only, never content). See
+    /// `proto::control::ControlMessage::ClipboardText` for the host ->
+    /// client direction.
+    ClipboardText { text: String },
 }
 
 #[cfg(test)]
@@ -100,6 +112,22 @@ mod tests {
 
         let json = serde_json::to_string(&msg).expect("serialize");
         assert_eq!(json, r#"{"type":"release_all"}"#);
+
+        let round_tripped: InputMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, msg);
+    }
+
+    #[test]
+    fn clipboard_text_round_trips_through_json_with_exact_shape() {
+        let msg = InputMessage::ClipboardText {
+            text: "hello from client".to_string(),
+        };
+
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"clipboard_text","text":"hello from client"}"#
+        );
 
         let round_tripped: InputMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, msg);

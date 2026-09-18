@@ -77,7 +77,16 @@ windows = { version = "0.61", features = [
     "Win32_System_Ole",
     # VARIANT, the value type ICodecAPI::SetValue takes.
     "Win32_System_Variant",
+    # GetClipboardSequenceNumber (clipboard::windows) -- cheap OS change
+    # counter, polled instead of reading the clipboard on every tick (2.5b).
+    "Win32_System_DataExchange",
 ] }
+# Буфер обмена (2.5b): текст только, default-features=false drops the
+# `image-data` feature (image crate, extra objc2-core-graphics on macOS).
+# On Windows arboard unconditionally pulls `clipboard-win` 5, which pulls a
+# second copy of `windows-sys` (<0.61) alongside our `windows` 0.61 -- an
+# accepted, separate crate family, not a duplicate of the same crate.
+arboard = { version = "3.6", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Версии совпадают с теми, что уже тянет `enigo` для macOS (см. Cargo.lock) --
@@ -95,7 +104,13 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSImage",
     "NSImageRep",
     "NSBitmapImageRep",
+    # NSPasteboard.generalPasteboard().changeCount() (clipboard::macos): cheap
+    # OS change counter, polled instead of reading the clipboard every tick (2.5b).
+    "NSPasteboard",
 ] }
+# Буфер обмена (2.5b), тот же default-features=false что для Windows выше --
+# нужен только текст.
+arboard = { version = "3.6", default-features = false }
 # CoreFoundation container/number/string types used to build VideoToolbox's
 # encoder-specification/property/frame-property dictionaries (encode::videotoolbox).
 objc2-core-foundation = { version = "0.3", default-features = false, features = [

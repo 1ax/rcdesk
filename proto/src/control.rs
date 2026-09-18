@@ -79,6 +79,17 @@ pub enum ControlMessage {
         available: bool,
         reason: Option<String>,
     },
+    /// host -> client: the host's clipboard text changed (slice 2.5b),
+    /// polled every 250ms via an OS change counter (`NSPasteboard`
+    /// `changeCount` / `GetClipboardSequenceNumber`, see `host::clipboard`).
+    /// `text` is never longer than `host::clipboard::MAX_CLIPBOARD_BYTES`
+    /// (200_000 UTF-8 bytes) -- anything bigger is dropped on the host with
+    /// a `warn` (length only, never content). Sent on the `control` channel,
+    /// never on `input`, since it isn't an input event; contrast
+    /// `proto::input::InputMessage::ClipboardText`, the client -> host
+    /// direction, which *does* need to travel on `input` (see that variant's
+    /// doc comment for why).
+    ClipboardText { text: String },
 }
 
 #[cfg(test)]
@@ -219,6 +230,22 @@ mod tests {
         assert_eq!(
             json,
             r#"{"type":"input_status","available":true,"reason":null}"#
+        );
+
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, msg);
+    }
+
+    #[test]
+    fn clipboard_text_round_trips_through_json_with_exact_shape() {
+        let msg = ControlMessage::ClipboardText {
+            text: "hello from host".to_string(),
+        };
+
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"clipboard_text","text":"hello from host"}"#
         );
 
         let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");

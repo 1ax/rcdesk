@@ -125,10 +125,11 @@ Keyboard Lock в Chrome в полноэкранном режиме. Оверле
   декодируют и Safari, и Chrome). Позже — переговоры High `640032` для Chrome и
   AV1 как опция. Без B-кадров, без открытых GOP, `max-fr`/`max-fs` не ограничиваем.
 - **Data channels** (SCTP):
-  - `input` — надёжный, упорядоченный: клавиши, кнопки мыши, колесо.
+  - `input` — надёжный, упорядоченный: клавиши, кнопки мыши, колесо; буфер обмена клиент → хост
+    (`ClipboardText` в одном потоке с клавишами: буфер хоста обновлён строго до следующего Cmd+V).
   - `pointer` — `ordered: false, maxRetransmits: 0`: движения мыши (потерянное
     движение не важно, следующее его заменит).
-  - `control` — надёжный: буфер обмена, смена монитора, качество, курсор, пинг.
+  - `control` — надёжный: буфер обмена хост → клиент, смена монитора, качество, курсор, пинг, статус ввода.
   - `file` — надёжный, чанки 64 КБ с backpressure по `bufferedAmount`.
 - **RTP-время видео:** отметка кадра = реальное время захвата (транспорт пакетизирует сам:
   `TrackLocalStaticRTP` + `Packetizer`, `skip_samples` на интервал между захватами). Фиксированный
@@ -343,9 +344,9 @@ Telegram-бот (`TRAFFIC_TG_BOT_TOKEN`/`TRAFFIC_TG_CHAT_ID` в `~/app/.env`); �
 | tokio-tungstenite 0.30 (rustls-tls-webpki-roots), futures-util 0.3 | host | WS/WSS-клиент сигналинга |
 | windows-capture =1.4.4 (пин) | host (Windows) | совместимость scap 0.0.8, см. docs/host-libs-api-notes.md |
 | base64 0.22 | host | RGBA курсора в JSON |
-| objc2 0.6, objc2-foundation 0.3, objc2-app-kit 0.3 | host (macOS) | NSCursor → NSBitmapImageRep (те же версии, что тянет enigo) |
-| windows 0.61 | host (Windows) | курсор (GetCursorInfo/GetIconInfo/GetDIBits), клавиатура (`SendInput`, `MapVirtualKeyW`), GDI-захват (`BitBlt`, `CreateDIBSection`), проба D3D 11 (`D3D11CreateDevice`; фича Dxgi нужна из-за cfg-гейта), DPI (`SetProcessDpiAwarenessContext`), Media Foundation H.264 MFT (`Win32_Media_MediaFoundation`; `Win32_System_{Com,Ole,Variant}` — COM-инициализация и `VARIANT` для `ICodecAPI::SetValue`). Та же версия, что у windows-capture |
+| objc2 0.6, objc2-foundation 0.3, objc2-app-kit 0.3 | host (macOS) | NSCursor → NSBitmapImageRep (те же версии, что тянет enigo); фича `NSPasteboard` — счётчик изменений буфера обмена (2.5b, для arboard тоже) |
+| windows 0.61 | host (Windows) | курсор (GetCursorInfo/GetIconInfo/GetDIBits), клавиатура (`SendInput`, `MapVirtualKeyW`), GDI-захват (`BitBlt`, `CreateDIBSection`), проба D3D 11 (`D3D11CreateDevice`; фича Dxgi нужна из-за cfg-гейта), DPI (`SetProcessDpiAwarenessContext`), Media Foundation H.264 MFT (`Win32_Media_MediaFoundation`; `Win32_System_{Com,Ole,Variant}` — COM-инициализация и `VARIANT` для `ICodecAPI::SetValue`), буфер обмена (`Win32_System_DataExchange` — `GetClipboardSequenceNumber`, 2.5b). Та же версия, что у windows-capture |
 | enigo 0.6 | host (macOS/Windows) | инъекция ввода: macOS — `raw()` = CGKeyCode; Windows — только мышь/колесо (`raw()` не принимает E0-префикс, клавиши идут через свой `SendInput`); `main_display()` для масштаба координат |
 | objc2-core-foundation, objc2-core-video, objc2-core-media, objc2-video-toolbox 0.3 | host (macOS) | VideoToolbox: `VTCompressionSession`, `CVPixelBuffer` (NV12 без конверсии), `CMSampleBuffer`/`CMBlockBuffer` (AVCC → Annex-B), CF-словари свойств. Минимальные фичи, без objc2-классов; сидят на тех же objc2 0.6 / core-foundation 0.3, что enigo |
-| arboard | host | буфер обмена (фаза 2) |
+| arboard 3.6 (default-features = false) | host (macOS/Windows) | текст буфера обмена (2.5); изменения — по счётчику ОС (NSPasteboard changeCount / GetClipboardSequenceNumber) |
 | vite 8, typescript 7, vitest 5 | web | сборка, типы, тесты; `vite.config.ts` использует `defineConfig` из `vitest/config` |

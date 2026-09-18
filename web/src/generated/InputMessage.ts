@@ -5,4 +5,4 @@ import type { PointerButton } from "./PointerButton";
  * A single input event from the client, JSON-encoded on the wire (see
  * ARCHITECTURE.md §5).
  */
-export type InputMessage = { "type": "pointer_move", x: number, y: number, } | { "type": "pointer_button", button: PointerButton, pressed: boolean, x: number, y: number, } | { "type": "wheel", dx: number, dy: number, x: number, y: number, } | { "type": "key", code: string, pressed: boolean, } | { "type": "release_all" };
+export type InputMessage = { "type": "pointer_move", x: number, y: number, } | { "type": "pointer_button", button: PointerButton, pressed: boolean, x: number, y: number, } | { "type": "wheel", dx: number, dy: number, x: number, y: number, } | { "type": "key", code: string, pressed: boolean, } | { "type": "release_all" } | { "type": "clipboard_text", text: string, };

@@ -189,6 +189,13 @@ fn apply(
         InputMessage::ReleaseAll => {
             release_all(injector, pressed_keys, pressed_buttons);
         }
+        InputMessage::ClipboardText { .. } => {
+            // Never reaches here: `crate::signaling::handle_session_event`
+            // intercepts `ClipboardText` on the `input` channel and applies
+            // it directly (synchronously, ahead of whatever `Key` follows)
+            // instead of handing it to the router. This arm exists only to
+            // keep the match exhaustive over `InputMessage`.
+        }
     }
 }
 

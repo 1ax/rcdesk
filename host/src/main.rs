@@ -7,6 +7,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tokio::sync::mpsc::error::TryRecvError;
 
 use rcdesk_host::capture::{self, FrameSource};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use rcdesk_host::clipboard::ClipboardBackend;
 use rcdesk_host::cursor::CursorSource;
 use rcdesk_host::encode::{build_encoder, EncoderConfig, EncoderKind, RateTarget};
 use rcdesk_host::input::Injector;
@@ -14,7 +16,7 @@ use rcdesk_host::input::Injector;
 use rcdesk_host::input::NoopInjector;
 use rcdesk_host::pipeline::Pipeline;
 use rcdesk_host::platform;
-use rcdesk_host::signaling::{HostContext, SignalingClient};
+use rcdesk_host::signaling::{BuildClipboard, HostContext, SignalingClient};
 use rcdesk_host::transport::SessionConfig;
 
 #[derive(Parser)]
@@ -144,6 +146,11 @@ enum Command {
         /// macOS "Universal Access" permission granted.
         #[arg(long)]
         no_input: bool,
+        /// Disable clipboard text sync (slice 2.5b): the host neither reads
+        /// nor writes the system clipboard for any session. See
+        /// `docs/dev-run.md`.
+        #[arg(long)]
+        no_clipboard: bool,
         /// Disable the bitrate/fps adaptation controller (slice 2.3): the
         /// encoder keeps `--bitrate`/`--fps` for the whole session. For
         /// before/after measurements.
@@ -206,13 +213,25 @@ async fn main() -> anyhow::Result<()> {
             max_qp,
             stun,
             no_input,
+            no_clipboard,
             no_adapt,
             capture,
             encoder,
         } => {
             run_serve(
-                server, name, synthetic, display, fps, bitrate, max_qp, stun, no_input, no_adapt,
-                capture, encoder,
+                server,
+                name,
+                synthetic,
+                display,
+                fps,
+                bitrate,
+                max_qp,
+                stun,
+                no_input,
+                no_clipboard,
+                no_adapt,
+                capture,
+                encoder,
             )
             .await
         }
@@ -337,6 +356,29 @@ fn build_real_cursor_source() -> Box<dyn CursorSource> {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn build_real_cursor_source() -> Box<dyn CursorSource> {
     Box::new(rcdesk_host::cursor::NoopCursorSource::new())
+}
+
+/// The real, platform-backed clipboard backend (slice 2.5b, see
+/// `rcdesk_host::clipboard::macos`/`::windows`). Unlike
+/// `build_real_cursor_source`/`build_real_injector` there is no no-op
+/// fallback on other platforms: `run_serve` passes `None` for
+/// `HostContext::build_clipboard` there instead, since "no clipboard sync"
+/// (not "sync that always fails") is the correct behavior when there's no
+/// backend at all.
+#[cfg(target_os = "macos")]
+fn build_real_clipboard_backend() -> anyhow::Result<Box<dyn ClipboardBackend>> {
+    Ok(
+        Box::new(rcdesk_host::clipboard::macos::MacClipboardBackend::new()?)
+            as Box<dyn ClipboardBackend>,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn build_real_clipboard_backend() -> anyhow::Result<Box<dyn ClipboardBackend>> {
+    Ok(
+        Box::new(rcdesk_host::clipboard::windows::WinClipboardBackend::new()?)
+            as Box<dyn ClipboardBackend>,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -496,6 +538,7 @@ async fn run_serve(
     max_qp: Option<u8>,
     stun: Vec<String>,
     no_input: bool,
+    no_clipboard: bool,
     no_adapt: bool,
     capture: CaptureBackend,
     encoder: EncoderBackend,
@@ -543,6 +586,19 @@ async fn run_serve(
             Box::new(build_real_injector)
         };
 
+    let build_clipboard: Option<BuildClipboard> = if no_clipboard {
+        None
+    } else {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            Some(Box::new(build_real_clipboard_backend) as BuildClipboard)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            None
+        }
+    };
+
     // Server-provided ICE servers (STUN, and TURN when configured -- see
     // `server/src/ice.rs`) plus any `--stun` overrides from the CLI.
     let mut ice_servers: Vec<proto::signal::IceServer> = client.ice_servers().to_vec();
@@ -567,6 +623,7 @@ async fn run_serve(
         display,
         build_injector,
         build_cursor_source: Box::new(build_real_cursor_source),
+        build_clipboard,
         runtime,
     };
 
