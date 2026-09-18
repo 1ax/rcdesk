@@ -14,6 +14,7 @@ import { PeerSession, toRtcIceServers } from "./session";
 import { summarizeStats, takeSnapshot } from "./stats";
 import type { Snapshot, StatsSummary } from "./stats";
 import { attachInput } from "./input";
+import { ClipboardBridge, isSafari } from "./clipboard";
 import { applyCursor } from "./cursor";
 import { displayOptions, parseDisplayId, shouldShowPicker } from "./displays";
 import { viewOnlyLabel } from "./inputStatus";
@@ -65,6 +66,10 @@ const PING_INTERVAL_MS = 1000;
 
 const STATS_INTERVAL_MS = 1000;
 
+/** How long `#clipboard-note` stays visible after `ClipboardBridge.notify`
+ * reports a too-large clipboard text (slice 2.5c, decision 5). */
+const CLIPBOARD_NOTE_MS = 4000;
+
 /** Builds the PIN/session UI inside `root` and wires it up. `root` may be
  * `null` (e.g. in an environment without the expected markup) -- a no-op. */
 export function mount(root: Element | null): void {
@@ -94,6 +99,7 @@ export function mount(root: Element | null): void {
       <div class="controls">
         <select id="display-select" class="display-select" hidden></select>
         <span id="view-only" class="status view-only" hidden></span>
+        <span id="clipboard-note" class="status clipboard-note" hidden></span>
         <span id="session-status" class="status"></span>
         <button id="disconnect-btn" class="btn btn-secondary">Disconnect</button>
       </div>
@@ -116,6 +122,7 @@ export function mount(root: Element | null): void {
   const disconnectBtn = root.querySelector<HTMLButtonElement>("#disconnect-btn")!;
   const displaySelect = root.querySelector<HTMLSelectElement>("#display-select")!;
   const viewOnlyEl = root.querySelector<HTMLSpanElement>("#view-only")!;
+  const clipboardNoteEl = root.querySelector<HTMLSpanElement>("#clipboard-note")!;
 
   let signaling: SignalingClient | null = null;
   let session: PeerSession | null = null;
@@ -147,6 +154,37 @@ export function mount(root: Element | null): void {
   // 2.5a, debt D26), from `ControlMessage::InputStatus`. While true, input
   // is never attached (see `maybeAttachInput`) and `#view-only` shows why.
   let inputBlocked = false;
+  // Mirrors the clipboard with the host for this session (slice 2.5c), or
+  // `null` when there's no session or `navigator.clipboard` isn't available
+  // (e.g. an insecure context) -- see the `joined` handler and `teardown`.
+  let clipboardBridge: ClipboardBridge | null = null;
+  // Whether `onClipboardChange` is currently registered on
+  // `navigator.clipboard` (only where `clipboardchange` exists -- Chrome),
+  // so `teardown` knows whether to remove it.
+  let clipboardChangeAttached = false;
+  let clipboardNoteTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** Shows `note` in `#clipboard-note` for `CLIPBOARD_NOTE_MS`, used as
+   * `ClipboardBridge`'s `notify` dependency (decision 5: a too-large
+   * clipboard text, in either direction). */
+  function showClipboardNote(note: string): void {
+    clipboardNoteEl.textContent = note;
+    clipboardNoteEl.hidden = false;
+    if (clipboardNoteTimer !== undefined) clearTimeout(clipboardNoteTimer);
+    clipboardNoteTimer = setTimeout(() => {
+      clipboardNoteEl.hidden = true;
+      clipboardNoteEl.textContent = "";
+      clipboardNoteTimer = undefined;
+    }, CLIPBOARD_NOTE_MS);
+  }
+
+  function onClipboardFocusOrGesture(): void {
+    clipboardBridge?.onFocusOrGesture();
+  }
+
+  function onClipboardChange(): void {
+    void clipboardBridge?.onLocalClipboardChange();
+  }
 
   /** Rebuilds `#display-select`'s options from `displays`/`currentDisplay`
    * and shows/hides it (only worth showing with 2+ displays, see
@@ -171,7 +209,17 @@ export function mount(root: Element | null): void {
   // reaching "connected" -- attach as soon as both are in hand.
   function maybeAttachInput(): void {
     if (detachInput || inputBlocked || !inputChannel || !pointerChannel) return;
-    detachInput = attachInput(video, { input: inputChannel, pointer: pointerChannel });
+    const bridge = clipboardBridge;
+    detachInput = attachInput(
+      video,
+      { input: inputChannel, pointer: pointerChannel },
+      bridge
+        ? {
+            beforePaste: () => bridge.syncBeforePaste(),
+            onCopyShortcut: () => bridge.beginDeferredCopy(),
+          }
+        : undefined,
+    );
   }
 
   function stopPingLoop(): void {
@@ -237,6 +285,10 @@ export function mount(root: Element | null): void {
         }
         return;
       }
+      if (msg.type === "clipboard_text") {
+        clipboardBridge?.onHostText(msg.text);
+        return;
+      }
       applyCursor(video, msg);
     });
   }
@@ -299,6 +351,22 @@ export function mount(root: Element | null): void {
     inputBlocked = false;
     viewOnlyEl.hidden = true;
     viewOnlyEl.textContent = "";
+    if (clipboardBridge) {
+      window.removeEventListener("focus", onClipboardFocusOrGesture);
+      document.removeEventListener("pointerdown", onClipboardFocusOrGesture, true);
+      document.removeEventListener("keydown", onClipboardFocusOrGesture, true);
+      if (clipboardChangeAttached) {
+        navigator.clipboard.removeEventListener("clipboardchange", onClipboardChange);
+        clipboardChangeAttached = false;
+      }
+    }
+    clipboardBridge = null;
+    if (clipboardNoteTimer !== undefined) {
+      clearTimeout(clipboardNoteTimer);
+      clipboardNoteTimer = undefined;
+    }
+    clipboardNoteEl.hidden = true;
+    clipboardNoteEl.textContent = "";
     session?.close();
     session = null;
     signaling?.close();
@@ -337,6 +405,37 @@ export function mount(root: Element | null): void {
       sessionId = msg.session_id;
       showSessionScreen();
       setSessionStatus("connecting");
+
+      if (navigator.clipboard) {
+        const clipboard = navigator.clipboard;
+        clipboardBridge = new ClipboardBridge({
+          writeText: (text) => clipboard.writeText(text),
+          readText: () => clipboard.readText(),
+          // The deferred `ClipboardItem` write (decision 3) is a
+          // Safari-only trick -- Chrome already gets the same result from
+          // `writeText` in `onHostText` (decision 1b).
+          writeDeferred: isSafari(navigator.userAgent)
+            ? (blob) => clipboard.write([new ClipboardItem({ "text/plain": blob })])
+            : undefined,
+          send: (msg) => {
+            if (inputChannel?.readyState === "open") {
+              inputChannel.send(JSON.stringify(msg));
+            }
+          },
+          notify: (note) => showClipboardNote(note),
+          setTimeout: (handler, ms) => setTimeout(handler, ms),
+          clearTimeout: (handle) => clearTimeout(handle),
+        });
+        window.addEventListener("focus", onClipboardFocusOrGesture);
+        document.addEventListener("pointerdown", onClipboardFocusOrGesture, true);
+        document.addEventListener("keydown", onClipboardFocusOrGesture, true);
+        if ("onclipboardchange" in clipboard) {
+          clipboard.addEventListener("clipboardchange", onClipboardChange);
+          clipboardChangeAttached = true;
+        }
+      } else {
+        console.warn("navigator.clipboard unavailable; clipboard sync disabled");
+      }
 
       session = new PeerSession(
         { iceServers: toRtcIceServers(msg.ice_servers) },

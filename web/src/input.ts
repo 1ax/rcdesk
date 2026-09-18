@@ -11,6 +11,7 @@
 
 import type { InputMessage } from "./generated/InputMessage";
 import type { PointerButton } from "./generated/PointerButton";
+import { isCopyShortcut, isPasteShortcut } from "./clipboard";
 
 /** The two data channels `attachInput` needs, opened by the host and handed
  * to the client via `PeerSession`'s `onDataChannel` callback (see
@@ -130,13 +131,79 @@ function send(channel: RTCDataChannel, msg: InputMessage): void {
 }
 
 /**
+ * Gates `input`-channel messages behind an in-flight paste sync (slice
+ * 2.5c, decision 2a): while open, every message passed to `send` is queued
+ * instead of forwarded straight to `sink`; `release` closes the gate and
+ * flushes the queue through `sink`, in the order the messages arrived --
+ * so a Cmd/Ctrl+V keydown (queued first, see `attachInput`'s `onKeyDown`)
+ * and every key event that lands while the host's clipboard is being
+ * synced go out in the same order they happened, after the sync settles
+ * (`ClipboardBridge.syncBeforePaste` never rejects, but `release` is
+ * called either way -- see `attachInput`). */
+export class KeyMessageGate {
+  private queue: InputMessage[] = [];
+  private open_ = false;
+
+  get isOpen(): boolean {
+    return this.open_;
+  }
+
+  open(): void {
+    this.open_ = true;
+  }
+
+  /** Forwards `msg` to `sink` immediately if the gate is closed, or queues
+   * it (in arrival order) if open. */
+  send(msg: InputMessage, sink: (msg: InputMessage) => void): void {
+    if (this.open_) this.queue.push(msg);
+    else sink(msg);
+  }
+
+  /** Closes the gate and flushes the queue through `sink`, in order. Safe
+   * to call when already closed (flushes an empty queue, a no-op). */
+  release(sink: (msg: InputMessage) => void): void {
+    this.open_ = false;
+    const pending = this.queue;
+    this.queue = [];
+    for (const msg of pending) sink(msg);
+  }
+}
+
+/** Optional clipboard hooks `attachInput` calls on the matching keyboard
+ * shortcuts (slice 2.5c) -- `app.ts` wires these to a `ClipboardBridge`.
+ * Omitted (e.g. no `ClipboardBridge` for this session), `attachInput`
+ * behaves exactly as it did before this slice: shortcuts are forwarded as
+ * plain `key` messages with no gating or copy hook. */
+export interface InputHooks {
+  /** Called on a Cmd/Ctrl+V keydown, before that keydown (and any key
+   * event that arrives while this promise is pending) is sent to the host
+   * -- gives the caller a chance to sync the local clipboard to the host
+   * first (`ClipboardBridge.syncBeforePaste`). Never expected to reject,
+   * but `attachInput` releases the gate either way. */
+  beforePaste?: () => Promise<void>;
+  /** Called synchronously from within a Cmd/Ctrl+C or +X keydown handler --
+   * i.e. still inside the user gesture, which Safari's
+   * `navigator.clipboard.write` requires (`ClipboardBridge.beginDeferredCopy`). */
+  onCopyShortcut?: () => void;
+}
+
+/**
  * Wires pointer/wheel/keyboard listeners on `video` and starts forwarding
  * them to the host over `channels`. Returns a `detach` function that removes
  * every listener this installed.
  */
-export function attachInput(video: HTMLVideoElement, channels: InputChannels): () => void {
+export function attachInput(
+  video: HTMLVideoElement,
+  channels: InputChannels,
+  hooks?: InputHooks,
+): () => void {
   let rafHandle: number | null = null;
   let pendingMove: { x: number; y: number } | null = null;
+  const keyGate = new KeyMessageGate();
+
+  function sendGatedInput(msg: InputMessage): void {
+    keyGate.send(msg, (m) => send(channels.input, m));
+  }
 
   function flushPointerMove(): void {
     rafHandle = null;
@@ -197,17 +264,38 @@ export function attachInput(video: HTMLVideoElement, channels: InputChannels): (
   function onKeyDown(e: KeyboardEvent): void {
     e.preventDefault();
     const msg = keyToMessage(e.code, true, e.repeat);
-    if (msg) send(channels.input, msg);
+
+    if (msg && isPasteShortcut(e) && hooks?.beforePaste) {
+      // Open the gate *before* queueing this keydown, so it -- and every
+      // key event that lands while `beforePaste` is pending -- goes out
+      // strictly after whatever `beforePaste` itself sends (the host's
+      // `clipboard_text`, sent directly on the same `input` channel, see
+      // `ClipboardBridge.syncBeforePaste`), in arrival order.
+      keyGate.open();
+      sendGatedInput(msg);
+      const wait = hooks.beforePaste();
+      wait
+        .catch(() => {
+          // `syncBeforePaste` doesn't reject, but the gate must still open
+          // if some other hook ever does.
+        })
+        .then(() => keyGate.release((m) => send(channels.input, m)));
+      return;
+    }
+
+    if (isCopyShortcut(e)) hooks?.onCopyShortcut?.();
+
+    if (msg) sendGatedInput(msg);
   }
 
   function onKeyUp(e: KeyboardEvent): void {
     e.preventDefault();
     const msg = keyToMessage(e.code, false, e.repeat);
-    if (msg) send(channels.input, msg);
+    if (msg) sendGatedInput(msg);
   }
 
   function releaseAll(): void {
-    send(channels.input, { type: "release_all" });
+    sendGatedInput({ type: "release_all" });
   }
 
   function onWindowBlur(): void {
