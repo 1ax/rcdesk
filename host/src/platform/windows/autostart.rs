@@ -195,8 +195,10 @@ fn read_run_value() -> anyhow::Result<Option<String>> {
 
     let len = (actual_len as usize).min(buf.len());
     let words: Vec<u16> = buf[..len]
-        .chunks_exact(2)
-        .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_ne_bytes(*pair))
         .collect();
     let s = String::from_utf16_lossy(&words);
     Ok(Some(s.trim_end_matches('\0').to_string()))
