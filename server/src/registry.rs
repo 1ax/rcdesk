@@ -24,6 +24,9 @@ const PIN_LEN: usize = 6;
 pub enum JoinError {
     UnknownPin,
     HostBusy,
+    /// `join_by_host_id` (slice 3.1): no host is currently registered under
+    /// that `host_id`.
+    HostOffline,
 }
 
 impl JoinError {
@@ -31,6 +34,7 @@ impl JoinError {
         match self {
             JoinError::UnknownPin => "unknown pin",
             JoinError::HostBusy => "host busy",
+            JoinError::HostOffline => "device offline",
         }
     }
 }
@@ -155,21 +159,56 @@ impl Registry {
     }
 
     /// A client joins a host by PIN. Returns the new session id, the host's
-    /// display name, and the host's tx (so the caller can notify it with
-    /// `PeerJoined`).
-    pub fn join(&self, pin: &str, client_tx: Tx) -> Result<(String, String, Tx), JoinError> {
+    /// `host_id` (slice 3.1: so the caller can link the device to a known
+    /// owner), the host's display name, and the host's tx (so the caller can
+    /// notify it with `PeerJoined`). Resolves `pin` to a `host_id` in its own
+    /// short critical section, then delegates the rest to `join_by_host_id`
+    /// -- the two can't share one critical section since both take the same
+    /// `Mutex`.
+    pub fn join(
+        &self,
+        pin: &str,
+        client_tx: Tx,
+    ) -> Result<(String, String, String, Tx), JoinError> {
+        let host_id = {
+            let inner = self.inner.lock().expect("registry mutex poisoned");
+            inner
+                .pin_to_host
+                .get(pin)
+                .cloned()
+                .ok_or(JoinError::UnknownPin)?
+        };
+
+        let (session_id, host_name, host_tx) =
+            self.join_by_host_id(&host_id, client_tx)
+                .map_err(|err| match err {
+                    // `host_id` was just resolved from a live `pin_to_host`
+                    // entry; if the host has since disconnected in the tiny
+                    // window before we re-took the lock, that's still "this pin
+                    // doesn't lead anywhere" from the PIN-joining caller's point
+                    // of view, not a caller-visible `HostOffline` (a PIN joiner
+                    // doesn't know about `host_id`s).
+                    JoinError::HostOffline => JoinError::UnknownPin,
+                    other => other,
+                })?;
+
+        Ok((session_id, host_id, host_name, host_tx))
+    }
+
+    /// A client joins a specific device by `host_id`, without a PIN (slice
+    /// 3.1: `ConnectDevice`, once the client is authenticated and the device
+    /// is confirmed linked to it). Returns the same triple as `join` minus
+    /// `host_id` (the caller already has it). `HostOffline` if no host is
+    /// currently registered under that id, `HostBusy` if it already has an
+    /// active session.
+    pub fn join_by_host_id(
+        &self,
+        host_id: &str,
+        client_tx: Tx,
+    ) -> Result<(String, String, Tx), JoinError> {
         let mut inner = self.inner.lock().expect("registry mutex poisoned");
 
-        let host_id = inner
-            .pin_to_host
-            .get(pin)
-            .cloned()
-            .ok_or(JoinError::UnknownPin)?;
-        let host = inner
-            .hosts
-            .get(&host_id)
-            .expect("pin_to_host points at a live host");
-
+        let host = inner.hosts.get(host_id).ok_or(JoinError::HostOffline)?;
         if host.session_id.is_some() {
             return Err(JoinError::HostBusy);
         }
@@ -187,18 +226,30 @@ impl Registry {
         inner.sessions.insert(
             session_id.clone(),
             SessionEntry {
-                host_id: host_id.clone(),
+                host_id: host_id.to_string(),
                 host_tx: host_tx.clone(),
                 client_tx,
             },
         );
         inner
             .hosts
-            .get_mut(&host_id)
+            .get_mut(host_id)
             .expect("host still present")
             .session_id = Some(session_id.clone());
 
         Ok((session_id, host_name, host_tx))
+    }
+
+    /// Presence of a registered device (slice 3.1, used to fill
+    /// `DeviceEntry.online`/`.busy`): `None` if it isn't currently
+    /// connected, `Some(busy)` if it is, where `busy` is whether it has an
+    /// active session.
+    pub fn host_presence(&self, host_id: &str) -> Option<bool> {
+        let inner = self.inner.lock().expect("registry mutex poisoned");
+        inner
+            .hosts
+            .get(host_id)
+            .map(|host| host.session_id.is_some())
     }
 
     /// Looks up the client tx for a session, validating that `host_id` is
@@ -347,7 +398,7 @@ mod tests {
             registry.register_host("host1".to_string(), "host".to_string(), host_tx);
 
         let (client_tx, _rx) = channel();
-        let (session_id, _name, _host_tx) =
+        let (session_id, _host_id, _name, _host_tx) =
             registry.join(&pin, client_tx.clone()).expect("join ok");
 
         assert!(registry
@@ -355,7 +406,7 @@ mod tests {
             .is_some());
 
         let (client_tx_2, _rx2) = channel();
-        let (_session_id_2, _name, _host_tx) =
+        let (_session_id_2, _host_id_2, _name, _host_tx) =
             registry.join(&pin, client_tx_2).expect("second join ok");
 
         // host is still registered and its pin/id unchanged
@@ -398,7 +449,7 @@ mod tests {
             registry.register_host("host1".to_string(), "host".to_string(), host_tx);
 
         let (client_tx, _client_rx) = channel();
-        let (session_id, _name, _host_tx) =
+        let (session_id, _host_id, _name, _host_tx) =
             registry.join(&pin, client_tx.clone()).expect("join ok");
 
         let (new_tx, _new_rx) = channel();
@@ -454,5 +505,77 @@ mod tests {
             registry.join(&pin, client_tx).unwrap_err(),
             JoinError::UnknownPin
         );
+    }
+
+    #[test]
+    fn join_by_host_id_for_unregistered_device_fails_with_host_offline() {
+        let registry = Registry::new();
+        let (client_tx, _rx) = channel();
+        let err = registry
+            .join_by_host_id("no-such-device", client_tx)
+            .unwrap_err();
+        assert_eq!(err, JoinError::HostOffline);
+    }
+
+    #[test]
+    fn join_by_host_id_for_busy_device_fails_with_host_busy() {
+        let registry = Registry::new();
+        let (host_tx, _host_rx) = channel();
+        registry.register_host("host1".to_string(), "host".to_string(), host_tx);
+
+        let (client_tx_1, _rx1) = channel();
+        registry
+            .join_by_host_id("host1", client_tx_1)
+            .expect("first join ok");
+
+        let (client_tx_2, _rx2) = channel();
+        let err = registry.join_by_host_id("host1", client_tx_2).unwrap_err();
+        assert_eq!(err, JoinError::HostBusy);
+    }
+
+    #[test]
+    fn join_by_host_id_success_is_visible_via_peer_tx_for_host() {
+        let registry = Registry::new();
+        let (host_tx, _host_rx) = channel();
+        registry.register_host("host1".to_string(), "host".to_string(), host_tx);
+
+        let (client_tx, _rx) = channel();
+        let (session_id, host_name, _host_tx) = registry
+            .join_by_host_id("host1", client_tx)
+            .expect("join ok");
+
+        assert_eq!(host_name, "host");
+        assert!(registry.peer_tx_for_host("host1", &session_id).is_some());
+    }
+
+    #[test]
+    fn join_by_pin_still_works_and_also_returns_the_hosts_id() {
+        let registry = Registry::new();
+        let (host_tx, _host_rx) = channel();
+        let (pin, _displaced) =
+            registry.register_host("host1".to_string(), "host".to_string(), host_tx);
+
+        let (client_tx, _rx) = channel();
+        let (_session_id, host_id, host_name, _host_tx) =
+            registry.join(&pin, client_tx).expect("join ok");
+
+        assert_eq!(host_id, "host1");
+        assert_eq!(host_name, "host");
+    }
+
+    #[test]
+    fn host_presence_reflects_disconnected_connected_and_busy_states() {
+        let registry = Registry::new();
+        assert_eq!(registry.host_presence("host1"), None);
+
+        let (host_tx, _host_rx) = channel();
+        registry.register_host("host1".to_string(), "host".to_string(), host_tx);
+        assert_eq!(registry.host_presence("host1"), Some(false));
+
+        let (client_tx, _rx) = channel();
+        registry
+            .join_by_host_id("host1", client_tx)
+            .expect("join ok");
+        assert_eq!(registry.host_presence("host1"), Some(true));
     }
 }

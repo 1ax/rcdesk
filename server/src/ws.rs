@@ -11,13 +11,14 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
-use proto::signal::{Role, SignalMessage};
+use proto::signal::{DeviceEntry, Role, SignalMessage};
 use tokio::sync::mpsc;
 
 use crate::app::AppState;
 use crate::db::Db;
 use crate::devices::{self, DeviceAuth};
 use crate::ice::{self, IceConfig};
+use crate::owners;
 use crate::registry::{Registry, Tx};
 
 pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -115,7 +116,7 @@ async fn run_connection(
 
     match role {
         Role::Host => run_host(stream, tx, registry, ice, db).await,
-        Role::Client => run_client(stream, tx, registry, ice).await,
+        Role::Client => run_client(stream, tx, registry, ice, db).await,
     }
 }
 
@@ -264,12 +265,45 @@ async fn run_host(
     }
 }
 
+/// Builds the `DeviceEntry` list for `Authenticated`/`Devices`: the owner's
+/// linked devices from the persistent store, each combined with its
+/// sign-in-memory presence from the registry. One place for this so the
+/// five branches below (`ClientAuth`, `ListDevices`, `ConnectDevice`'s
+/// ownership check aside, `RenameDevice`, `ForgetDevice`) don't repeat it.
+fn device_entries_for_owner(
+    db: &Db,
+    registry: &Registry,
+    owner_id: &str,
+) -> anyhow::Result<Vec<DeviceEntry>> {
+    let devices = db.devices_for_owner(owner_id)?;
+    Ok(devices
+        .into_iter()
+        .map(|device| {
+            let presence = registry.host_presence(&device.device_id);
+            DeviceEntry {
+                device_id: device.device_id,
+                name: device.name,
+                alias: device.alias,
+                online: presence.is_some(),
+                busy: presence == Some(true),
+                last_seen_at: device.last_seen_at,
+            }
+        })
+        .collect())
+}
+
 async fn run_client(
     stream: &mut SplitStream<WebSocket>,
     tx: Tx,
     registry: &Registry,
     ice: &IceConfig,
+    db: &Db,
 ) {
+    // The owner this connection has authenticated as (slice 3.1), if any --
+    // `ClientAuth` is optional, so an older client that never sends it stays
+    // fully compatible, just without device linking/listing.
+    let mut owner: Option<String> = None;
+
     loop {
         let msg = match next_message(stream, &tx).await {
             Some(msg) => msg,
@@ -277,8 +311,158 @@ async fn run_client(
         };
 
         match msg {
+            SignalMessage::ClientAuth { token } => {
+                match owners::authenticate(db, token.as_deref(), ice::now_unix() as i64) {
+                    Ok((owner_id, token)) => {
+                        let devices = match device_entries_for_owner(db, registry, &owner_id) {
+                            Ok(devices) => devices,
+                            Err(err) => {
+                                tracing::error!(?err, "failed to load devices for owner");
+                                Vec::new()
+                            }
+                        };
+                        owner = Some(owner_id);
+                        let _ = tx.send(SignalMessage::Authenticated { token, devices });
+                    }
+                    Err(err) => {
+                        tracing::error!(?err, "owner authentication failed");
+                        let _ = tx.send(SignalMessage::Error {
+                            message: "internal error".to_string(),
+                        });
+                    }
+                }
+            }
+            SignalMessage::ListDevices => match &owner {
+                Some(owner_id) => match device_entries_for_owner(db, registry, owner_id) {
+                    Ok(devices) => {
+                        let _ = tx.send(SignalMessage::Devices { devices });
+                    }
+                    Err(err) => {
+                        tracing::error!(?err, "failed to load devices for owner");
+                        let _ = tx.send(SignalMessage::Error {
+                            message: "internal error".to_string(),
+                        });
+                    }
+                },
+                None => {
+                    let _ = tx.send(SignalMessage::Error {
+                        message: "not authenticated".to_string(),
+                    });
+                }
+            },
+            SignalMessage::ConnectDevice { device_id } => {
+                let Some(owner_id) = owner.clone() else {
+                    let _ = tx.send(SignalMessage::Error {
+                        message: "not authenticated".to_string(),
+                    });
+                    continue;
+                };
+
+                let linked = match db.devices_for_owner(&owner_id) {
+                    Ok(devices) => devices.iter().any(|d| d.device_id == device_id),
+                    Err(err) => {
+                        tracing::error!(?err, "failed to check device ownership");
+                        let _ = tx.send(SignalMessage::Error {
+                            message: "internal error".to_string(),
+                        });
+                        continue;
+                    }
+                };
+                if !linked {
+                    let _ = tx.send(SignalMessage::Error {
+                        message: "device not linked".to_string(),
+                    });
+                    continue;
+                }
+
+                match registry.join_by_host_id(&device_id, tx.clone()) {
+                    Ok((session_id, host_name, host_tx)) => {
+                        tracing::info!(%session_id, "client connected to device");
+                        let _ = tx.send(SignalMessage::Joined {
+                            session_id: session_id.clone(),
+                            host_name,
+                            ice_servers: ice.ice_servers(ice::now_unix()),
+                        });
+                        let _ = host_tx.send(SignalMessage::PeerJoined {
+                            session_id,
+                            ice_servers: ice.ice_servers(ice::now_unix()),
+                        });
+                    }
+                    Err(err) => {
+                        let _ = tx.send(SignalMessage::Error {
+                            message: err.message().to_string(),
+                        });
+                    }
+                }
+            }
+            SignalMessage::RenameDevice { device_id, alias } => {
+                let Some(owner_id) = owner.clone() else {
+                    let _ = tx.send(SignalMessage::Error {
+                        message: "not authenticated".to_string(),
+                    });
+                    continue;
+                };
+
+                match db.set_alias(&owner_id, &device_id, alias.as_deref()) {
+                    Ok(true) => match device_entries_for_owner(db, registry, &owner_id) {
+                        Ok(devices) => {
+                            let _ = tx.send(SignalMessage::Devices { devices });
+                        }
+                        Err(err) => {
+                            tracing::error!(?err, "failed to load devices for owner");
+                            let _ = tx.send(SignalMessage::Error {
+                                message: "internal error".to_string(),
+                            });
+                        }
+                    },
+                    Ok(false) => {
+                        let _ = tx.send(SignalMessage::Error {
+                            message: "device not linked".to_string(),
+                        });
+                    }
+                    Err(err) => {
+                        tracing::error!(?err, "failed to set device alias");
+                        let _ = tx.send(SignalMessage::Error {
+                            message: "internal error".to_string(),
+                        });
+                    }
+                }
+            }
+            SignalMessage::ForgetDevice { device_id } => {
+                let Some(owner_id) = owner.clone() else {
+                    let _ = tx.send(SignalMessage::Error {
+                        message: "not authenticated".to_string(),
+                    });
+                    continue;
+                };
+
+                match db.unlink_device(&owner_id, &device_id) {
+                    Ok(true) => match device_entries_for_owner(db, registry, &owner_id) {
+                        Ok(devices) => {
+                            let _ = tx.send(SignalMessage::Devices { devices });
+                        }
+                        Err(err) => {
+                            tracing::error!(?err, "failed to load devices for owner");
+                            let _ = tx.send(SignalMessage::Error {
+                                message: "internal error".to_string(),
+                            });
+                        }
+                    },
+                    Ok(false) => {
+                        let _ = tx.send(SignalMessage::Error {
+                            message: "device not linked".to_string(),
+                        });
+                    }
+                    Err(err) => {
+                        tracing::error!(?err, "failed to unlink device");
+                        let _ = tx.send(SignalMessage::Error {
+                            message: "internal error".to_string(),
+                        });
+                    }
+                }
+            }
             SignalMessage::Join { pin } => match registry.join(&pin, tx.clone()) {
-                Ok((session_id, host_name, host_tx)) => {
+                Ok((session_id, host_id, host_name, host_tx)) => {
                     tracing::info!(%session_id, "client joined");
                     let _ = tx.send(SignalMessage::Joined {
                         session_id: session_id.clone(),
@@ -289,6 +473,12 @@ async fn run_client(
                         session_id,
                         ice_servers: ice.ice_servers(ice::now_unix()),
                     });
+                    if let Some(owner_id) = &owner {
+                        if let Err(err) = db.link_device(owner_id, &host_id, ice::now_unix() as i64)
+                        {
+                            tracing::error!(?err, "failed to link device to owner");
+                        }
+                    }
                 }
                 Err(err) => {
                     let _ = tx.send(SignalMessage::Error {

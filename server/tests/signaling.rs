@@ -77,6 +77,19 @@ async fn hello(ws: &mut WsStream, role: Role) {
     .await;
 }
 
+/// Sends `ClientAuth { token }` and returns the `Authenticated` response's
+/// own token and device list.
+async fn client_auth(
+    ws: &mut WsStream,
+    token: Option<String>,
+) -> (String, Vec<proto::signal::DeviceEntry>) {
+    send(ws, &SignalMessage::ClientAuth { token }).await;
+    match recv(ws).await {
+        SignalMessage::Authenticated { token, devices } => (token, devices),
+        other => panic!("expected authenticated, got {other:?}"),
+    }
+}
+
 /// Registers a host and joins it with one client. Returns the connections,
 /// the shared session id, and the host's PIN (for tests that need to attempt
 /// a second join).
@@ -587,5 +600,337 @@ async fn re_registering_same_device_displaces_old_connection_and_ends_its_sessio
             assert!(device.is_none());
         }
         other => panic!("expected registered, got {other:?}"),
+    }
+}
+
+// (m) a client with no saved token sends ClientAuth{token: None} and gets
+// back a fresh, non-empty token with an empty device list.
+#[tokio::test]
+async fn client_auth_without_token_issues_token_with_empty_devices() {
+    let url = spawn_server().await;
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+
+    let (token, devices) = client_auth(&mut client, None).await;
+
+    assert!(!token.is_empty());
+    assert!(devices.is_empty());
+}
+
+// (n) presenting a previously issued token on a new connection is
+// recognized: same token comes back.
+#[tokio::test]
+async fn client_auth_with_known_token_returns_same_token() {
+    let url = spawn_server().await;
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    let (token, _devices) = client_auth(&mut client, None).await;
+    drop(client);
+
+    let mut client2 = connect(&url).await;
+    hello(&mut client2, Role::Client).await;
+    let (token2, _devices2) = client_auth(&mut client2, Some(token.clone())).await;
+
+    assert_eq!(token2, token);
+}
+
+// (o) an unrecognized token is not resurrected: a different owner and token
+// are issued instead.
+#[tokio::test]
+async fn client_auth_with_unknown_token_issues_a_different_token() {
+    let url = spawn_server().await;
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+
+    let (token, _devices) = client_auth(&mut client, Some("not-a-real-token".to_string())).await;
+
+    assert_ne!(token, "not-a-real-token");
+}
+
+// (p) after ClientAuth, joining by PIN links the device to the owner: on a
+// new connection, ClientAuth with the same token lists that device_id,
+// online (the host is still connected).
+#[tokio::test]
+async fn joining_by_pin_after_client_auth_links_device_to_owner() {
+    let url = spawn_server().await;
+
+    let mut host = connect(&url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: None,
+        },
+    )
+    .await;
+    let (host_id, pin) = match recv(&mut host).await {
+        SignalMessage::Registered {
+            host_id,
+            pin,
+            device,
+            ..
+        } => {
+            assert!(device.is_some());
+            (host_id, pin)
+        }
+        other => panic!("expected registered, got {other:?}"),
+    };
+
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    let (token, _devices) = client_auth(&mut client, None).await;
+    send(&mut client, &SignalMessage::Join { pin }).await;
+    match recv(&mut client).await {
+        SignalMessage::Joined { .. } => {}
+        other => panic!("expected joined, got {other:?}"),
+    }
+    match recv(&mut host).await {
+        SignalMessage::PeerJoined { .. } => {}
+        other => panic!("expected peer_joined, got {other:?}"),
+    }
+    drop(client);
+
+    let mut client2 = connect(&url).await;
+    hello(&mut client2, Role::Client).await;
+    let (_token2, devices) = client_auth(&mut client2, Some(token)).await;
+
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].device_id, host_id);
+    assert!(devices[0].online);
+}
+
+// (q) ConnectDevice on a device linked to the authenticated owner starts a
+// session: the client gets Joined, the host gets PeerJoined with the same
+// session_id.
+#[tokio::test]
+async fn connect_device_starts_a_session_for_a_linked_device() {
+    let url = spawn_server().await;
+
+    let mut host = connect(&url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: None,
+        },
+    )
+    .await;
+    let (host_id, pin) = match recv(&mut host).await {
+        SignalMessage::Registered { host_id, pin, .. } => (host_id, pin),
+        other => panic!("expected registered, got {other:?}"),
+    };
+
+    // First, link the device to an owner by joining once via PIN, then end
+    // that session so the host is free for `ConnectDevice`.
+    let mut linking_client = connect(&url).await;
+    hello(&mut linking_client, Role::Client).await;
+    let (token, _devices) = client_auth(&mut linking_client, None).await;
+    send(&mut linking_client, &SignalMessage::Join { pin }).await;
+    let session_id = match recv(&mut linking_client).await {
+        SignalMessage::Joined { session_id, .. } => session_id,
+        other => panic!("expected joined, got {other:?}"),
+    };
+    match recv(&mut host).await {
+        SignalMessage::PeerJoined { .. } => {}
+        other => panic!("expected peer_joined, got {other:?}"),
+    }
+    send(
+        &mut linking_client,
+        &SignalMessage::Bye {
+            session_id: session_id.clone(),
+        },
+    )
+    .await;
+    match recv(&mut host).await {
+        SignalMessage::Bye { session_id: sid } => assert_eq!(sid, session_id),
+        other => panic!("expected bye, got {other:?}"),
+    }
+    drop(linking_client);
+
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    client_auth(&mut client, Some(token)).await;
+    send(
+        &mut client,
+        &SignalMessage::ConnectDevice { device_id: host_id },
+    )
+    .await;
+
+    let new_session_id = match recv(&mut client).await {
+        SignalMessage::Joined { session_id, .. } => session_id,
+        other => panic!("expected joined, got {other:?}"),
+    };
+    match recv(&mut host).await {
+        SignalMessage::PeerJoined { session_id, .. } => assert_eq!(session_id, new_session_id),
+        other => panic!("expected peer_joined, got {other:?}"),
+    }
+}
+
+// (r) ConnectDevice for a device_id not linked to the authenticated owner ->
+// Error{"device not linked"}.
+#[tokio::test]
+async fn connect_device_for_unlinked_device_returns_error() {
+    let url = spawn_server().await;
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    client_auth(&mut client, None).await;
+
+    send(
+        &mut client,
+        &SignalMessage::ConnectDevice {
+            device_id: "no-such-device".to_string(),
+        },
+    )
+    .await;
+
+    match recv(&mut client).await {
+        SignalMessage::Error { message } => assert_eq!(message, "device not linked"),
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+// (s) ConnectDevice for a linked device whose host has since disconnected ->
+// Error{"device offline"}.
+#[tokio::test]
+async fn connect_device_for_offline_device_returns_error() {
+    let url = spawn_server().await;
+
+    let mut host = connect(&url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: None,
+        },
+    )
+    .await;
+    let (host_id, pin) = match recv(&mut host).await {
+        SignalMessage::Registered { host_id, pin, .. } => (host_id, pin),
+        other => panic!("expected registered, got {other:?}"),
+    };
+
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    client_auth(&mut client, None).await;
+    send(&mut client, &SignalMessage::Join { pin }).await;
+    let session_id = match recv(&mut client).await {
+        SignalMessage::Joined { session_id, .. } => session_id,
+        other => panic!("expected joined, got {other:?}"),
+    };
+    match recv(&mut host).await {
+        SignalMessage::PeerJoined { .. } => {}
+        other => panic!("expected peer_joined, got {other:?}"),
+    }
+
+    // Dropping the host ends its session; waiting for the client's Bye
+    // guarantees the server has already removed the host from the registry
+    // before we send ConnectDevice below (same connection, so ordering is
+    // guaranteed).
+    drop(host);
+    match recv(&mut client).await {
+        SignalMessage::Bye { session_id: sid } => assert_eq!(sid, session_id),
+        other => panic!("expected bye, got {other:?}"),
+    }
+
+    send(
+        &mut client,
+        &SignalMessage::ConnectDevice { device_id: host_id },
+    )
+    .await;
+
+    match recv(&mut client).await {
+        SignalMessage::Error { message } => assert_eq!(message, "device offline"),
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+// (t) ListDevices and ConnectDevice before any ClientAuth -> Error{"not
+// authenticated"}.
+#[tokio::test]
+async fn list_devices_and_connect_device_without_client_auth_return_not_authenticated() {
+    let url = spawn_server().await;
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+
+    send(&mut client, &SignalMessage::ListDevices).await;
+    match recv(&mut client).await {
+        SignalMessage::Error { message } => assert_eq!(message, "not authenticated"),
+        other => panic!("expected error, got {other:?}"),
+    }
+
+    send(
+        &mut client,
+        &SignalMessage::ConnectDevice {
+            device_id: "whatever".to_string(),
+        },
+    )
+    .await;
+    match recv(&mut client).await {
+        SignalMessage::Error { message } => assert_eq!(message, "not authenticated"),
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+// (u) RenameDevice changes the alias in the returned Devices list;
+// ForgetDevice then removes the device from it.
+#[tokio::test]
+async fn rename_device_updates_alias_and_forget_device_removes_it() {
+    let url = spawn_server().await;
+
+    let mut host = connect(&url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: None,
+        },
+    )
+    .await;
+    let (host_id, pin) = match recv(&mut host).await {
+        SignalMessage::Registered { host_id, pin, .. } => (host_id, pin),
+        other => panic!("expected registered, got {other:?}"),
+    };
+
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    client_auth(&mut client, None).await;
+    send(&mut client, &SignalMessage::Join { pin }).await;
+    match recv(&mut client).await {
+        SignalMessage::Joined { .. } => {}
+        other => panic!("expected joined, got {other:?}"),
+    }
+    match recv(&mut host).await {
+        SignalMessage::PeerJoined { .. } => {}
+        other => panic!("expected peer_joined, got {other:?}"),
+    }
+
+    send(
+        &mut client,
+        &SignalMessage::RenameDevice {
+            device_id: host_id.clone(),
+            alias: Some("Work Mac".to_string()),
+        },
+    )
+    .await;
+    match recv(&mut client).await {
+        SignalMessage::Devices { devices } => {
+            assert_eq!(devices.len(), 1);
+            assert_eq!(devices[0].alias, Some("Work Mac".to_string()));
+        }
+        other => panic!("expected devices, got {other:?}"),
+    }
+
+    send(
+        &mut client,
+        &SignalMessage::ForgetDevice { device_id: host_id },
+    )
+    .await;
+    match recv(&mut client).await {
+        SignalMessage::Devices { devices } => assert!(devices.is_empty()),
+        other => panic!("expected devices, got {other:?}"),
     }
 }

@@ -38,6 +38,20 @@ pub struct DeviceCredentials {
     pub secret: String,
 }
 
+/// Одно устройство в списке владельца (слайс 3.1). `name` — как его
+/// назвал сам хост (имя машины), `alias` — переименование владельцем,
+/// `online`/`busy` — сиюминутное состояние из реестра соединений.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeviceEntry {
+    pub device_id: String,
+    pub name: String,
+    pub alias: Option<String>,
+    pub online: bool,
+    pub busy: bool,
+    pub last_seen_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(export)]
@@ -96,6 +110,34 @@ pub enum SignalMessage {
     },
     /// either side; server forwards to the other and closes the session
     Bye { session_id: String },
+    /// client -> server, необязательное сообщение сразу после `Hello`:
+    /// `token` — сохранённый браузером токен владельца, если он есть.
+    ClientAuth {
+        #[serde(default)]
+        token: Option<String>,
+    },
+    /// server -> client, ответ на `ClientAuth`: актуальный токен владельца
+    /// (тот же, если присланный опознан, иначе свежевыданный — его надо
+    /// сохранить) и его текущий список устройств.
+    Authenticated {
+        token: String,
+        devices: Vec<DeviceEntry>,
+    },
+    /// client -> server: перечитать список устройств.
+    ListDevices,
+    /// server -> client: текущий список устройств владельца.
+    Devices { devices: Vec<DeviceEntry> },
+    /// client -> server: подключиться к своему устройству без PIN.
+    ConnectDevice { device_id: String },
+    /// client -> server: переименовать своё устройство (`alias = None` —
+    /// снять переименование). В ответ сервер шлёт обновлённый `Devices`.
+    RenameDevice {
+        device_id: String,
+        alias: Option<String>,
+    },
+    /// client -> server: убрать устройство из своего списка. В ответ сервер
+    /// шлёт обновлённый `Devices`.
+    ForgetDevice { device_id: String },
     /// server -> either side
     Error { message: String },
 }
@@ -181,6 +223,33 @@ mod tests {
                 device: None,
             }
         );
+    }
+
+    #[test]
+    fn client_auth_without_token_field_deserializes_to_none() {
+        let json = r#"{"type":"client_auth"}"#;
+
+        let msg: SignalMessage = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(msg, SignalMessage::ClientAuth { token: None });
+    }
+
+    #[test]
+    fn authenticated_with_devices_round_trips_through_json() {
+        let authenticated = SignalMessage::Authenticated {
+            token: "tok123".to_string(),
+            devices: vec![DeviceEntry {
+                device_id: "dev123".to_string(),
+                name: "My Mac".to_string(),
+                alias: Some("Work Mac".to_string()),
+                online: true,
+                busy: false,
+                last_seen_at: 1234,
+            }],
+        };
+
+        let json = serde_json::to_string(&authenticated).expect("serialize");
+        let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, authenticated);
     }
 
     #[test]
