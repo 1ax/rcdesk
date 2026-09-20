@@ -1,6 +1,7 @@
 pub mod autostart;
 pub mod d3d;
 pub mod dpi;
+pub mod elevation;
 pub mod event_loop;
 pub mod keyboard;
 pub mod monitors;

@@ -177,6 +177,11 @@ body {
   text-transform: none;
 }
 
+.input-blocked {
+  color: var(--danger);
+  text-transform: none;
+}
+
 .clipboard-note {
   text-transform: none;
 }

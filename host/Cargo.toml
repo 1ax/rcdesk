@@ -99,6 +99,14 @@ windows = { version = "0.61", features = [
     # login" registration, the Windows counterpart of macOS's LaunchAgent
     # plist.
     "Win32_System_Registry",
+    # OpenProcess (platform::windows::elevation, 2.6e) -- opens the
+    # foreground window's owning process to read its integrity level.
+    "Win32_System_Threading",
+    # OpenProcessToken/GetTokenInformation/GetSidSubAuthority(Count)
+    # (platform::windows::elevation, 2.6e) -- reads a process token's
+    # TokenIntegrityLevel label to detect a foreground window running
+    # elevated relative to this agent (UIPI blocks SendInput into it).
+    "Win32_Security",
 ] }
 # Буфер обмена (2.5b): текст только, default-features=false drops the
 # `image-data` feature (image crate, extra objc2-core-graphics on macOS).

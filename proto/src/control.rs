@@ -79,6 +79,26 @@ pub enum ControlMessage {
         available: bool,
         reason: Option<String>,
     },
+    /// host -> client: the Windows foreground window belongs to a process
+    /// running at a higher integrity level than the host agent's own
+    /// (slice 2.6e, e.g. Task Manager opened "as administrator") -- UIPI
+    /// silently drops `SendInput` events aimed at it, so clicks/keys the
+    /// client sends while this window is focused have no effect. **Not**
+    /// the same thing as `InputStatus`: that one means there is no input
+    /// injector at all for the whole session, and the client detaches
+    /// input entirely. `InputBlocked` is a transient, window-by-window
+    /// condition -- the client keeps sending input as usual (so the user
+    /// can still click away from the blocking window) and only shows a
+    /// warning banner. Sent whenever the host's foreground-window watcher
+    /// (polled once a second, Windows only) observes a change; a session
+    /// that never sends this is never blocked. `reason` is set to a
+    /// human-readable explanation when `blocked` is `true`, `None` when
+    /// `blocked` is `false`. The full-control mode (phase 4.1, host running
+    /// as a service) doesn't have this limitation.
+    InputBlocked {
+        blocked: bool,
+        reason: Option<String>,
+    },
     /// host -> client: the host's clipboard text changed (slice 2.5b),
     /// polled every 250ms via an OS change counter (`NSPasteboard`
     /// `changeCount` / `GetClipboardSequenceNumber`, see `host::clipboard`).
@@ -230,6 +250,43 @@ mod tests {
         assert_eq!(
             json,
             r#"{"type":"input_status","available":true,"reason":null}"#
+        );
+
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, msg);
+    }
+
+    #[test]
+    fn input_blocked_true_round_trips_through_json_with_exact_shape() {
+        let msg = ControlMessage::InputBlocked {
+            blocked: true,
+            reason: Some(
+                "Foreground window runs with administrator rights; input is blocked by Windows (UIPI)"
+                    .to_string(),
+            ),
+        };
+
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"input_blocked","blocked":true,"reason":"Foreground window runs with administrator rights; input is blocked by Windows (UIPI)"}"#
+        );
+
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, msg);
+    }
+
+    #[test]
+    fn input_blocked_false_serializes_reason_as_json_null() {
+        let msg = ControlMessage::InputBlocked {
+            blocked: false,
+            reason: None,
+        };
+
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"input_blocked","blocked":false,"reason":null}"#
         );
 
         let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");

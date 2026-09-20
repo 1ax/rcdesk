@@ -17,6 +17,7 @@ import { attachInput } from "./input";
 import { ClipboardBridge, isSafari } from "./clipboard";
 import { applyCursor } from "./cursor";
 import { displayOptions, parseDisplayId, shouldShowPicker } from "./displays";
+import { inputBlockedLabel } from "./inputBlocked";
 import { viewOnlyLabel } from "./inputStatus";
 import type { ControlMessage } from "./generated/ControlMessage";
 import type { DisplayEntry } from "./generated/DisplayEntry";
@@ -99,6 +100,7 @@ export function mount(root: Element | null): void {
       <div class="controls">
         <select id="display-select" class="display-select" hidden></select>
         <span id="view-only" class="status view-only" hidden></span>
+        <span id="input-blocked" class="status input-blocked" hidden></span>
         <span id="clipboard-note" class="status clipboard-note" hidden></span>
         <span id="session-status" class="status"></span>
         <button id="disconnect-btn" class="btn btn-secondary">Disconnect</button>
@@ -122,6 +124,7 @@ export function mount(root: Element | null): void {
   const disconnectBtn = root.querySelector<HTMLButtonElement>("#disconnect-btn")!;
   const displaySelect = root.querySelector<HTMLSelectElement>("#display-select")!;
   const viewOnlyEl = root.querySelector<HTMLSpanElement>("#view-only")!;
+  const inputBlockedEl = root.querySelector<HTMLSpanElement>("#input-blocked")!;
   const clipboardNoteEl = root.querySelector<HTMLSpanElement>("#clipboard-note")!;
 
   let signaling: SignalingClient | null = null;
@@ -285,6 +288,17 @@ export function mount(root: Element | null): void {
         }
         return;
       }
+      if (msg.type === "input_blocked") {
+        // Slice 2.6e: this is a warning banner, not a view-only switch --
+        // input keeps flowing as usual (`maybeAttachInput`/`inputBlocked`
+        // above are untouched), the host's `SendInput` calls are just
+        // silently dropped by Windows UIPI while an elevated window is
+        // focused.
+        const label = inputBlockedLabel(msg);
+        inputBlockedEl.textContent = label ?? "";
+        inputBlockedEl.hidden = label === null;
+        return;
+      }
       if (msg.type === "clipboard_text") {
         clipboardBridge?.onHostText(msg.text);
         return;
@@ -351,6 +365,8 @@ export function mount(root: Element | null): void {
     inputBlocked = false;
     viewOnlyEl.hidden = true;
     viewOnlyEl.textContent = "";
+    inputBlockedEl.hidden = true;
+    inputBlockedEl.textContent = "";
     if (clipboardBridge) {
       window.removeEventListener("focus", onClipboardFocusOrGesture);
       document.removeEventListener("pointerdown", onClipboardFocusOrGesture, true);

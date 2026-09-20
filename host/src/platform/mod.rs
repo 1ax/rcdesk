@@ -39,6 +39,18 @@ pub use other::autostart;
 #[cfg(target_os = "windows")]
 pub use windows::autostart;
 
+/// "Is the foreground window running elevated relative to us" (slice
+/// 2.6e) -- re-exported the same way `event_loop` is above, so
+/// `signaling::start_session`'s background watcher can name it as
+/// `platform::elevation::foreground_input_blocked`. `windows` (unlike
+/// `macos`) is already `pub mod`, so this re-export exists purely for the
+/// same cfg-free-path consistency `event_loop`'s doc comment explains, not
+/// because the module would otherwise be unreachable. No macOS/other
+/// re-export: the check is meaningless off Windows (no UIPI), so `windows`
+/// is the only platform module with an `elevation` submodule at all.
+#[cfg(target_os = "windows")]
+pub use windows::elevation;
+
 #[cfg(target_os = "macos")]
 pub fn name() -> &'static str {
     macos::name()

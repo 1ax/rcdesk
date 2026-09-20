@@ -34,6 +34,8 @@ use crate::cursor::{self, CursorSource, CursorState};
 use crate::encode::{build_encoder, EncodedFrame, EncoderConfig, EncoderKind, RateTarget};
 use crate::input::{Injector, InputRouter, NoopInjector};
 use crate::pipeline::Pipeline;
+#[cfg(target_os = "windows")]
+use crate::platform;
 use crate::transport::{PeerSession, SessionConfig, SessionEvent};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -43,6 +45,26 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// plenty for a cursor shape, which changes far less often than the pointer
 /// moves.
 const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(33);
+
+/// How often the Windows foreground-window elevation watcher polls
+/// `platform::windows::elevation::foreground_input_blocked` (slice 2.6e).
+/// 1s: this is a warning banner, not a latency-sensitive path, and the
+/// watcher only speaks up on an actual state change (see
+/// `InputBlockedWatcher::update`).
+#[cfg(target_os = "windows")]
+const ELEVATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// `ControlMessage::InputBlocked { blocked: true, .. }`'s `reason`, shown to
+/// the client while the foreground window runs elevated relative to this
+/// agent (slice 2.6e). `InputBlockedWatcher`, which uses it, is
+/// platform-independent code (see its doc comment), so on a non-Windows
+/// build the only caller left is the `cfg(test)` unit tests below -- hence
+/// `cfg(any(test, target_os = "windows"))` rather than an unconditional
+/// `pub`/no-cfg, which would be genuine dead code (and a clippy error) on
+/// e.g. a plain macOS release build.
+#[cfg(any(test, target_os = "windows"))]
+const ELEVATED_INPUT_BLOCKED_REASON: &str =
+    "Foreground window runs with administrator rights; input is blocked by Windows (UIPI)";
 
 /// See `HostContext::build_clipboard`'s doc comment. Factored out (clippy
 /// `type_complexity`): the `Option<Box<dyn Fn() -> ...>>` nesting is one
@@ -541,6 +563,55 @@ impl VideoPipeline {
     }
 }
 
+/// Tracks the Windows foreground-window elevation watcher's last-reported
+/// state across its 1s polls (slice 2.6e), so the background task (Windows
+/// only, see `start_session`) sends `ControlMessage::InputBlocked` exactly
+/// on a *change* rather than once per poll. Deliberately platform-independent
+/// -- it holds no Windows types and calls no Windows API, only `update` --
+/// so it stays unit-testable on any OS (the actual `foreground_input_blocked`
+/// check lives in `platform::windows::elevation`, cfg-gated). The type
+/// itself is `cfg(any(test, target_os = "windows"))` -- see
+/// `ELEVATED_INPUT_BLOCKED_REASON`'s doc comment for why: its only
+/// production caller (`spawn_elevation_watcher`) is Windows-only, so
+/// without `test` in the `cfg` it would be dead code everywhere else.
+#[cfg(any(test, target_os = "windows"))]
+#[derive(Default)]
+struct InputBlockedWatcher {
+    /// `None` before the first poll.
+    last: Option<bool>,
+}
+
+#[cfg(any(test, target_os = "windows"))]
+impl InputBlockedWatcher {
+    /// Feeds one freshly observed `blocked` state in. Returns
+    /// `Some(ControlMessage::InputBlocked)` when the client needs telling:
+    /// on every poll after the first where the state changed, and on the
+    /// very first poll only when it's already `true` -- a client that never
+    /// receives this message defaults to "not blocked"
+    /// (`ControlMessage::InputBlocked`'s doc comment), so a quiet `false`
+    /// first poll needs no message.
+    fn update(&mut self, blocked: bool) -> Option<ControlMessage> {
+        let first_poll = self.last.is_none();
+        let changed = self.last != Some(blocked);
+        self.last = Some(blocked);
+
+        if first_poll {
+            return blocked.then(|| input_blocked_message(true));
+        }
+        changed.then(|| input_blocked_message(blocked))
+    }
+}
+
+/// Builds `ControlMessage::InputBlocked`, filling in `ELEVATED_INPUT_BLOCKED_REASON`
+/// for `blocked: true` and `None` for `blocked: false`.
+#[cfg(any(test, target_os = "windows"))]
+fn input_blocked_message(blocked: bool) -> ControlMessage {
+    ControlMessage::InputBlocked {
+        blocked,
+        reason: blocked.then(|| ELEVATED_INPUT_BLOCKED_REASON.to_string()),
+    }
+}
+
 /// A running `PeerSession` plus the task feeding it encoded frames from the
 /// video pipeline.
 struct ActiveSession {
@@ -597,6 +668,13 @@ struct ActiveSession {
     /// for why the watcher lives inside the task's future rather than being
     /// held separately. `None` alongside `clipboard: None`.
     clipboard_task: Option<tokio::task::JoinHandle<()>>,
+    /// The Windows foreground-window elevation watcher (slice 2.6e), polling
+    /// `platform::windows::elevation::foreground_input_blocked` once a
+    /// second and forwarding changes as `ControlMessage::InputBlocked`.
+    /// `None` on non-Windows platforms, and on Windows too when the session
+    /// has no real input injector (`input_available == false`) -- nothing
+    /// to warn about when input isn't wired up at all.
+    elevation_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ActiveSession {
@@ -605,6 +683,9 @@ impl ActiveSession {
         self.video.stop();
         self.cursor_task.abort();
         if let Some(task) = self.clipboard_task {
+            task.abort();
+        }
+        if let Some(task) = self.elevation_task {
             task.abort();
         }
     }
@@ -657,6 +738,7 @@ async fn handle_signal_message(
                             input_reason: parts.input_reason,
                             clipboard: parts.clipboard,
                             clipboard_task: parts.clipboard_task,
+                            elevation_task: parts.elevation_task,
                         });
                     }
                     Err(err) => {
@@ -664,6 +746,9 @@ async fn handle_signal_message(
                         parts.video.stop();
                         parts.cursor_task.abort();
                         if let Some(task) = parts.clipboard_task {
+                            task.abort();
+                        }
+                        if let Some(task) = parts.elevation_task {
                             task.abort();
                         }
                         let _ = out_tx.send(SignalMessage::Bye { session_id });
@@ -1065,6 +1150,8 @@ struct SessionParts {
     clipboard: Option<Arc<Mutex<ClipboardSync>>>,
     /// See `ActiveSession::clipboard_task`.
     clipboard_task: Option<tokio::task::JoinHandle<()>>,
+    /// See `ActiveSession::elevation_task`.
+    elevation_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Combines one session's ICE credentials with the extra `--stun` servers
@@ -1097,6 +1184,31 @@ fn peer_ice_servers<'a>(
     } else {
         from_peer_joined
     }
+}
+
+/// Spawns the Windows foreground-window elevation watcher for one session
+/// (slice 2.6e, see `start_session`'s call site for when this is skipped).
+/// Polls `platform::elevation::foreground_input_blocked` every
+/// `ELEVATION_POLL_INTERVAL`; `tokio::time::interval`'s first tick fires
+/// immediately, which is exactly the "first poll" `InputBlockedWatcher`
+/// expects. Aborted from `ActiveSession::shutdown` like `cursor_task`/
+/// `clipboard_task`.
+#[cfg(target_os = "windows")]
+fn spawn_elevation_watcher(peer: Arc<PeerSession>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut watcher = InputBlockedWatcher::default();
+        let mut ticker = tokio::time::interval(ELEVATION_POLL_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let blocked = platform::elevation::foreground_input_blocked();
+            if let Some(msg) = watcher.update(blocked) {
+                tracing::info!(blocked, "foreground window elevation state changed");
+                if let Err(err) = peer.send_control(&msg).await {
+                    tracing::warn!(?err, "failed to send input_blocked control message");
+                }
+            }
+        }
+    })
 }
 
 /// Builds the video pipeline and the `PeerSession` for one joining peer, and
@@ -1211,6 +1323,16 @@ async fn start_session(
         None => (None, None),
     };
 
+    // Only worth watching when there's a real injector to worry about --
+    // a view-only session (`input_available == false`) already tells the
+    // client that up front via `InputStatus` and never attaches input at
+    // all, so a UIPI warning on top would be noise. Windows only: UIPI
+    // (and elevation generally) doesn't exist on macOS.
+    #[cfg(target_os = "windows")]
+    let elevation_task = input_available.then(|| spawn_elevation_watcher(Arc::clone(&peer)));
+    #[cfg(not(target_os = "windows"))]
+    let elevation_task: Option<tokio::task::JoinHandle<()>> = None;
+
     Ok(SessionParts {
         peer,
         video,
@@ -1223,6 +1345,7 @@ async fn start_session(
         input_reason,
         clipboard,
         clipboard_task,
+        elevation_task,
     })
 }
 
@@ -1421,6 +1544,62 @@ mod tests {
                 server("stun:server-b"),
                 server("stun:cli-extra"),
             ]
+        );
+    }
+
+    #[test]
+    fn input_blocked_watcher_stays_quiet_on_a_first_unblocked_poll() {
+        let mut watcher = InputBlockedWatcher::default();
+        assert_eq!(watcher.update(false), None);
+    }
+
+    #[test]
+    fn input_blocked_watcher_speaks_up_immediately_on_a_first_blocked_poll() {
+        let mut watcher = InputBlockedWatcher::default();
+        assert_eq!(
+            watcher.update(true),
+            Some(ControlMessage::InputBlocked {
+                blocked: true,
+                reason: Some(ELEVATED_INPUT_BLOCKED_REASON.to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn input_blocked_watcher_stays_quiet_while_state_does_not_change() {
+        let mut watcher = InputBlockedWatcher::default();
+        assert_eq!(watcher.update(false), None);
+        assert_eq!(watcher.update(false), None);
+
+        assert!(watcher.update(true).is_some());
+        assert_eq!(watcher.update(true), None);
+    }
+
+    #[test]
+    fn input_blocked_watcher_reports_every_change_in_either_direction() {
+        let mut watcher = InputBlockedWatcher::default();
+        assert_eq!(watcher.update(false), None);
+
+        assert_eq!(
+            watcher.update(true),
+            Some(ControlMessage::InputBlocked {
+                blocked: true,
+                reason: Some(ELEVATED_INPUT_BLOCKED_REASON.to_string()),
+            })
+        );
+        assert_eq!(
+            watcher.update(false),
+            Some(ControlMessage::InputBlocked {
+                blocked: false,
+                reason: None,
+            })
+        );
+        assert_eq!(
+            watcher.update(true),
+            Some(ControlMessage::InputBlocked {
+                blocked: true,
+                reason: Some(ELEVATED_INPUT_BLOCKED_REASON.to_string()),
+            })
         );
     }
 
@@ -1628,6 +1807,9 @@ mod tests {
 
         parts.video.stop();
         parts.cursor_task.abort();
+        if let Some(task) = parts.elevation_task {
+            task.abort();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1642,6 +1824,9 @@ mod tests {
 
         parts.video.stop();
         parts.cursor_task.abort();
+        if let Some(task) = parts.elevation_task {
+            task.abort();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
