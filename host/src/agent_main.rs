@@ -40,6 +40,7 @@ mod imp {
 
     use rcdesk_host::agent::{self, menu_model, probe_permissions, render_icon, IconState};
     use rcdesk_host::app::{self, CaptureBackend, EncoderBackend, ReconnectPolicy, ServeOptions};
+    use rcdesk_host::device::DeviceStore;
     use rcdesk_host::platform;
     use rcdesk_host::signaling::{AgentCommand, AgentStatus, Keepalive};
 
@@ -100,6 +101,8 @@ mod imp {
             }
         };
 
+        let device_store = DeviceStore::new(&data_dir);
+
         tracing::info!(
             version = env!("CARGO_PKG_VERSION"),
             platform = platform::name(),
@@ -159,6 +162,7 @@ mod imp {
                 &host_name,
                 ReconnectPolicy::default(),
                 Keepalive::default(),
+                &device_store,
                 status_tx,
                 cmd_rx,
             )

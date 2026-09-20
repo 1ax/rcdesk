@@ -23,7 +23,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use proto::control::{ControlMessage, DisplayEntry};
-use proto::signal::{Role, SignalMessage};
+use proto::signal::{DeviceCredentials, Role, SignalMessage};
 use webrtc::peer_connection::RTCPeerConnectionState;
 use webrtc::runtime::Runtime;
 
@@ -192,21 +192,46 @@ pub enum AgentCommand {
     EndSession,
 }
 
+/// Why `SignalingClient::connect` failed. Distinguishes the one case
+/// `app::run_agent` must react to specially -- the server not recognizing a
+/// saved device (slice 3.1c) -- from every other failure.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectError {
+    /// The signaling server doesn't know this device (e.g. its database was
+    /// recreated) -- the caller should forget its saved credentials and
+    /// register again as a new device.
+    #[error("signaling server does not know this device")]
+    UnknownDevice,
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
 /// A registered signaling connection, holding the PIN the owner reads out to
 /// pair a client.
 pub struct SignalingClient {
     host_id: String,
     pin: String,
     ice_servers: Vec<proto::signal::IceServer>,
+    /// Freshly issued device credentials (slice 3.1c), present only when
+    /// this `connect` call was this device's very first registration -- see
+    /// `issued_device`.
+    issued_device: Option<DeviceCredentials>,
     write: SplitSink<WsStream, Message>,
     read: SplitStream<WsStream>,
 }
 
 impl SignalingClient {
-    /// Connects to the signaling server, sends `Hello` + `HostRegister`, and
-    /// waits for `Registered`.
-    pub async fn connect(url: &str, name: &str) -> anyhow::Result<Self> {
-        let (ws_stream, _response) = tokio_tungstenite::connect_async(url).await?;
+    /// Connects to the signaling server, sends `Hello` + `HostRegister`
+    /// (carrying `device`, if the caller has saved credentials from a
+    /// previous registration -- slice 3.1c), and waits for `Registered`.
+    pub async fn connect(
+        url: &str,
+        name: &str,
+        device: Option<DeviceCredentials>,
+    ) -> Result<Self, ConnectError> {
+        let (ws_stream, _response) = tokio_tungstenite::connect_async(url)
+            .await
+            .map_err(anyhow::Error::from)?;
         let (mut write, mut read) = ws_stream.split();
 
         send(
@@ -221,29 +246,43 @@ impl SignalingClient {
             &mut write,
             &SignalMessage::HostRegister {
                 name: name.to_string(),
-                device: None,
+                device,
             },
         )
         .await?;
 
-        let (host_id, pin, ice_servers) = match next_message(&mut read).await {
+        let (host_id, pin, ice_servers, issued_device) = match next_message(&mut read).await {
             Some(SignalMessage::Registered {
                 host_id,
                 pin,
                 ice_servers,
-                ..
-            }) => (host_id, pin, ice_servers),
+                device,
+            }) => (host_id, pin, ice_servers, device),
             Some(SignalMessage::Error { message }) => {
-                anyhow::bail!("signaling server rejected registration: {message}")
+                if message == "unknown device" {
+                    return Err(ConnectError::UnknownDevice);
+                }
+                return Err(ConnectError::Other(anyhow::anyhow!(
+                    "signaling server rejected registration: {message}"
+                )));
             }
-            Some(other) => anyhow::bail!("unexpected reply while registering: {other:?}"),
-            None => anyhow::bail!("signaling connection closed before registration completed"),
+            Some(other) => {
+                return Err(ConnectError::Other(anyhow::anyhow!(
+                    "unexpected reply while registering: {other:?}"
+                )))
+            }
+            None => {
+                return Err(ConnectError::Other(anyhow::anyhow!(
+                    "signaling connection closed before registration completed"
+                )))
+            }
         };
 
         Ok(Self {
             host_id,
             pin,
             ice_servers,
+            issued_device,
             write,
             read,
         })
@@ -262,6 +301,15 @@ impl SignalingClient {
     /// `SessionConfig` used for every session (see `docs/dev-run.md`).
     pub fn ice_servers(&self) -> &[proto::signal::IceServer] {
         &self.ice_servers
+    }
+
+    /// Freshly issued device credentials (slice 3.1c), as `Registered` sent
+    /// them -- `Some` only on this device's very first registration; on a
+    /// successful re-registration with already-known credentials it's
+    /// `None`, since the caller already has what it needs saved. See
+    /// `app::run_agent`, which saves this via `device::DeviceStore::save`.
+    pub fn issued_device(&self) -> Option<&DeviceCredentials> {
+        self.issued_device.as_ref()
     }
 
     /// Drives the signaling connection: forwards SDP/ICE between the wire
@@ -296,6 +344,7 @@ impl SignalingClient {
             host_id,
             pin,
             ice_servers: registered_ice_servers,
+            issued_device: _,
             mut read,
             write,
         } = self;

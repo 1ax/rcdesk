@@ -14,13 +14,15 @@ use crate::capture::{self, FrameSource};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::clipboard::ClipboardBackend;
 use crate::cursor::CursorSource;
+use crate::device::DeviceStore;
 use crate::encode::EncoderKind;
 use crate::input::Injector;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use crate::input::NoopInjector;
 use crate::platform;
 use crate::signaling::{
-    AgentCommand, AgentStatus, BuildClipboard, HostContext, Keepalive, SignalingClient,
+    AgentCommand, AgentStatus, BuildClipboard, ConnectError, HostContext, Keepalive,
+    SignalingClient,
 };
 use crate::transport::SessionConfig;
 
@@ -410,19 +412,34 @@ impl Backoff {
 /// registration. `serve` (no tray UI) passes a receiver whose sender it just
 /// holds onto for the process lifetime -- nothing ever sends on it, so this
 /// branch simply never fires there.
+///
+/// `device_store` holds this host's persistent device credentials (slice
+/// 3.1c): loaded fresh before every `connect` attempt (so a credentials file
+/// written by a previous run, or forgotten below, is always picked up), and
+/// saved once `connect` reports a freshly issued one
+/// (`SignalingClient::issued_device`, `Some` only on this device's very
+/// first registration). `ConnectError::UnknownDevice` (the server doesn't
+/// recognize the saved credentials, e.g. its database was recreated) makes
+/// this loop forget them and retry immediately, skipping the backoff
+/// sleep/advance below entirely -- this isn't a lost connection, just a
+/// device the server no longer knows, so there's no reason to wait or to
+/// disturb the backoff state a real connection failure is tracking.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent(
     ctx: &HostContext,
     server: &str,
     name: &str,
     policy: ReconnectPolicy,
     keepalive: Keepalive,
+    device_store: &DeviceStore,
     status: watch::Sender<AgentStatus>,
     mut commands: mpsc::UnboundedReceiver<AgentCommand>,
 ) -> anyhow::Result<std::convert::Infallible> {
     let mut backoff = Backoff::new(policy);
     loop {
         let _ = status.send(AgentStatus::Connecting);
-        match SignalingClient::connect(server, name).await {
+        let device = device_store.load();
+        match SignalingClient::connect(server, name, device).await {
             Ok(client) => {
                 let pin = client.pin().to_string();
                 tracing::info!(
@@ -430,6 +447,15 @@ pub async fn run_agent(
                     host_id = client.host_id(),
                     "registered with signaling server"
                 );
+                if let Some(issued) = client.issued_device() {
+                    if let Err(err) = device_store.save(issued) {
+                        tracing::warn!(
+                            error = %err,
+                            path = %device_store.path().display(),
+                            "failed to save issued device credentials, may re-register as a new device next time"
+                        );
+                    }
+                }
                 let _ = status.send(AgentStatus::Registered { pin: pin.clone() });
                 backoff.reset();
 
@@ -446,8 +472,43 @@ pub async fn run_agent(
                     });
                 }
             }
-            Err(err) => {
+            Err(ConnectError::UnknownDevice) => {
+                tracing::info!("the server does not know this device, registering as a new one");
+                match device_store.forget() {
+                    Ok(()) => {
+                        // Not a lost connection -- retry right away, without
+                        // waiting out or disturbing `backoff` (see this
+                        // function's doc comment). Safe from spinning only
+                        // because the credentials are now gone: the next
+                        // attempt registers without any, which the server
+                        // never answers with `unknown device`.
+                        continue;
+                    }
+                    Err(err) => {
+                        // The stale credentials are still on disk, so an
+                        // immediate retry would present them again and land
+                        // right back here -- fall through to the backoff
+                        // sleep instead of spinning.
+                        tracing::warn!(
+                            error = %err,
+                            path = %device_store.path().display(),
+                            "failed to remove stale device credentials file"
+                        );
+                    }
+                }
+            }
+            Err(ConnectError::Other(err)) => {
                 let retry_in = backoff.current();
+                if err.to_string().contains("invalid device credentials") {
+                    // Unlike `UnknownDevice`, this isn't forgotten
+                    // automatically: a rejected secret is a sign of tampering
+                    // or corruption, not a routine "this device is new to the
+                    // server" case, so it's left for the owner to act on.
+                    tracing::warn!(
+                        path = %device_store.path().display(),
+                        "saved device credentials were rejected as invalid -- delete this file to register as a new device"
+                    );
+                }
                 tracing::warn!(
                     error = %err,
                     ?retry_in,
@@ -512,18 +573,35 @@ mod tests {
 
     /// Drains Hello + HostRegister (this fake server doesn't care about
     /// their contents, only that a registration was attempted) and replies
-    /// with `Registered { pin, .. }`.
-    async fn respond_with_registered(ws: &mut WebSocketStream<TcpStream>, pin: &str) {
+    /// with `Registered { pin, device, .. }`.
+    async fn respond_with_registered(
+        ws: &mut WebSocketStream<TcpStream>,
+        pin: &str,
+        device: Option<proto::signal::DeviceCredentials>,
+    ) {
         let _ = ws.next().await;
         let _ = ws.next().await;
         let msg = serde_json::to_string(&SignalMessage::Registered {
             host_id: "host-1".to_string(),
             pin: pin.to_string(),
             ice_servers: vec![],
-            device: None,
+            device,
         })
         .unwrap();
         ws.send(Message::text(msg)).await.unwrap();
+    }
+
+    /// A fresh, per-test `DeviceStore` directory under the system temp dir --
+    /// same reasoning as `agent::logging`'s/`device`'s own `scratch_dir`
+    /// helper: a unique name is enough, `tempfile` is not an approved
+    /// dependency.
+    fn scratch_device_store(name: &str) -> (crate::device::DeviceStore, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "rcdesk-host-app-test-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        (crate::device::DeviceStore::new(&dir), dir)
     }
 
     async fn next_status(rx: &mut watch::Receiver<AgentStatus>) -> AgentStatus {
@@ -558,7 +636,7 @@ mod tests {
             // reconnect.
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            respond_with_registered(&mut ws, "111111").await;
+            respond_with_registered(&mut ws, "111111", None).await;
             let _ = saw_first_rx.await;
             drop(ws);
 
@@ -567,11 +645,12 @@ mod tests {
             // aborts the task.
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            respond_with_registered(&mut ws, "222222").await;
+            respond_with_registered(&mut ws, "222222", None).await;
             std::future::pending::<()>().await;
         });
 
         let ctx = Arc::new(crate::signaling::test_ctx());
+        let (device_store, device_dir) = scratch_device_store("reconnect-drop");
         let (status_tx, mut status_rx) = watch::channel(AgentStatus::Connecting);
         let policy = ReconnectPolicy {
             initial: Duration::from_millis(50),
@@ -587,6 +666,7 @@ mod tests {
                 "test-host",
                 policy,
                 Keepalive::default(),
+                &device_store,
                 status_tx,
                 cmd_rx,
             )
@@ -633,6 +713,7 @@ mod tests {
         .expect("timed out waiting for the second registration");
 
         agent.abort();
+        let _ = std::fs::remove_dir_all(&device_dir);
     }
 
     /// Proves the keepalive timeout, not just the "the socket errored out"
@@ -650,7 +731,7 @@ mod tests {
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            respond_with_registered(&mut ws, "111111").await;
+            respond_with_registered(&mut ws, "111111", None).await;
             // Never call `.next()`/`.send()` on `ws` again: tungstenite only
             // queues/sends an automatic Pong reply to an incoming Ping while
             // actively being polled, so simply not polling it any more is
@@ -662,6 +743,7 @@ mod tests {
         });
 
         let ctx = crate::signaling::test_ctx();
+        let (device_store, device_dir) = scratch_device_store("silent");
         let (status_tx, mut status_rx) = watch::channel(AgentStatus::Connecting);
         let policy = ReconnectPolicy::default();
         let keepalive = Keepalive {
@@ -677,6 +759,7 @@ mod tests {
                 "test-host",
                 policy,
                 keepalive,
+                &device_store,
                 status_tx,
                 cmd_rx,
             )
@@ -699,6 +782,7 @@ mod tests {
         );
 
         agent.abort();
+        let _ = std::fs::remove_dir_all(&device_dir);
     }
 
     /// The mirror image of the test above: a server that keeps responding
@@ -715,7 +799,7 @@ mod tests {
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            respond_with_registered(&mut ws, "111111").await;
+            respond_with_registered(&mut ws, "111111", None).await;
             // Keep polling so tungstenite's automatic Pong replies to our
             // Pings actually go out -- the opposite of the silent-server
             // test above, which relies on never polling again.
@@ -723,6 +807,7 @@ mod tests {
         });
 
         let ctx = crate::signaling::test_ctx();
+        let (device_store, device_dir) = scratch_device_store("keepalive-ok");
         let (status_tx, mut status_rx) = watch::channel(AgentStatus::Connecting);
         let policy = ReconnectPolicy::default();
         let keepalive = Keepalive {
@@ -738,6 +823,7 @@ mod tests {
                 "test-host",
                 policy,
                 keepalive,
+                &device_store,
                 status_tx,
                 cmd_rx,
             )
@@ -775,5 +861,258 @@ mod tests {
         );
 
         agent.abort();
+        let _ = std::fs::remove_dir_all(&device_dir);
+    }
+
+    /// Slice 3.1c: a first registration whose `Registered` carries freshly
+    /// issued device credentials must have them saved to `device_store`'s
+    /// file before the caller can observe `AgentStatus::Registered` (see
+    /// `run_agent`'s save-then-announce ordering) -- verified here through a
+    /// second, independent `DeviceStore` over the same directory, since the
+    /// original is moved into the spawned task.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_agent_saves_freshly_issued_device_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}/ws");
+
+        let issued = proto::signal::DeviceCredentials {
+            device_id: "dev-abc".to_string(),
+            secret: "top-secret".to_string(),
+        };
+        let issued_for_server = issued.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            respond_with_registered(&mut ws, "111111", Some(issued_for_server)).await;
+            std::future::pending::<()>().await;
+        });
+
+        let ctx = crate::signaling::test_ctx();
+        let (device_store, device_dir) = scratch_device_store("issue-save");
+        let (status_tx, mut status_rx) = watch::channel(AgentStatus::Connecting);
+        let policy = ReconnectPolicy::default();
+
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let agent = tokio::spawn(async move {
+            let _ = run_agent(
+                &ctx,
+                &url,
+                "test-host",
+                policy,
+                Keepalive::default(),
+                &device_store,
+                status_tx,
+                cmd_rx,
+            )
+            .await;
+        });
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    next_status(&mut status_rx).await,
+                    AgentStatus::Registered { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the registration");
+
+        agent.abort();
+
+        let loaded = crate::device::DeviceStore::new(&device_dir).load();
+        assert_eq!(loaded, Some(issued));
+
+        let _ = std::fs::remove_dir_all(&device_dir);
+    }
+
+    /// Slice 3.1c: when `device_store` already holds saved credentials
+    /// before `connect`, they must be sent back to the server in
+    /// `HostRegister.device` on the very next registration.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_agent_presents_saved_device_credentials_on_register() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}/ws");
+
+        let saved = proto::signal::DeviceCredentials {
+            device_id: "dev-saved".to_string(),
+            secret: "saved-secret".to_string(),
+        };
+
+        let (seen_tx, seen_rx) =
+            tokio::sync::oneshot::channel::<Option<proto::signal::DeviceCredentials>>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = ws.next().await; // Hello
+            let register = ws.next().await.unwrap().unwrap();
+            let device = match register {
+                Message::Text(text) => match serde_json::from_str::<SignalMessage>(text.as_str())
+                    .expect("valid HostRegister json")
+                {
+                    SignalMessage::HostRegister { device, .. } => device,
+                    other => panic!("expected HostRegister, got {other:?}"),
+                },
+                other => panic!("expected a text message, got {other:?}"),
+            };
+            let _ = seen_tx.send(device);
+            // Hello + HostRegister were already drained by hand above (to
+            // inspect the latter), so send `Registered` directly instead of
+            // `respond_with_registered`, which expects to drain both itself.
+            let msg = serde_json::to_string(&SignalMessage::Registered {
+                host_id: "host-1".to_string(),
+                pin: "111111".to_string(),
+                ice_servers: vec![],
+                device: None,
+            })
+            .unwrap();
+            ws.send(Message::text(msg)).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let ctx = crate::signaling::test_ctx();
+        let (device_store, device_dir) = scratch_device_store("present-saved");
+        device_store.save(&saved).unwrap();
+        let (status_tx, mut status_rx) = watch::channel(AgentStatus::Connecting);
+        let policy = ReconnectPolicy::default();
+
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let agent = tokio::spawn(async move {
+            let _ = run_agent(
+                &ctx,
+                &url,
+                "test-host",
+                policy,
+                Keepalive::default(),
+                &device_store,
+                status_tx,
+                cmd_rx,
+            )
+            .await;
+        });
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    next_status(&mut status_rx).await,
+                    AgentStatus::Registered { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the registration");
+
+        let seen = timeout(Duration::from_secs(5), seen_rx)
+            .await
+            .expect("timed out waiting for the server to see HostRegister")
+            .expect("server task dropped the sender");
+        assert_eq!(seen, Some(saved));
+
+        agent.abort();
+        let _ = std::fs::remove_dir_all(&device_dir);
+    }
+
+    /// Slice 3.1c: `Error { message: "unknown device" }` on the first
+    /// registration attempt must make `run_agent` forget the stale
+    /// credentials and retry right away (no backoff wait), ending up
+    /// registered again with whatever new credentials the server issues.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_agent_forgets_credentials_and_reregisters_on_unknown_device() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}/ws");
+
+        let old = proto::signal::DeviceCredentials {
+            device_id: "dev-old".to_string(),
+            secret: "old-secret".to_string(),
+        };
+        let new_creds = proto::signal::DeviceCredentials {
+            device_id: "dev-new".to_string(),
+            secret: "new-secret".to_string(),
+        };
+        let new_creds_for_server = new_creds.clone();
+
+        tokio::spawn(async move {
+            // First connection: the server no longer recognizes the saved
+            // (old) device.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = ws.next().await; // Hello
+            let _ = ws.next().await; // HostRegister (with the now-stale credentials)
+            let err = serde_json::to_string(&SignalMessage::Error {
+                message: "unknown device".to_string(),
+            })
+            .unwrap();
+            ws.send(Message::text(err)).await.unwrap();
+            drop(ws);
+
+            // Second connection, immediately after (no backoff wait): a
+            // fresh registration, issuing new credentials.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            respond_with_registered(&mut ws, "222222", Some(new_creds_for_server)).await;
+            std::future::pending::<()>().await;
+        });
+
+        let ctx = crate::signaling::test_ctx();
+        let (device_store, device_dir) = scratch_device_store("unknown-device");
+        device_store.save(&old).unwrap();
+        let (status_tx, mut status_rx) = watch::channel(AgentStatus::Connecting);
+        // A generous policy: this test relies on the unknown-device retry
+        // skipping the backoff wait entirely, but keeps a real (non-zero)
+        // one so a regression that *does* wait would show up as a timeout
+        // rather than passing by accident.
+        let policy = ReconnectPolicy {
+            initial: Duration::from_secs(5),
+            max: Duration::from_secs(5),
+        };
+
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let agent = tokio::spawn(async move {
+            let _ = run_agent(
+                &ctx,
+                &url,
+                "test-host",
+                policy,
+                Keepalive::default(),
+                &device_store,
+                status_tx,
+                cmd_rx,
+            )
+            .await;
+        });
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if next_status(&mut status_rx).await
+                    == (AgentStatus::Registered {
+                        pin: "222222".to_string(),
+                    })
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect(
+            "timed out waiting for re-registration after unknown device (backoff not skipped?)",
+        );
+
+        agent.abort();
+
+        let loaded = crate::device::DeviceStore::new(&device_dir).load();
+        assert_eq!(
+            loaded,
+            Some(new_creds),
+            "device store must hold the newly issued credentials, not the old ones"
+        );
+
+        let _ = std::fs::remove_dir_all(&device_dir);
     }
 }

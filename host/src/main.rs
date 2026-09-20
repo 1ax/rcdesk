@@ -7,8 +7,10 @@ use clap::{Parser, Subcommand};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::watch;
 
+use rcdesk_host::agent;
 use rcdesk_host::app::{self, CaptureBackend, EncoderBackend, ReconnectPolicy, ServeOptions};
 use rcdesk_host::capture::{self, FrameSource};
+use rcdesk_host::device::DeviceStore;
 use rcdesk_host::encode::{build_encoder, EncoderConfig, RateTarget};
 use rcdesk_host::pipeline::Pipeline;
 use rcdesk_host::platform;
@@ -413,6 +415,8 @@ async fn run_serve(opts: ServeOptions) -> anyhow::Result<()> {
     // sends on it.
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    let device_store = DeviceStore::new(&agent::paths::data_dir());
+
     let (status_tx, mut status_rx) = watch::channel(AgentStatus::Connecting);
     let print_task = tokio::spawn(async move {
         let mut last_printed: Option<String> = None;
@@ -432,6 +436,7 @@ async fn run_serve(opts: ServeOptions) -> anyhow::Result<()> {
         &name,
         ReconnectPolicy::default(),
         Keepalive::default(),
+        &device_store,
         status_tx,
         cmd_rx,
     )
