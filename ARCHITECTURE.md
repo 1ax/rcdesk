@@ -390,3 +390,4 @@ Telegram-бот (`TRAFFIC_TG_BOT_TOKEN`/`TRAFFIC_TG_CHAT_ID` в `~/app/.env`); �
 | arboard 3.6 (default-features = false) | host (macOS/Windows) | текст буфера обмена (2.5); изменения — по счётчику ОС (NSPasteboard changeCount / GetClipboardSequenceNumber) |
 | tray-icon 0.25 (default-features = false) | host (macOS/Windows) | трей/меню-бар `rcdesk-agent` (2.6c): иконка + меню через реэкспорт `tray_icon::menu` (`muda`, без отдельной зависимости). Без winit/tao — свой минимальный цикл событий (`platform::{macos,windows}::event_loop`) |
 | vite 8, typescript 7, vitest 5 | web | сборка, типы, тесты; `vite.config.ts` использует `defineConfig` из `vitest/config` |
+| rusqlite 0.40 (bundled) | server | постоянное состояние сигналинга: устройства, владельцы, привязки (слайс 3.1); SQLite статически в бинарнике, файл в томе `/data` |

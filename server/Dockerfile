@@ -33,6 +33,15 @@ COPY --from=builder /app/target/release/rcdesk-server /usr/local/bin/rcdesk-serv
 
 ENV RCDESK_PORT=8080
 EXPOSE 8080
+
+# Docker inherits the owner/permissions from the IMAGE's directory when it
+# first initializes an EMPTY named volume mounted at that path -- so
+# creating /data as nobody:nogroup here means nobody can write into the
+# volume on the VPS without any manual `chown` (the `rcdesk` deploy user
+# there has no root to run one).
+RUN mkdir -p /data && chown nobody:nogroup /data
+ENV RCDESK_DB_PATH=/data/rcdesk.db
+
 USER nobody
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \

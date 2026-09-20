@@ -16,6 +16,14 @@ services:
     ports:
       - "127.0.0.1:8100:8080"
     env_file: .env
+    # Именованный том, не bind-mount в ~/app/data: на пустом томе docker
+    # наследует владельца/права из каталога /data образа (создан как
+    # nobody:nogroup в server/Dockerfile), поэтому процесс внутри
+    # контейнера (USER nobody) может писать в SQLite-файл без ручного
+    # `chown` на VPS -- у пользователя rcdesk там нет root. `RCDESK_DB_PATH`
+    # уже задан в образе (ENV), дублировать его тут не нужно.
+    volumes:
+      - db-data:/data
     deploy:
       resources:
         limits:
@@ -47,3 +55,6 @@ services:
       # читает infra/traffic-monitor.sh (ARCHITECTURE.md §11).
       - "--prometheus"
       - "--prometheus-address=127.0.0.1"
+
+volumes:
+  db-data:

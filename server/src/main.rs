@@ -1,4 +1,5 @@
 use rcdesk_server::app::app;
+use rcdesk_server::db::Db;
 use rcdesk_server::ice::IceConfig;
 use rcdesk_server::registry::Registry;
 
@@ -16,12 +17,16 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|value| value.parse().ok())
         .unwrap_or(8080);
 
+    let db_path = std::env::var("RCDESK_DB_PATH").unwrap_or_else(|_| "rcdesk.db".to_string());
+    tracing::info!("opening database at {db_path}");
+    let db = Db::open(std::path::Path::new(&db_path))?;
+
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     tracing::info!("rcdesk-server listening on {addr}");
 
-    axum::serve(listener, app(Registry::new(), IceConfig::from_env())).await?;
+    axum::serve(listener, app(Registry::new(), IceConfig::from_env(), db)).await?;
 
     Ok(())
 }
