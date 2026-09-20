@@ -17,10 +17,14 @@ use std::sync::OnceLock;
 use windows::core::Owned;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Security::{
-    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, OpenProcessToken,
-    TokenIntegrityLevel, PSID, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel, PSID,
+    TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
 };
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+// `OpenProcessToken` lives in `System::Threading`, not `Security`, in the
+// `windows` crate (its token *types* are in `Security`).
+use windows::Win32::System::Threading::{
+    OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 /// Reads process `pid`'s integrity level, as the last RID (sub-authority)
