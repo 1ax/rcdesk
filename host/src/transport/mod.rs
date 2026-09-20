@@ -72,6 +72,12 @@ const VIDEO_CLOCK_RATE: u32 = 90_000;
 /// gap during active use.
 const MAX_CAPTURE_GAP: Duration = Duration::from_secs(10);
 
+/// How often `PeerSession::start_video` may re-arm the pipeline's keyframe
+/// request while the video SSRC/payload type still isn't negotiated. Each
+/// re-arm costs one keyframe encode, so this bounds encoder load on a
+/// session that never finishes negotiating.
+const KEYFRAME_REARM_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Constrained Baseline `42e01f`: the one profile both Safari and Chrome are
 /// guaranteed to decode in hardware (see ARCHITECTURE.md §5).
 const H264_FMTP_LINE: &str =
@@ -570,6 +576,7 @@ impl PeerSession {
             // instead of using `TrackLocalStaticSample`.
             let mut packetizer: Option<Box<dyn Packetizer>> = None;
             let mut prev_captured_at: Option<Instant> = None;
+            let mut last_rearm: Option<Instant> = None;
             while let Some(frame) = frames.recv().await {
                 // Wait for the connection to actually be up (DTLS/SRTP
                 // ready), not just SDP-negotiated: `get_parameters()` below
@@ -586,7 +593,21 @@ impl PeerSession {
                 }
                 let Some((ssrc, pt)) = negotiated else {
                     // Not connected/negotiated yet: nobody to send this
-                    // frame to.
+                    // frame to. Dropping it silently used to park this loop
+                    // on `frames.recv()` forever whenever the host screen was
+                    // static, because no further frame is ever captured --
+                    // measured on the Win10 stand (2026-09-20): 15-17s of
+                    // black screen on connect, then a picture only once per
+                    // client PLI. Re-arm the keyframe request instead: the
+                    // pipeline's idle keyframe repeat (slice 2.6f) answers
+                    // within `SLOT_WAIT_TIMEOUT` even with nothing new
+                    // captured. Rate-limited so a session that never
+                    // negotiates can't spin the encoder.
+                    if last_rearm.is_none_or(|at| at.elapsed() >= KEYFRAME_REARM_INTERVAL) {
+                        last_rearm = Some(Instant::now());
+                        request_keyframe.store(true, Ordering::Release);
+                        tracing::debug!("video not negotiated yet, re-requesting a keyframe");
+                    }
                     continue;
                 };
                 let packetizer = packetizer.get_or_insert_with(|| {
