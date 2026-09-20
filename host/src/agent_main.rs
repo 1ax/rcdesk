@@ -325,12 +325,29 @@ mod imp {
                 }
 
                 if new_model.icon != model.icon {
-                    if let Ok(icon) = Icon::from_rgba(
+                    match Icon::from_rgba(
                         render_icon(new_model.icon, ICON_SIZE),
                         ICON_SIZE,
                         ICON_SIZE,
                     ) {
-                        let _ = tray_icon.set_icon_with_as_template(Some(icon), is_macos);
+                        // `set_icon_with_as_template` is macOS-only in
+                        // tray-icon 0.25: on Windows it drops the icon and
+                        // returns `Ok(())`, so the tray icon never changed
+                        // with the session (found on the Win10 stand,
+                        // 2026-09-20). `set_icon` is the cross-platform one.
+                        Ok(icon) => {
+                            let result = if is_macos {
+                                tray_icon.set_icon_with_as_template(Some(icon), true)
+                            } else {
+                                tray_icon.set_icon(Some(icon))
+                            };
+                            if let Err(err) = result {
+                                tracing::warn!(error = %err, "failed to update the tray icon");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "failed to build the tray icon image");
+                        }
                     }
                 }
 
