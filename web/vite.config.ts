@@ -9,6 +9,11 @@ const pkg = JSON.parse(
 export default defineConfig({
   define: {
     __APP_VERSION__: JSON.stringify(pkg.version),
+    // Short commit sha the build was made from, shown in the session panel
+    // as `build <id>` (slice 2.6f) so a stale tab left open across a deploy
+    // is obvious instead of silently missing new protocol handling. `dev`
+    // outside CI (GITHUB_SHA unset), e.g. `npm run dev`/local `npm run build`.
+    __BUILD_ID__: JSON.stringify(process.env.GITHUB_SHA?.slice(0, 7) ?? "dev"),
   },
   server: {
     proxy: {

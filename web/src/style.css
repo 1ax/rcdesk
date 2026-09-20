@@ -208,6 +208,18 @@ body {
   font-size: 13px;
 }
 
+.build-badge {
+  position: fixed;
+  left: 10px;
+  bottom: 8px;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--muted);
+  opacity: 0.6;
+  pointer-events: none;
+  z-index: 1;
+}
+
 /* The UA stylesheet hides [hidden] with plain `display: none`, which any
    class-level `display: flex/block` above would override. Screens are toggled
    via the `hidden` attribute, so make it win. */

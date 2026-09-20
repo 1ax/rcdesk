@@ -29,6 +29,15 @@ function signalUrl(): string {
   return `${scheme}://${location.host}/ws`;
 }
 
+/** Formats the `.build-badge` text (slice 2.6f): a visible commit id so a
+ * tab left open across a deploy is obviously stale instead of silently
+ * missing new protocol handling (see docs/dev-run.md) -- this cost a whole
+ * live-check session once. `__BUILD_ID__` is defined by Vite from
+ * `GITHUB_SHA` in CI, `"dev"` locally (see `vite.config.ts`). */
+export function formatBuildBadge(buildId: string): string {
+  return `build ${buildId}`;
+}
+
 /** The adaptation controller's current rate target (slice 2.3), from the
  * host's `ControlMessage::Quality` -- informational only, shown in the
  * overlay as `target N.N Mbit/s @ N fps (reason)`. */
@@ -77,6 +86,7 @@ export function mount(root: Element | null): void {
   if (!root) return;
 
   root.innerHTML = `
+    <div class="build-badge" id="build-badge"></div>
     <div class="pin-screen" id="pin-screen">
       <div class="card">
         <h1>rcdesk</h1>
@@ -107,6 +117,13 @@ export function mount(root: Element | null): void {
       </div>
     </div>
   `;
+
+  // Not part of either screen (see the markup above): a single element
+  // outside the `hidden`-toggled `pin-screen`/`session-screen` pair, so it
+  // stays visible before a session starts too -- the whole point (a stale
+  // tab left open across a deploy) doesn't wait for a connection to matter.
+  const buildBadge = root.querySelector<HTMLDivElement>("#build-badge")!;
+  buildBadge.textContent = formatBuildBadge(__BUILD_ID__);
 
   const pinScreen = root.querySelector<HTMLDivElement>("#pin-screen")!;
   const sessionScreen = root.querySelector<HTMLDivElement>("#session-screen")!;

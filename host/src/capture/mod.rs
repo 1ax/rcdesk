@@ -45,6 +45,18 @@ impl RawFrame {
             RawFrame::Nv12 { ts, .. } | RawFrame::Bgra { ts, .. } => *ts,
         }
     }
+
+    /// Overwrites the capture timestamp. Used by the pipeline's encode
+    /// thread when it re-encodes the last captured frame as a keyframe
+    /// after a capture timeout (see `pipeline::mod`): the frame's bytes are
+    /// stale, but RTP timing derives from this timestamp, so replaying the
+    /// original one would confuse the client's jitter buffer -- it has to
+    /// read "now".
+    pub fn set_ts(&mut self, new_ts: Instant) {
+        match self {
+            RawFrame::Nv12 { ts, .. } | RawFrame::Bgra { ts, .. } => *ts = new_ts,
+        }
+    }
 }
 
 /// Something that produces a sequence of raw frames, one call at a time.
@@ -196,6 +208,27 @@ impl FramePacer {
 /// "unchanged".
 pub fn frame_unchanged(prev: Option<&[u8]>, cur: &[u8]) -> bool {
     matches!(prev, Some(p) if p == cur)
+}
+
+#[cfg(test)]
+mod raw_frame_tests {
+    use super::*;
+
+    #[test]
+    fn set_ts_overwrites_the_capture_timestamp() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(50);
+        let mut frame = RawFrame::Bgra {
+            width: 2,
+            height: 2,
+            data: vec![0; 16],
+            stride: 8,
+            ts: t0,
+        };
+        assert_eq!(frame.ts(), t0);
+        frame.set_ts(t1);
+        assert_eq!(frame.ts(), t1);
+    }
 }
 
 #[cfg(test)]

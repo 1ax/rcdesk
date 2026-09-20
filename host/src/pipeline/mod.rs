@@ -86,6 +86,15 @@ pub struct PipelineStats {
     /// than the encoder consumed them. Distinct from `paced_out` (skipped on
     /// purpose, cheaply) and `dropped` (encoded but not delivered).
     pub overwritten: AtomicU64,
+    /// Keyframes produced by re-encoding the last captured frame after a
+    /// `SLOT_WAIT_TIMEOUT` wait found no new frame in the slot and a
+    /// keyframe request was pending (see the encode thread in
+    /// `Pipeline::start_with_keyframe_flag`) -- the fix for a client joining
+    /// a session where nothing on screen has changed since: without this,
+    /// there is nothing to encode a keyframe from until the screen next
+    /// changes. Included in `keyframes` too; this counts the subset that
+    /// came from a repeat rather than a freshly captured frame.
+    pub keyframe_repeats: AtomicU64,
 }
 
 /// Runtime bitrate/fps target shared between whoever drives adaptation
@@ -213,30 +222,100 @@ impl Pipeline {
             let rate_control = Arc::clone(&rate_control);
             std::thread::spawn(move || {
                 let mut pacer = Pacer::new();
+                // The last frame actually handed to the encoder, kept
+                // *without* cloning: `encoder.encode(&raw, ..)` below only
+                // borrows it, so after the call the frame is still ours to
+                // hold onto. Used to answer a keyframe request when the
+                // source has gone quiet (see the `SlotWait::Timeout` arm
+                // below) -- otherwise a client that joins a session with a
+                // static screen never gets a first frame to decode.
+                let mut last_raw: Option<RawFrame> = None;
+
+                // What the wait for the next slot frame ended with:
+                // distinguishing a real timeout from a frame arriving lets
+                // the loop below answer a pending keyframe request from
+                // `last_raw` only when the source truly produced nothing in
+                // time, not on every spurious condvar wakeup.
+                enum SlotWait {
+                    Frame(RawFrame),
+                    Timeout,
+                    Stopped,
+                }
 
                 loop {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
 
-                    let raw = {
+                    let outcome = {
                         let mut guard = slot.frame.lock().expect("frame slot mutex poisoned");
                         loop {
                             if let Some(frame) = guard.take() {
-                                break Some(frame);
+                                break SlotWait::Frame(frame);
                             }
                             if stop.load(Ordering::Relaxed) {
-                                break None;
+                                break SlotWait::Stopped;
                             }
-                            let (next_guard, _timeout) = slot
+                            let (next_guard, timeout) = slot
                                 .condvar
                                 .wait_timeout(guard, SLOT_WAIT_TIMEOUT)
                                 .expect("frame slot mutex poisoned");
                             guard = next_guard;
+                            if timeout.timed_out() {
+                                // The notify and the timeout can race; if a
+                                // frame is there after all, prefer it.
+                                if let Some(frame) = guard.take() {
+                                    break SlotWait::Frame(frame);
+                                }
+                                break SlotWait::Timeout;
+                            }
+                            // Spurious wakeup with no frame yet: loop back
+                            // and wait out the rest of the timeout.
                         }
                     };
 
-                    let Some(raw) = raw else { continue };
+                    let raw = match outcome {
+                        SlotWait::Frame(frame) => frame,
+                        SlotWait::Stopped => continue,
+                        SlotWait::Timeout => {
+                            // Nothing new arrived within `SLOT_WAIT_TIMEOUT`
+                            // -- the source is quiet (a static screen: GDI's
+                            // `frame_unchanged`, ScreenCaptureKit's own
+                            // change-only delivery). If a keyframe is
+                            // pending and there is something to encode, redo
+                            // the last frame as one instead of waiting
+                            // forever for the screen to change. At most once
+                            // per timeout by construction (this arm runs at
+                            // most once per `SLOT_WAIT_TIMEOUT`), and only
+                            // when the encoder can actually take another
+                            // frame -- never queue this behind a full
+                            // channel.
+                            if let Some(last) = last_raw.as_mut().filter(|_| tx.capacity() > 0) {
+                                let force_keyframe = request_keyframe.swap(false, Ordering::AcqRel);
+                                if force_keyframe {
+                                    last.set_ts(Instant::now());
+                                    match encoder.encode(last, true) {
+                                        Ok(Some(encoded)) => {
+                                            stats.encoded.fetch_add(1, Ordering::Relaxed);
+                                            stats.keyframes.fetch_add(1, Ordering::Relaxed);
+                                            stats.keyframe_repeats.fetch_add(1, Ordering::Relaxed);
+                                            tracing::debug!(
+                                                "keyframe repeat: no new frame within \
+                                                 timeout, re-encoded the last frame"
+                                            );
+                                            if tx.try_send(encoded).is_err() {
+                                                stats.dropped.fetch_add(1, Ordering::Relaxed);
+                                                request_keyframe.store(true, Ordering::Release);
+                                            }
+                                        }
+                                        Ok(None) => {}
+                                        Err(_) => break,
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    };
                     let captured_at = raw.ts();
 
                     // (a) Apply any pending rate-control target before this
@@ -260,6 +339,10 @@ impl Pipeline {
                     // (b) Pace to the target fps (see `Pacer`).
                     if !pacer.admit(captured_at, rate_control.fps()) {
                         stats.paced_out.fetch_add(1, Ordering::Relaxed);
+                        // Still the most recent real frame the source
+                        // produced, even though it isn't being encoded now
+                        // -- keep it as the keyframe-repeat candidate.
+                        last_raw = Some(raw);
                         continue;
                     }
 
@@ -269,6 +352,7 @@ impl Pipeline {
                     // frame instead.
                     if tx.capacity() == 0 {
                         stats.dropped.fetch_add(1, Ordering::Relaxed);
+                        last_raw = Some(raw);
                         continue;
                     }
 
@@ -298,6 +382,10 @@ impl Pipeline {
                         Ok(None) => {}
                         Err(_) => break,
                     }
+                    // The encoder only borrowed `raw`; it's still ours to
+                    // keep as the keyframe-repeat candidate for the next
+                    // time the source goes quiet.
+                    last_raw = Some(raw);
                 }
             })
         };
@@ -605,5 +693,161 @@ mod tests {
             "expected pipeline to keep producing frames after set_rate, got {}",
             received.len()
         );
+    }
+
+    /// A source that hands out exactly one frame and then blocks, the way a
+    /// static screen does on both real backends (GDI's `frame_unchanged`,
+    /// ScreenCaptureKit's own change-only delivery): `next_frame` never
+    /// returns again until the test tells it to via `unblock`, at which
+    /// point it reports the source stopped so the capture thread's loop
+    /// exits cleanly and `PipelineHandle::stop()` can join it.
+    struct StaticScreenSource {
+        served_first: bool,
+        width: u32,
+        height: u32,
+        stop_signal: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl StaticScreenSource {
+        fn new(width: u32, height: u32) -> (Self, Arc<(Mutex<bool>, Condvar)>) {
+            let stop_signal = Arc::new((Mutex::new(false), Condvar::new()));
+            (
+                Self {
+                    served_first: false,
+                    width,
+                    height,
+                    stop_signal: Arc::clone(&stop_signal),
+                },
+                stop_signal,
+            )
+        }
+
+        /// Tells the blocked `next_frame` call to give up and return an
+        /// error, letting the capture thread exit.
+        fn unblock(stop_signal: &Arc<(Mutex<bool>, Condvar)>) {
+            let (lock, cvar) = &**stop_signal;
+            *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            cvar.notify_all();
+        }
+    }
+
+    impl FrameSource for StaticScreenSource {
+        fn next_frame(&mut self) -> Result<RawFrame, crate::capture::CaptureError> {
+            if !self.served_first {
+                self.served_first = true;
+                let len = self.width as usize * self.height as usize * 4;
+                return Ok(RawFrame::Bgra {
+                    width: self.width,
+                    height: self.height,
+                    data: vec![0u8; len],
+                    stride: self.width as usize * 4,
+                    ts: Instant::now(),
+                });
+            }
+            let (lock, cvar) = &*self.stop_signal;
+            let mut stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*stopped {
+                stopped = cvar
+                    .wait(stopped)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            Err(crate::capture::CaptureError::Stopped)
+        }
+
+        fn size(&self) -> (u32, u32) {
+            (self.width, self.height)
+        }
+    }
+
+    #[test]
+    fn keyframe_request_gets_answered_even_with_no_new_frames() {
+        let _guard = serialized();
+        let (source, stop_signal) = StaticScreenSource::new(64, 64);
+        let cfg = EncoderConfig {
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_kbps: 2000,
+            keyframe_interval_frames: 60,
+            max_qp: None,
+        };
+        let (encoder, _kind) =
+            build_encoder(Some(EncoderKind::OpenH264), cfg).expect("encoder init");
+
+        let mut handle = Pipeline::start(
+            Box::new(source),
+            encoder,
+            RateTarget {
+                bitrate_kbps: 2000,
+                fps: 30,
+            },
+        );
+
+        // The one frame the source ever produces on its own.
+        let first = drain_for(&mut handle, Duration::from_millis(300));
+        assert_eq!(first.len(), 1, "expected exactly the one served frame");
+        assert!(first[0].keyframe, "first encoded frame must be a keyframe");
+
+        handle.request_keyframe();
+        let repeats = drain_for(&mut handle, Duration::from_secs(2));
+        assert!(
+            repeats.iter().any(|f| f.keyframe),
+            "expected a keyframe within 2s of request_keyframe() despite no new \
+             frames from the source, got {} frames",
+            repeats.len()
+        );
+        assert!(
+            handle.stats.keyframe_repeats.load(Ordering::Relaxed) >= 1,
+            "expected keyframe_repeats to have counted the repeat"
+        );
+
+        StaticScreenSource::unblock(&stop_signal);
+        handle.stop();
+    }
+
+    #[test]
+    fn no_keyframe_repeat_without_a_pending_request() {
+        let _guard = serialized();
+        let (source, stop_signal) = StaticScreenSource::new(64, 64);
+        let cfg = EncoderConfig {
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_kbps: 2000,
+            keyframe_interval_frames: 60,
+            max_qp: None,
+        };
+        let (encoder, _kind) =
+            build_encoder(Some(EncoderKind::OpenH264), cfg).expect("encoder init");
+
+        let mut handle = Pipeline::start(
+            Box::new(source),
+            encoder,
+            RateTarget {
+                bitrate_kbps: 2000,
+                fps: 30,
+            },
+        );
+
+        let first = drain_for(&mut handle, Duration::from_millis(300));
+        assert_eq!(first.len(), 1, "expected exactly the one served frame");
+
+        // No `request_keyframe()` call this time: with the source blocked,
+        // nothing more should arrive over the same window the previous test
+        // used to observe a repeat.
+        let idle = drain_for(&mut handle, Duration::from_secs(2));
+        assert!(
+            idle.is_empty(),
+            "expected no frames without a pending keyframe request, got {}",
+            idle.len()
+        );
+        assert_eq!(
+            handle.stats.keyframe_repeats.load(Ordering::Relaxed),
+            0,
+            "expected no keyframe repeats without a request"
+        );
+
+        StaticScreenSource::unblock(&stop_signal);
+        handle.stop();
     }
 }
