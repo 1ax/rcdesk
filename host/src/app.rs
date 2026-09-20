@@ -520,6 +520,7 @@ mod tests {
             host_id: "host-1".to_string(),
             pin: pin.to_string(),
             ice_servers: vec![],
+            device: None,
         })
         .unwrap();
         ws.send(Message::text(msg)).await.unwrap();

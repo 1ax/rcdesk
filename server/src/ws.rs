@@ -15,6 +15,8 @@ use proto::signal::{Role, SignalMessage};
 use tokio::sync::mpsc;
 
 use crate::app::AppState;
+use crate::db::Db;
+use crate::devices::{self, DeviceAuth};
 use crate::ice::{self, IceConfig};
 use crate::registry::{Registry, Tx};
 
@@ -43,7 +45,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     });
 
     tracing::info!("websocket connection opened");
-    run_connection(&mut stream, tx.clone(), &state.registry, &state.ice).await;
+    run_connection(
+        &mut stream,
+        tx.clone(),
+        &state.registry,
+        &state.ice,
+        &state.db,
+    )
+    .await;
     tracing::info!("websocket connection closed");
 
     // Drop our own sender clone so the writer task's channel closes once no
@@ -91,6 +100,7 @@ async fn run_connection(
     tx: Tx,
     registry: &Registry,
     ice: &IceConfig,
+    db: &Db,
 ) {
     let role = match next_message(stream, &tx).await {
         Some(SignalMessage::Hello { role, .. }) => role,
@@ -104,7 +114,7 @@ async fn run_connection(
     };
 
     match role {
-        Role::Host => run_host(stream, tx, registry, ice).await,
+        Role::Host => run_host(stream, tx, registry, ice, db).await,
         Role::Client => run_client(stream, tx, registry, ice).await,
     }
 }
@@ -114,9 +124,10 @@ async fn run_host(
     tx: Tx,
     registry: &Registry,
     ice: &IceConfig,
+    db: &Db,
 ) {
-    let name = match next_message(stream, &tx).await {
-        Some(SignalMessage::HostRegister { name }) => name,
+    let (name, device) = match next_message(stream, &tx).await {
+        Some(SignalMessage::HostRegister { name, device }) => (name, device),
         Some(_) => {
             let _ = tx.send(SignalMessage::Error {
                 message: "expected host_register".to_string(),
@@ -126,12 +137,53 @@ async fn run_host(
         None => return,
     };
 
-    let (host_id, pin) = registry.register_host(name, tx.clone());
+    let auth = match devices::authenticate(db, device.as_ref(), &name, ice::now_unix() as i64) {
+        Ok(auth) => auth,
+        Err(err) => {
+            tracing::error!(?err, "device authentication failed");
+            let _ = tx.send(SignalMessage::Error {
+                message: "internal error".to_string(),
+            });
+            return;
+        }
+    };
+
+    let (host_id, issued_credentials) = match auth {
+        DeviceAuth::Unknown => {
+            let _ = tx.send(SignalMessage::Error {
+                message: "unknown device".to_string(),
+            });
+            return;
+        }
+        DeviceAuth::BadSecret => {
+            let _ = tx.send(SignalMessage::Error {
+                message: "invalid device credentials".to_string(),
+            });
+            return;
+        }
+        DeviceAuth::Issued {
+            device_id,
+            credentials,
+        } => (device_id, Some(credentials)),
+        DeviceAuth::Known { device_id } => (device_id, None),
+    };
+
+    let (pin, displaced) = registry.register_host(host_id.clone(), name, tx.clone());
     tracing::info!(host_id = %host_id, "host registered");
+    if let Some(displaced) = displaced {
+        tracing::info!(host_id = %host_id, "displaced an existing connection for this host_id");
+        let _ = displaced.host_tx.send(SignalMessage::Error {
+            message: "replaced by a new connection".to_string(),
+        });
+        if let Some((session_id, client_tx)) = displaced.session {
+            let _ = client_tx.send(SignalMessage::Bye { session_id });
+        }
+    }
     let _ = tx.send(SignalMessage::Registered {
         host_id: host_id.clone(),
         pin,
         ice_servers: ice.ice_servers(ice::now_unix()),
+        device: issued_credentials,
     });
 
     loop {
@@ -207,7 +259,7 @@ async fn run_host(
     }
 
     tracing::info!(host_id = %host_id, "host disconnected");
-    if let Some((session_id, client_tx)) = registry.unregister_host(&host_id) {
+    if let Some((session_id, client_tx)) = registry.unregister_host(&host_id, &tx) {
         let _ = client_tx.send(SignalMessage::Bye { session_id });
     }
 }

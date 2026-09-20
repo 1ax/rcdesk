@@ -60,21 +60,53 @@ pub struct Registry {
     inner: Arc<Mutex<Inner>>,
 }
 
+/// The old connection of the same device, displaced by a new registration
+/// under the same `host_id` (slice 3.1: `host_id` is now the device's
+/// persistent id, so a reconnecting host -- e.g. after 2.6a's backoff,
+/// before the server notices the old socket is dead -- registers again
+/// under an id that's still "live"). The caller (`ws.rs`) uses `host_tx` to
+/// tell the old connection it's been replaced, and, if it was in a session,
+/// `session` to tell that session's client `Bye`.
+pub struct Displaced {
+    pub host_tx: Tx,
+    pub session: Option<(String, Tx)>,
+}
+
 impl Registry {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Registers a new host, generating a unique `host_id` and PIN.
-    pub fn register_host(&self, name: String, tx: Tx) -> (String, String) {
+    /// Registers a host under the given `host_id` (slice 3.1: the caller --
+    /// `devices::authenticate` via `ws.rs` -- decides this, it's no longer
+    /// generated here). If `host_id` is already registered to a live
+    /// connection, that connection is displaced: its session (if any) is
+    /// closed and its `tx`/session info is returned in `Displaced` so the
+    /// caller can notify it. A fresh PIN is generated either way.
+    pub fn register_host(
+        &self,
+        host_id: String,
+        name: String,
+        tx: Tx,
+    ) -> (String, Option<Displaced>) {
         let mut inner = self.inner.lock().expect("registry mutex poisoned");
 
-        let host_id = loop {
-            let candidate = random_id();
-            if !inner.hosts.contains_key(&candidate) {
-                break candidate;
-            }
+        let displaced = if let Some(old) = inner.hosts.remove(&host_id) {
+            inner.pin_to_host.remove(&old.pin);
+            let session = old.session_id.and_then(|session_id| {
+                inner
+                    .sessions
+                    .remove(&session_id)
+                    .map(|s| (session_id, s.client_tx))
+            });
+            Some(Displaced {
+                host_tx: old.tx,
+                session,
+            })
+        } else {
+            None
         };
+
         let pin = loop {
             let candidate = random_pin();
             if !inner.pin_to_host.contains_key(&candidate) {
@@ -84,7 +116,7 @@ impl Registry {
 
         inner.pin_to_host.insert(pin.clone(), host_id.clone());
         inner.hosts.insert(
-            host_id.clone(),
+            host_id,
             HostEntry {
                 name,
                 pin: pin.clone(),
@@ -93,14 +125,25 @@ impl Registry {
             },
         );
 
-        (host_id, pin)
+        (pin, displaced)
     }
 
-    /// Removes a host on disconnect. If it had an active session, returns
-    /// that session's id and the client's tx so the caller can notify the
-    /// client with `Bye`.
-    pub fn unregister_host(&self, host_id: &str) -> Option<(String, Tx)> {
+    /// Removes a host on disconnect, but only if `tx` is still the
+    /// connection that owns `host_id` (`same_channel`) -- a displaced
+    /// connection's own disconnect (it was already removed from the
+    /// registry by `register_host`) must not tear down whatever new
+    /// connection has since taken over `host_id`. If the host had an active
+    /// session, returns that session's id and the client's tx so the caller
+    /// can notify the client with `Bye`.
+    pub fn unregister_host(&self, host_id: &str, tx: &Tx) -> Option<(String, Tx)> {
         let mut inner = self.inner.lock().expect("registry mutex poisoned");
+        if !inner
+            .hosts
+            .get(host_id)
+            .is_some_and(|host| host.tx.same_channel(tx))
+        {
+            return None;
+        }
         let host = inner.hosts.remove(host_id)?;
         inner.pin_to_host.remove(&host.pin);
 
@@ -231,11 +274,19 @@ impl Registry {
     }
 }
 
-fn random_id() -> String {
+/// A random string of `len` characters drawn from `ID_CHARS`
+/// (`a-z0-9`), used both for this module's own ids (`random_id`) and, via
+/// `server::devices`, for device ids/secrets (slice 3.1) -- one generator so
+/// the alphabet isn't duplicated.
+pub fn random_token(len: usize) -> String {
     let mut rng = rand::rng();
-    (0..ID_LEN)
+    (0..len)
         .map(|_| ID_CHARS[rng.random_range(0..ID_CHARS.len())] as char)
         .collect()
+}
+
+pub fn random_id() -> String {
+    random_token(ID_LEN)
 }
 
 fn random_pin() -> String {
@@ -255,15 +306,14 @@ mod tests {
     }
 
     #[test]
-    fn register_host_generates_six_digit_pin_and_sixteen_char_id() {
+    fn register_host_with_given_id_generates_six_digit_pin_and_no_displaced() {
         let registry = Registry::new();
         let (tx, _rx) = channel();
-        let (host_id, pin) = registry.register_host("host".to_string(), tx);
+        let (pin, displaced) = registry.register_host("host1".to_string(), "host".to_string(), tx);
 
-        assert_eq!(host_id.len(), ID_LEN);
-        assert!(host_id.bytes().all(|b| ID_CHARS.contains(&b)));
         assert_eq!(pin.len(), PIN_LEN);
         assert!(pin.chars().all(|c| c.is_ascii_digit()));
+        assert!(displaced.is_none());
     }
 
     #[test]
@@ -278,7 +328,8 @@ mod tests {
     fn join_busy_host_fails() {
         let registry = Registry::new();
         let (host_tx, _host_rx) = channel();
-        let (_host_id, pin) = registry.register_host("host".to_string(), host_tx);
+        let (pin, _displaced) =
+            registry.register_host("host1".to_string(), "host".to_string(), host_tx);
 
         let (client_tx_1, _rx1) = channel();
         registry.join(&pin, client_tx_1).expect("first join ok");
@@ -292,7 +343,8 @@ mod tests {
     fn close_session_by_client_frees_host_for_same_pin() {
         let registry = Registry::new();
         let (host_tx, _host_rx) = channel();
-        let (host_id, pin) = registry.register_host("host".to_string(), host_tx);
+        let (pin, _displaced) =
+            registry.register_host("host1".to_string(), "host".to_string(), host_tx);
 
         let (client_tx, _rx) = channel();
         let (session_id, _name, _host_tx) =
@@ -307,6 +359,100 @@ mod tests {
             registry.join(&pin, client_tx_2).expect("second join ok");
 
         // host is still registered and its pin/id unchanged
-        assert!(registry.peer_tx_for_host(&host_id, "nonexistent").is_none());
+        assert!(registry.peer_tx_for_host("host1", "nonexistent").is_none());
+    }
+
+    #[test]
+    fn re_registering_same_host_id_displaces_old_connection_and_invalidates_old_pin() {
+        let registry = Registry::new();
+        let (old_tx, _old_rx) = channel();
+        let (old_pin, displaced) =
+            registry.register_host("host1".to_string(), "host".to_string(), old_tx.clone());
+        assert!(displaced.is_none());
+
+        let (new_tx, _new_rx) = channel();
+        let (new_pin, displaced) =
+            registry.register_host("host1".to_string(), "host".to_string(), new_tx);
+
+        let displaced = displaced.expect("second registration displaces the first");
+        assert!(displaced.host_tx.same_channel(&old_tx));
+        assert!(displaced.session.is_none());
+
+        let (client_tx, _rx) = channel();
+        assert_eq!(
+            registry.join(&old_pin, client_tx).unwrap_err(),
+            JoinError::UnknownPin
+        );
+
+        let (client_tx_2, _rx2) = channel();
+        registry
+            .join(&new_pin, client_tx_2)
+            .expect("new pin still works");
+    }
+
+    #[test]
+    fn re_registering_host_in_session_displaces_and_returns_session_info() {
+        let registry = Registry::new();
+        let (host_tx, _host_rx) = channel();
+        let (pin, _displaced) =
+            registry.register_host("host1".to_string(), "host".to_string(), host_tx);
+
+        let (client_tx, _client_rx) = channel();
+        let (session_id, _name, _host_tx) =
+            registry.join(&pin, client_tx.clone()).expect("join ok");
+
+        let (new_tx, _new_rx) = channel();
+        let (_new_pin, displaced) =
+            registry.register_host("host1".to_string(), "host".to_string(), new_tx);
+
+        let displaced = displaced.expect("re-registration while in session displaces");
+        let (displaced_session_id, displaced_client_tx) =
+            displaced.session.expect("displaced host was in a session");
+        assert_eq!(displaced_session_id, session_id);
+        assert!(displaced_client_tx.same_channel(&client_tx));
+
+        // the session is gone: the client can no longer be found via it
+        assert!(registry
+            .peer_tx_for_client(&session_id, &client_tx)
+            .is_none());
+    }
+
+    #[test]
+    fn unregister_host_with_stale_tx_is_a_no_op() {
+        let registry = Registry::new();
+        let (old_tx, _old_rx) = channel();
+        let (_old_pin, _displaced) =
+            registry.register_host("host1".to_string(), "host".to_string(), old_tx.clone());
+
+        let (new_tx, _new_rx) = channel();
+        let (new_pin, _displaced) =
+            registry.register_host("host1".to_string(), "host".to_string(), new_tx);
+
+        // the stale (displaced) tx unregistering must not remove the new
+        // registration
+        assert!(registry.unregister_host("host1", &old_tx).is_none());
+
+        let (client_tx, _rx) = channel();
+        registry
+            .join(&new_pin, client_tx)
+            .expect("new registration still works");
+    }
+
+    #[test]
+    fn unregister_host_with_current_tx_removes_registration() {
+        let registry = Registry::new();
+        let (tx, _rx) = channel();
+        let (pin, _displaced) =
+            registry.register_host("host1".to_string(), "host".to_string(), tx.clone());
+
+        // No session was active, so a successful unregister also returns
+        // `None` here -- verify success via the pin no longer working.
+        assert!(registry.unregister_host("host1", &tx).is_none());
+
+        let (client_tx, _rx2) = channel();
+        assert_eq!(
+            registry.join(&pin, client_tx).unwrap_err(),
+            JoinError::UnknownPin
+        );
     }
 }

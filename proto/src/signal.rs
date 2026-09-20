@@ -28,19 +28,42 @@ pub struct IceServer {
     pub credential: Option<String>,
 }
 
+/// Постоянные креды устройства (слайс 3.1): сервер выдаёт их при первой
+/// регистрации, хост сохраняет у себя и предъявляет при каждой следующей,
+/// получая тот же `host_id` вместо нового случайного.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeviceCredentials {
+    pub device_id: String,
+    pub secret: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(export)]
 pub enum SignalMessage {
     /// First message from any client on connect.
     Hello { role: Role, version: String },
-    /// host -> server
-    HostRegister { name: String },
-    /// server -> host
+    /// host -> server. `device` carries the persistent device credentials
+    /// (slice 3.1) issued by a previous `Registered`, if the host has any
+    /// saved; `#[serde(default)]` so an older host that predates 3.1 (whose
+    /// `HostRegister` has no `device` field) stays compatible with a newer
+    /// server -- same reasoning as `PeerJoined.ice_servers` below.
+    HostRegister {
+        name: String,
+        #[serde(default)]
+        device: Option<DeviceCredentials>,
+    },
+    /// server -> host. `device` carries freshly issued credentials (slice
+    /// 3.1) only on a host's very first registration; on a successful
+    /// re-registration with already-known credentials it's `None` -- the
+    /// host already has what it needs saved.
     Registered {
         host_id: String,
         pin: String,
         ice_servers: Vec<IceServer>,
+        #[serde(default)]
+        device: Option<DeviceCredentials>,
     },
     /// client -> server
     Join { pin: String },
@@ -144,5 +167,36 @@ mod tests {
                 ice_servers: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn host_register_without_device_field_deserializes_to_none() {
+        let json = r#"{"type":"host_register","name":"My Mac"}"#;
+
+        let msg: SignalMessage = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            msg,
+            SignalMessage::HostRegister {
+                name: "My Mac".to_string(),
+                device: None,
+            }
+        );
+    }
+
+    #[test]
+    fn registered_with_device_round_trips_through_json() {
+        let registered = SignalMessage::Registered {
+            host_id: "host123".to_string(),
+            pin: "123456".to_string(),
+            ice_servers: Vec::new(),
+            device: Some(DeviceCredentials {
+                device_id: "dev123".to_string(),
+                secret: "supersecret".to_string(),
+            }),
+        };
+
+        let json = serde_json::to_string(&registered).expect("serialize");
+        let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, registered);
     }
 }

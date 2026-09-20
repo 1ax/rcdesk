@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use proto::signal::{IceCandidate, Role, SignalMessage};
+use proto::signal::{DeviceCredentials, IceCandidate, Role, SignalMessage};
 use rcdesk_server::app::app;
 use rcdesk_server::db::Db;
 use rcdesk_server::ice::IceConfig;
@@ -87,6 +87,7 @@ async fn host_and_joined_client(url: &str) -> (WsStream, WsStream, String, Strin
         &mut host,
         &SignalMessage::HostRegister {
             name: "Test Host".to_string(),
+            device: None,
         },
     )
     .await;
@@ -120,6 +121,7 @@ async fn host_registers_and_receives_six_digit_pin() {
         &mut host,
         &SignalMessage::HostRegister {
             name: "My Mac".to_string(),
+            device: None,
         },
     )
     .await;
@@ -129,6 +131,7 @@ async fn host_registers_and_receives_six_digit_pin() {
             host_id,
             pin,
             ice_servers,
+            ..
         } => {
             assert_eq!(host_id.len(), 16);
             assert_eq!(pin.len(), 6);
@@ -151,6 +154,7 @@ async fn client_join_succeeds_and_host_is_notified() {
         &mut host,
         &SignalMessage::HostRegister {
             name: "My Mac".to_string(),
+            device: None,
         },
     )
     .await;
@@ -363,5 +367,225 @@ async fn first_message_must_be_hello() {
         Some(Ok(Message::Close(_))) => {}
         Some(Err(_)) => {}
         other => panic!("expected the connection to close, got {other:?}"),
+    }
+}
+
+// (h) a host that registers without device credentials (slice 3.1) is
+// issued fresh ones, and its host_id is exactly the issued device_id.
+#[tokio::test]
+async fn host_without_device_credentials_is_issued_fresh_ones() {
+    let url = spawn_server().await;
+    let mut host = connect(&url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "My Mac".to_string(),
+            device: None,
+        },
+    )
+    .await;
+
+    match recv(&mut host).await {
+        SignalMessage::Registered {
+            host_id, device, ..
+        } => {
+            let device = device.expect("first registration issues device credentials");
+            assert_eq!(host_id, device.device_id);
+        }
+        other => panic!("expected registered, got {other:?}"),
+    }
+}
+
+// (i) presenting previously issued device credentials reconnects under the
+// same host_id, and Registered.device is None (nothing new to save).
+#[tokio::test]
+async fn reconnecting_with_issued_credentials_reuses_host_id() {
+    let url = spawn_server().await;
+
+    let mut host = connect(&url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "My Mac".to_string(),
+            device: None,
+        },
+    )
+    .await;
+    let (host_id, credentials) = match recv(&mut host).await {
+        SignalMessage::Registered {
+            host_id, device, ..
+        } => (
+            host_id,
+            device.expect("first registration issues device credentials"),
+        ),
+        other => panic!("expected registered, got {other:?}"),
+    };
+    drop(host);
+
+    let mut host2 = connect(&url).await;
+    hello(&mut host2, Role::Host).await;
+    send(
+        &mut host2,
+        &SignalMessage::HostRegister {
+            name: "My Mac".to_string(),
+            device: Some(credentials),
+        },
+    )
+    .await;
+
+    match recv(&mut host2).await {
+        SignalMessage::Registered {
+            host_id: reused_host_id,
+            device,
+            ..
+        } => {
+            assert_eq!(reused_host_id, host_id);
+            assert!(device.is_none());
+        }
+        other => panic!("expected registered, got {other:?}"),
+    }
+}
+
+// (j) presenting the right device_id but the wrong secret is rejected.
+#[tokio::test]
+async fn reconnecting_with_wrong_secret_is_rejected() {
+    let url = spawn_server().await;
+
+    let mut host = connect(&url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "My Mac".to_string(),
+            device: None,
+        },
+    )
+    .await;
+    let credentials = match recv(&mut host).await {
+        SignalMessage::Registered { device, .. } => {
+            device.expect("first registration issues device credentials")
+        }
+        other => panic!("expected registered, got {other:?}"),
+    };
+    drop(host);
+
+    let mut host2 = connect(&url).await;
+    hello(&mut host2, Role::Host).await;
+    send(
+        &mut host2,
+        &SignalMessage::HostRegister {
+            name: "My Mac".to_string(),
+            device: Some(DeviceCredentials {
+                device_id: credentials.device_id,
+                secret: format!("{}-wrong", credentials.secret),
+            }),
+        },
+    )
+    .await;
+
+    match recv(&mut host2).await {
+        SignalMessage::Error { message } => assert_eq!(message, "invalid device credentials"),
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+// (k) presenting a device_id the server has never heard of is rejected --
+// e.g. the server's database was recreated.
+#[tokio::test]
+async fn reconnecting_with_unknown_device_id_is_rejected() {
+    let url = spawn_server().await;
+
+    let mut host = connect(&url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "My Mac".to_string(),
+            device: Some(DeviceCredentials {
+                device_id: "no-such-device".to_string(),
+                secret: "whatever".to_string(),
+            }),
+        },
+    )
+    .await;
+
+    match recv(&mut host).await {
+        SignalMessage::Error { message } => assert_eq!(message, "unknown device"),
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+// (l) a second connection presenting the same device credentials displaces
+// the first: the first gets Error{"replaced by a new connection"}, and the
+// client of its active session gets Bye with that session's id.
+#[tokio::test]
+async fn re_registering_same_device_displaces_old_connection_and_ends_its_session() {
+    let url = spawn_server().await;
+
+    let mut host1 = connect(&url).await;
+    hello(&mut host1, Role::Host).await;
+    send(
+        &mut host1,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: None,
+        },
+    )
+    .await;
+    let (host_id1, pin1, credentials) = match recv(&mut host1).await {
+        SignalMessage::Registered {
+            host_id,
+            pin,
+            device,
+            ..
+        } => (
+            host_id,
+            pin,
+            device.expect("first registration issues device credentials"),
+        ),
+        other => panic!("expected registered, got {other:?}"),
+    };
+
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    send(&mut client, &SignalMessage::Join { pin: pin1.clone() }).await;
+    let session_id = match recv(&mut client).await {
+        SignalMessage::Joined { session_id, .. } => session_id,
+        other => panic!("expected joined, got {other:?}"),
+    };
+    match recv(&mut host1).await {
+        SignalMessage::PeerJoined { .. } => {}
+        other => panic!("expected peer_joined, got {other:?}"),
+    }
+
+    let mut host2 = connect(&url).await;
+    hello(&mut host2, Role::Host).await;
+    send(
+        &mut host2,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: Some(credentials),
+        },
+    )
+    .await;
+
+    match recv(&mut host1).await {
+        SignalMessage::Error { message } => assert_eq!(message, "replaced by a new connection"),
+        other => panic!("expected error, got {other:?}"),
+    }
+    match recv(&mut client).await {
+        SignalMessage::Bye { session_id: sid } => assert_eq!(sid, session_id),
+        other => panic!("expected bye, got {other:?}"),
+    }
+    match recv(&mut host2).await {
+        SignalMessage::Registered {
+            host_id, device, ..
+        } => {
+            assert_eq!(host_id, host_id1);
+            assert!(device.is_none());
+        }
+        other => panic!("expected registered, got {other:?}"),
     }
 }

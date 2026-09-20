@@ -221,6 +221,7 @@ impl SignalingClient {
             &mut write,
             &SignalMessage::HostRegister {
                 name: name.to_string(),
+                device: None,
             },
         )
         .await?;
@@ -230,6 +231,7 @@ impl SignalingClient {
                 host_id,
                 pin,
                 ice_servers,
+                ..
             }) => (host_id, pin, ice_servers),
             Some(SignalMessage::Error { message }) => {
                 anyhow::bail!("signaling server rejected registration: {message}")
