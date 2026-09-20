@@ -543,12 +543,22 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let url = format!("ws://{addr}/ws");
 
+        // `watch` keeps only the *latest* value: if this server dropped the
+        // first connection right away, run_agent could race through
+        // Registered{111111} -> Reconnecting -> Registered{222222} before
+        // the test ever reads the channel, and the first registration would
+        // be invisible (a real flake: it failed this way on a loaded macOS
+        // CI runner, Deploy 35498413799). The test signals through this
+        // oneshot once it has actually observed the first registration.
+        let (saw_first_tx, saw_first_rx) = tokio::sync::oneshot::channel::<()>();
+
         tokio::spawn(async move {
             // First connection: register, then drop -- forcing run_agent to
             // reconnect.
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             respond_with_registered(&mut ws, "111111").await;
+            let _ = saw_first_rx.await;
             drop(ws);
 
             // Second connection: register and then just hang -- run_agent's
@@ -597,20 +607,24 @@ mod tests {
         .await
         .expect("timed out waiting for the first registration");
 
-        // Reconnecting, then Registered{222222}.
+        // Now let the server drop the first connection.
+        let _ = saw_first_tx.send(());
+
+        // The second registration carries a different PIN, which is itself
+        // proof that run_agent reconnected. The intermediate `Reconnecting`
+        // is deliberately *not* asserted here: `watch` coalesces, so it can
+        // legitimately be overwritten before this loop sees it. That status
+        // is covered deterministically by
+        // `run_agent_reconnects_when_the_connection_goes_silent`, whose
+        // backoff (1s) keeps it observable.
         timeout(Duration::from_secs(10), async {
-            let mut saw_reconnecting = false;
             loop {
-                match next_status(&mut status_rx).await {
-                    AgentStatus::Reconnecting { .. } => saw_reconnecting = true,
-                    AgentStatus::Registered { pin } if pin == "222222" => {
-                        assert!(
-                            saw_reconnecting,
-                            "expected a Reconnecting status between the two registrations"
-                        );
-                        break;
-                    }
-                    _ => {}
+                if next_status(&mut status_rx).await
+                    == (AgentStatus::Registered {
+                        pin: "222222".to_string(),
+                    })
+                {
+                    break;
                 }
             }
         })
