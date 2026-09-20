@@ -117,6 +117,119 @@ body {
   color: var(--muted);
 }
 
+.devices {
+  margin: 0 0 20px;
+  text-align: left;
+}
+
+.devices h2 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.device-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.device-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.device-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.device-name {
+  font-size: 14px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device-status {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.device-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.device-actions .btn,
+.device-actions .btn-secondary {
+  width: auto;
+  margin-top: 0;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.device-actions .btn:disabled {
+  opacity: 0.4;
+}
+
+.device-forget {
+  color: var(--danger);
+  background: transparent;
+}
+
+.device-forget:hover:not(:disabled) {
+  background: rgb(224 85 79 / 15%);
+}
+
+.device-rename-input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  font-size: 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+}
+
+.device-rename-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.device-rename-save {
+  width: auto;
+  margin-top: 0;
+  padding: 6px 10px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.pin-hint {
+  margin-top: 0;
+  margin-bottom: 8px;
+}
+
 .session-screen {
   position: relative;
   height: 100%;

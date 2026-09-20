@@ -19,8 +19,17 @@ import { applyCursor } from "./cursor";
 import { displayOptions, parseDisplayId, shouldShowPicker } from "./displays";
 import { inputBlockedLabel } from "./inputBlocked";
 import { viewOnlyLabel } from "./inputStatus";
+import {
+  canConnect,
+  deviceLabel,
+  deviceStatusLabel,
+  loadOwnerToken,
+  saveOwnerToken,
+  sortDevices,
+} from "./myDevices";
 import type { ControlMessage } from "./generated/ControlMessage";
 import type { DisplayEntry } from "./generated/DisplayEntry";
+import type { DeviceEntry } from "./generated/DeviceEntry";
 
 type SessionStatus = "connecting" | "connected" | "disconnected" | "error";
 
@@ -48,6 +57,19 @@ const QUALITY_REASON_LABELS: Record<string, string> = {
   remb: "remb",
 };
 
+/** `window.localStorage` can throw on *access*, not just on read/write, when
+ * the browser blocks site data for this origin entirely -- `loadOwnerToken`'s
+ * own try/catch is too late in that case, since the throw happens while
+ * evaluating its argument. Returning `null` keeps the whole client working
+ * (PIN entry included), just without a remembered owner token. */
+function ownerStorage(): Storage | null {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
 function signalUrl(): string {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   return `${scheme}://${location.host}/ws`;
@@ -62,6 +84,11 @@ const SIGNAL_ERROR_LABELS: Record<string, string> = {
   "host busy": "К этому хосту уже подключён другой клиент",
   "invalid message": "Сервер не понял сообщение клиента",
   "expected host_register": "Сервер не понял сообщение клиента",
+  "device offline": "Устройство сейчас не в сети — попробуйте позже",
+  "device not linked": "Это устройство не привязано к вашему аккаунту",
+  "not authenticated": "Не удалось подтвердить вход — обновите страницу",
+  "internal error": "Внутренняя ошибка сервера — попробуйте ещё раз",
+  "replaced by a new connection": "Вы вошли с этим аккаунтом в другой вкладке — эта отключена",
 };
 
 export function signalErrorLabel(message: string): string {
@@ -116,6 +143,11 @@ const PING_INTERVAL_MS = 1000;
 
 const STATS_INTERVAL_MS = 1000;
 
+/** How often `app.ts` re-requests the device list (`list_devices`) while
+ * the PIN/list screen is showing -- state (online/busy, a rename from
+ * another tab) can change at any time. */
+const DEVICE_LIST_INTERVAL_MS = 10000;
+
 /** How long `#clipboard-note` stays visible after `ClipboardBridge.notify`
  * reports a too-large clipboard text (slice 2.5c, decision 5). */
 const CLIPBOARD_NOTE_MS = 4000;
@@ -130,6 +162,11 @@ export function mount(root: Element | null): void {
     <div class="pin-screen" id="pin-screen">
       <div class="card">
         <h1>rcdesk</h1>
+        <div class="devices" id="devices" hidden>
+          <h2>Мои компьютеры</h2>
+          <ul class="device-list" id="device-list"></ul>
+        </div>
+        <p class="hint pin-hint">Или введите PIN с экрана хоста</p>
         <input
           id="pin-input"
           class="pin-input"
@@ -183,8 +220,16 @@ export function mount(root: Element | null): void {
   const viewOnlyEl = root.querySelector<HTMLSpanElement>("#view-only")!;
   const inputBlockedEl = root.querySelector<HTMLSpanElement>("#input-blocked")!;
   const clipboardNoteEl = root.querySelector<HTMLSpanElement>("#clipboard-note")!;
+  const devicesEl = root.querySelector<HTMLDivElement>("#devices")!;
+  const deviceListEl = root.querySelector<HTMLUListElement>("#device-list")!;
 
-  let signaling: SignalingClient | null = null;
+  // One long-lived signaling connection for the whole tab (slice 3.1e): the
+  // server remembers which owner a socket authenticated as (and which
+  // device, mid-session) only for the lifetime of that one WebSocket, so a
+  // PIN-less reconnect to a device the owner already owns needs the same
+  // connection to stay open across the "list of my computers" screen and a
+  // live session, not a fresh one per session like before this slice.
+  const signaling = new SignalingClient();
   let session: PeerSession | null = null;
   let sessionId: string | null = null;
   let statsTimer: ReturnType<typeof setInterval> | undefined;
@@ -223,6 +268,22 @@ export function mount(root: Element | null): void {
   // so `teardown` knows whether to remove it.
   let clipboardChangeAttached = false;
   let clipboardNoteTimer: ReturnType<typeof setTimeout> | undefined;
+  // The owner's device list (slice 3.1e), from `Authenticated`/`Devices` --
+  // drives `renderDeviceList`. Empty until the first of either arrives.
+  let devices: DeviceEntry[] = [];
+  // The device currently being renamed inline (its row shows a text input
+  // instead of its label), or `null` when no row is in that state. Only one
+  // row at a time.
+  let renamingDeviceId: string | null = null;
+  // The device whose "Удалить" button currently reads "Точно?", awaiting a
+  // second click to confirm (see the document-level `click` listener below,
+  // which resets this when the user clicks anything else).
+  let confirmingForgetId: string | null = null;
+  // Set once the signaling socket itself closes (not just a session ending)
+  // -- disables every connect affordance, since there is nothing to
+  // reconnect to yet (auto-reconnect is slice 3.5, not this one).
+  let connectionLost = false;
+  let deviceListTimer: ReturnType<typeof setInterval> | undefined;
 
   /** Shows `note` in `#clipboard-note` for `CLIPBOARD_NOTE_MS`, used as
    * `ClipboardBridge`'s `notify` dependency (decision 5: a too-large
@@ -262,6 +323,150 @@ export function mount(root: Element | null): void {
     }
     displaySelect.hidden = !shouldShowPicker(displays);
     displaySelect.disabled = false;
+  }
+
+  /** Rebuilds `#device-list` from `devices` (see `sortDevices`/`deviceLabel`/
+   * `deviceStatusLabel`/`canConnect` in `myDevices.ts`) and shows/hides
+   * `#devices` -- only worth showing once the owner has at least one linked
+   * device. Rebuilt from scratch on every call, the same approach as
+   * `renderDisplayPicker` above; the list is small and this runs at most a
+   * few times a minute (see `startDeviceListLoop`). */
+  function renderDeviceList(): void {
+    const sorted = sortDevices(devices);
+    devicesEl.hidden = sorted.length === 0;
+    deviceListEl.innerHTML = "";
+    const nowSecs = Math.floor(Date.now() / 1000);
+
+    for (const entry of sorted) {
+      const li = document.createElement("li");
+      li.className = "device-item";
+
+      if (renamingDeviceId === entry.device_id) {
+        const input = document.createElement("input");
+        input.className = "device-rename-input";
+        input.value = deviceLabel(entry);
+        input.addEventListener("keydown", (event) => {
+          if (event.key === "Enter") {
+            commitRename(entry.device_id, input.value);
+          } else if (event.key === "Escape") {
+            renamingDeviceId = null;
+            renderDeviceList();
+          }
+        });
+        const saveBtn = document.createElement("button");
+        saveBtn.className = "btn-secondary device-rename-save";
+        saveBtn.textContent = "Сохранить";
+        saveBtn.addEventListener("click", () => commitRename(entry.device_id, input.value));
+        li.appendChild(input);
+        li.appendChild(saveBtn);
+        deviceListEl.appendChild(li);
+        continue;
+      }
+
+      const info = document.createElement("div");
+      info.className = "device-info";
+      const nameEl = document.createElement("span");
+      nameEl.className = "device-name";
+      nameEl.textContent = deviceLabel(entry);
+      const statusEl = document.createElement("span");
+      statusEl.className = "device-status";
+      statusEl.textContent = deviceStatusLabel(entry, nowSecs);
+      info.appendChild(nameEl);
+      info.appendChild(statusEl);
+
+      const actions = document.createElement("div");
+      actions.className = "device-actions";
+
+      const connectRowBtn = document.createElement("button");
+      connectRowBtn.className = "btn device-connect";
+      connectRowBtn.textContent = "Подключиться";
+      connectRowBtn.disabled = connectionLost || !canConnect(entry);
+      connectRowBtn.addEventListener("click", () => {
+        // Call play() inside this click handler (a user gesture), same
+        // reasoning as `connectBtn`'s listener below (ARCHITECTURE.md §10).
+        void video.play().catch(() => {
+          // Expected: there's no source yet. The gesture is what matters.
+        });
+        beginSession(() =>
+          signaling.send({ type: "connect_device", device_id: entry.device_id }),
+        );
+      });
+
+      const renameBtn = document.createElement("button");
+      renameBtn.className = "btn-secondary device-rename";
+      renameBtn.textContent = "Переименовать";
+      renameBtn.addEventListener("click", () => {
+        renamingDeviceId = entry.device_id;
+        renderDeviceList();
+      });
+
+      const forgetBtn = document.createElement("button");
+      forgetBtn.className = "btn-secondary device-forget";
+      forgetBtn.dataset.deviceId = entry.device_id;
+      forgetBtn.textContent = confirmingForgetId === entry.device_id ? "Точно?" : "Удалить";
+      forgetBtn.addEventListener("click", () => {
+        if (confirmingForgetId === entry.device_id) {
+          signaling.send({ type: "forget_device", device_id: entry.device_id });
+          confirmingForgetId = null;
+        } else {
+          confirmingForgetId = entry.device_id;
+        }
+        renderDeviceList();
+      });
+
+      actions.appendChild(connectRowBtn);
+      actions.appendChild(renameBtn);
+      actions.appendChild(forgetBtn);
+      li.appendChild(info);
+      li.appendChild(actions);
+      deviceListEl.appendChild(li);
+    }
+  }
+
+  /** Sends the renamed alias (or `null` to clear it, when blank after
+   * trimming) and leaves rename mode. */
+  function commitRename(deviceId: string, value: string): void {
+    const alias = value.trim();
+    signaling.send({
+      type: "rename_device",
+      device_id: deviceId,
+      alias: alias === "" ? null : alias,
+    });
+    renamingDeviceId = null;
+    renderDeviceList();
+  }
+
+  // Resets a pending "Точно?" delete confirmation when the user clicks
+  // anything other than that same button (see `forgetBtn` above) -- a click
+  // on the confirming button itself is handled, and re-renders, before this
+  // listener runs (document is last in the bubbling chain), and `closest`
+  // matches the (possibly now-detached) target element itself first, so
+  // that click is never mistaken for "clicked elsewhere".
+  document.addEventListener("click", (event) => {
+    if (confirmingForgetId === null) return;
+    const target = event.target as Element | null;
+    if (target?.closest(`.device-forget[data-device-id="${confirmingForgetId}"]`)) return;
+    confirmingForgetId = null;
+    renderDeviceList();
+  });
+
+  function stopDeviceListLoop(): void {
+    if (deviceListTimer !== undefined) {
+      clearInterval(deviceListTimer);
+      deviceListTimer = undefined;
+    }
+  }
+
+  /** Polls the device list every `DEVICE_LIST_INTERVAL_MS` while the
+   * PIN/list screen is showing (state can change on another device or
+   * another tab at any time -- online/busy, a rename, ...); stopped for the
+   * duration of a session (see `showSessionScreen`) and restarted once
+   * `teardown` returns to this screen (see `showPinScreen`). */
+  function startDeviceListLoop(): void {
+    stopDeviceListLoop();
+    deviceListTimer = setInterval(() => {
+      signaling.send({ type: "list_devices" });
+    }, DEVICE_LIST_INTERVAL_MS);
   }
 
   // `input` and `pointer` arrive via `onDataChannel` in whatever order the
@@ -372,11 +577,13 @@ export function mount(root: Element | null): void {
   function showPinScreen(): void {
     sessionScreen.hidden = true;
     pinScreen.hidden = false;
+    startDeviceListLoop();
   }
 
   function showSessionScreen(): void {
     pinScreen.hidden = true;
     sessionScreen.hidden = false;
+    stopDeviceListLoop();
   }
 
   function stopStatsLoop(): void {
@@ -442,17 +649,199 @@ export function mount(root: Element | null): void {
     clipboardNoteEl.textContent = "";
     session?.close();
     session = null;
-    signaling?.close();
-    signaling = null;
+    // Unlike before this slice, the signaling connection itself is *not*
+    // closed or discarded here -- it's one long-lived connection for the
+    // whole tab now (see where `signaling` is created above), since the
+    // server only remembers which owner (and, mid-session, which device) a
+    // socket authenticated as for the lifetime of that one WebSocket. Only
+    // the WebRTC session ends; the tab drops back to the PIN/list screen on
+    // the same connection.
     sessionId = null;
     prevSnapshot = undefined;
     video.srcObject = null;
     video.style.cursor = "";
     overlay.textContent = "";
-    connectBtn.disabled = false;
+    connectBtn.disabled = connectionLost;
     pinStatus.textContent = reason;
     showPinScreen();
+    // Refresh the list right away rather than waiting for the next
+    // `startDeviceListLoop` tick (up to `DEVICE_LIST_INTERVAL_MS` later) --
+    // state (this device's own `busy`, in particular) just changed.
+    signaling.send({ type: "list_devices" });
   }
+
+  /** Shared setup for both ways to start a session -- entering a PIN or
+   * picking a device from "Мои компьютеры" (slice 3.1e). The only
+   * difference between the two paths is which message kicks it off (`join`
+   * vs `connect_device`); `send` performs that one. Must be called only
+   * after the caller has already invoked `video.play()` synchronously
+   * inside the click that triggered it -- Safari requires that exact call
+   * to happen inside the user gesture (ARCHITECTURE.md §10), so it can't be
+   * moved in here. */
+  function beginSession(send: () => void): void {
+    pinStatus.textContent = "";
+    connectBtn.disabled = true;
+    send();
+  }
+
+  // The `joined`/`offer`/`ice`/`bye`/`error` subscriptions below used to be
+  // (re-)created inside `connectBtn`'s click listener, on a fresh
+  // `SignalingClient` made for that one PIN entry. Slice 3.1e made the
+  // connection long-lived (see where `signaling` is declared above), so
+  // these are set up once, here, for the connection's whole lifetime
+  // instead -- both the PIN path and the device-list path drive the same
+  // session lifecycle through them.
+  signaling.on("authenticated", (msg) => {
+    const storage = ownerStorage();
+    if (storage) saveOwnerToken(storage, msg.token);
+    devices = msg.devices;
+    renderDeviceList();
+  });
+
+  signaling.on("devices", (msg) => {
+    devices = msg.devices;
+    renderDeviceList();
+  });
+
+  signaling.on("joined", (msg) => {
+    sessionId = msg.session_id;
+    showSessionScreen();
+    setSessionStatus("connecting");
+
+    if (navigator.clipboard) {
+      const clipboard = navigator.clipboard;
+      clipboardBridge = new ClipboardBridge({
+        writeText: (text) => clipboard.writeText(text),
+        readText: () => clipboard.readText(),
+        // The deferred `ClipboardItem` write (decision 3) is a
+        // Safari-only trick -- Chrome already gets the same result from
+        // `writeText` in `onHostText` (decision 1b).
+        writeDeferred: isSafari(navigator.userAgent)
+          ? (blob) => clipboard.write([new ClipboardItem({ "text/plain": blob })])
+          : undefined,
+        send: (msg) => {
+          if (inputChannel?.readyState === "open") {
+            inputChannel.send(JSON.stringify(msg));
+          }
+        },
+        notify: (note) => showClipboardNote(note),
+        setTimeout: (handler, ms) => setTimeout(handler, ms),
+        clearTimeout: (handle) => clearTimeout(handle),
+      });
+      window.addEventListener("focus", onClipboardFocusOrGesture);
+      document.addEventListener("pointerdown", onClipboardFocusOrGesture, true);
+      document.addEventListener("keydown", onClipboardFocusOrGesture, true);
+      if ("onclipboardchange" in clipboard) {
+        clipboard.addEventListener("clipboardchange", onClipboardChange);
+        clipboardChangeAttached = true;
+      }
+    } else {
+      console.warn("navigator.clipboard unavailable; clipboard sync disabled");
+    }
+
+    session = new PeerSession(
+      { iceServers: toRtcIceServers(msg.ice_servers) },
+      {
+        onIceCandidate: (candidate) => {
+          if (sessionId) {
+            signaling.send({ type: "ice", session_id: sessionId, candidate });
+          }
+        },
+        onTrack: (stream) => {
+          video.srcObject = stream;
+        },
+        onDataChannel: (label, dc) => {
+          if (label === "input") inputChannel = dc;
+          else if (label === "pointer") pointerChannel = dc;
+          else if (label === "control") setupControlChannel(dc);
+          maybeAttachInput();
+        },
+        onConnectionStateChange: (state) => {
+          if (state === "connected") {
+            setSessionStatus("connected");
+          } else if (state === "failed" || state === "closed" || state === "disconnected") {
+            teardown(`Соединение разорвано (${state})`);
+          }
+        },
+      },
+    );
+    startStatsLoop();
+  });
+
+  signaling.on("offer", (msg) => {
+    if (!session) return;
+    session
+      .acceptOffer(msg.sdp)
+      .then((sdp) => {
+        if (sessionId) {
+          signaling.send({ type: "answer", session_id: sessionId, sdp });
+        }
+      })
+      .catch((err: unknown) => {
+        console.error("failed to negotiate session", err);
+        setSessionStatus("error");
+        teardown("Не удалось согласовать сеанс");
+      });
+  });
+
+  signaling.on("ice", (msg) => {
+    session?.addRemoteIce(msg.candidate).catch((err: unknown) => {
+      console.error("failed to add remote ice candidate", err);
+    });
+  });
+
+  signaling.on("bye", () => {
+    setSessionStatus("disconnected");
+    teardown("Сеанс завершён");
+  });
+
+  signaling.on("error", (msg) => {
+    if (sessionId === null) {
+      // No session yet (a bad PIN, a stale device row, an auth hiccup --
+      // all the new 3.1e error codes land here): stay on the PIN/list
+      // screen, just surface it and make sure nothing's left disabled from
+      // the attempt that failed. `teardown` would be wrong here -- there is
+      // no session to tear down, and it would also (harmlessly but
+      // needlessly) re-request the device list and flip the screen it's
+      // already on.
+      pinStatus.textContent = signalErrorLabel(msg.message);
+      connectBtn.disabled = connectionLost;
+      renderDeviceList();
+      return;
+    }
+    setSessionStatus("error");
+    teardown(signalErrorLabel(msg.message));
+  });
+
+  // Not a `SignalMessage` (so not reachable through `.on`, whose listener
+  // type is keyed on `SignalMessage["type"]`) -- `SignalingClient` extends
+  // `EventTarget` and dispatches this itself on the underlying WebSocket's
+  // `close` (see `signaling.ts`). No auto-reconnect here (slice 3.5): just
+  // tell the owner and stop offering ways to start a new session.
+  signaling.addEventListener("close", () => {
+    connectionLost = true;
+    pinStatus.textContent = "Нет связи с сервером — обновите страницу";
+    connectBtn.disabled = true;
+    stopDeviceListLoop();
+    renderDeviceList();
+  });
+
+  // A tab brought back into view may have missed a while of state changes
+  // (another tab/device connecting, going busy, being renamed) -- refresh
+  // right away instead of waiting for `startDeviceListLoop`'s next tick.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && !pinScreen.hidden) {
+      signaling.send({ type: "list_devices" });
+    }
+  });
+
+  // One connection for the whole tab (see where `signaling` is declared
+  // above): open it now, at mount, rather than waiting for a PIN/device
+  // click -- `client_auth` needs to ride this same connection for the
+  // server to recognize the owner and hand back their device list.
+  signaling.connect(signalUrl());
+  const storage = ownerStorage();
+  signaling.send({ type: "client_auth", token: storage ? loadOwnerToken(storage) : null });
 
   connectBtn.addEventListener("click", () => {
     const pin = pinInput.value.trim();
@@ -468,119 +857,11 @@ export function mount(root: Element | null): void {
       // Expected: there's no source yet. The gesture is what matters.
     });
 
-    pinStatus.textContent = "";
-    connectBtn.disabled = true;
-
-    const client = new SignalingClient();
-    signaling = client;
-
-    client.on("joined", (msg) => {
-      sessionId = msg.session_id;
-      showSessionScreen();
-      setSessionStatus("connecting");
-
-      if (navigator.clipboard) {
-        const clipboard = navigator.clipboard;
-        clipboardBridge = new ClipboardBridge({
-          writeText: (text) => clipboard.writeText(text),
-          readText: () => clipboard.readText(),
-          // The deferred `ClipboardItem` write (decision 3) is a
-          // Safari-only trick -- Chrome already gets the same result from
-          // `writeText` in `onHostText` (decision 1b).
-          writeDeferred: isSafari(navigator.userAgent)
-            ? (blob) => clipboard.write([new ClipboardItem({ "text/plain": blob })])
-            : undefined,
-          send: (msg) => {
-            if (inputChannel?.readyState === "open") {
-              inputChannel.send(JSON.stringify(msg));
-            }
-          },
-          notify: (note) => showClipboardNote(note),
-          setTimeout: (handler, ms) => setTimeout(handler, ms),
-          clearTimeout: (handle) => clearTimeout(handle),
-        });
-        window.addEventListener("focus", onClipboardFocusOrGesture);
-        document.addEventListener("pointerdown", onClipboardFocusOrGesture, true);
-        document.addEventListener("keydown", onClipboardFocusOrGesture, true);
-        if ("onclipboardchange" in clipboard) {
-          clipboard.addEventListener("clipboardchange", onClipboardChange);
-          clipboardChangeAttached = true;
-        }
-      } else {
-        console.warn("navigator.clipboard unavailable; clipboard sync disabled");
-      }
-
-      session = new PeerSession(
-        { iceServers: toRtcIceServers(msg.ice_servers) },
-        {
-          onIceCandidate: (candidate) => {
-            if (sessionId) {
-              client.send({ type: "ice", session_id: sessionId, candidate });
-            }
-          },
-          onTrack: (stream) => {
-            video.srcObject = stream;
-          },
-          onDataChannel: (label, dc) => {
-            if (label === "input") inputChannel = dc;
-            else if (label === "pointer") pointerChannel = dc;
-            else if (label === "control") setupControlChannel(dc);
-            maybeAttachInput();
-          },
-          onConnectionStateChange: (state) => {
-            if (state === "connected") {
-              setSessionStatus("connected");
-            } else if (
-              state === "failed" ||
-              state === "closed" ||
-              state === "disconnected"
-            ) {
-              teardown(`Соединение разорвано (${state})`);
-            }
-          },
-        },
-      );
-      startStatsLoop();
-    });
-
-    client.on("offer", (msg) => {
-      if (!session) return;
-      session
-        .acceptOffer(msg.sdp)
-        .then((sdp) => {
-          if (sessionId) {
-            client.send({ type: "answer", session_id: sessionId, sdp });
-          }
-        })
-        .catch((err: unknown) => {
-          console.error("failed to negotiate session", err);
-          setSessionStatus("error");
-          teardown("Не удалось согласовать сеанс");
-        });
-    });
-
-    client.on("ice", (msg) => {
-      session?.addRemoteIce(msg.candidate).catch((err: unknown) => {
-        console.error("failed to add remote ice candidate", err);
-      });
-    });
-
-    client.on("bye", () => {
-      setSessionStatus("disconnected");
-      teardown("Сеанс завершён");
-    });
-
-    client.on("error", (msg) => {
-      setSessionStatus("error");
-      teardown(signalErrorLabel(msg.message));
-    });
-
-    client.connect(signalUrl());
-    client.join(pin);
+    beginSession(() => signaling.send({ type: "join", pin }));
   });
 
   disconnectBtn.addEventListener("click", () => {
-    if (signaling && sessionId) {
+    if (sessionId) {
       signaling.send({ type: "bye", session_id: sessionId });
     }
     teardown("Отключено");

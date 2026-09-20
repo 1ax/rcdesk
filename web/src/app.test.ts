@@ -21,4 +21,14 @@ describe("signalErrorLabel", () => {
   it("passes an unknown code through instead of swallowing it", () => {
     expect(signalErrorLabel("something new")).toBe("Ошибка: something new");
   });
+
+  it("translates the device-list error codes added in slice 3.1e", () => {
+    expect(signalErrorLabel("device offline")).toContain("не в сети");
+    expect(signalErrorLabel("device not linked")).toContain("не привязано");
+    expect(signalErrorLabel("not authenticated")).not.toBe("Ошибка: not authenticated");
+    expect(signalErrorLabel("internal error")).not.toBe("Ошибка: internal error");
+    expect(signalErrorLabel("replaced by a new connection")).not.toBe(
+      "Ошибка: replaced by a new connection",
+    );
+  });
 });
