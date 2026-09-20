@@ -24,9 +24,48 @@ import type { DisplayEntry } from "./generated/DisplayEntry";
 
 type SessionStatus = "connecting" | "connected" | "disconnected" | "error";
 
+/** Russian display text for each `SessionStatus`, shown in `#session-status`
+ * (see `setSessionStatus`) -- the `data-status` attribute keeps the English
+ * enum value unchanged (CSS selectors like `.status[data-status="error"]`
+ * key off it), only the visible text is translated. */
+const SESSION_STATUS_LABELS: Record<SessionStatus, string> = {
+  connecting: "подключение",
+  connected: "подключено",
+  disconnected: "отключено",
+  error: "ошибка",
+};
+
+/** Russian labels for the adaptation controller's `Quality.reason` codes
+ * (see the `Quality` interface below and `host/src/adapt/mod.rs`, which
+ * mints these as plain protocol strings -- not translated on the wire, only
+ * here for display). An unrecognized code (shouldn't happen) is shown as
+ * received rather than hidden. */
+const QUALITY_REASON_LABELS: Record<string, string> = {
+  bitrate: "битрейт",
+  loss: "потери",
+  encoder: "кодер",
+  probe: "проба",
+  remb: "remb",
+};
+
 function signalUrl(): string {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   return `${scheme}://${location.host}/ws`;
+}
+
+/** The signaling server's `error` messages are protocol strings, deliberately
+ * kept stable and English server-side (`server/src/registry.rs`,
+ * `server/src/ws.rs`); the client is what localizes them (slice 2.6h). An
+ * unknown code still reaches the user verbatim rather than being swallowed. */
+const SIGNAL_ERROR_LABELS: Record<string, string> = {
+  "unknown pin": "Хост с таким PIN не найден — проверьте код на хосте",
+  "host busy": "К этому хосту уже подключён другой клиент",
+  "invalid message": "Сервер не понял сообщение клиента",
+  "expected host_register": "Сервер не понял сообщение клиента",
+};
+
+export function signalErrorLabel(message: string): string {
+  return SIGNAL_ERROR_LABELS[message] ?? `Ошибка: ${message}`;
 }
 
 /** Formats the `.build-badge` text (slice 2.6f): a visible commit id so a
@@ -63,8 +102,9 @@ function formatOverlay(s: StatsSummary, appRttMs?: number, quality?: Quality): s
   if (appRttMs !== undefined) parts.push(`app ${appRttMs.toFixed(0)} ms`);
   if (s.jitterBufferMs !== undefined) parts.push(`jb ${s.jitterBufferMs.toFixed(0)} ms`);
   if (quality !== undefined) {
+    const reason = QUALITY_REASON_LABELS[quality.reason] ?? quality.reason;
     parts.push(
-      `target ${(quality.bitrateKbps / 1000).toFixed(1)} Mbit/s @ ${quality.fps} fps (${quality.reason})`,
+      `target ${(quality.bitrateKbps / 1000).toFixed(1)} Mbit/s @ ${quality.fps} fps (${reason})`,
     );
   }
   return parts.join(" · ");
@@ -100,7 +140,7 @@ export function mount(root: Element | null): void {
           placeholder="000000"
           autocomplete="one-time-code"
         />
-        <button id="connect-btn" class="btn">Connect</button>
+        <button id="connect-btn" class="btn">Подключиться</button>
         <p id="pin-status" class="hint"></p>
       </div>
     </div>
@@ -113,7 +153,7 @@ export function mount(root: Element | null): void {
         <span id="input-blocked" class="status input-blocked" hidden></span>
         <span id="clipboard-note" class="status clipboard-note" hidden></span>
         <span id="session-status" class="status"></span>
-        <button id="disconnect-btn" class="btn btn-secondary">Disconnect</button>
+        <button id="disconnect-btn" class="btn btn-secondary">Отключиться</button>
       </div>
     </div>
   `;
@@ -325,7 +365,7 @@ export function mount(root: Element | null): void {
   }
 
   function setSessionStatus(status: SessionStatus): void {
-    sessionStatus.textContent = status;
+    sessionStatus.textContent = SESSION_STATUS_LABELS[status];
     sessionStatus.dataset.status = status;
   }
 
@@ -417,7 +457,7 @@ export function mount(root: Element | null): void {
   connectBtn.addEventListener("click", () => {
     const pin = pinInput.value.trim();
     if (!/^\d{6}$/.test(pin)) {
-      pinStatus.textContent = "Enter the 6-digit PIN";
+      pinStatus.textContent = "Введите 6-значный PIN";
       return;
     }
 
@@ -495,7 +535,7 @@ export function mount(root: Element | null): void {
               state === "closed" ||
               state === "disconnected"
             ) {
-              teardown(`disconnected (${state})`);
+              teardown(`Соединение разорвано (${state})`);
             }
           },
         },
@@ -515,7 +555,7 @@ export function mount(root: Element | null): void {
         .catch((err: unknown) => {
           console.error("failed to negotiate session", err);
           setSessionStatus("error");
-          teardown("Failed to negotiate the session");
+          teardown("Не удалось согласовать сеанс");
         });
     });
 
@@ -527,12 +567,12 @@ export function mount(root: Element | null): void {
 
     client.on("bye", () => {
       setSessionStatus("disconnected");
-      teardown("Session ended");
+      teardown("Сеанс завершён");
     });
 
     client.on("error", (msg) => {
       setSessionStatus("error");
-      teardown(`Error: ${msg.message}`);
+      teardown(signalErrorLabel(msg.message));
     });
 
     client.connect(signalUrl());
@@ -543,7 +583,7 @@ export function mount(root: Element | null): void {
     if (signaling && sessionId) {
       signaling.send({ type: "bye", session_id: sessionId });
     }
-    teardown("Disconnected");
+    teardown("Отключено");
   });
 
   displaySelect.addEventListener("change", () => {

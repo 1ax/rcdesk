@@ -8,11 +8,11 @@ describe("viewOnlyLabel", () => {
 
   it("returns a labeled reason when input is unavailable with a reason", () => {
     expect(
-      viewOnlyLabel({ available: false, reason: "no Accessibility permission" }),
-    ).toBe("View only: no Accessibility permission");
+      viewOnlyLabel({ available: false, reason: "нет разрешения «Универсальный доступ»" }),
+    ).toBe("Только просмотр: нет разрешения «Универсальный доступ»");
   });
 
   it("returns a bare label when input is unavailable without a reason", () => {
-    expect(viewOnlyLabel({ available: false, reason: null })).toBe("View only");
+    expect(viewOnlyLabel({ available: false, reason: null })).toBe("Только просмотр");
   });
 });

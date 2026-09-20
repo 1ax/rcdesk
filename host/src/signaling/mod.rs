@@ -64,7 +64,7 @@ const ELEVATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// e.g. a plain macOS release build.
 #[cfg(any(test, target_os = "windows"))]
 const ELEVATED_INPUT_BLOCKED_REASON: &str =
-    "Foreground window runs with administrator rights; input is blocked by Windows (UIPI)";
+    "Активное окно запущено с правами администратора: Windows блокирует ввод (UIPI)";
 
 /// See `HostContext::build_clipboard`'s doc comment. Factored out (clippy
 /// `type_complexity`): the `Option<Box<dyn Fn() -> ...>>` nesting is one

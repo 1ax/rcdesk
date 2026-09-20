@@ -23,6 +23,6 @@ export interface InputBlocked {
  * `blocked: false` and nothing should be shown. */
 export function inputBlockedLabel(msg: InputBlocked): string | null {
   if (!msg.blocked) return null;
-  const base = "Admin window: input is blocked by Windows";
+  const base = "Окно администратора: Windows не пропускает ввод";
   return msg.reason ? `${base} (${msg.reason})` : base;
 }

@@ -15,16 +15,16 @@ describe("inputBlockedLabel", () => {
       inputBlockedLabel({
         blocked: true,
         reason:
-          "Foreground window runs with administrator rights; input is blocked by Windows (UIPI)",
+          "Активное окно запущено с правами администратора: Windows блокирует ввод (UIPI)",
       }),
     ).toBe(
-      "Admin window: input is blocked by Windows (Foreground window runs with administrator rights; input is blocked by Windows (UIPI))",
+      "Окно администратора: Windows не пропускает ввод (Активное окно запущено с правами администратора: Windows блокирует ввод (UIPI))",
     );
   });
 
   it("returns a bare label when blocked without a reason", () => {
     expect(inputBlockedLabel({ blocked: true, reason: null })).toBe(
-      "Admin window: input is blocked by Windows",
+      "Окно администратора: Windows не пропускает ввод",
     );
   });
 });

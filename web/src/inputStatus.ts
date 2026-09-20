@@ -18,5 +18,5 @@ export interface InputStatus {
  * available and no banner should be shown. */
 export function viewOnlyLabel(msg: InputStatus): string | null {
   if (msg.available) return null;
-  return msg.reason ? `View only: ${msg.reason}` : "View only";
+  return msg.reason ? `Только просмотр: ${msg.reason}` : "Только просмотр";
 }

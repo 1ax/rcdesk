@@ -260,7 +260,7 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
             // the reason to the client over `ControlMessage::InputStatus`
             // (slice 2.5a, debt D26) -- this way `--no-input` gets a clear,
             // specific reason instead of a generic one.
-            Box::new(|| Err(anyhow::anyhow!("disabled by --no-input")))
+            Box::new(|| Err(anyhow::anyhow!("отключено флагом --no-input")))
         } else {
             Box::new(build_real_injector)
         };

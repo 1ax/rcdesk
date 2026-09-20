@@ -43,7 +43,7 @@ fn format_pin(pin: &str) -> String {
 /// above for what each part feeds.
 pub fn menu_model(status: &AgentStatus, perms: &Permissions) -> MenuModel {
     let (status_text, pin, can_end_session, icon) = match status {
-        AgentStatus::Connecting => ("Connecting…".to_string(), None, false, IconState::Idle),
+        AgentStatus::Connecting => ("Подключение…".to_string(), None, false, IconState::Idle),
         AgentStatus::Registered { pin } => (
             format!("PIN {}", format_pin(pin)),
             Some(pin.clone()),
@@ -51,13 +51,13 @@ pub fn menu_model(status: &AgentStatus, perms: &Permissions) -> MenuModel {
             IconState::Idle,
         ),
         AgentStatus::InSession { pin } => (
-            format!("Session active · PIN {}", format_pin(pin)),
+            format!("Сеанс активен · PIN {}", format_pin(pin)),
             Some(pin.clone()),
             true,
             IconState::Session,
         ),
         AgentStatus::Reconnecting { retry_in, .. } => (
-            format!("Offline — retrying in {}s", retry_in.as_secs()),
+            format!("Офлайн — повтор через {}с", retry_in.as_secs()),
             None,
             false,
             IconState::Offline,
@@ -66,11 +66,12 @@ pub fn menu_model(status: &AgentStatus, perms: &Permissions) -> MenuModel {
 
     let mut warnings = Vec::new();
     if !perms.screen {
-        warnings.push("Screen Recording permission is required".to_string());
+        warnings.push("Требуется разрешение «Запись экрана»".to_string());
     }
     if !perms.input {
         warnings.push(
-            "Accessibility permission is required for mouse and keyboard control".to_string(),
+            "Для управления мышью и клавиатурой требуется разрешение «Универсальный доступ»"
+                .to_string(),
         );
     }
 
@@ -97,8 +98,8 @@ mod tests {
     #[test]
     fn connecting() {
         let model = menu_model(&AgentStatus::Connecting, &OK);
-        assert_eq!(model.status_text, "Connecting…");
-        assert_eq!(model.tooltip, "rcdesk — Connecting…");
+        assert_eq!(model.status_text, "Подключение…");
+        assert_eq!(model.tooltip, "rcdesk — Подключение…");
         assert_eq!(model.pin, None);
         assert!(!model.can_end_session);
         assert_eq!(model.icon, IconState::Idle);
@@ -124,7 +125,7 @@ mod tests {
             pin: "123456".to_string(),
         };
         let model = menu_model(&status, &OK);
-        assert_eq!(model.status_text, "Session active · PIN 123 456");
+        assert_eq!(model.status_text, "Сеанс активен · PIN 123 456");
         assert_eq!(model.pin.as_deref(), Some("123456"));
         assert!(model.can_end_session);
         assert_eq!(model.icon, IconState::Session);
@@ -137,7 +138,7 @@ mod tests {
             retry_in: Duration::from_secs(8),
         };
         let model = menu_model(&status, &OK);
-        assert_eq!(model.status_text, "Offline — retrying in 8s");
+        assert_eq!(model.status_text, "Офлайн — повтор через 8с");
         assert_eq!(model.pin, None);
         assert!(!model.can_end_session);
         assert_eq!(model.icon, IconState::Offline);

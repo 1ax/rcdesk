@@ -23,7 +23,7 @@ describe("displayOptions", () => {
     const options = displayOptions(displays, 2);
 
     expect(options).toEqual([
-      { value: "1", label: "1: Built-in Display 1920×1080 (primary)", selected: false },
+      { value: "1", label: "1: Built-in Display 1920×1080 (основной)", selected: false },
       { value: "2", label: "2: External 2560×1440", selected: true },
     ]);
   });
@@ -31,7 +31,7 @@ describe("displayOptions", () => {
   it("appends the primary suffix only for the primary display", () => {
     const displays = [display({ id: 5, title: "Studio", primary: true })];
     const options = displayOptions(displays, 5);
-    expect(options[0].label).toBe("1: Studio 1920×1080 (primary)");
+    expect(options[0].label).toBe("1: Studio 1920×1080 (основной)");
   });
 
   it("returns an empty array for an empty display list", () => {

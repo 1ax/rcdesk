@@ -214,7 +214,7 @@ describe("ClipboardBridge.onHostText", () => {
     bridge.onHostText(big);
 
     expect(deps.writeText).not.toHaveBeenCalled();
-    expect(deps.notify).toHaveBeenCalledWith(expect.stringContaining("too large"));
+    expect(deps.notify).toHaveBeenCalledWith(expect.stringContaining("слишком большой"));
     expect(warnSpy.mock.calls[0]?.join(" ")).not.toContain(big);
     warnSpy.mockRestore();
   });
@@ -317,7 +317,7 @@ describe("ClipboardBridge.syncBeforePaste", () => {
     await bridge.syncBeforePaste();
 
     expect(deps.send).not.toHaveBeenCalled();
-    expect(deps.notify).toHaveBeenCalledWith(expect.stringContaining("too large"));
+    expect(deps.notify).toHaveBeenCalledWith(expect.stringContaining("слишком большой"));
     warnSpy.mockRestore();
   });
 

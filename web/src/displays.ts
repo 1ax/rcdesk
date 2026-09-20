@@ -22,7 +22,7 @@ export interface DisplayOption {
  * for the primary display. */
 export function displayOptions(displays: DisplayEntry[], current: number): DisplayOption[] {
   return displays.map((display, index) => {
-    const suffix = display.primary ? " (primary)" : "";
+    const suffix = display.primary ? " (основной)" : "";
     return {
       value: String(display.id),
       label: `${index + 1}: ${display.title} ${display.width}×${display.height}${suffix}`,

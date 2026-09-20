@@ -192,10 +192,15 @@ mod imp {
             !perms.input,
             None,
         );
-        let copy_pin_item = MenuItem::with_id("copy_pin", "Copy PIN", model.pin.is_some(), None);
-        let end_session_item =
-            MenuItem::with_id("end_session", "End session", model.can_end_session, None);
-        let open_log_item = MenuItem::with_id("open_log", "Open log", true, None);
+        let copy_pin_item =
+            MenuItem::with_id("copy_pin", "Копировать PIN", model.pin.is_some(), None);
+        let end_session_item = MenuItem::with_id(
+            "end_session",
+            "Завершить сеанс",
+            model.can_end_session,
+            None,
+        );
+        let open_log_item = MenuItem::with_id("open_log", "Открыть лог", true, None);
         // Initial checked state: best-effort -- if `agent_path`/`is_enabled`
         // fails (should only happen if `current_exe()` itself fails), show
         // unchecked rather than block the menu on it; a click still retries
@@ -204,9 +209,14 @@ mod imp {
             .ok()
             .and_then(|path| platform::autostart::is_enabled(&path).ok())
             .unwrap_or(false);
-        let autostart_item =
-            CheckMenuItem::with_id("autostart", "Start at login", true, autostart_enabled, None);
-        let quit_item = MenuItem::with_id("quit", "Quit rcdesk", true, None);
+        let autostart_item = CheckMenuItem::with_id(
+            "autostart",
+            "Запускать при входе",
+            true,
+            autostart_enabled,
+            None,
+        );
+        let quit_item = MenuItem::with_id("quit", "Выйти из rcdesk", true, None);
 
         let menu = Menu::new();
         menu.append(&status_item).expect("append status menu item");
@@ -450,18 +460,18 @@ mod imp {
     #[cfg(target_os = "macos")]
     fn screen_item_label(screen_ok: bool) -> String {
         if screen_ok {
-            "Screen Recording: granted".to_string()
+            "Запись экрана: разрешено".to_string()
         } else {
-            "Grant Screen Recording permission…".to_string()
+            "Выдать разрешение «Запись экрана»…".to_string()
         }
     }
 
     #[cfg(target_os = "macos")]
     fn input_item_label(input_ok: bool) -> String {
         if input_ok {
-            "Accessibility: granted".to_string()
+            "Универсальный доступ: разрешено".to_string()
         } else {
-            "Grant Accessibility permission…".to_string()
+            "Выдать разрешение «Универсальный доступ»…".to_string()
         }
     }
 

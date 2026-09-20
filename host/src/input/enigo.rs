@@ -45,9 +45,9 @@ impl EnigoInjector {
         };
         let enigo = Enigo::new(&settings).map_err(|err| match err {
             ::enigo::NewConError::NoPermission => anyhow::anyhow!(
-                "no Accessibility permission (System Settings → Privacy & Security → Accessibility)"
+                "нет разрешения «Универсальный доступ» (Системные настройки → Конфиденциальность и безопасность → Универсальный доступ)"
             ),
-            other => anyhow::anyhow!("failed to init enigo: {other}"),
+            other => anyhow::anyhow!("не удалось инициализировать ввод: {other}"),
         })?;
         Ok(Self { enigo })
     }

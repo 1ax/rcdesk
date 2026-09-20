@@ -101,7 +101,7 @@ interface DeferredCopy {
 function warnTooLarge(deps: Pick<ClipboardBridgeDeps, "notify">, text: string): void {
   const bytes = utf8Length(text);
   console.warn(`clipboard text too large to sync (${bytes} bytes)`);
-  deps.notify(`Clipboard too large to sync (${Math.round(bytes / 1024)} KB)`);
+  deps.notify(`Буфер обмена слишком большой для синхронизации (${Math.round(bytes / 1024)} КБ)`);
 }
 
 /**
