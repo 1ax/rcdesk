@@ -10,7 +10,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -77,6 +77,73 @@ const MAX_CAPTURE_GAP: Duration = Duration::from_secs(10);
 /// re-arm costs one keyframe encode, so this bounds encoder load on a
 /// session that never finishes negotiating.
 const KEYFRAME_REARM_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How often `PeerSession::start_video`'s startup keyframe task re-requests a
+/// keyframe after the connection reaches `Connected`, until the receiver
+/// confirms it is actually getting video via an RTCP Receiver Report (see
+/// `StartupKeyframe`).
+///
+/// The host's `RTCPeerConnectionState` reaches `Connected` on the DTLS
+/// *server* side of the handshake, which finishes its final flight roughly
+/// half an RTT before the DTLS *client* (Chrome) derives its SRTP keys and
+/// can decrypt anything. Any packet sent in that window -- in particular the
+/// forced startup keyframe `start_video`'s frame-writer task sends right
+/// after `negotiated_ssrc_and_pt()` succeeds -- is silently dropped by
+/// Chrome's SRTP layer before it ever reaches the decoder. Chrome never
+/// sends a PLI for a packet it never received, so on a static host screen
+/// (no further frame ever captured to retry with) the session can sit at a
+/// black screen indefinitely. Measured live on the Win10 stand (2026-09-21,
+/// RTT ~350 ms): Chrome reported `connected` at 3.4 s with zero video
+/// packets received in 30+ s in one run, and the first frame only arriving
+/// at the 9th second in another. The task driven by `StartupKeyframe` covers
+/// this window by re-requesting a keyframe every
+/// `STARTUP_KEYFRAME_INTERVAL` until the receiver confirms delivery or
+/// `STARTUP_KEYFRAME_DEADLINE` elapses.
+const STARTUP_KEYFRAME_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Upper bound on how long `PeerSession::start_video`'s startup keyframe task
+/// keeps re-requesting after `Connected` without a confirming receiver
+/// report -- see `STARTUP_KEYFRAME_INTERVAL`'s doc comment.
+const STARTUP_KEYFRAME_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Startup keyframe re-arm after the connection is up, until the receiver
+/// confirms it is getting video (see `STARTUP_KEYFRAME_INTERVAL`'s doc
+/// comment on the DTLS server/client asymmetry). Plain, non-async and
+/// webrtc-free by design so it can be driven with explicit `Instant`s in
+/// tests instead of a real clock.
+struct StartupKeyframe {
+    started: Instant,
+    last: Option<Instant>,
+}
+
+impl StartupKeyframe {
+    fn new(now: Instant) -> Self {
+        Self {
+            started: now,
+            last: None,
+        }
+    }
+
+    /// `true` when a keyframe should be requested now.
+    fn should_request(&mut self, now: Instant, delivered: bool) -> bool {
+        if delivered || self.finished(now, delivered) {
+            return false;
+        }
+        let due = match self.last {
+            None => true,
+            Some(last) => now.duration_since(last) >= STARTUP_KEYFRAME_INTERVAL,
+        };
+        if due {
+            self.last = Some(now);
+        }
+        due
+    }
+
+    /// `true` once there's nothing more to do: delivered, or past the deadline.
+    fn finished(&self, now: Instant, delivered: bool) -> bool {
+        delivered || now.duration_since(self.started) >= STARTUP_KEYFRAME_DEADLINE
+    }
+}
 
 /// Constrained Baseline `42e01f`: the one profile both Safari and Chrome are
 /// guaranteed to decode in hardware (see ARCHITECTURE.md §5).
@@ -564,8 +631,18 @@ impl PeerSession {
         mut frames: mpsc::Receiver<EncodedFrame>,
         request_keyframe: Arc<AtomicBool>,
     ) {
+        // Set by the RTCP task below on the first receiver report that
+        // covers our video SSRC -- i.e. the first proof Chrome is actually
+        // getting our video, not just that the peer connection is up. Read
+        // by the startup keyframe task to know when to stop re-arming (see
+        // `STARTUP_KEYFRAME_INTERVAL`'s doc comment).
+        let video_delivered = Arc::new(AtomicBool::new(false));
+
         let session = Arc::clone(self);
         let request_keyframe_on_connect = Arc::clone(&request_keyframe);
+        // Cloned now, before the RTCP task below moves `request_keyframe`
+        // into its closure.
+        let request_keyframe_startup = Arc::clone(&request_keyframe);
         tokio::spawn(async move {
             let request_keyframe = request_keyframe_on_connect;
             let mut negotiated: Option<(u32, u8)> = None;
@@ -659,6 +736,7 @@ impl PeerSession {
         });
 
         let session = Arc::clone(self);
+        let video_delivered_rtcp = Arc::clone(&video_delivered);
         tokio::spawn(async move {
             // The video track's SSRC is assigned explicitly at track creation
             // (see `PeerSession::new`'s `RTCRtpCodingParameters { ssrc: Some(ssrc),
@@ -689,6 +767,16 @@ impl PeerSession {
                                     if Some(report.ssrc) != video_ssrc {
                                         continue;
                                     }
+                                    // First proof Chrome is actually
+                                    // receiving our video (see
+                                    // `STARTUP_KEYFRAME_INTERVAL`'s doc
+                                    // comment) -- `swap` so this logs only
+                                    // once, on the first matching report.
+                                    if !video_delivered_rtcp.swap(true, Ordering::Release) {
+                                        tracing::info!(
+                                            "video delivery confirmed by receiver report"
+                                        );
+                                    }
                                     let rtt = rtt_from_report(
                                         ntp_mid32_now(),
                                         report.last_sender_report,
@@ -714,6 +802,47 @@ impl PeerSession {
                         }
                     }
                 }
+            }
+        });
+
+        // Startup keyframe re-arm: covers the DTLS server/client asymmetry
+        // window between the host's `Connected` and Chrome's own -- see
+        // `STARTUP_KEYFRAME_INTERVAL`'s doc comment. Holds a `Weak` (not an
+        // `Arc`) to `self` so this task never keeps the session alive on its
+        // own; it bails out via `upgrade()` failing as soon as the session
+        // is dropped instead of running for up to 15s past close.
+        let session_weak: Weak<PeerSession> = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                match session_weak.upgrade() {
+                    Some(session) if session.connected.load(Ordering::Acquire) => break,
+                    Some(_) => {}
+                    None => return,
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            let mut keyframe = StartupKeyframe::new(Instant::now());
+            loop {
+                if session_weak.upgrade().is_none() {
+                    return;
+                }
+                let now = Instant::now();
+                let delivered = video_delivered.load(Ordering::Acquire);
+                if keyframe.should_request(now, delivered) {
+                    request_keyframe_startup.store(true, Ordering::Release);
+                    tracing::debug!(
+                        "startup keyframe re-arm: requesting keyframe until receiver \
+                         confirms video delivery"
+                    );
+                }
+                if keyframe.finished(now, delivered) {
+                    if !delivered {
+                        tracing::warn!("no receiver report for video within 15s");
+                    }
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
     }
@@ -859,6 +988,42 @@ mod tests {
         // 200 ms before: beyond the tolerance -- None.
         let now = lsr.wrapping_add(delay).wrapping_sub(13_107);
         assert_eq!(rtt_from_report(now, lsr, delay), None);
+    }
+
+    #[test]
+    fn startup_keyframe_requests_immediately() {
+        let base = Instant::now();
+        let mut sk = StartupKeyframe::new(base);
+        assert!(sk.should_request(base, false));
+    }
+
+    #[test]
+    fn startup_keyframe_reissues_after_interval() {
+        let base = Instant::now();
+        let mut sk = StartupKeyframe::new(base);
+        assert!(sk.should_request(base, false));
+        assert!(!sk.should_request(base + Duration::from_millis(200), false));
+        assert!(sk.should_request(base + Duration::from_millis(500), false));
+    }
+
+    #[test]
+    fn startup_keyframe_stops_once_delivered() {
+        let base = Instant::now();
+        let mut sk = StartupKeyframe::new(base);
+        assert!(sk.should_request(base, false));
+        let now = base + Duration::from_secs(1);
+        assert!(!sk.should_request(now, true));
+        assert!(sk.finished(now, true));
+    }
+
+    #[test]
+    fn startup_keyframe_stops_after_deadline() {
+        let base = Instant::now();
+        let mut sk = StartupKeyframe::new(base);
+        assert!(sk.should_request(base, false));
+        let now = base + Duration::from_secs(15);
+        assert!(sk.finished(now, false));
+        assert!(!sk.should_request(now, false));
     }
 
     #[test]
