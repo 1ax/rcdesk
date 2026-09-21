@@ -122,6 +122,13 @@ body {
   text-align: left;
 }
 
+/* With a device list showing, 320px leaves no room for a name next to three
+ * buttons -- widen the card only in that state; the bare PIN screen keeps its
+ * compact width. */
+.card:has(.devices:not([hidden])) {
+  max-width: 400px;
+}
+
 .devices h2 {
   margin: 0 0 8px;
   font-size: 13px;
@@ -139,21 +146,24 @@ body {
   flex-direction: column;
   gap: 8px;
   max-height: 240px;
+  overflow-x: hidden;
   overflow-y: auto;
 }
 
+/* Two rows: name + status across the full width, actions underneath. A
+ * single row squeezed the name to nothing behind the buttons. */
 .device-item {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  flex-wrap: wrap;
   gap: 8px;
-  padding: 8px 10px;
+  padding: 10px 12px;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 8px;
 }
 
 .device-info {
+  flex: 1 1 100%;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -174,10 +184,14 @@ body {
 }
 
 .device-actions {
+  flex: 1 1 100%;
   display: flex;
   align-items: center;
   gap: 6px;
-  flex-shrink: 0;
+}
+
+.device-actions .device-connect {
+  flex: 1;
 }
 
 .device-actions .btn,
