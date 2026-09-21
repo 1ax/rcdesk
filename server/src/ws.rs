@@ -389,6 +389,11 @@ async fn run_client(
                             session_id: session_id.clone(),
                             host_name,
                             ice_servers: ice.ice_servers(ice::now_unix()),
+                            // `device_id` is the same id the client already
+                            // used to ask for this connection (slice 3.5b):
+                            // every registered host is a persistent device
+                            // since 3.1, so this is always known here.
+                            device_id: Some(device_id.clone()),
                         });
                         let _ = host_tx.send(SignalMessage::PeerJoined {
                             session_id,
@@ -475,6 +480,11 @@ async fn run_client(
                         session_id: session_id.clone(),
                         host_name,
                         ice_servers: ice.ice_servers(ice::now_unix()),
+                        // `host_id` is the device's persistent id (slice
+                        // 3.1: every registered host is one) -- carried
+                        // back so the client can reconnect to the same
+                        // device later without a PIN (slice 3.5b).
+                        device_id: Some(host_id.clone()),
                     });
                     let _ = host_tx.send(SignalMessage::PeerJoined {
                         session_id,

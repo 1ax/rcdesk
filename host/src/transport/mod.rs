@@ -9,7 +9,7 @@
 //! WebRTC.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -263,13 +263,35 @@ pub struct SessionConfig {
     pub fps: u32,
 }
 
+/// Hands out a fresh, process-wide unique `PeerSession` tag (fix to slice
+/// 3.5b) -- see `SessionEvent::ConnectionState`/`DataChannelClosed`'s doc
+/// comments for why events that can end a session need one. `Relaxed`: the
+/// only property needed is that two sessions never get the same value, not
+/// any particular ordering relative to other memory operations.
+static NEXT_SESSION_TAG: AtomicU64 = AtomicU64::new(1);
+
+fn next_session_tag() -> u64 {
+    NEXT_SESSION_TAG.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Events a `PeerSession` reports back to its owner (the signaling client).
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     /// A local ICE candidate was gathered and should be sent to the peer.
     LocalIce(proto::signal::IceCandidate),
-    /// The peer connection's aggregate connection state changed.
-    ConnectionState(RTCPeerConnectionState),
+    /// The peer connection's aggregate connection state changed. `tag` is
+    /// the `PeerSession` this came from (`PeerSession::tag`) -- fix to slice
+    /// 3.5b: during automatic client reconnection (bye -> new
+    /// `connect_device` -> `PeerJoined`, all while the old `PeerConnection`
+    /// is still tearing down), a state change from the *old*, already
+    /// superseded session can land on the shared event channel after a new
+    /// session has already taken its place; `handle_session_event` compares
+    /// this against `ActiveSession::session_tag` and ignores a mismatch
+    /// instead of wrongly ending the new session.
+    ConnectionState {
+        state: RTCPeerConnectionState,
+        tag: u64,
+    },
     /// A message arrived on one of the fixed data channels.
     DataChannelMessage {
         label: String,
@@ -300,6 +322,25 @@ pub enum SessionEvent {
     /// send the client its initial state over `control` (e.g. the display
     /// list, slice 2.4).
     DataChannelOpen { label: String },
+    /// One of the four fixed data channels was closed by the remote peer
+    /// (its `RTCDataChannelState` reached `Closed`). Slice 3.5b: the
+    /// signaling layer treats the `control` channel closing as a
+    /// deliberate end of session (the client closed the tab/`PeerConnection`)
+    /// and ends the session right away, rather than waiting out the
+    /// `Disconnected` grace window -- see `crate::signaling::handle_session_event`.
+    /// `tag` is the `PeerSession` this came from -- same reasoning as
+    /// `ConnectionState`'s `tag`.
+    DataChannelClosed { label: String, tag: u64 },
+    /// Slice 3.5b: a `ConnectionState(Disconnected)` grace window (see
+    /// `crate::signaling::handle_session_event`) expired without the
+    /// connection recovering to `Connected`. Not sent by anything in this
+    /// module -- the signaling layer arms a timer that sends this back to
+    /// itself over the same `SessionEvent` channel it reads from, so it
+    /// keeps working across a signaling reconnect and while offline
+    /// (`SessionSlot::run_while_offline`). `generation` identifies *which*
+    /// grace window this is for, so a timeout from a window a later
+    /// `Connected` already cancelled is recognized as stale and ignored.
+    DisconnectTimeout { session_id: String, generation: u64 },
 }
 
 fn ice_candidate_from_rtc(c: RTCIceCandidateInit) -> proto::signal::IceCandidate {
@@ -335,6 +376,9 @@ struct Handler {
     /// SRTP context yet), which is exactly the case that must not eat the
     /// forced startup keyframe below.
     connected: Arc<AtomicBool>,
+    /// This `Handler`'s owning `PeerSession`'s tag -- see
+    /// `SessionEvent::ConnectionState`'s doc comment.
+    tag: u64,
 }
 
 #[async_trait::async_trait]
@@ -354,7 +398,13 @@ impl PeerConnectionEventHandler for Handler {
         if state == RTCPeerConnectionState::Connected {
             self.connected.store(true, Ordering::Release);
         }
-        let _ = self.events.send(SessionEvent::ConnectionState(state)).await;
+        let _ = self
+            .events
+            .send(SessionEvent::ConnectionState {
+                state,
+                tag: self.tag,
+            })
+            .await;
     }
 }
 
@@ -370,6 +420,9 @@ pub struct PeerSession {
     /// ARCHITECTURE.md §5), kept aside from the other three so
     /// `send_control` can write to it directly.
     control_channel: Arc<dyn DataChannel>,
+    /// This session's unique tag (fix to slice 3.5b) -- see
+    /// `SessionEvent::ConnectionState`'s doc comment.
+    tag: u64,
 }
 
 /// `(label, RTCDataChannelInit)` for the four channels every session opens
@@ -431,6 +484,7 @@ fn default_data_channel_init() -> RTCDataChannelInit {
 async fn open_data_channels(
     pc: &dyn PeerConnection,
     events: mpsc::Sender<SessionEvent>,
+    tag: u64,
 ) -> anyhow::Result<Arc<dyn DataChannel>> {
     let mut control_channel = None;
     for (label, init) in data_channel_specs() {
@@ -438,7 +492,7 @@ async fn open_data_channels(
         if label == "control" {
             control_channel = Some(Arc::clone(&dc));
         }
-        spawn_data_channel_reader(label, dc, events.clone());
+        spawn_data_channel_reader(label, dc, events.clone(), tag);
     }
     control_channel.ok_or_else(|| anyhow::anyhow!("data_channel_specs did not include \"control\""))
 }
@@ -502,10 +556,12 @@ impl PeerSession {
             .with_ice_servers(ice_servers)
             .build();
 
+        let tag = next_session_tag();
         let connected = Arc::new(AtomicBool::new(false));
         let handler = Arc::new(Handler {
             events: events.clone(),
             connected: Arc::clone(&connected),
+            tag,
         });
 
         let pc: Box<dyn PeerConnection> = Box::new(
@@ -540,7 +596,7 @@ impl PeerSession {
             .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal>)
             .await?;
 
-        let control_channel = open_data_channels(pc.as_ref(), events.clone()).await?;
+        let control_channel = open_data_channels(pc.as_ref(), events.clone(), tag).await?;
 
         let session = Arc::new(PeerSession {
             pc,
@@ -549,9 +605,18 @@ impl PeerSession {
             events: events.clone(),
             connected,
             control_channel,
+            tag,
         });
 
         Ok(session)
+    }
+
+    /// This session's unique tag (fix to slice 3.5b) -- see
+    /// `SessionEvent::ConnectionState`'s doc comment. `crate::signaling`
+    /// stashes this in `ActiveSession::session_tag` right after
+    /// construction, to recognize a stale event from a superseded session.
+    pub fn tag(&self) -> u64 {
+        self.tag
     }
 
     /// Creates an SDP offer, sets it as the local description, and returns
@@ -861,6 +926,7 @@ fn spawn_data_channel_reader(
     label: &'static str,
     dc: Arc<dyn DataChannel>,
     events: mpsc::Sender<SessionEvent>,
+    tag: u64,
 ) {
     tokio::spawn(async move {
         while let Some(event) = dc.poll().await {
@@ -875,6 +941,12 @@ fn spawn_data_channel_reader(
                 }
                 DataChannelEvent::OnClose => {
                     tracing::info!(label, "data channel closed");
+                    let _ = events
+                        .send(SessionEvent::DataChannelClosed {
+                            label: label.to_owned(),
+                            tag,
+                        })
+                        .await;
                     break;
                 }
                 DataChannelEvent::OnMessage(msg) => {

@@ -81,11 +81,21 @@ pub enum SignalMessage {
     },
     /// client -> server
     Join { pin: String },
-    /// server -> client
+    /// server -> client. `device_id` (slice 3.5b) is the persistent id of
+    /// the device the client just joined (see `DeviceCredentials`/`3.1`) --
+    /// `Some` whenever the host is registered as a persistent device (true
+    /// for every host since 3.1), `None` only for compatibility with a
+    /// hypothetical host that has no device id at all. The client keeps it
+    /// to reconnect to the same device after a lost session (slice 3.5b)
+    /// without asking the owner for a PIN again. `#[serde(default)]` so an
+    /// older server that predates 3.5b (whose `Joined` has no `device_id`
+    /// field) stays compatible with a newer client.
     Joined {
         session_id: String,
         host_name: String,
         ice_servers: Vec<IceServer>,
+        #[serde(default)]
+        device_id: Option<String>,
     },
     /// server -> host. `ice_servers` are freshly minted for this session
     /// (same call as `Joined`'s), so a host that has been running for a
@@ -250,6 +260,37 @@ mod tests {
         let json = serde_json::to_string(&authenticated).expect("serialize");
         let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, authenticated);
+    }
+
+    #[test]
+    fn joined_with_device_id_round_trips_through_json() {
+        let joined = SignalMessage::Joined {
+            session_id: "sess-1".to_string(),
+            host_name: "My Mac".to_string(),
+            ice_servers: Vec::new(),
+            device_id: Some("dev123".to_string()),
+        };
+
+        let json = serde_json::to_string(&joined).expect("serialize");
+        let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, joined);
+    }
+
+    #[test]
+    fn joined_without_device_id_field_deserializes_to_none() {
+        let json =
+            r#"{"type":"joined","session_id":"sess-1","host_name":"My Mac","ice_servers":[]}"#;
+
+        let msg: SignalMessage = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            msg,
+            SignalMessage::Joined {
+                session_id: "sess-1".to_string(),
+                host_name: "My Mac".to_string(),
+                ice_servers: Vec::new(),
+                device_id: None,
+            }
+        );
     }
 
     #[test]

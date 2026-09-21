@@ -164,6 +164,15 @@ pub enum AgentStatus {
     Reconnecting { error: String, retry_in: Duration },
 }
 
+/// Slice 3.5b: how long a `RTCPeerConnectionState::Disconnected` is
+/// tolerated before the session is torn down. ICE can flap through
+/// `Disconnected` on a brief network hiccup (a Wi-Fi roam, a dropped packet
+/// train) and recover to `Connected` on its own -- only `Failed`/`Closed`,
+/// or this grace window expiring without a recovery, actually end the
+/// session. See `handle_session_event`'s `ConnectionState`/
+/// `DisconnectTimeout` arms.
+const DISCONNECT_GRACE: Duration = Duration::from_secs(15);
+
 /// How often `SignalingClient::run` pings the signaling server, and how long
 /// it tolerates silence (no incoming frame of any kind) before deciding the
 /// connection is dead -- see `run`'s doc comment for why a plain
@@ -437,7 +446,7 @@ impl SignalingClient {
                     .await;
                 }
                 Some(event) = slot.event_rx.recv() => {
-                    handle_session_event(event, ctx, &pin, status, &out_tx, &mut slot.active, &mut slot.current_session_id).await;
+                    handle_session_event(event, ctx, &pin, status, &out_tx, &slot.event_tx, &mut slot.active, &mut slot.current_session_id).await;
                 }
                 Some(cmd) = commands.recv() => {
                     handle_agent_command(cmd, &pin, status, &out_tx, &mut slot.active, &mut slot.current_session_id).await;
@@ -738,6 +747,123 @@ struct ActiveSession {
     /// has no real input injector (`input_available == false`) -- nothing
     /// to warn about when input isn't wired up at all.
     elevation_task: Option<tokio::task::JoinHandle<()>>,
+    /// This session's `PeerSession::tag()` (fix to slice 3.5b). Events that
+    /// can end a session (`SessionEvent::ConnectionState`/`DataChannelClosed`)
+    /// carry the tag of the `PeerSession` that produced them;
+    /// `handle_session_event` compares it against this field and ignores a
+    /// mismatch as stale -- see those variants' doc comments in
+    /// `transport::SessionEvent` for the scenario this guards against
+    /// (an old, already-superseded session's event arriving after a new one
+    /// has taken its place, e.g. during automatic client reconnection).
+    session_tag: u64,
+    /// Slice 3.5b: tracks the current `RTCPeerConnectionState::Disconnected`
+    /// grace window (if any) for this session -- see `DisconnectGrace`'s
+    /// doc comment and `handle_session_event`'s `ConnectionState`/
+    /// `DisconnectTimeout` arms, its only caller.
+    disconnect_grace: DisconnectGrace,
+}
+
+/// Slice 3.5b: pure decision logic for the `RTCPeerConnectionState::Disconnected`
+/// grace window (`DISCONNECT_GRACE`) -- whether a `Disconnected` should arm a
+/// fresh timeout timer, whether a `Connected` cancels one in progress, and
+/// whether a `SessionEvent::DisconnectTimeout` that comes back is still the
+/// current window or a stale one from a window a `Connected` already
+/// cancelled. Deliberately free of any timer/async/webrtc type -- see
+/// `handle_session_event`, the only caller -- so it's unit-testable as plain
+/// data (this workspace does not enable tokio's `test-util` feature needed
+/// to pause a real clock in a test).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DisconnectGrace {
+    /// Monotonically increasing, bumped every time a fresh grace window
+    /// starts. Never reset for the session's lifetime.
+    epoch: u64,
+    /// `Some(epoch)` while a grace window is running; that `epoch` is the
+    /// generation `handle_session_event` arms the timer with.
+    pending: Option<u64>,
+}
+
+impl DisconnectGrace {
+    /// The connection reported `Disconnected`. Returns the new window's
+    /// generation when this starts a *fresh* window (the caller should arm
+    /// a `DISCONNECT_GRACE` timer for it), or `None` when a window was
+    /// already running -- repeated `Disconnected` events (if the
+    /// `RTCPeerConnection` ever reports it more than once in a row) must
+    /// not re-arm the timer or bump the generation out from under it.
+    fn disconnected(&mut self) -> Option<u64> {
+        if self.pending.is_some() {
+            return None;
+        }
+        self.epoch += 1;
+        self.pending = Some(self.epoch);
+        Some(self.epoch)
+    }
+
+    /// The connection reported `Connected`: cancels any grace window in
+    /// progress.
+    fn connected(&mut self) {
+        self.pending = None;
+    }
+
+    /// Whether a `DisconnectTimeout` for `generation` still refers to the
+    /// window currently running -- `false` once a `Connected` cancelled it
+    /// (or a session ended and a new one started, tracked separately by
+    /// `handle_session_event` via `current_session_id`).
+    fn is_current(&self, generation: u64) -> bool {
+        self.pending == Some(generation)
+    }
+}
+
+#[cfg(test)]
+mod disconnect_grace_tests {
+    use super::DisconnectGrace;
+
+    #[test]
+    fn first_disconnect_starts_a_window_with_generation_one() {
+        let mut grace = DisconnectGrace::default();
+        assert_eq!(grace.disconnected(), Some(1));
+        assert!(grace.is_current(1));
+    }
+
+    #[test]
+    fn a_second_disconnect_while_one_is_pending_does_not_rearm() {
+        let mut grace = DisconnectGrace::default();
+        assert_eq!(grace.disconnected(), Some(1));
+        assert_eq!(
+            grace.disconnected(),
+            None,
+            "a window is already running, must not restart it"
+        );
+        assert!(grace.is_current(1));
+    }
+
+    #[test]
+    fn connected_cancels_the_pending_window() {
+        let mut grace = DisconnectGrace::default();
+        grace.disconnected();
+        grace.connected();
+        assert!(!grace.is_current(1));
+    }
+
+    #[test]
+    fn a_timeout_for_a_cancelled_window_is_not_current() {
+        let mut grace = DisconnectGrace::default();
+        let generation = grace.disconnected().unwrap();
+        grace.connected();
+        // A later disconnect starts a fresh window with a new generation --
+        // the stale one from before `connected()` must stay stale even
+        // though a window is running again.
+        let new_generation = grace.disconnected().unwrap();
+        assert_ne!(generation, new_generation);
+        assert!(!grace.is_current(generation));
+        assert!(grace.is_current(new_generation));
+    }
+
+    #[test]
+    fn no_window_is_pending_before_any_disconnect() {
+        let grace = DisconnectGrace::default();
+        assert!(!grace.is_current(0));
+        assert!(!grace.is_current(1));
+    }
 }
 
 impl ActiveSession {
@@ -828,6 +954,7 @@ impl SessionSlot {
                         "",
                         &discard_status,
                         &discard_out_tx,
+                        &self.event_tx,
                         &mut self.active,
                         &mut self.current_session_id,
                     )
@@ -890,6 +1017,7 @@ async fn handle_signal_message(
                             sdp,
                         });
                         *current_session_id = Some(session_id);
+                        let session_tag = parts.peer.tag();
                         *active = Some(ActiveSession {
                             peer: parts.peer,
                             video: parts.video,
@@ -903,6 +1031,8 @@ async fn handle_signal_message(
                             clipboard: parts.clipboard,
                             clipboard_task: parts.clipboard_task,
                             elevation_task: parts.elevation_task,
+                            session_tag,
+                            disconnect_grace: DisconnectGrace::default(),
                         });
                     }
                     Err(err) => {
@@ -1009,6 +1139,7 @@ async fn handle_session_event(
     pin: &str,
     status: &watch::Sender<AgentStatus>,
     out_tx: &mpsc::UnboundedSender<SignalMessage>,
+    event_tx: &mpsc::Sender<SessionEvent>,
     active: &mut Option<ActiveSession>,
     current_session_id: &mut Option<String>,
 ) {
@@ -1021,18 +1152,64 @@ async fn handle_session_event(
                 });
             }
         }
-        SessionEvent::ConnectionState(state) => {
-            tracing::info!(?state, "peer connection state changed");
-            if state == RTCPeerConnectionState::Connected && active.is_some() {
-                let _ = status.send(AgentStatus::InSession {
-                    pin: pin.to_string(),
-                });
+        SessionEvent::ConnectionState { state, tag } => {
+            // Fix to slice 3.5b: during automatic client reconnection (bye
+            // -> `connect_device` -> `PeerJoined`, all while the old
+            // `PeerConnection` is still tearing down), a state change from
+            // the *old*, already superseded session can land here after a
+            // new session has already taken `active`'s place -- e.g. its
+            // `Closed` arriving right as the new session is starting up.
+            // Acting on it would wrongly end the new session, so it's
+            // dropped unless it's tagged with the session that's actually
+            // current right now.
+            if !active.as_ref().is_some_and(|a| a.session_tag == tag) {
+                tracing::debug!(
+                    ?state,
+                    tag,
+                    "connection state event from a superseded session, ignoring"
+                );
+                return;
             }
-            if matches!(
+            tracing::info!(?state, "peer connection state changed");
+            if state == RTCPeerConnectionState::Connected {
+                // Slice 3.5b: also cancels any disconnect grace window in
+                // progress -- the connection recovered on its own.
+                if let Some(active) = active.as_mut() {
+                    active.disconnect_grace.connected();
+                    let _ = status.send(AgentStatus::InSession {
+                        pin: pin.to_string(),
+                    });
+                }
+            } else if state == RTCPeerConnectionState::Disconnected {
+                // Slice 3.5b: `Disconnected` can be a brief ICE hiccup (a
+                // Wi-Fi roam, a dropped packet train) that recovers to
+                // `Connected` on its own -- unlike `Failed`/`Closed`, it
+                // does not end the session right away. Arm a
+                // `DISCONNECT_GRACE` window instead: `Connected` above
+                // cancels it if it arrives first; otherwise
+                // `DisconnectTimeout` below ends the session the same way
+                // `Failed`/`Closed` do. Agent status deliberately stays
+                // `InSession` for the whole window -- no flicker on a
+                // hiccup that self-heals.
+                if let (Some(active), Some(session_id)) =
+                    (active.as_mut(), current_session_id.clone())
+                {
+                    if let Some(generation) = active.disconnect_grace.disconnected() {
+                        let timer_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(DISCONNECT_GRACE).await;
+                            let _ = timer_tx
+                                .send(SessionEvent::DisconnectTimeout {
+                                    session_id,
+                                    generation,
+                                })
+                                .await;
+                        });
+                    }
+                }
+            } else if matches!(
                 state,
-                RTCPeerConnectionState::Failed
-                    | RTCPeerConnectionState::Closed
-                    | RTCPeerConnectionState::Disconnected
+                RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
             ) {
                 if let Some(old) = active.take() {
                     old.shutdown().await;
@@ -1041,6 +1218,60 @@ async fn handle_session_event(
                     });
                 }
                 *current_session_id = None;
+            }
+        }
+        SessionEvent::DisconnectTimeout {
+            session_id,
+            generation,
+        } => {
+            let matches_current = current_session_id.as_deref() == Some(session_id.as_str());
+            let matches_pending = active
+                .as_ref()
+                .is_some_and(|a| a.disconnect_grace.is_current(generation));
+            if matches_current && matches_pending {
+                tracing::info!(%session_id, "disconnect grace window expired, ending session");
+                if let Some(old) = active.take() {
+                    old.shutdown().await;
+                    let _ = status.send(AgentStatus::Registered {
+                        pin: pin.to_string(),
+                    });
+                }
+                *current_session_id = None;
+            } else {
+                tracing::debug!(%session_id, generation, "stale disconnect timeout, ignoring");
+            }
+        }
+        SessionEvent::DataChannelClosed { label, tag } => {
+            if label != "control" {
+                tracing::debug!(label, "non-control data channel closed");
+            } else if active.as_ref().is_some_and(|a| a.session_tag == tag) {
+                // Slice 3.5b: the `control` channel closing is a
+                // deliberate end of session from the client (closing the
+                // tab, `pc.close()`) -- end it immediately instead of
+                // waiting for the `Disconnected` grace window. Guarded with
+                // `active.take()` (a no-op if already `None`) since our own
+                // `ActiveSession::shutdown` closing the peer connection also
+                // closes this same channel and can deliver this event again
+                // after the slot is already empty.
+                if let Some(old) = active.take() {
+                    tracing::info!("control data channel closed by remote peer, ending session");
+                    old.shutdown().await;
+                    let _ = status.send(AgentStatus::Registered {
+                        pin: pin.to_string(),
+                    });
+                }
+                *current_session_id = None;
+            } else {
+                // Fix to slice 3.5b: same reasoning as `ConnectionState`'s
+                // tag check above -- this is the *old* session's `control`
+                // channel finishing its close handshake after a new session
+                // has already taken `active`'s place (e.g. during automatic
+                // client reconnection), not the current session's.
+                tracing::debug!(
+                    label,
+                    tag,
+                    "control data channel closed event from a superseded session, ignoring"
+                );
             }
         }
         SessionEvent::DataChannelMessage {
@@ -2059,7 +2290,7 @@ mod tests {
             "111111",
             &status_tx,
             &out_tx,
-            event_tx,
+            event_tx.clone(),
             &mut active,
             &mut current_session_id,
         )
@@ -2081,6 +2312,7 @@ mod tests {
             "111111",
             &status_tx,
             &out_tx,
+            &event_tx,
             &mut active,
             &mut current_session_id,
         )
@@ -2296,10 +2528,12 @@ mod tests {
         assert!(slot.is_active(), "session must have started successfully");
         let _ = out_rx.try_recv(); // the Offer
 
+        let tag = slot.active.as_ref().unwrap().session_tag;
         slot.event_tx
-            .send(SessionEvent::ConnectionState(
-                RTCPeerConnectionState::Closed,
-            ))
+            .send(SessionEvent::ConnectionState {
+                state: RTCPeerConnectionState::Closed,
+                tag,
+            })
             .await
             .expect("the slot's own event channel must accept a send");
 
@@ -2315,5 +2549,573 @@ mod tests {
             !slot.is_active(),
             "a ConnectionState(Closed) event must free the slot even while offline"
         );
+    }
+
+    /// Starts a real session (via `PeerJoined`, same as the other tests in
+    /// this module) and returns the pieces `handle_session_event` needs, for
+    /// the slice 3.5b `Disconnected`/`DisconnectTimeout`/`DataChannelClosed`
+    /// tests below.
+    async fn started_session(
+        session_id: &str,
+    ) -> (
+        HostContext,
+        Option<ActiveSession>,
+        Option<String>,
+        mpsc::UnboundedSender<SignalMessage>,
+        mpsc::UnboundedReceiver<SignalMessage>,
+        mpsc::Sender<SessionEvent>,
+        watch::Sender<AgentStatus>,
+        watch::Receiver<AgentStatus>,
+    ) {
+        let ctx = test_ctx();
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+        let (status_tx, status_rx) = watch::channel(AgentStatus::Connecting);
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: session_id.to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+        assert!(active.is_some(), "session must have started successfully");
+
+        (
+            ctx,
+            active,
+            current_session_id,
+            out_tx,
+            out_rx,
+            event_tx,
+            status_tx,
+            status_rx,
+        )
+    }
+
+    /// Slice 3.5b: `ConnectionState(Disconnected)` must not end the session
+    /// right away -- only arm the `DISCONNECT_GRACE` window.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disconnected_does_not_end_the_session_immediately() {
+        let (ctx, mut active, mut current_session_id, out_tx, _out_rx, event_tx, status_tx, _) =
+            started_session("sess-1").await;
+
+        handle_session_event(
+            SessionEvent::ConnectionState {
+                state: RTCPeerConnectionState::Disconnected,
+                tag: active.as_ref().unwrap().session_tag,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+
+        assert!(
+            active.is_some(),
+            "Disconnected alone must not end the session"
+        );
+        assert_eq!(current_session_id.as_deref(), Some("sess-1"));
+
+        if let Some(active) = active.take() {
+            active.shutdown().await;
+        }
+    }
+
+    /// Slice 3.5b: `Connected` arriving while a disconnect grace window is
+    /// running cancels it -- the session survives and status goes back to
+    /// `InSession`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connected_within_the_grace_window_cancels_it() {
+        let (
+            ctx,
+            mut active,
+            mut current_session_id,
+            out_tx,
+            _out_rx,
+            event_tx,
+            status_tx,
+            status_rx,
+        ) = started_session("sess-1").await;
+
+        handle_session_event(
+            SessionEvent::ConnectionState {
+                state: RTCPeerConnectionState::Disconnected,
+                tag: active.as_ref().unwrap().session_tag,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+        handle_session_event(
+            SessionEvent::ConnectionState {
+                state: RTCPeerConnectionState::Connected,
+                tag: active.as_ref().unwrap().session_tag,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+
+        assert!(active.is_some(), "the session must survive");
+        assert_eq!(
+            *status_rx.borrow(),
+            AgentStatus::InSession {
+                pin: "111111".to_string()
+            }
+        );
+
+        // The now-cancelled window's `DisconnectTimeout` must be ignored --
+        // proven directly in `disconnect_grace_tests`; here it's enough to
+        // check `pending_disconnect`'s observable effect via `is_current`.
+        assert!(!active.as_ref().unwrap().disconnect_grace.is_current(1));
+
+        if let Some(active) = active.take() {
+            active.shutdown().await;
+        }
+    }
+
+    /// Slice 3.5b: a `DisconnectTimeout` matching the currently pending
+    /// grace window ends the session, the same way `Failed`/`Closed` do.
+    /// The real `DISCONNECT_GRACE` timer isn't waited out here (this
+    /// workspace doesn't enable tokio's `test-util` feature needed to pause
+    /// the clock) -- the event is injected directly, exercising exactly the
+    /// same handler code the real timer's `send` would reach.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disconnect_timeout_with_matching_generation_ends_the_session() {
+        let (
+            ctx,
+            mut active,
+            mut current_session_id,
+            out_tx,
+            _out_rx,
+            event_tx,
+            status_tx,
+            status_rx,
+        ) = started_session("sess-1").await;
+
+        handle_session_event(
+            SessionEvent::ConnectionState {
+                state: RTCPeerConnectionState::Disconnected,
+                tag: active.as_ref().unwrap().session_tag,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+        handle_session_event(
+            SessionEvent::DisconnectTimeout {
+                session_id: "sess-1".to_string(),
+                generation: 1,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+
+        assert!(
+            active.is_none(),
+            "the grace window expiring must end the session"
+        );
+        assert_eq!(current_session_id, None);
+        assert_eq!(
+            *status_rx.borrow(),
+            AgentStatus::Registered {
+                pin: "111111".to_string()
+            }
+        );
+    }
+
+    /// Slice 3.5b: a `DisconnectTimeout` from a window a `Connected` already
+    /// cancelled must be ignored -- it's stale.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disconnect_timeout_from_a_cancelled_window_is_ignored() {
+        let (ctx, mut active, mut current_session_id, out_tx, _out_rx, event_tx, status_tx, _) =
+            started_session("sess-1").await;
+
+        handle_session_event(
+            SessionEvent::ConnectionState {
+                state: RTCPeerConnectionState::Disconnected,
+                tag: active.as_ref().unwrap().session_tag,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+        handle_session_event(
+            SessionEvent::ConnectionState {
+                state: RTCPeerConnectionState::Connected,
+                tag: active.as_ref().unwrap().session_tag,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+        handle_session_event(
+            SessionEvent::DisconnectTimeout {
+                session_id: "sess-1".to_string(),
+                generation: 1,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+
+        assert!(
+            active.is_some(),
+            "a stale DisconnectTimeout must not end the session"
+        );
+
+        if let Some(active) = active.take() {
+            active.shutdown().await;
+        }
+    }
+
+    /// Slice 3.5b: a `DisconnectTimeout` naming a session that's no longer
+    /// current (a new one has since started) must not touch the new
+    /// session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disconnect_timeout_from_an_old_session_does_not_touch_a_new_one() {
+        let (ctx, mut active, mut current_session_id, out_tx, mut out_rx, event_tx, status_tx, _) =
+            started_session("sess-1").await;
+
+        handle_session_event(
+            SessionEvent::ConnectionState {
+                state: RTCPeerConnectionState::Disconnected,
+                tag: active.as_ref().unwrap().session_tag,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+
+        // A brand new session replaces the (still disconnected) old one --
+        // mirrors `new PeerJoined while a session was active` in
+        // `handle_signal_message`.
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-2".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+        assert_eq!(current_session_id.as_deref(), Some("sess-2"));
+        let _ = out_rx.try_recv(); // sess-1's Offer
+        let _ = out_rx.try_recv(); // sess-2's Offer
+
+        // sess-1's stale timeout arrives after sess-2 has already started.
+        handle_session_event(
+            SessionEvent::DisconnectTimeout {
+                session_id: "sess-1".to_string(),
+                generation: 1,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+
+        assert!(
+            active.is_some(),
+            "an old session's timeout must not end the new session"
+        );
+        assert_eq!(current_session_id.as_deref(), Some("sess-2"));
+
+        if let Some(active) = active.take() {
+            active.shutdown().await;
+        }
+    }
+
+    /// Fix to slice 3.5b: a `ConnectionState` event tagged with an old,
+    /// already-superseded session's tag must not touch the new one -- the
+    /// scenario this guards against is automatic client reconnection (bye ->
+    /// `connect_device` -> `PeerJoined`, all while the old `PeerConnection`
+    /// is still tearing down): its `Closed` can land on the shared event
+    /// channel after a new session has already taken `active`'s place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connection_state_from_an_old_session_does_not_touch_a_new_one() {
+        let (
+            ctx,
+            mut active,
+            mut current_session_id,
+            out_tx,
+            mut out_rx,
+            event_tx,
+            status_tx,
+            status_rx,
+        ) = started_session("sess-1").await;
+        let old_tag = active.as_ref().unwrap().session_tag;
+
+        // sess-1 is superseded by a brand new sess-2, same as the
+        // `DisconnectTimeout` test above.
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-2".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+        assert_eq!(current_session_id.as_deref(), Some("sess-2"));
+        let new_tag = active.as_ref().unwrap().session_tag;
+        assert_ne!(old_tag, new_tag, "each PeerSession must get a distinct tag");
+        let _ = out_rx.try_recv(); // sess-1's Offer
+        let _ = out_rx.try_recv(); // sess-2's Offer
+        let mut status_rx = status_rx;
+        status_rx.borrow_and_update(); // mark the supersede's own status send as seen
+
+        // sess-1's `PeerConnection`, still tearing down, reports `Closed`
+        // after sess-2 has already started.
+        handle_session_event(
+            SessionEvent::ConnectionState {
+                state: RTCPeerConnectionState::Closed,
+                tag: old_tag,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+
+        assert!(
+            active.is_some(),
+            "an old session's Closed event must not end the new session"
+        );
+        assert_eq!(current_session_id.as_deref(), Some("sess-2"));
+        assert!(
+            !status_rx.has_changed().unwrap(),
+            "a stale Closed event must not report any new status"
+        );
+
+        if let Some(active) = active.take() {
+            active.shutdown().await;
+        }
+    }
+
+    /// Fix to slice 3.5b: same as
+    /// `connection_state_from_an_old_session_does_not_touch_a_new_one`, for
+    /// the `control` data channel closing -- the concrete bug this fixes
+    /// (client reconnects: bye -> new session starts -> the old session's
+    /// `control` channel finishes closing and its event arrives after).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn data_channel_closed_from_an_old_session_does_not_touch_a_new_one() {
+        let (ctx, mut active, mut current_session_id, out_tx, mut out_rx, event_tx, status_tx, _) =
+            started_session("sess-1").await;
+        let old_tag = active.as_ref().unwrap().session_tag;
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-2".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+        assert_eq!(current_session_id.as_deref(), Some("sess-2"));
+        let _ = out_rx.try_recv(); // sess-1's Offer
+        let _ = out_rx.try_recv(); // sess-2's Offer
+
+        // sess-1's `control` channel finishes its close handshake after
+        // sess-2 has already started.
+        handle_session_event(
+            SessionEvent::DataChannelClosed {
+                label: "control".to_string(),
+                tag: old_tag,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+
+        assert!(
+            active.is_some(),
+            "an old session's control channel closing must not end the new session"
+        );
+        assert_eq!(current_session_id.as_deref(), Some("sess-2"));
+
+        if let Some(active) = active.take() {
+            active.shutdown().await;
+        }
+    }
+
+    /// Slice 3.5b: the `control` data channel closing ends the session
+    /// immediately, without waiting for a `Disconnected` grace window.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_data_channel_closed_ends_the_session_immediately() {
+        let (
+            ctx,
+            mut active,
+            mut current_session_id,
+            out_tx,
+            _out_rx,
+            event_tx,
+            status_tx,
+            status_rx,
+        ) = started_session("sess-1").await;
+        let tag = active.as_ref().unwrap().session_tag;
+
+        handle_session_event(
+            SessionEvent::DataChannelClosed {
+                label: "control".to_string(),
+                tag,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+
+        assert!(active.is_none());
+        assert_eq!(current_session_id, None);
+        assert_eq!(
+            *status_rx.borrow(),
+            AgentStatus::Registered {
+                pin: "111111".to_string()
+            }
+        );
+
+        // Our own `ActiveSession::shutdown` (called above) closing the peer
+        // connection can deliver a second `DataChannelClosed` for the same
+        // channel once the slot is already empty -- must be a quiet no-op,
+        // not a double status flip or a panic. Same `tag` as before: from
+        // the *now-gone* session's own control channel.
+        handle_session_event(
+            SessionEvent::DataChannelClosed {
+                label: "control".to_string(),
+                tag,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+        assert!(active.is_none());
+    }
+
+    /// A non-`control` data channel closing (e.g. `input`) must not end the
+    /// session -- only `control` is treated as a deliberate end of session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_control_data_channel_closed_does_not_end_the_session() {
+        let (ctx, mut active, mut current_session_id, out_tx, _out_rx, event_tx, status_tx, _) =
+            started_session("sess-1").await;
+
+        handle_session_event(
+            SessionEvent::DataChannelClosed {
+                label: "input".to_string(),
+                tag: active.as_ref().unwrap().session_tag,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+
+        assert!(active.is_some());
+        assert_eq!(current_session_id.as_deref(), Some("sess-1"));
+
+        if let Some(active) = active.take() {
+            active.shutdown().await;
+        }
     }
 }

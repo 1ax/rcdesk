@@ -28,11 +28,30 @@ import {
   sortDevices,
 } from "./myDevices";
 import { reconnectBackoffMs } from "./reconnectBackoff";
+import {
+  connectionBannerLabel,
+  connectionStateOutcome,
+  DISCONNECT_GRACE_MS,
+  recoveryDelayMs,
+  recoveryExhausted,
+  shouldAttemptRecovery,
+} from "./sessionRecovery";
+import type { ConnectionBannerPhase } from "./sessionRecovery";
 import type { ControlMessage } from "./generated/ControlMessage";
 import type { DisplayEntry } from "./generated/DisplayEntry";
 import type { DeviceEntry } from "./generated/DeviceEntry";
 
-type SessionStatus = "connecting" | "connected" | "disconnected" | "error";
+/** Slice 3.5b adds `disconnecting` (a `DISCONNECT_GRACE_MS` window is
+ * running, see `sessionRecovery.connectionStateOutcome`) and `reconnecting`
+ * (an automatic recovery attempt to the same device is in flight, see
+ * `beginRecovery`). */
+type SessionStatus =
+  | "connecting"
+  | "connected"
+  | "disconnecting"
+  | "reconnecting"
+  | "disconnected"
+  | "error";
 
 /** Russian display text for each `SessionStatus`, shown in `#session-status`
  * (see `setSessionStatus`) -- the `data-status` attribute keeps the English
@@ -41,6 +60,8 @@ type SessionStatus = "connecting" | "connected" | "disconnected" | "error";
 const SESSION_STATUS_LABELS: Record<SessionStatus, string> = {
   connecting: "подключение",
   connected: "подключено",
+  disconnecting: "связь прерывается…",
+  reconnecting: "переподключение…",
   disconnected: "отключено",
   error: "ошибка",
 };
@@ -184,6 +205,7 @@ export function mount(root: Element | null): void {
     </div>
     <div class="session-screen" id="session-screen" hidden>
       <video id="video" autoplay playsinline muted></video>
+      <div class="connection-banner" id="connection-banner" hidden></div>
       <div class="overlay" id="stats-overlay"></div>
       <div class="controls">
         <select id="display-select" class="display-select" hidden></select>
@@ -214,7 +236,19 @@ export function mount(root: Element | null): void {
   // gives it focus the same way clicking any input widget would.
   video.tabIndex = 0;
   video.addEventListener("click", () => video.focus());
+  // D32: the first real frame of a (re)started session -- `playing` rather
+  // than `loadeddata` since it only fires once decoding/rendering actually
+  // resumes (`loadeddata` can fire for a frame that's then immediately
+  // stalled). Attached once, here, since `video` itself persists across
+  // sessions -- `srcObject` is what gets reassigned on each new one (see
+  // `joined`, which resets `firstFrameShown` before that reassignment).
+  video.addEventListener("playing", () => {
+    if (firstFrameShown) return;
+    firstFrameShown = true;
+    updateConnectionBanner();
+  });
   const overlay = root.querySelector<HTMLDivElement>("#stats-overlay")!;
+  const connectionBannerEl = root.querySelector<HTMLDivElement>("#connection-banner")!;
   const sessionStatus = root.querySelector<HTMLSpanElement>("#session-status")!;
   const disconnectBtn = root.querySelector<HTMLButtonElement>("#disconnect-btn")!;
   const displaySelect = root.querySelector<HTMLSelectElement>("#display-select")!;
@@ -290,6 +324,36 @@ export function mount(root: Element | null): void {
   let reconnectAttempt = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let deviceListTimer: ReturnType<typeof setInterval> | undefined;
+  // Slice 3.5b: the persistent device id from the current/last `Joined`
+  // (`#[serde(default)]` on the wire, so `null` with a pre-3.5b server) --
+  // what `beginRecovery` reconnects to after losing a session. Cleared on
+  // any intentional teardown (see `teardown`) so a stray timer left over
+  // from a previous session can never reconnect to the wrong device.
+  let deviceId: string | null = null;
+  // Whether the video has shown a frame yet for the *current* `PeerSession`
+  // -- drives the D32 "Подключение к хосту…" banner (see
+  // `updateConnectionBanner`). Reset every time a fresh session starts
+  // (`joined`), since `video.srcObject` is reassigned to a new stream then.
+  let firstFrameShown = false;
+  // The pending `DISCONNECT_GRACE_MS` timer armed on a `disconnected`
+  // connection state (see `onConnectionStateChange` below); cleared on
+  // `connected` (recovered on its own), when it fires (the session is
+  // lost), or on any teardown.
+  let disconnectGraceTimer: ReturnType<typeof setTimeout> | undefined;
+  // Slice 3.5b: `true` while automatically reconnecting to `deviceId` after
+  // losing a session (see `beginRecovery`) -- the session screen stays up
+  // throughout, showing the "reconnecting" status/banner.
+  let recovering = false;
+  // 1-based attempt count for `sessionRecovery.recoveryDelayMs`'s backoff;
+  // only meaningful while `recovering`.
+  let recoveryAttempt = 0;
+  let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
+  // Set when a recovery attempt's `connect_device` couldn't be sent because
+  // the signaling socket itself is down (`connectionLost`) -- the attempt is
+  // retried as soon as `authenticated` confirms the socket is back, without
+  // burning it on a send that would just be dropped (see
+  // `performRecoveryAttempt`).
+  let recoveryWaitingForSocket = false;
 
   /** Shows `note` in `#clipboard-note` for `CLIPBOARD_NOTE_MS`, used as
    * `ClipboardBridge`'s `notify` dependency (decision 5: a too-large
@@ -643,7 +707,50 @@ export function mount(root: Element | null): void {
     }, STATS_INTERVAL_MS);
   }
 
-  function teardown(reason: string): void {
+  function clearDisconnectGraceTimer(): void {
+    if (disconnectGraceTimer !== undefined) {
+      clearTimeout(disconnectGraceTimer);
+      disconnectGraceTimer = undefined;
+    }
+  }
+
+  function clearRecoveryTimer(): void {
+    if (recoveryTimer !== undefined) {
+      clearTimeout(recoveryTimer);
+      recoveryTimer = undefined;
+    }
+  }
+
+  /** Recomputes and applies the D32 video-overlay banner (`#connection-banner`)
+   * from the current state -- called after anything that can change which
+   * `ConnectionBannerPhase` applies (a fresh `joined`, the first video
+   * frame, the disconnect grace window starting/ending, a recovery attempt
+   * ticking over). Priority mirrors `sessionRecovery.ConnectionBannerPhase`'s
+   * doc comment: reconnecting > disconnecting > connecting (no frame yet) >
+   * hidden. */
+  function updateConnectionBanner(): void {
+    let phase: ConnectionBannerPhase;
+    if (recovering) {
+      phase = { kind: "reconnecting", attempt: recoveryAttempt };
+    } else if (disconnectGraceTimer !== undefined) {
+      phase = { kind: "disconnecting" };
+    } else if (!firstFrameShown) {
+      phase = { kind: "connecting" };
+    } else {
+      phase = { kind: "streaming" };
+    }
+    const label = connectionBannerLabel(phase);
+    connectionBannerEl.textContent = label ?? "";
+    connectionBannerEl.hidden = label === null;
+  }
+
+  /** Tears down everything belonging to the *current* `PeerSession` --
+   * shared by `teardown` (an intentional/final end of session) and
+   * `handleSessionLost` (which, unlike `teardown`, may then start
+   * `beginRecovery` instead of returning to the PIN/list screen). Leaves the
+   * screen, `pinStatus`/`connectBtn`, and the recovery/grace-window state
+   * machine itself untouched -- callers decide those. */
+  function stopSessionResources(): void {
     stopStatsLoop();
     stopPingLoop();
     detachInput?.();
@@ -680,6 +787,29 @@ export function mount(root: Element | null): void {
     clipboardNoteEl.textContent = "";
     session?.close();
     session = null;
+    sessionId = null;
+    prevSnapshot = undefined;
+    video.srcObject = null;
+    video.style.cursor = "";
+    overlay.textContent = "";
+    firstFrameShown = false;
+  }
+
+  /** Final, intentional end of session (slice 3.5b: button, peer `bye`,
+   * negotiation error, or a `beginRecovery` run that exhausted all its
+   * attempts) -- unlike `handleSessionLost`, always returns to the PIN/list
+   * screen and never triggers `beginRecovery`. Clears every piece of the
+   * disconnect-grace/recovery state machine so nothing left over from this
+   * session can fire later. */
+  function teardown(reason: string): void {
+    clearDisconnectGraceTimer();
+    clearRecoveryTimer();
+    recovering = false;
+    recoveryAttempt = 0;
+    recoveryWaitingForSocket = false;
+    deviceId = null;
+    stopSessionResources();
+    updateConnectionBanner();
     // Unlike before this slice, the signaling connection itself is *not*
     // closed or discarded here -- it's one long-lived connection for the
     // whole tab now (see where `signaling` is created above), since the
@@ -687,11 +817,6 @@ export function mount(root: Element | null): void {
     // socket authenticated as for the lifetime of that one WebSocket. Only
     // the WebRTC session ends; the tab drops back to the PIN/list screen on
     // the same connection.
-    sessionId = null;
-    prevSnapshot = undefined;
-    video.srcObject = null;
-    video.style.cursor = "";
-    overlay.textContent = "";
     connectBtn.disabled = connectionLost;
     pinStatus.textContent = reason;
     showPinScreen();
@@ -699,6 +824,76 @@ export function mount(root: Element | null): void {
     // `startDeviceListLoop` tick (up to `DEVICE_LIST_INTERVAL_MS` later) --
     // state (this device's own `busy`, in particular) just changed.
     signaling.send({ type: "list_devices" });
+  }
+
+  /** Sends `connect_device` for `deviceId` to retry the current recovery
+   * attempt, or, if the signaling socket itself is down right now, defers it
+   * -- `authenticated` (below) retries it as soon as the socket is back,
+   * without spending another attempt on a send that would just be dropped
+   * (slice 3.5b). */
+  function performRecoveryAttempt(): void {
+    if (!deviceId) {
+      // Can't happen (`beginRecovery` only runs when `shouldAttemptRecovery`
+      // is true), but stay defensive rather than reconnecting to nothing.
+      teardown("Не удалось переподключиться");
+      return;
+    }
+    if (connectionLost) {
+      recoveryWaitingForSocket = true;
+      return;
+    }
+    signaling.send({ type: "connect_device", device_id: deviceId });
+  }
+
+  /** Schedules recovery attempt number `recoveryAttempt + 1` after
+   * `recoveryDelayMs`, or gives up (`teardown`) once
+   * `recoveryExhausted` -- called for the first attempt (`beginRecovery`)
+   * and again after each failed one (the `error` handler below). */
+  function scheduleRecoveryAttempt(): void {
+    recoveryAttempt += 1;
+    updateConnectionBanner();
+    if (recoveryExhausted(recoveryAttempt)) {
+      teardown("Не удалось переподключиться");
+      return;
+    }
+    clearRecoveryTimer();
+    recoveryTimer = setTimeout(() => {
+      recoveryTimer = undefined;
+      performRecoveryAttempt();
+    }, recoveryDelayMs(recoveryAttempt));
+  }
+
+  /** Starts automatic reconnection to `deviceId` after `handleSessionLost`
+   * -- the session screen stays up (only `stopSessionResources` already
+   * ran), showing the "reconnecting" status/banner until either a `joined`
+   * succeeds (see that handler, which resets `recovering`) or every attempt
+   * is exhausted (`scheduleRecoveryAttempt`, which then tears down to the
+   * PIN/list screen). */
+  function beginRecovery(): void {
+    recovering = true;
+    recoveryAttempt = 0;
+    setSessionStatus("reconnecting");
+    scheduleRecoveryAttempt();
+  }
+
+  /** The session is gone -- either the `DISCONNECT_GRACE_MS` window expired
+   * or the connection went straight to `failed`/`closed` (slice 3.5b, see
+   * `connectionStateOutcome`). Tells the host (`bye`, best-effort -- only if
+   * the signaling socket is actually up), tears down the dead
+   * `PeerSession`, and either starts `beginRecovery` (a known `deviceId`) or
+   * finishes with `teardown` back to the PIN/list screen. */
+  function handleSessionLost(): void {
+    const lostSessionId = sessionId;
+    const canRecover = shouldAttemptRecovery(deviceId);
+    stopSessionResources();
+    if (lostSessionId && !connectionLost) {
+      signaling.send({ type: "bye", session_id: lostSessionId });
+    }
+    if (canRecover) {
+      beginRecovery();
+    } else {
+      teardown("Связь потеряна");
+    }
   }
 
   /** Shared setup for both ways to start a session -- entering a PIN or
@@ -740,6 +935,14 @@ export function mount(root: Element | null): void {
       if (!pinScreen.hidden) startDeviceListLoop();
       renderDeviceList();
     }
+    // Slice 3.5b: a recovery attempt deferred because the socket was down
+    // (`performRecoveryAttempt`) retries right away now that it's back --
+    // without this it would otherwise sit idle until `beginRecovery`'s
+    // caller gives up waiting, since nothing else re-triggers it.
+    if (recovering && recoveryWaitingForSocket) {
+      recoveryWaitingForSocket = false;
+      performRecoveryAttempt();
+    }
   });
 
   signaling.on("devices", (msg) => {
@@ -749,8 +952,21 @@ export function mount(root: Element | null): void {
 
   signaling.on("joined", (msg) => {
     sessionId = msg.session_id;
+    // Slice 3.5b: refreshed on *every* `joined` (a fresh PIN join, a device-list
+    // connect, or a `beginRecovery` retry) -- what a later `handleSessionLost`
+    // reconnects to. Also resets the whole disconnect-grace/recovery state
+    // machine: this is a brand new `PeerSession`, so a leftover window/attempt
+    // from whatever session (if any) preceded it no longer applies.
+    deviceId = msg.device_id;
+    firstFrameShown = false;
+    clearDisconnectGraceTimer();
+    clearRecoveryTimer();
+    recovering = false;
+    recoveryAttempt = 0;
+    recoveryWaitingForSocket = false;
     showSessionScreen();
     setSessionStatus("connecting");
+    updateConnectionBanner();
 
     if (navigator.clipboard) {
       const clipboard = navigator.clipboard;
@@ -783,7 +999,15 @@ export function mount(root: Element | null): void {
       console.warn("navigator.clipboard unavailable; clipboard sync disabled");
     }
 
-    session = new PeerSession(
+    // Bound to `session` right after construction, below; captured by
+    // `onConnectionStateChange` so a stray event delivered from *this*
+    // `RTCPeerConnection` after it's been superseded (`stopSessionResources`
+    // reassigns `session`, e.g. via `handleSessionLost` starting a recovery
+    // attempt) is recognized as stale and ignored, instead of e.g. tearing
+    // down a session that has already moved on (slice 3.5b -- the client
+    // analog of the host's `current_session_id`/generation checks).
+    let thisSession: PeerSession;
+    thisSession = session = new PeerSession(
       { iceServers: toRtcIceServers(msg.ice_servers) },
       {
         onIceCandidate: (candidate) => {
@@ -793,6 +1017,15 @@ export function mount(root: Element | null): void {
         },
         onTrack: (stream) => {
           video.srcObject = stream;
+          // A recovery session (slice 3.5b) starts without a user gesture,
+          // and `stopSessionResources` left the element paused with no
+          // source -- `autoplay` alone doesn't resume it (seen live in a
+          // background tab: frames decoded, `video.paused` stayed true).
+          // Muted playback needs no gesture, so ask explicitly.
+          void video.play().catch(() => {
+            // Safari's first session is covered by the play() inside the
+            // click handler; nothing more to do if this one is refused.
+          });
         },
         onDataChannel: (label, dc) => {
           if (label === "input") inputChannel = dc;
@@ -801,11 +1034,27 @@ export function mount(root: Element | null): void {
           maybeAttachInput();
         },
         onConnectionStateChange: (state) => {
-          if (state === "connected") {
+          if (session !== thisSession) return;
+          // Slice 3.5b: `disconnected` no longer tears the session down --
+          // see `sessionRecovery.connectionStateOutcome`'s doc comment for
+          // why (mirrors `host/src/signaling/mod.rs`'s `DisconnectGrace`).
+          const outcome = connectionStateOutcome(state, disconnectGraceTimer !== undefined);
+          if (outcome === "connected") {
+            clearDisconnectGraceTimer();
             setSessionStatus("connected");
-          } else if (state === "failed" || state === "closed" || state === "disconnected") {
-            teardown(`Соединение разорвано (${state})`);
+            updateConnectionBanner();
+          } else if (outcome === "start-disconnect-grace") {
+            setSessionStatus("disconnecting");
+            disconnectGraceTimer = setTimeout(() => {
+              disconnectGraceTimer = undefined;
+              handleSessionLost();
+            }, DISCONNECT_GRACE_MS);
+            updateConnectionBanner();
+          } else if (outcome === "session-lost") {
+            clearDisconnectGraceTimer();
+            handleSessionLost();
           }
+          // "already-disconnecting" / "ignore": nothing to do.
         },
       },
     );
@@ -847,6 +1096,17 @@ export function mount(root: Element | null): void {
   });
 
   signaling.on("error", (msg) => {
+    if (recovering) {
+      // A recovery attempt's `connect_device` was rejected (device offline
+      // or busy, most likely) -- try again per the backoff schedule, or
+      // give up once attempts are exhausted (slice 3.5b,
+      // `scheduleRecoveryAttempt`). The session screen stays up either way;
+      // the specific server message isn't surfaced per-attempt, only the
+      // attempt count (the banner/status already show that).
+      console.warn("recovery attempt failed", msg.message);
+      scheduleRecoveryAttempt();
+      return;
+    }
     if (sessionId === null) {
       // No session yet (a bad PIN, a stale device row, an auth hiccup --
       // all the new 3.1e error codes land here): stay on the PIN/list
@@ -896,6 +1156,12 @@ export function mount(root: Element | null): void {
   // learns the session is over immediately instead of only noticing once its
   // own connection drops.
   window.addEventListener("pagehide", () => {
+    // Slice 3.5b: an intentional end of session -- no point in a page that's
+    // going away scheduling a recovery attempt (or the grace window that
+    // would lead to one) for a moment after it's gone.
+    clearDisconnectGraceTimer();
+    clearRecoveryTimer();
+    recovering = false;
     if (sessionId) {
       signaling.send({ type: "bye", session_id: sessionId });
     }

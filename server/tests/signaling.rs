@@ -189,8 +189,8 @@ async fn client_join_succeeds_and_host_is_notified() {
         },
     )
     .await;
-    let pin = match recv(&mut host).await {
-        SignalMessage::Registered { pin, .. } => pin,
+    let (pin, host_id) = match recv(&mut host).await {
+        SignalMessage::Registered { pin, host_id, .. } => (pin, host_id),
         other => panic!("expected registered, got {other:?}"),
     };
 
@@ -203,10 +203,15 @@ async fn client_join_succeeds_and_host_is_notified() {
             session_id,
             host_name,
             ice_servers,
+            device_id,
         } => {
             assert_eq!(host_name, "My Mac");
             assert!(!ice_servers.is_empty());
             assert!(ice_servers[0].urls[0].starts_with("stun:"));
+            // Slice 3.5b: `Joined.device_id` is the host's persistent id
+            // (every registered host is one since slice 3.1), so the client
+            // can reconnect to the same device without a PIN later.
+            assert_eq!(device_id, Some(host_id));
             (session_id, ice_servers)
         }
         other => panic!("expected joined, got {other:?}"),
@@ -775,12 +780,23 @@ async fn connect_device_starts_a_session_for_a_linked_device() {
     client_auth(&mut client, Some(token)).await;
     send(
         &mut client,
-        &SignalMessage::ConnectDevice { device_id: host_id },
+        &SignalMessage::ConnectDevice {
+            device_id: host_id.clone(),
+        },
     )
     .await;
 
     let new_session_id = match recv(&mut client).await {
-        SignalMessage::Joined { session_id, .. } => session_id,
+        SignalMessage::Joined {
+            session_id,
+            device_id,
+            ..
+        } => {
+            // Slice 3.5b: `ConnectDevice`'s `Joined` carries back the same
+            // `device_id` the client asked for.
+            assert_eq!(device_id, Some(host_id));
+            session_id
+        }
         other => panic!("expected joined, got {other:?}"),
     };
     match recv(&mut host).await {
