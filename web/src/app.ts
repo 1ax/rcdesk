@@ -34,6 +34,11 @@ import {
   saveOwnerToken,
   sortDevices,
 } from "./myDevices";
+import {
+  loadQualityPreset,
+  QUALITY_PRESET_LABELS,
+  saveQualityPreset,
+} from "./qualityPreset";
 import { reconnectBackoffMs } from "./reconnectBackoff";
 import {
   connectionBannerLabel,
@@ -47,6 +52,7 @@ import type { ConnectionBannerPhase } from "./sessionRecovery";
 import type { ControlMessage } from "./generated/ControlMessage";
 import type { DisplayEntry } from "./generated/DisplayEntry";
 import type { DeviceEntry } from "./generated/DeviceEntry";
+import type { QualityPreset } from "./generated/QualityPreset";
 
 /** Slice 3.5b adds `disconnecting` (a `DISCONNECT_GRACE_MS` window is
  * running, see `sessionRecovery.connectionStateOutcome`) and `reconnecting`
@@ -84,6 +90,7 @@ const QUALITY_REASON_LABELS: Record<string, string> = {
   encoder: "кодер",
   probe: "проба",
   remb: "remb",
+  preset: "пресет",
 };
 
 /** `window.localStorage` can throw on *access*, not just on read/write, when
@@ -220,6 +227,7 @@ export function mount(root: Element | null): void {
       <div class="overlay" id="stats-overlay"></div>
       <div class="controls">
         <select id="display-select" class="display-select" hidden></select>
+        <select id="quality-select" class="quality-select" title="Качество"></select>
         <span id="view-only" class="status view-only" hidden></span>
         <span id="input-blocked" class="status input-blocked" hidden></span>
         <span id="clipboard-note" class="status clipboard-note" hidden></span>
@@ -265,6 +273,17 @@ export function mount(root: Element | null): void {
   const sessionStatus = root.querySelector<HTMLSpanElement>("#session-status")!;
   const disconnectBtn = root.querySelector<HTMLButtonElement>("#disconnect-btn")!;
   const displaySelect = root.querySelector<HTMLSelectElement>("#display-select")!;
+  const qualitySelect = root.querySelector<HTMLSelectElement>("#quality-select")!;
+  // Fixed set of options (unlike `#display-select`'s, which is rebuilt from
+  // the host's list on every `displays` message) -- built once, here, from
+  // `QUALITY_PRESET_LABELS` so the picker's text has a single source of
+  // truth (see `qualityPreset.ts`).
+  for (const [value, label] of Object.entries(QUALITY_PRESET_LABELS)) {
+    const el = document.createElement("option");
+    el.value = value;
+    el.textContent = label;
+    qualitySelect.appendChild(el);
+  }
   const viewOnlyEl = root.querySelector<HTMLSpanElement>("#view-only")!;
   const inputBlockedEl = root.querySelector<HTMLSpanElement>("#input-blocked")!;
   const clipboardNoteEl = root.querySelector<HTMLSpanElement>("#clipboard-note")!;
@@ -644,10 +663,36 @@ export function mount(root: Element | null): void {
     }, PING_INTERVAL_MS);
   }
 
+  /** Sends `ControlMessage::SetQuality` on `dc` if it's open, a no-op
+   * otherwise (mirrors `displaySelect`'s change listener, which checks
+   * `readyState` itself rather than relying on a caller to). */
+  function sendQualityPreset(dc: RTCDataChannel, preset: QualityPreset): void {
+    if (dc.readyState !== "open") return;
+    const msg: ControlMessage = { type: "set_quality", preset };
+    dc.send(JSON.stringify(msg));
+  }
+
   function setupControlChannel(dc: RTCDataChannel): void {
     controlChannel = dc;
-    if (dc.readyState === "open") startPingLoop(dc);
-    else dc.addEventListener("open", () => startPingLoop(dc));
+    // Slice 3.5e: a fresh `control` channel (a new session, or a 3.5b
+    // automatic reconnect) means a fresh host-side session too -- the
+    // adaptation controller always starts at `auto` (see
+    // `host/src/adapt/mod.rs`'s `Controller::new`), so a remembered non-auto
+    // choice has to be resent every time, not just once per device.
+    const announcePreset = () => {
+      const storage = ownerStorage();
+      const preset = storage ? loadQualityPreset(storage, deviceId) : "auto";
+      if (preset !== "auto") sendQualityPreset(dc, preset);
+    };
+    if (dc.readyState === "open") {
+      startPingLoop(dc);
+      announcePreset();
+    } else {
+      dc.addEventListener("open", () => {
+        startPingLoop(dc);
+        announcePreset();
+      });
+    }
     dc.addEventListener("message", (event: MessageEvent<unknown>) => {
       if (typeof event.data !== "string") return;
       let msg: ControlMessage;
@@ -1011,6 +1056,12 @@ export function mount(root: Element | null): void {
     // machine: this is a brand new `PeerSession`, so a leftover window/attempt
     // from whatever session (if any) preceded it no longer applies.
     deviceId = msg.device_id;
+    // Slice 3.5e: reflect the owner's remembered choice for this device (or
+    // "auto" for a fresh/unknown one) in the picker right away -- the actual
+    // `set_quality` message goes out once `control` opens (see
+    // `setupControlChannel`), since there's no channel to send it on yet.
+    const storage = ownerStorage();
+    qualitySelect.value = storage ? loadQualityPreset(storage, deviceId) : "auto";
     firstFrameShown = false;
     clearDisconnectGraceTimer();
     clearRecoveryTimer();
@@ -1306,6 +1357,19 @@ export function mount(root: Element | null): void {
     // Give focus back to the video so keyboard input keeps going to the
     // session (see the `click` listener above, which does the same after a
     // user gesture on the video itself).
+    video.focus();
+  });
+
+  qualitySelect.addEventListener("change", () => {
+    // The `<option>`s are exactly `QualityPreset`'s wire values (see the
+    // options built from `QUALITY_PRESET_LABELS` above), so the select's
+    // own value is already valid -- no parsing needed here.
+    const preset = qualitySelect.value as QualityPreset;
+    const storage = ownerStorage();
+    if (storage) saveQualityPreset(storage, deviceId, preset);
+    if (controlChannel) sendQualityPreset(controlChannel, preset);
+    // Give focus back to the video, same reasoning as `displaySelect`'s
+    // change listener above.
     video.focus();
   });
 

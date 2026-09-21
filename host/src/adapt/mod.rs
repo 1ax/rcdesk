@@ -29,6 +29,8 @@
 
 use std::time::{Duration, Instant};
 
+use proto::control::QualityPreset;
+
 use crate::encode::RateTarget;
 
 /// How often `tick()` is expected to be called. Fine-grained enough to react
@@ -103,8 +105,35 @@ pub const ENCODER_FAST_TICKS: u32 = 5;
 
 /// Minimum bits-per-pixel-per-frame the target bitrate/fps combination must
 /// afford. Below this, more fps just spreads the same bits over more (worse)
-/// frames -- ARCHITECTURE.md §5 says to sacrifice fps before quality.
+/// frames -- ARCHITECTURE.md §5 says to sacrifice fps before quality. This is
+/// the `QualityPreset::Auto` budget; `Sharp`/`Smooth` scale it (see
+/// `SHARP_BPP_MULTIPLIER`/`SMOOTH_BPP_MULTIPLIER`).
 pub const MIN_BITS_PER_PIXEL_PER_FRAME: f64 = 0.02;
+
+/// `QualityPreset::Sharp` (slice 3.5e, "Чёткость"): multiplies the bit budget
+/// so the controller gives up fps for frame quality much sooner than `auto`
+/// -- meant for text-heavy sessions where legibility matters more than
+/// motion smoothness.
+pub const SHARP_BPP_MULTIPLIER: f64 = 3.0;
+
+/// `QualityPreset::Smooth` (slice 3.5e, "Плавность"): shrinks the bit budget
+/// so the controller tolerates a much softer frame in exchange for keeping
+/// fps up -- meant for video/animation-heavy sessions.
+pub const SMOOTH_BPP_MULTIPLIER: f64 = 0.5;
+
+/// `QualityPreset::Sharp`'s fps ceiling: text doesn't need more than this to
+/// read as smooth, and giving up the headroom lets the bit-budget check
+/// (`Controller::bitrate_fps_step`) step fps down before quality earlier
+/// than `auto` would. Combined with the session's own configured `max_fps`
+/// (the lower of the two applies -- see `QualityPolicy::for_preset`).
+pub const SHARP_FPS_CEILING: u32 = 15;
+
+/// `QualityPreset::Smooth`'s fps floor: below this a video/animation reads as
+/// broken, so the controller cuts bitrate (down to `MIN_BITRATE_KBPS`)
+/// rather than fps once this floor is reached. Combined with the session's
+/// own configured `min_fps` (the higher of the two applies -- see
+/// `QualityPolicy::for_preset`).
+pub const SMOOTH_FPS_FLOOR: u32 = 15;
 
 /// Everything the controller needs to know about the session's configured
 /// limits: the ceiling comes from `--bitrate`/`--fps`, the floor is fixed
@@ -134,6 +163,14 @@ pub enum Feedback {
     /// overwrote them first (`pipeline::PipelineStats::overwritten`, delta
     /// since the previous tick) -- the "encoder can't keep up" signal.
     Overrun { frames: u64 },
+    /// `proto::control::ControlMessage::SetQuality` (slice 3.5e), forwarded
+    /// as-is from `signaling::handle_session_event`'s `control` channel
+    /// handling rather than a separate command channel -- `Controller`
+    /// already processes every `Feedback` on arrival (see `feedback`), so
+    /// this reuses that same plumbing. Applied immediately (not batched
+    /// until the next `tick()` like the other variants): see
+    /// `Controller::set_preset`.
+    Preset { preset: QualityPreset },
 }
 
 /// A change to the encoder's rate target the controller decided on, with the
@@ -142,6 +179,47 @@ pub enum Feedback {
 pub struct Decision {
     pub target: RateTarget,
     pub reason: &'static str,
+}
+
+/// The fps bounds and bit budget `Controller` drives its ladder
+/// (`Controller::ladder`) and bit-budget check (`Controller::bitrate_fps_step`)
+/// from, derived from `AdaptConfig`'s session ceiling and the current
+/// `QualityPreset` (slice 3.5e). `AdaptConfig` itself never changes for a
+/// session (it's the `--bitrate`/`--fps` ceiling); this is the layer a
+/// preset switch (`Controller::set_preset`) actually mutates.
+#[derive(Debug, Clone, Copy)]
+struct QualityPolicy {
+    max_fps: u32,
+    min_fps: u32,
+    bpp_budget: f64,
+}
+
+impl QualityPolicy {
+    /// `auto` uses the session's own ceiling/floor and `MIN_BITS_PER_PIXEL_PER_FRAME`
+    /// unchanged; `sharp`/`smooth` narrow the fps range and scale the bit
+    /// budget as documented on `SHARP_FPS_CEILING`/`SHARP_BPP_MULTIPLIER`/
+    /// `SMOOTH_FPS_FLOOR`/`SMOOTH_BPP_MULTIPLIER`. Bitrate bounds
+    /// (`AdaptConfig::min_bitrate_kbps`/`max_bitrate_kbps`) are not part of
+    /// this policy -- no preset changes them (see this module's plan doc).
+    fn for_preset(preset: QualityPreset, cfg: &AdaptConfig) -> Self {
+        match preset {
+            QualityPreset::Auto => QualityPolicy {
+                max_fps: cfg.max_fps,
+                min_fps: cfg.min_fps,
+                bpp_budget: MIN_BITS_PER_PIXEL_PER_FRAME,
+            },
+            QualityPreset::Sharp => QualityPolicy {
+                max_fps: cfg.max_fps.min(SHARP_FPS_CEILING),
+                min_fps: cfg.min_fps,
+                bpp_budget: MIN_BITS_PER_PIXEL_PER_FRAME * SHARP_BPP_MULTIPLIER,
+            },
+            QualityPreset::Smooth => QualityPolicy {
+                max_fps: cfg.max_fps,
+                min_fps: cfg.min_fps.max(SMOOTH_FPS_FLOOR).min(cfg.max_fps),
+                bpp_budget: MIN_BITS_PER_PIXEL_PER_FRAME * SMOOTH_BPP_MULTIPLIER,
+            },
+        }
+    }
 }
 
 /// Accumulates feedback between ticks; see this module's doc comment.
@@ -162,6 +240,18 @@ impl Window {
 /// how it's driven.
 pub struct Controller {
     cfg: AdaptConfig,
+    /// The current quality preset's derived fps bounds/bit budget (slice
+    /// 3.5e) -- see `QualityPolicy`'s doc comment. Starts at `Auto`
+    /// (`QualityPolicy::for_preset(QualityPreset::Auto, &cfg)`), changed only
+    /// by `set_preset`.
+    policy: QualityPolicy,
+    preset: QualityPreset,
+    /// Set by `set_preset`, consumed by the next `tick()`: forces that tick
+    /// to report the (already clamped, see `set_preset`) target with
+    /// `reason: "preset"` regardless of `HYSTERESIS`, so the client's overlay
+    /// picks up the switch right away instead of waiting for unrelated
+    /// feedback to move the target past the hysteresis threshold.
+    preset_announce_pending: bool,
     target: RateTarget,
     last_remb_kbps: Option<f64>,
     last_remb_at: Option<Instant>,
@@ -189,6 +279,9 @@ impl Controller {
         };
         Self {
             cfg,
+            policy: QualityPolicy::for_preset(QualityPreset::Auto, &cfg),
+            preset: QualityPreset::Auto,
+            preset_announce_pending: false,
             target,
             last_remb_kbps: None,
             last_remb_at: None,
@@ -207,6 +300,12 @@ impl Controller {
         self.target
     }
 
+    /// The controller's current quality preset (slice 3.5e), starting at
+    /// `Auto` and changed only by `set_preset`.
+    pub fn preset(&self) -> QualityPreset {
+        self.preset
+    }
+
     pub fn feedback(&mut self, fb: Feedback, now: Instant) {
         match fb {
             Feedback::Remb { bitrate_bps } => {
@@ -223,20 +322,56 @@ impl Controller {
             Feedback::Overrun { frames } => {
                 self.window.overruns += frames;
             }
+            Feedback::Preset { preset } => {
+                self.set_preset(preset, now);
+            }
         }
     }
 
-    /// The fps ladder for this controller's config: entries of `FPS_LADDER`
-    /// within `[min_fps, max_fps]`, plus `max_fps` itself if it isn't one of
-    /// them, sorted highest first.
+    /// Switches the controller's quality preset (slice 3.5e): rederives
+    /// `policy` (`QualityPolicy::for_preset`) and immediately moves the
+    /// committed `target` into the new bounds -- fps to the new ceiling
+    /// (`policy.max_fps`), the same place `Controller::new` starts: an
+    /// explicit choice should show at once, not after `ENCODER_FAST_TICKS`
+    /// of probing back up (seen live: sharp -> smooth sat at 15 fps for
+    /// ~8 s); the usual feedback steps it down if the encoder or link can't
+    /// keep up. Bitrate is clamped to
+    /// `[cfg.min_bitrate_kbps, cfg.max_bitrate_kbps]` (defensive: no preset
+    /// actually changes these bounds, see `QualityPolicy::for_preset`).
+    /// Resets the feedback window and `last_tick_at` to `now` -- the window
+    /// accumulated under the old policy shouldn't carry into a decision made
+    /// under the new one. Sets `preset_announce_pending` so the very next
+    /// `tick()` reports this new target with `reason: "preset"` (see that
+    /// field's doc comment) instead of running the usual feedback-driven
+    /// logic for that tick.
+    pub fn set_preset(&mut self, preset: QualityPreset, now: Instant) {
+        self.preset = preset;
+        self.policy = QualityPolicy::for_preset(preset, &self.cfg);
+        let fps = self.policy.max_fps;
+        let bitrate_kbps = self
+            .target
+            .bitrate_kbps
+            .clamp(self.cfg.min_bitrate_kbps, self.cfg.max_bitrate_kbps);
+        self.target = RateTarget { bitrate_kbps, fps };
+        self.window.reset();
+        self.last_tick_at = now;
+        self.preset_announce_pending = true;
+    }
+
+    /// The fps ladder for this controller's current policy (slice 3.5e:
+    /// `self.policy`, not the session's raw `AdaptConfig` -- narrower for
+    /// `Sharp`/`Smooth`, see `QualityPolicy::for_preset`): entries of
+    /// `FPS_LADDER` within `[policy.min_fps, policy.max_fps]`, plus
+    /// `policy.max_fps` itself if it isn't one of them, sorted highest
+    /// first.
     fn ladder(&self) -> Vec<u32> {
         let mut steps: Vec<u32> = FPS_LADDER
             .iter()
             .copied()
-            .filter(|&f| f >= self.cfg.min_fps && f <= self.cfg.max_fps)
+            .filter(|&f| f >= self.policy.min_fps && f <= self.policy.max_fps)
             .collect();
-        if !steps.contains(&self.cfg.max_fps) {
-            steps.push(self.cfg.max_fps);
+        if !steps.contains(&self.policy.max_fps) {
+            steps.push(self.policy.max_fps);
         }
         steps.sort_unstable_by(|a, b| b.cmp(a));
         steps.dedup();
@@ -247,6 +382,16 @@ impl Controller {
     /// to be worth publishing (see `HYSTERESIS`), `None` otherwise -- in
     /// which case the controller's committed target is left untouched.
     pub fn tick(&mut self, now: Instant) -> Option<Decision> {
+        if self.preset_announce_pending {
+            self.preset_announce_pending = false;
+            self.window.reset();
+            self.last_tick_at = now;
+            return Some(Decision {
+                target: self.target,
+                reason: "preset",
+            });
+        }
+
         let elapsed = now
             .saturating_duration_since(self.last_tick_at)
             .as_secs_f64();
@@ -341,13 +486,14 @@ impl Controller {
 
         let bitrate_fps = self.bitrate_fps_step(&steps, b);
         let new_fps = self
-            .cfg
+            .policy
             .max_fps
             .min(encoder_fps)
             .min(bitrate_fps)
-            .max(self.cfg.min_fps);
-        let bitrate_limited_fps =
-            new_fps == bitrate_fps && bitrate_fps < self.cfg.max_fps && bitrate_fps <= encoder_fps;
+            .max(self.policy.min_fps);
+        let bitrate_limited_fps = new_fps == bitrate_fps
+            && bitrate_fps < self.policy.max_fps
+            && bitrate_fps <= encoder_fps;
 
         self.window.reset();
         self.last_tick_at = now;
@@ -378,21 +524,22 @@ impl Controller {
         })
     }
 
-    /// Largest ladder step for which `b` (kbps) affords at least
-    /// `MIN_BITS_PER_PIXEL_PER_FRAME` bits/pixel/frame at this controller's
-    /// resolution; falls back to `min_fps` if even the smallest step doesn't
-    /// (see `MIN_BITS_PER_PIXEL_PER_FRAME`'s doc comment: fewer, better
-    /// frames beat more, worse ones).
+    /// Largest ladder step for which `b` (kbps) affords at least the current
+    /// policy's `bpp_budget` bits/pixel/frame at this controller's
+    /// resolution (slice 3.5e: `Sharp`/`Smooth` scale this budget, see
+    /// `QualityPolicy::for_preset`); falls back to `policy.min_fps` if even
+    /// the smallest step doesn't (see `MIN_BITS_PER_PIXEL_PER_FRAME`'s doc
+    /// comment: fewer, better frames beat more, worse ones).
     fn bitrate_fps_step(&self, steps: &[u32], b_kbps: f64) -> u32 {
         let threshold_bits =
-            self.cfg.width as f64 * self.cfg.height as f64 * MIN_BITS_PER_PIXEL_PER_FRAME;
+            self.cfg.width as f64 * self.cfg.height as f64 * self.policy.bpp_budget;
         for &fps in steps {
             let budget_bits = b_kbps * 1000.0 / fps as f64;
             if budget_bits >= threshold_bits {
                 return fps;
             }
         }
-        self.cfg.min_fps
+        self.policy.min_fps
     }
 }
 
@@ -790,5 +937,181 @@ mod tests {
             );
         }
         assert_eq!(c.target().bitrate_kbps, 302);
+    }
+
+    // --- Slice 3.5e: quality presets ---------------------------------
+
+    #[test]
+    fn set_preset_sharp_clamps_fps_ceiling_and_announces_next_tick() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        assert_eq!(c.target().fps, 30);
+
+        // Via `Feedback::Preset`, the same path `signaling::run_adapt_task`
+        // uses for a `ControlMessage::SetQuality` arriving from the client.
+        let now = t0 + TICK;
+        c.feedback(
+            Feedback::Preset {
+                preset: QualityPreset::Sharp,
+            },
+            now,
+        );
+        assert_eq!(c.preset(), QualityPreset::Sharp);
+        // Clamped immediately by `set_preset`, before any `tick()` call.
+        assert_eq!(c.target().fps, 15);
+        assert_eq!(c.target().bitrate_kbps, 6000);
+
+        let decision = c
+            .tick(now + TICK)
+            .expect("expected the forced preset announcement");
+        assert_eq!(decision.reason, "preset");
+        assert_eq!(decision.target.fps, 15);
+        assert_eq!(decision.target.bitrate_kbps, 6000);
+    }
+
+    #[test]
+    fn set_preset_starts_at_the_new_ceiling_even_from_a_low_fps() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        // Drive fps down well below 15 via sustained encoder overruns
+        // (auto's floor is `MIN_FPS` = 5).
+        let mut now = t0;
+        for _ in 0..5 {
+            now += TICK;
+            frames(&mut c, now, 25_000);
+            c.feedback(Feedback::Overrun { frames: 5 }, now);
+            c.tick(now);
+        }
+        assert!(
+            c.target().fps < 15,
+            "fps must have dropped below 15 by now, got {}",
+            c.target().fps
+        );
+
+        now += TICK;
+        c.set_preset(QualityPreset::Smooth, now);
+        assert_eq!(c.target().fps, 30);
+    }
+
+    #[test]
+    fn sharp_bit_budget_steps_fps_down_before_auto_at_the_same_bitrate() {
+        // max_fps=10 keeps `SHARP_FPS_CEILING` (15) from being the reason
+        // sharp differs here -- only the 3x bit budget is under test.
+        let cfg = AdaptConfig {
+            max_bitrate_kbps: 6000,
+            min_bitrate_kbps: MIN_BITRATE_KBPS,
+            max_fps: 10,
+            min_fps: MIN_FPS,
+            width: 1280,
+            height: 720,
+        };
+        let t0 = Instant::now();
+        let auto = Controller::new(cfg, t0);
+        let mut sharp = Controller::new(cfg, t0);
+        sharp.set_preset(QualityPreset::Sharp, t0);
+
+        // 1280x720: auto threshold = 921_600 * 0.02 = 18_432 bits/frame,
+        // sharp threshold = 921_600 * 0.06 = 55_296 bits/frame. At 450 kbps,
+        // auto's top rung (10fps, 45_000 bits/frame) affords it; sharp's
+        // doesn't (45_000 < 55_296), so sharp steps down to 8fps (56_250
+        // bits/frame, which does fit) on the exact same input.
+        let steps_auto = auto.ladder();
+        let steps_sharp = sharp.ladder();
+        assert_eq!(auto.bitrate_fps_step(&steps_auto, 450.0), 10);
+        assert_eq!(sharp.bitrate_fps_step(&steps_sharp, 450.0), 8);
+    }
+
+    #[test]
+    fn smooth_never_steps_fps_below_the_floor_on_sustained_overruns() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0 + TICK;
+        c.set_preset(QualityPreset::Smooth, now);
+        let announce = c.tick(now).expect("expected the preset announcement");
+        assert_eq!(announce.reason, "preset");
+        assert_eq!(announce.target.fps, 30);
+
+        for expected in [24u32, 20, 15] {
+            now += TICK;
+            frames(&mut c, now, 25_000);
+            c.feedback(Feedback::Overrun { frames: 5 }, now);
+            let decision = c.tick(now).expect("expected an encoder step down");
+            assert_eq!(decision.target.fps, expected);
+        }
+
+        // Further overruns cannot push fps below the smooth floor (15):
+        // `ladder()` itself has no rung below it while this preset is
+        // active, so `step_down` has nowhere left to go.
+        for _ in 0..5 {
+            now += TICK;
+            frames(&mut c, now, 25_000);
+            c.feedback(Feedback::Overrun { frames: 5 }, now);
+            assert_eq!(c.tick(now), None);
+            assert_eq!(c.target().fps, 15);
+        }
+    }
+
+    #[test]
+    fn smooth_floors_fps_and_cuts_bitrate_instead_when_the_bit_budget_is_too_tight() {
+        // 1920x1080, smooth budget = 1920*1080*0.01 = 20_736 bits/frame --
+        // even the smooth floor (15fps) doesn't afford a REMB-capped 300
+        // kbps (300_000/15 = 20_000 < 20_736), but `bitrate_fps_step` must
+        // still floor at 15 rather than falling through to `MIN_FPS` (5) the
+        // way `low_bitrate_limits_fps` (auto) does at the same resolution.
+        let cfg = AdaptConfig {
+            max_bitrate_kbps: 6000,
+            min_bitrate_kbps: MIN_BITRATE_KBPS,
+            max_fps: 30,
+            min_fps: MIN_FPS,
+            width: 1920,
+            height: 1080,
+        };
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg, t0);
+        c.set_preset(QualityPreset::Smooth, t0);
+        c.tick(t0).expect("expected the preset announcement");
+        let mut now = t0;
+
+        // Loaded-link REMB pins bitrate to 300 kbps over two ticks (same
+        // scenario as `low_bitrate_limits_fps`).
+        now += TICK;
+        frames(&mut c, now, 750_000);
+        remb(&mut c, now, 300_000);
+        assert_eq!(c.tick(now), None);
+        now += TICK;
+        frames(&mut c, now, 750_000);
+        remb(&mut c, now, 300_000);
+        let decision = c.tick(now).expect("expected a decision");
+        assert_eq!(decision.reason, "remb");
+        assert_eq!(decision.target.bitrate_kbps, 300);
+        assert_eq!(
+            decision.target.fps, 15,
+            "smooth must floor fps at 15, never fall through to MIN_FPS"
+        );
+    }
+
+    #[test]
+    fn switching_back_to_auto_restores_the_original_policy() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0;
+
+        c.set_preset(QualityPreset::Sharp, now);
+        c.tick(now).expect("expected the preset announcement");
+        assert_eq!(c.target().fps, 15);
+
+        now += TICK;
+        c.set_preset(QualityPreset::Auto, now);
+        assert_eq!(c.preset(), QualityPreset::Auto);
+        let announce = c.tick(now).expect("expected the preset announcement");
+        assert_eq!(announce.reason, "preset");
+
+        // Bounds/budget are back to auto's, even though the committed fps
+        // itself only recovers through the usual feedback-driven probing
+        // (not an automatic jump on preset switch -- see `set_preset`'s doc
+        // comment).
+        let steps = c.ladder();
+        assert_eq!(steps, vec![30, 24, 20, 15, 12, 10, 8]);
+        assert_eq!(c.bitrate_fps_step(&steps, 6000.0), 30);
     }
 }

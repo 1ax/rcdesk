@@ -21,6 +21,22 @@ pub struct DisplayEntry {
     pub primary: bool,
 }
 
+/// The owner's chosen quality preset (slice 3.5e), sent to the host in
+/// `ControlMessage::SetQuality` and interpreted by the adaptation controller
+/// (`host::adapt::Controller::set_preset`): `Auto` is the controller's
+/// original feedback-driven behavior, `Sharp` favors legible text (a lower
+/// fps ceiling, a bigger per-frame bit budget), `Smooth` favors motion (a
+/// higher fps floor, a smaller per-frame bit budget). See
+/// `host/src/adapt/mod.rs` for the exact numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum QualityPreset {
+    Auto,
+    Sharp,
+    Smooth,
+}
+
 /// A single `control`-channel message, JSON-encoded on the wire (see
 /// ARCHITECTURE.md §5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -110,6 +126,12 @@ pub enum ControlMessage {
     /// direction, which *does* need to travel on `input` (see that variant's
     /// doc comment for why).
     ClipboardText { text: String },
+    /// client -> host: switch the adaptation controller's quality preset
+    /// (slice 3.5e). Applies to the session's current pipeline and survives
+    /// a later `SelectDisplay` (the host re-applies it to the rebuilt
+    /// pipeline's controller). With `--no-adapt`, the host ignores this with
+    /// a `debug` log -- there is no controller to switch.
+    SetQuality { preset: QualityPreset },
 }
 
 #[cfg(test)]
@@ -307,5 +329,25 @@ mod tests {
 
         let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, msg);
+    }
+
+    #[test]
+    fn set_quality_round_trips_through_json_with_exact_shape() {
+        for (preset, wire) in [
+            (QualityPreset::Auto, "auto"),
+            (QualityPreset::Sharp, "sharp"),
+            (QualityPreset::Smooth, "smooth"),
+        ] {
+            let msg = ControlMessage::SetQuality { preset };
+
+            let json = serde_json::to_string(&msg).expect("serialize");
+            assert_eq!(
+                json,
+                format!(r#"{{"type":"set_quality","preset":"{wire}"}}"#)
+            );
+
+            let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(round_tripped, msg);
+        }
     }
 }

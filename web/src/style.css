@@ -338,7 +338,8 @@ body {
   text-transform: none;
 }
 
-.display-select {
+.display-select,
+.quality-select {
   font-size: 12px;
   padding: 4px 10px;
   border: none;

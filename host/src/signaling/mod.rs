@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use proto::control::{ControlMessage, DisplayEntry};
+use proto::control::{ControlMessage, DisplayEntry, QualityPreset};
 use proto::signal::{DeviceCredentials, Role, SignalMessage};
 use webrtc::peer_connection::RTCPeerConnectionState;
 use webrtc::runtime::Runtime;
@@ -501,6 +501,13 @@ struct VideoPipeline {
     stop_tx: Option<oneshot::Sender<()>>,
     adapt_tx: Option<mpsc::UnboundedSender<Feedback>>,
     adapt_task: Option<JoinHandle<()>>,
+    /// Test-only escape hatch onto the pipeline's `RateControl` (slice
+    /// 3.5e), so a test can observe `ControlMessage::SetQuality` actually
+    /// reaching the adaptation controller (via `run_adapt_task`'s real
+    /// ticker) without a real WebRTC peer to read `ControlMessage::Quality`
+    /// back off of -- see `switching_quality_preset_reaches_the_adapt_controller`.
+    #[cfg(test)]
+    rate_control: Arc<crate::pipeline::RateControl>,
 }
 
 impl VideoPipeline {
@@ -550,6 +557,8 @@ impl VideoPipeline {
             keyframe_flag,
         );
         let rate_control = handle.rate_control();
+        #[cfg(test)]
+        let rate_control_for_test = Arc::clone(&rate_control);
 
         // `Some` only when `HostContext::adapt` is set (`serve` without
         // `--no-adapt`, see `docs/dev-run.md`); `adapt_tx` is cloned into the
@@ -618,6 +627,8 @@ impl VideoPipeline {
             stop_tx: Some(stop_tx),
             adapt_tx,
             adapt_task,
+            #[cfg(test)]
+            rate_control: rate_control_for_test,
         })
     }
 
@@ -756,6 +767,14 @@ struct ActiveSession {
     /// (an old, already-superseded session's event arriving after a new one
     /// has taken its place, e.g. during automatic client reconnection).
     session_tag: u64,
+    /// The owner's chosen quality preset (slice 3.5e, `ControlMessage::SetQuality`),
+    /// starting at `QualityPreset::Auto` for every new session. Kept here
+    /// (rather than only inside the adapt task's `Controller`) so
+    /// `switch_display` -- which rebuilds `VideoPipeline` and therefore
+    /// starts a fresh `Controller` at `Auto` -- can re-apply it to the new
+    /// pipeline's controller instead of silently resetting the owner's
+    /// choice on every display switch.
+    quality_preset: QualityPreset,
     /// Slice 3.5b: tracks the current `RTCPeerConnectionState::Disconnected`
     /// grace window (if any) for this session -- see `DisconnectGrace`'s
     /// doc comment and `handle_session_event`'s `ConnectionState`/
@@ -1032,6 +1051,7 @@ async fn handle_signal_message(
                             clipboard_task: parts.clipboard_task,
                             elevation_task: parts.elevation_task,
                             session_tag,
+                            quality_preset: QualityPreset::Auto,
                             disconnect_grace: DisconnectGrace::default(),
                         });
                     }
@@ -1335,6 +1355,20 @@ async fn handle_session_event(
                                 switch_display(ctx, active, id).await;
                             }
                         }
+                        Ok(ControlMessage::SetQuality { preset }) => {
+                            if let Some(active) = active.as_mut() {
+                                active.quality_preset = preset;
+                                if let Some(adapt_tx) = &active.video.adapt_tx {
+                                    let _ = adapt_tx.send(Feedback::Preset { preset });
+                                } else {
+                                    tracing::debug!(
+                                        label,
+                                        ?preset,
+                                        "set_quality received with adaptation disabled (--no-adapt), ignoring"
+                                    );
+                                }
+                            }
+                        }
                         Ok(ControlMessage::ClipboardText { text }) => {
                             // Wrong direction: `ClipboardText` is host ->
                             // client only on `control` (see
@@ -1505,6 +1539,16 @@ async fn switch_display(ctx: &HostContext, active: &mut ActiveSession, id: u32) 
             let from = active.video.display.id;
             let old = std::mem::replace(&mut active.video, new);
             old.stop();
+            // The new pipeline's `Controller` (if any) always starts fresh
+            // at `QualityPreset::Auto` -- re-apply the session's own choice
+            // (slice 3.5e) so a display switch doesn't silently revert it.
+            if active.quality_preset != QualityPreset::Auto {
+                if let Some(adapt_tx) = &active.video.adapt_tx {
+                    let _ = adapt_tx.send(Feedback::Preset {
+                        preset: active.quality_preset,
+                    });
+                }
+            }
             active
                 .router
                 .set_capture_rect(crate::input::CaptureRect::from(&active.video.display));
@@ -2319,6 +2363,90 @@ mod tests {
         .await;
 
         assert_eq!(fake_clipboard.set_calls(), vec!["from client".to_string()]);
+
+        if let Some(active) = active.take() {
+            active.shutdown().await;
+        }
+    }
+
+    /// `ControlMessage::SetQuality` arriving on the `control` channel must
+    /// reach the session's adaptation controller (slice 3.5e) -- proven
+    /// through the real `run_adapt_task` and its 1s ticker (`adapt::TICK`),
+    /// the same harness as `clipboard_text_on_input_channel_is_applied_directly_not_routed`
+    /// (no real WebRTC peer needed). There's no open data channel to read
+    /// `ControlMessage::Quality` back off of, so the effect is observed
+    /// through `VideoPipeline`'s test-only `rate_control` handle instead
+    /// (`run_adapt_task` calls `rate_control.set()` on every `Decision`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_quality_reaches_the_adapt_controller() {
+        let mut ctx = test_ctx();
+        ctx.adapt = true;
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+        let (status_tx, _status_rx) = watch::channel(AgentStatus::Connecting);
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+        assert!(active.is_some(), "session must have started successfully");
+        let _ = out_rx.try_recv(); // the Offer
+
+        assert_eq!(
+            active.as_ref().unwrap().video.rate_control.fps(),
+            30,
+            "starts pinned to the session's configured fps"
+        );
+
+        let msg = ControlMessage::SetQuality {
+            preset: QualityPreset::Sharp,
+        };
+        let data = serde_json::to_vec(&msg).unwrap();
+        handle_session_event(
+            SessionEvent::DataChannelMessage {
+                label: "control".to_string(),
+                data: data.into(),
+                is_string: true,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+        )
+        .await;
+
+        assert_eq!(
+            active.as_ref().unwrap().quality_preset,
+            QualityPreset::Sharp,
+            "the session remembers the chosen preset"
+        );
+
+        // `run_adapt_task` only applies a `Decision` to `RateControl` on its
+        // own 1s ticker (see that function's doc comment) -- wait a couple
+        // of ticks rather than racing it.
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert_eq!(
+            active.as_ref().unwrap().video.rate_control.fps(),
+            15,
+            "sharp's fps ceiling must have reached the controller and been applied"
+        );
 
         if let Some(active) = active.take() {
             active.shutdown().await;
