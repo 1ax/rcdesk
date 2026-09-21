@@ -21,7 +21,7 @@ use crate::input::Injector;
 use crate::input::NoopInjector;
 use crate::platform;
 use crate::signaling::{
-    AgentCommand, AgentStatus, BuildClipboard, ConnectError, HostContext, Keepalive,
+    AgentCommand, AgentStatus, BuildClipboard, ConnectError, HostContext, Keepalive, SessionSlot,
     SignalingClient,
 };
 use crate::transport::SessionConfig;
@@ -424,6 +424,17 @@ impl Backoff {
 /// sleep/advance below entirely -- this isn't a lost connection, just a
 /// device the server no longer knows, so there's no reason to wait or to
 /// disturb the backoff state a real connection failure is tracking.
+///
+/// A `SessionSlot` (slice 3.5a) is created once, above the loop, and lives
+/// across every reconnect: an active session is peer-to-peer and outlives
+/// the signaling connection that set it up, so losing the WebSocket must not
+/// tear it down. While there's no live connection -- mid-`connect` below, or
+/// sleeping out `backoff` at the bottom of the loop -- the slot's own
+/// `run_while_offline` keeps draining its session events and `commands` so
+/// input keeps flowing and `EndSession` still works (see that method's doc
+/// comment for why this isn't optional). After a successful registration,
+/// the status reported is `InSession` rather than `Registered` if a session
+/// survived the gap.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_agent(
     ctx: &HostContext,
@@ -436,10 +447,18 @@ pub async fn run_agent(
     mut commands: mpsc::UnboundedReceiver<AgentCommand>,
 ) -> anyhow::Result<std::convert::Infallible> {
     let mut backoff = Backoff::new(policy);
+    let mut slot = SessionSlot::new();
     loop {
         let _ = status.send(AgentStatus::Connecting);
         let device = device_store.load();
-        match SignalingClient::connect(server, name, device).await {
+        let connect_result = slot
+            .run_while_offline(
+                ctx,
+                &mut commands,
+                SignalingClient::connect(server, name, device),
+            )
+            .await;
+        match connect_result {
             Ok(client) => {
                 let pin = client.pin().to_string();
                 tracing::info!(
@@ -456,10 +475,21 @@ pub async fn run_agent(
                         );
                     }
                 }
-                let _ = status.send(AgentStatus::Registered { pin: pin.clone() });
+                // A session may have survived from before this reconnect
+                // (slice 3.5a) -- report that instead of claiming
+                // `Registered` with a session already running underneath.
+                let status_after_register = if slot.is_active() {
+                    AgentStatus::InSession { pin: pin.clone() }
+                } else {
+                    AgentStatus::Registered { pin: pin.clone() }
+                };
+                let _ = status.send(status_after_register);
                 backoff.reset();
 
-                if let Err(err) = client.run(ctx, &status, keepalive, &mut commands).await {
+                if let Err(err) = client
+                    .run(ctx, &status, keepalive, &mut commands, &mut slot)
+                    .await
+                {
                     let retry_in = backoff.current();
                     tracing::warn!(
                         error = %err,
@@ -520,7 +550,8 @@ pub async fn run_agent(
                 });
             }
         }
-        tokio::time::sleep(backoff.current()).await;
+        slot.run_while_offline(ctx, &mut commands, tokio::time::sleep(backoff.current()))
+            .await;
         backoff.advance();
     }
 }

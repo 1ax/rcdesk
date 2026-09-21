@@ -176,8 +176,11 @@ async fn run_host(
         let _ = displaced.host_tx.send(SignalMessage::Error {
             message: "replaced by a new connection".to_string(),
         });
-        if let Some((session_id, client_tx)) = displaced.session {
-            let _ = client_tx.send(SignalMessage::Bye { session_id });
+        if let Some((session_id, _client_tx)) = displaced.session {
+            // The session is P2P; losing signaling (here, the host's old
+            // socket being displaced) doesn't tear it down, so the client is
+            // not told `Bye` -- it keeps talking to the host directly.
+            tracing::info!(%session_id, "session left to p2p after signaling loss");
         }
     }
     let _ = tx.send(SignalMessage::Registered {
@@ -244,9 +247,11 @@ async fn run_host(
                         let _ = client_tx.send(SignalMessage::Bye { session_id });
                     }
                     None => {
-                        let _ = tx.send(SignalMessage::Error {
-                            message: "not in session".to_string(),
-                        });
+                        // Unknown to the server -- most likely a stale
+                        // `session_id` from before a signaling reconnect
+                        // (slice 3.5a). The session is P2P and may well still
+                        // be live; a quiet no-op instead of `Error`.
+                        tracing::debug!(%session_id, "bye for a session not in session");
                     }
                 }
             }
@@ -260,8 +265,10 @@ async fn run_host(
     }
 
     tracing::info!(host_id = %host_id, "host disconnected");
-    if let Some((session_id, client_tx)) = registry.unregister_host(&host_id, &tx) {
-        let _ = client_tx.send(SignalMessage::Bye { session_id });
+    if let Some((session_id, _client_tx)) = registry.unregister_host(&host_id, &tx) {
+        // Same reasoning as the displaced-connection case above: the socket
+        // closing doesn't mean the P2P session is over, so no `Bye`.
+        tracing::info!(%session_id, "session left to p2p after signaling loss");
     }
 }
 
@@ -536,9 +543,11 @@ async fn run_client(
                         let _ = host_tx.send(SignalMessage::Bye { session_id });
                     }
                     None => {
-                        let _ = tx.send(SignalMessage::Error {
-                            message: "not in session".to_string(),
-                        });
+                        // Unknown to the server -- most likely a stale
+                        // `session_id` from before a signaling reconnect
+                        // (slice 3.5a). The session is P2P and may well still
+                        // be live; a quiet no-op instead of `Error`.
+                        tracing::debug!(%session_id, "bye for a session not in session");
                     }
                 }
             }
@@ -551,8 +560,9 @@ async fn run_client(
         }
     }
 
-    if let Some((session_id, host_tx)) = registry.disconnect_client(&tx) {
-        tracing::info!(%session_id, "client disconnected");
-        let _ = host_tx.send(SignalMessage::Bye { session_id });
+    if let Some((session_id, _host_tx)) = registry.disconnect_client(&tx) {
+        // Same reasoning as the host-side disconnect above: the socket
+        // closing doesn't mean the P2P session is over, so no `Bye`.
+        tracing::info!(%session_id, "session left to p2p after signaling loss");
     }
 }

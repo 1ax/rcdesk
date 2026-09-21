@@ -142,4 +142,71 @@ describe("SignalingClient", () => {
     expect(errorSpy).toHaveBeenCalled();
     errorSpy.mockRestore();
   });
+
+  // Slice 3.5a: losing the signaling WebSocket must not prevent
+  // reconnecting -- `app.ts` calls `connect()` again on `close`.
+  it("lets connect() be called again after the socket closes, sending hello first on the new one", () => {
+    const sockets: FakeWebSocket[] = [];
+    const client = new SignalingClient((_url) => {
+      const ws = new FakeWebSocket();
+      sockets.push(ws);
+      return ws;
+    });
+
+    client.connect("ws://example.test/ws");
+    sockets[0].open();
+    sockets[0].close();
+
+    client.connect("ws://example.test/ws");
+    expect(sockets).toHaveLength(2);
+    sockets[1].open();
+
+    expect(sockets[1].sent.map((f) => JSON.parse(f).type)).toEqual(["hello"]);
+  });
+
+  it("drops messages queued before a close instead of replaying them after reconnect", () => {
+    const sockets: FakeWebSocket[] = [];
+    const client = new SignalingClient((_url) => {
+      const ws = new FakeWebSocket();
+      sockets.push(ws);
+      return ws;
+    });
+
+    client.connect("ws://example.test/ws");
+    client.join("111111"); // queued: socket still CONNECTING
+    sockets[0].close(); // never opened -- the queued join must be dropped
+
+    client.connect("ws://example.test/ws");
+    sockets[1].open();
+
+    expect(sockets[1].sent.map((f) => JSON.parse(f).type)).toEqual(["hello"]);
+  });
+
+  it("send() does not throw when there is no socket at all", () => {
+    const client = new SignalingClient((_url) => new FakeWebSocket());
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    expect(() => client.send({ type: "bye", session_id: "sess-1" })).not.toThrow();
+
+    expect(errorSpy).toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it("send() does not throw once the socket has closed", () => {
+    let ws!: FakeWebSocket;
+    const client = new SignalingClient((_url) => {
+      ws = new FakeWebSocket();
+      return ws;
+    });
+    client.connect("ws://example.test/ws");
+    ws.open();
+    ws.close();
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    expect(() => client.join("111111")).not.toThrow();
+
+    expect(errorSpy).toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
 });

@@ -7,6 +7,15 @@
 //! which loops `SignalingClient::connect` + `run()` with backoff (slice
 //! 2.6a): `run()` itself still just returns an `Err` the moment the
 //! connection is lost, same as before.
+//!
+//! The one active session's state lives in `SessionSlot`, owned by
+//! `run_agent` across every reconnect (slice 3.5a): a session is
+//! peer-to-peer once its `RTCPeerConnection` is up, so losing the signaling
+//! WebSocket -- a server restart, a flaky network -- does not end it. `run()`
+//! takes the slot as `&mut` and no longer shuts an active session down when
+//! it returns; `run_agent` keeps draining the slot's events/commands
+//! (`SessionSlot::run_while_offline`) even while there's no connection to
+//! reconnect on.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -333,12 +342,19 @@ impl SignalingClient {
     /// `commands` is the tray agent's "End session" (and any future command,
     /// slice 2.6c) input, owned by `app::run_agent` across every reconnect
     /// -- see `AgentCommand`'s doc comment.
+    ///
+    /// `slot` is the one active session's state (`SessionSlot`), also owned
+    /// by `app::run_agent` across every reconnect (slice 3.5a). Unlike
+    /// before 3.5a, `run` does **not** shut an active session down when it
+    /// returns -- losing signaling doesn't end a peer-to-peer session, only
+    /// the ability to set up a new one until the socket comes back.
     pub async fn run(
         self,
         ctx: &HostContext,
         status: &watch::Sender<AgentStatus>,
         keepalive: Keepalive,
         commands: &mut mpsc::UnboundedReceiver<AgentCommand>,
+        slot: &mut SessionSlot,
     ) -> anyhow::Result<()> {
         let SignalingClient {
             host_id,
@@ -378,10 +394,6 @@ impl SignalingClient {
             let _ = write.close().await;
         });
 
-        let (event_tx, mut event_rx) = mpsc::channel::<SessionEvent>(64);
-        let mut active: Option<ActiveSession> = None;
-        let mut current_session_id: Option<String> = None;
-
         let mut last_incoming = Instant::now();
         let mut timeout_checker = tokio::time::interval(keepalive.interval);
         timeout_checker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -418,17 +430,17 @@ impl SignalingClient {
                         &pin,
                         status,
                         &out_tx,
-                        event_tx.clone(),
-                        &mut active,
-                        &mut current_session_id,
+                        slot.event_tx.clone(),
+                        &mut slot.active,
+                        &mut slot.current_session_id,
                     )
                     .await;
                 }
-                Some(event) = event_rx.recv() => {
-                    handle_session_event(event, ctx, &pin, status, &out_tx, &mut active, &mut current_session_id).await;
+                Some(event) = slot.event_rx.recv() => {
+                    handle_session_event(event, ctx, &pin, status, &out_tx, &mut slot.active, &mut slot.current_session_id).await;
                 }
                 Some(cmd) = commands.recv() => {
-                    handle_agent_command(cmd, &pin, status, &out_tx, &mut active, &mut current_session_id).await;
+                    handle_agent_command(cmd, &pin, status, &out_tx, &mut slot.active, &mut slot.current_session_id).await;
                 }
                 _ = timeout_checker.tick() => {
                     let silence = last_incoming.elapsed();
@@ -441,9 +453,9 @@ impl SignalingClient {
             }
         }
 
-        if let Some(active) = active.take() {
-            active.shutdown().await;
-        }
+        // Deliberately no `slot.active` shutdown here (slice 3.5a): the
+        // session is peer-to-peer and outlives this signaling connection --
+        // `run_agent` keeps it alive across the reconnect that follows.
         drop(out_tx);
         // On a dead (half-open) connection the writer's close handshake can
         // block on the socket; don't let that stall the reconnect.
@@ -739,6 +751,107 @@ impl ActiveSession {
         if let Some(task) = self.elevation_task {
             task.abort();
         }
+    }
+}
+
+/// The one active session's state (if any), owned by `app::run_agent`
+/// across every signaling reconnect (slice 3.5a). A session is
+/// peer-to-peer once its `RTCPeerConnection` is up -- signaling only sets it
+/// up -- so losing the WebSocket (server restart, flaky network on either
+/// side) must not tear it down; only the ability to negotiate a *new*
+/// session is gone until the socket comes back. `SignalingClient::run`
+/// takes this as `&mut` instead of owning equivalent fields itself, and no
+/// longer shuts an active session down on exit.
+pub struct SessionSlot {
+    active: Option<ActiveSession>,
+    current_session_id: Option<String>,
+    event_tx: mpsc::Sender<SessionEvent>,
+    event_rx: mpsc::Receiver<SessionEvent>,
+}
+
+impl SessionSlot {
+    pub fn new() -> Self {
+        // Same bound as before 3.5a (when this channel was created fresh
+        // inside `run`): unchanged, just moved here so it -- and any event
+        // already queued on it -- survives a reconnect instead of being
+        // dropped and recreated on every `SignalingClient::run` call.
+        let (event_tx, event_rx) = mpsc::channel(64);
+        Self {
+            active: None,
+            current_session_id: None,
+            event_tx,
+            event_rx,
+        }
+    }
+
+    /// Whether a session is live right now. `app::run_agent` checks this
+    /// right after a fresh registration to pick `AgentStatus::InSession`
+    /// (the session survived the reconnect) over `AgentStatus::Registered`.
+    pub fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    /// Drains this slot's session events and `AgentCommand`s while `future`
+    /// runs, for stretches with no live signaling connection to hand them to
+    /// -- `app::run_agent` mid-`connect` attempt, or sleeping out its
+    /// backoff. This isn't optional: `event_rx` is bounded (64) and its
+    /// senders live on the session's own WebRTC tasks (input arriving over
+    /// data channels, connection-state changes, ...) -- left undrained past
+    /// one reconnect cycle, they'd block. `AgentCommand::EndSession` still
+    /// ends the session locally (nothing else can do it while offline);
+    /// there's simply no connection left to send its `Bye` on. Both
+    /// handlers get throwaway `status`/`out_tx` stand-ins: the real agent
+    /// status must not flip to `Registered`/`InSession` just because a
+    /// session event fired while there's nothing registered to report, and
+    /// an outgoing `SignalMessage` has nowhere to go anyway.
+    pub async fn run_while_offline<F, T>(
+        &mut self,
+        ctx: &HostContext,
+        commands: &mut mpsc::UnboundedReceiver<AgentCommand>,
+        future: F,
+    ) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let (discard_status, _discard_status_rx) = watch::channel(AgentStatus::Connecting);
+        let (discard_out_tx, discard_out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        drop(discard_out_rx);
+
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                result = &mut future => return result,
+                Some(event) = self.event_rx.recv() => {
+                    handle_session_event(
+                        event,
+                        ctx,
+                        "",
+                        &discard_status,
+                        &discard_out_tx,
+                        &mut self.active,
+                        &mut self.current_session_id,
+                    )
+                    .await;
+                }
+                Some(cmd) = commands.recv() => {
+                    handle_agent_command(
+                        cmd,
+                        "",
+                        &discard_status,
+                        &discard_out_tx,
+                        &mut self.active,
+                        &mut self.current_session_id,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+}
+
+impl Default for SessionSlot {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -2061,6 +2174,146 @@ mod tests {
         assert!(
             !status_rx.has_changed().unwrap(),
             "status must not change when there was no active session"
+        );
+    }
+
+    /// Slice 3.5a: `run` must not shut an active session down when it
+    /// returns -- a P2P session outlives the signaling connection that set
+    /// it up. Proven end to end against a fake server: register, trigger a
+    /// session via `PeerJoined` (real `start_session`/`PeerSession`, same as
+    /// `peer_joined_sends_bye_when_session_start_fails` above), wait for the
+    /// host's `Offer` as proof it started, then drop the connection. `run`
+    /// must return an error, and the slot -- the observable way to check
+    /// this without reaching into `ActiveSession`'s private internals --
+    /// must still report a live session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_leaves_the_slot_session_active_when_the_connection_drops() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}/ws");
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = ws.next().await; // Hello
+            let _ = ws.next().await; // HostRegister
+            let registered = serde_json::to_string(&SignalMessage::Registered {
+                host_id: "host-1".to_string(),
+                pin: "111111".to_string(),
+                ice_servers: vec![],
+                device: None,
+            })
+            .unwrap();
+            ws.send(Message::text(registered)).await.unwrap();
+
+            let peer_joined = serde_json::to_string(&SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+                ice_servers: vec![],
+            })
+            .unwrap();
+            ws.send(Message::text(peer_joined)).await.unwrap();
+
+            // Wait for the host's Offer (proof the session actually
+            // started) before dropping the connection out from under it.
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(SignalMessage::Offer { .. }) =
+                            serde_json::from_str::<SignalMessage>(&text)
+                        {
+                            break;
+                        }
+                    }
+                    other => panic!("connection ended before an Offer arrived: {other:?}"),
+                }
+            }
+            drop(ws);
+        });
+
+        let client = SignalingClient::connect(&url, "test-host", None)
+            .await
+            .expect("connect");
+        let ctx = test_ctx();
+        let (status_tx, _status_rx) = watch::channel(AgentStatus::Connecting);
+        let (_cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<AgentCommand>();
+        let mut slot = SessionSlot::new();
+
+        let result = client
+            .run(
+                &ctx,
+                &status_tx,
+                Keepalive::default(),
+                &mut cmd_rx,
+                &mut slot,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "run must return once the server drops the connection"
+        );
+
+        assert!(
+            slot.is_active(),
+            "the P2P session must survive the signaling connection dropping"
+        );
+
+        if let Some(active) = slot.active.take() {
+            active.shutdown().await;
+        }
+    }
+
+    /// Slice 3.5a: `SessionSlot::run_while_offline` must still drain and act
+    /// on session events while there's no live signaling connection --
+    /// otherwise input arriving over data channels would stall (the event
+    /// channel is bounded) and e.g. the peer connection failing would never
+    /// free the slot. Exercised directly on the slot: start a session, feed
+    /// it a `ConnectionState(Closed)` event through the slot's own
+    /// `event_tx` (the same channel `PeerSession` reports through in
+    /// production), and confirm `run_while_offline` frees the slot before
+    /// the passed-in future resolves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_while_offline_still_frees_the_slot_on_connection_state_closed() {
+        let ctx = test_ctx();
+        let mut slot = SessionSlot::new();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (status_tx, _status_rx) = watch::channel(AgentStatus::Connecting);
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            slot.event_tx.clone(),
+            &mut slot.active,
+            &mut slot.current_session_id,
+        )
+        .await;
+        assert!(slot.is_active(), "session must have started successfully");
+        let _ = out_rx.try_recv(); // the Offer
+
+        slot.event_tx
+            .send(SessionEvent::ConnectionState(
+                RTCPeerConnectionState::Closed,
+            ))
+            .await
+            .expect("the slot's own event channel must accept a send");
+
+        let (_cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<AgentCommand>();
+        slot.run_while_offline(&ctx, &mut cmd_rx, async {
+            // Give the offline select loop a turn to drain the event above
+            // before the wrapped future resolves.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        })
+        .await;
+
+        assert!(
+            !slot.is_active(),
+            "a ConnectionState(Closed) event must free the slot even while offline"
         );
     }
 }

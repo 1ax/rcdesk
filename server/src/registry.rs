@@ -69,8 +69,9 @@ pub struct Registry {
 /// persistent id, so a reconnecting host -- e.g. after 2.6a's backoff,
 /// before the server notices the old socket is dead -- registers again
 /// under an id that's still "live"). The caller (`ws.rs`) uses `host_tx` to
-/// tell the old connection it's been replaced, and, if it was in a session,
-/// `session` to tell that session's client `Bye`.
+/// tell the old connection it's been replaced. `session`, if the old
+/// connection was in one, is returned so the caller can log it -- the P2P
+/// session itself is left alone (slice 3.5a: no `Bye` on signaling loss).
 pub struct Displaced {
     pub host_tx: Tx,
     pub session: Option<(String, Tx)>,
@@ -137,8 +138,9 @@ impl Registry {
     /// connection's own disconnect (it was already removed from the
     /// registry by `register_host`) must not tear down whatever new
     /// connection has since taken over `host_id`. If the host had an active
-    /// session, returns that session's id and the client's tx so the caller
-    /// can notify the client with `Bye`.
+    /// session, returns that session's id and the client's tx for the
+    /// caller to log (slice 3.5a: the P2P session itself is left running,
+    /// no `Bye` is sent for a signaling-only disconnect).
     pub fn unregister_host(&self, host_id: &str, tx: &Tx) -> Option<(String, Tx)> {
         let mut inner = self.inner.lock().expect("registry mutex poisoned");
         if !inner
@@ -309,7 +311,9 @@ impl Registry {
 
     /// Called when a client connection is dropped without an explicit `Bye`.
     /// Scans active sessions for one whose client tx is `client_tx`, removes
-    /// it, frees the host, and returns `(session_id, host_tx)` to notify.
+    /// it, frees the host, and returns `(session_id, host_tx)` for the
+    /// caller to log (slice 3.5a: no `Bye` is sent for a signaling-only
+    /// disconnect -- the P2P session is left running).
     pub fn disconnect_client(&self, client_tx: &Tx) -> Option<(String, Tx)> {
         let mut inner = self.inner.lock().expect("registry mutex poisoned");
         let session_id = inner

@@ -27,6 +27,7 @@ import {
   saveOwnerToken,
   sortDevices,
 } from "./myDevices";
+import { reconnectBackoffMs } from "./reconnectBackoff";
 import type { ControlMessage } from "./generated/ControlMessage";
 import type { DisplayEntry } from "./generated/DisplayEntry";
 import type { DeviceEntry } from "./generated/DeviceEntry";
@@ -280,9 +281,14 @@ export function mount(root: Element | null): void {
   // which resets this when the user clicks anything else).
   let confirmingForgetId: string | null = null;
   // Set once the signaling socket itself closes (not just a session ending)
-  // -- disables every connect affordance, since there is nothing to
-  // reconnect to yet (auto-reconnect is slice 3.5, not this one).
+  // -- disables every connect affordance until `scheduleReconnect`'s next
+  // attempt succeeds (slice 3.5a; the live WebRTC session, if any, is
+  // untouched -- signaling is only needed to set one up).
   let connectionLost = false;
+  // Attempt counter for `scheduleReconnect`'s backoff (`reconnectBackoffMs`);
+  // reset to 0 once `authenticated` confirms the reconnect worked.
+  let reconnectAttempt = 0;
+  let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let deviceListTimer: ReturnType<typeof setInterval> | undefined;
 
   /** Shows `note` in `#clipboard-note` for `CLIPBOARD_NOTE_MS`, used as
@@ -455,6 +461,31 @@ export function mount(root: Element | null): void {
       clearInterval(deviceListTimer);
       deviceListTimer = undefined;
     }
+  }
+
+  function stopReconnectTimer(): void {
+    if (reconnectTimer !== undefined) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
+    }
+  }
+
+  /** Schedules the next signaling reconnect attempt after the WebSocket
+   * closes (slice 3.5a). The delay follows `reconnectBackoffMs`'s schedule
+   * (1, 2, 4, 8, 16, 30s); a failed attempt (server still down) reaches
+   * `close` again, which calls this again for the next attempt, and a
+   * successful one is detected in the `authenticated` handler, which resets
+   * `reconnectAttempt` back to 0. Only the signaling connection is affected
+   * -- an already-live WebRTC session doesn't need it and is left running. */
+  function scheduleReconnect(): void {
+    stopReconnectTimer();
+    reconnectAttempt += 1;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = undefined;
+      signaling.connect(signalUrl());
+      const storage = ownerStorage();
+      signaling.send({ type: "client_auth", token: storage ? loadOwnerToken(storage) : null });
+    }, reconnectBackoffMs(reconnectAttempt));
   }
 
   /** Polls the device list every `DEVICE_LIST_INTERVAL_MS` while the
@@ -696,6 +727,19 @@ export function mount(root: Element | null): void {
     if (storage) saveOwnerToken(storage, msg.token);
     devices = msg.devices;
     renderDeviceList();
+    // Confirms a reconnect (slice 3.5a) succeeded, if that's what this is --
+    // a no-op the rest of the time, since `connectionLost` starts `false`.
+    if (connectionLost) {
+      connectionLost = false;
+      reconnectAttempt = 0;
+      pinStatus.textContent = "";
+      connectBtn.disabled = connectionLost;
+      // Only while the PIN/list screen is actually showing -- during a
+      // session this loop stays stopped, same as `showSessionScreen` left it
+      // (see `startDeviceListLoop`'s doc comment).
+      if (!pinScreen.hidden) startDeviceListLoop();
+      renderDeviceList();
+    }
   });
 
   signaling.on("devices", (msg) => {
@@ -790,7 +834,14 @@ export function mount(root: Element | null): void {
     });
   });
 
-  signaling.on("bye", () => {
+  signaling.on("bye", (msg) => {
+    // A `bye` for a session that isn't the current one is stale -- e.g. one
+    // sent for a session that already ended some other way before a
+    // signaling reconnect (slice 3.5a; the server itself no longer sends
+    // `bye` at all for a plain signaling-only disconnect, see
+    // `server/src/ws.rs`, but an explicit `bye` can still race a reconnect).
+    // Tearing down whatever session *is* now running would be wrong.
+    if (msg.session_id !== sessionId) return;
     setSessionStatus("disconnected");
     teardown("Сеанс завершён");
   });
@@ -816,14 +867,17 @@ export function mount(root: Element | null): void {
   // Not a `SignalMessage` (so not reachable through `.on`, whose listener
   // type is keyed on `SignalMessage["type"]`) -- `SignalingClient` extends
   // `EventTarget` and dispatches this itself on the underlying WebSocket's
-  // `close` (see `signaling.ts`). No auto-reconnect here (slice 3.5): just
-  // tell the owner and stop offering ways to start a new session.
+  // `close` (see `signaling.ts`). Slice 3.5a: signaling is only needed to
+  // set a session up, not to keep one running, so a live WebRTC session is
+  // left completely alone here -- only the ability to start a *new* one is
+  // disabled until `scheduleReconnect` gets the socket back.
   signaling.addEventListener("close", () => {
     connectionLost = true;
-    pinStatus.textContent = "Нет связи с сервером — обновите страницу";
+    pinStatus.textContent = "Нет связи с сервером — переподключаюсь…";
     connectBtn.disabled = true;
     stopDeviceListLoop();
     renderDeviceList();
+    scheduleReconnect();
   });
 
   // A tab brought back into view may have missed a while of state changes
@@ -833,6 +887,19 @@ export function mount(root: Element | null): void {
     if (document.visibilityState === "visible" && !pinScreen.hidden) {
       signaling.send({ type: "list_devices" });
     }
+  });
+
+  // Best-effort notice that this tab is going away (slice 3.5a): `pagehide`
+  // fires reliably on navigation/tab close/reload (unlike `beforeunload`,
+  // unreliable on mobile Safari in particular). Not guaranteed to reach the
+  // server -- the socket may already be down -- but when it does, the host
+  // learns the session is over immediately instead of only noticing once its
+  // own connection drops.
+  window.addEventListener("pagehide", () => {
+    if (sessionId) {
+      signaling.send({ type: "bye", session_id: sessionId });
+    }
+    session?.close();
   });
 
   // One connection for the whole tab (see where `signaling` is declared

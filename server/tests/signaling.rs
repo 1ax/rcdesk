@@ -14,6 +14,10 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const TIMEOUT: Duration = Duration::from_secs(2);
+/// Used where a test asserts the server stays *silent* (slice 3.5a: no
+/// `Bye` for a signaling-only disconnect, no `Error` for a stale `Bye`) --
+/// short because we're waiting for a negative to hold, not for an event.
+const SILENCE_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// Boots the signaling app on an OS-assigned port and returns its ws:// URL.
 async fn spawn_server() -> String {
@@ -62,6 +66,20 @@ async fn recv(ws: &mut WsStream) -> SignalMessage {
             }
             Message::Ping(_) | Message::Pong(_) => continue,
             other => panic!("unexpected non-text frame: {other:?}"),
+        }
+    }
+}
+
+/// Asserts no message arrives on `ws` within `dur`. Used to check the
+/// server stays silent about something (see `SILENCE_TIMEOUT`).
+async fn expect_silence(ws: &mut WsStream, dur: Duration) {
+    if let Ok(item) = timeout(dur, ws.next()).await {
+        match item {
+            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Text(text))) => panic!("expected silence, got {text}"),
+            Some(Ok(other)) => panic!("expected silence, got {other:?}"),
+            Some(Err(err)) => panic!("expected silence, got transport error {err:?}"),
+            None => {}
         }
     }
 }
@@ -332,27 +350,31 @@ async fn second_client_on_busy_host_gets_error() {
     }
 }
 
-// (f) client disconnects -> host gets Bye -> a new client can join with the
-// same PIN.
+// (f) client disconnects -> the P2P session is left running, so the host
+// gets no `Bye` (slice 3.5a) -- but the registry still frees the host, so a
+// new client can join with the same PIN. Joining may need a retry or two:
+// the server processes the closed socket asynchronously, so there's a short
+// window right after `drop` where the host still looks busy.
 #[tokio::test]
-async fn client_disconnect_frees_host_for_new_client() {
+async fn client_disconnect_frees_host_without_sending_bye() {
     let url = spawn_server().await;
-    let (mut host, client, session_id, pin) = host_and_joined_client(&url).await;
+    let (mut host, client, _session_id, pin) = host_and_joined_client(&url).await;
 
     drop(client);
 
-    match recv(&mut host).await {
-        SignalMessage::Bye { session_id: sid } => assert_eq!(sid, session_id),
-        other => panic!("expected bye, got {other:?}"),
-    }
+    expect_silence(&mut host, SILENCE_TIMEOUT).await;
 
     let mut new_client = connect(&url).await;
     hello(&mut new_client, Role::Client).await;
-    send(&mut new_client, &SignalMessage::Join { pin }).await;
-
-    match recv(&mut new_client).await {
-        SignalMessage::Joined { .. } => {}
-        other => panic!("expected joined, got {other:?}"),
+    loop {
+        send(&mut new_client, &SignalMessage::Join { pin: pin.clone() }).await;
+        match recv(&mut new_client).await {
+            SignalMessage::Joined { .. } => break,
+            SignalMessage::Error { message } if message == "host busy" => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => panic!("expected joined or host busy, got {other:?}"),
+        }
     }
 }
 
@@ -532,9 +554,11 @@ async fn reconnecting_with_unknown_device_id_is_rejected() {
 
 // (l) a second connection presenting the same device credentials displaces
 // the first: the first gets Error{"replaced by a new connection"}, and the
-// client of its active session gets Bye with that session's id.
+// client of its active session gets no `Bye` (slice 3.5a: the P2P session
+// is left running) -- the new connection still registers under the same
+// host_id.
 #[tokio::test]
-async fn re_registering_same_device_displaces_old_connection_and_ends_its_session() {
+async fn re_registering_same_device_displaces_old_connection_without_bye_to_its_client() {
     let url = spawn_server().await;
 
     let mut host1 = connect(&url).await;
@@ -564,8 +588,8 @@ async fn re_registering_same_device_displaces_old_connection_and_ends_its_sessio
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
     send(&mut client, &SignalMessage::Join { pin: pin1.clone() }).await;
-    let session_id = match recv(&mut client).await {
-        SignalMessage::Joined { session_id, .. } => session_id,
+    match recv(&mut client).await {
+        SignalMessage::Joined { .. } => {}
         other => panic!("expected joined, got {other:?}"),
     };
     match recv(&mut host1).await {
@@ -588,10 +612,7 @@ async fn re_registering_same_device_displaces_old_connection_and_ends_its_sessio
         SignalMessage::Error { message } => assert_eq!(message, "replaced by a new connection"),
         other => panic!("expected error, got {other:?}"),
     }
-    match recv(&mut client).await {
-        SignalMessage::Bye { session_id: sid } => assert_eq!(sid, session_id),
-        other => panic!("expected bye, got {other:?}"),
-    }
+    expect_silence(&mut client, SILENCE_TIMEOUT).await;
     match recv(&mut host2).await {
         SignalMessage::Registered {
             host_id, device, ..
@@ -816,35 +837,38 @@ async fn connect_device_for_offline_device_returns_error() {
     hello(&mut client, Role::Client).await;
     client_auth(&mut client, None).await;
     send(&mut client, &SignalMessage::Join { pin }).await;
-    let session_id = match recv(&mut client).await {
-        SignalMessage::Joined { session_id, .. } => session_id,
+    match recv(&mut client).await {
+        SignalMessage::Joined { .. } => {}
         other => panic!("expected joined, got {other:?}"),
-    };
+    }
     match recv(&mut host).await {
         SignalMessage::PeerJoined { .. } => {}
         other => panic!("expected peer_joined, got {other:?}"),
     }
 
-    // Dropping the host ends its session; waiting for the client's Bye
-    // guarantees the server has already removed the host from the registry
-    // before we send ConnectDevice below (same connection, so ordering is
-    // guaranteed).
+    // Dropping the host no longer sends the client a `Bye` (slice 3.5a), so
+    // there's nothing to wait on for the server to notice the closed socket
+    // and remove the host from the registry. Retry `ConnectDevice` until
+    // that's happened -- while it's still in flight the host looks busy
+    // (its stale session hasn't been cleared yet), not offline.
     drop(host);
-    match recv(&mut client).await {
-        SignalMessage::Bye { session_id: sid } => assert_eq!(sid, session_id),
-        other => panic!("expected bye, got {other:?}"),
-    }
-
-    send(
-        &mut client,
-        &SignalMessage::ConnectDevice { device_id: host_id },
-    )
-    .await;
-
-    match recv(&mut client).await {
-        SignalMessage::Error { message } => assert_eq!(message, "device offline"),
-        other => panic!("expected error, got {other:?}"),
-    }
+    let message = loop {
+        send(
+            &mut client,
+            &SignalMessage::ConnectDevice {
+                device_id: host_id.clone(),
+            },
+        )
+        .await;
+        match recv(&mut client).await {
+            SignalMessage::Error { message } if message == "host busy" => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            SignalMessage::Error { message } => break message,
+            other => panic!("expected error, got {other:?}"),
+        }
+    };
+    assert_eq!(message, "device offline");
 }
 
 // (t) ListDevices and ConnectDevice before any ClientAuth -> Error{"not
@@ -933,4 +957,47 @@ async fn rename_device_updates_alias_and_forget_device_removes_it() {
         SignalMessage::Devices { devices } => assert!(devices.is_empty()),
         other => panic!("expected devices, got {other:?}"),
     }
+}
+
+// (v) `Bye` for a session_id the server doesn't know -- from a host or from
+// a client -- is a silent no-op, not `Error{"not in session"}` (slice 3.5a:
+// a stale `Bye` sent after a signaling reconnect, e.g. for a session that
+// already ended some other way, shouldn't look like a protocol violation).
+#[tokio::test]
+async fn bye_for_unknown_session_from_host_or_client_is_a_silent_no_op() {
+    let url = spawn_server().await;
+
+    let mut host = connect(&url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: None,
+        },
+    )
+    .await;
+    match recv(&mut host).await {
+        SignalMessage::Registered { .. } => {}
+        other => panic!("expected registered, got {other:?}"),
+    }
+    send(
+        &mut host,
+        &SignalMessage::Bye {
+            session_id: "no-such-session".to_string(),
+        },
+    )
+    .await;
+    expect_silence(&mut host, SILENCE_TIMEOUT).await;
+
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    send(
+        &mut client,
+        &SignalMessage::Bye {
+            session_id: "no-such-session".to_string(),
+        },
+    )
+    .await;
+    expect_silence(&mut client, SILENCE_TIMEOUT).await;
 }

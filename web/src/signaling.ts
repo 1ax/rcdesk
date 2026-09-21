@@ -71,6 +71,17 @@ export class SignalingClient extends EventTarget {
     });
 
     ws.addEventListener("close", () => {
+      // Only reset if `ws` is still the current socket -- a stale listener
+      // from a socket a previous `close()`/reconnect already replaced must
+      // not clobber the new one. Pending messages are dropped, not queued
+      // across the gap: they were addressed to a connection that's gone, and
+      // by the time a reconnect (see `app.ts`) succeeds they'd be stale
+      // anyway (slice 3.5a -- losing the WS must not affect a live WebRTC
+      // session, so nothing here is quietly retried).
+      if (this.ws === ws) {
+        this.ws = null;
+        this.pending = [];
+      }
       this.dispatchEvent(new CustomEvent("close"));
     });
 
