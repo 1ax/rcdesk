@@ -334,6 +334,10 @@ body {
   text-transform: none;
 }
 
+.fullscreen-note {
+  text-transform: none;
+}
+
 .display-select {
   font-size: 12px;
   padding: 4px 10px;

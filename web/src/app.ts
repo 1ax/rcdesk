@@ -17,6 +17,13 @@ import { attachInput } from "./input";
 import { ClipboardBridge, isSafari } from "./clipboard";
 import { applyCursor } from "./cursor";
 import { displayOptions, parseDisplayId, shouldShowPicker } from "./displays";
+import {
+  fullscreenButtonLabel,
+  fullscreenHintLabel,
+  isFullscreenSupported,
+  supportsKeyboardLock,
+} from "./fullscreen";
+import type { NavigatorWithKeyboard } from "./fullscreen";
 import { inputBlockedLabel } from "./inputBlocked";
 import { viewOnlyLabel } from "./inputStatus";
 import {
@@ -174,6 +181,10 @@ const DEVICE_LIST_INTERVAL_MS = 10000;
  * reports a too-large clipboard text (slice 2.5c, decision 5). */
 const CLIPBOARD_NOTE_MS = 4000;
 
+/** How long `#fullscreen-note` (the "for exit press/hold Esc" hint) stays
+ * visible after entering fullscreen (slice 3.5c). */
+const FULLSCREEN_NOTE_MS = 3000;
+
 /** Builds the PIN/session UI inside `root` and wires it up. `root` may be
  * `null` (e.g. in an environment without the expected markup) -- a no-op. */
 export function mount(root: Element | null): void {
@@ -212,7 +223,9 @@ export function mount(root: Element | null): void {
         <span id="view-only" class="status view-only" hidden></span>
         <span id="input-blocked" class="status input-blocked" hidden></span>
         <span id="clipboard-note" class="status clipboard-note" hidden></span>
+        <span id="fullscreen-note" class="status fullscreen-note" hidden></span>
         <span id="session-status" class="status"></span>
+        <button id="fullscreen-btn" class="btn btn-secondary" hidden>На весь экран</button>
         <button id="disconnect-btn" class="btn btn-secondary">Отключиться</button>
       </div>
     </div>
@@ -255,6 +268,11 @@ export function mount(root: Element | null): void {
   const viewOnlyEl = root.querySelector<HTMLSpanElement>("#view-only")!;
   const inputBlockedEl = root.querySelector<HTMLSpanElement>("#input-blocked")!;
   const clipboardNoteEl = root.querySelector<HTMLSpanElement>("#clipboard-note")!;
+  const fullscreenNoteEl = root.querySelector<HTMLSpanElement>("#fullscreen-note")!;
+  const fullscreenBtn = root.querySelector<HTMLButtonElement>("#fullscreen-btn")!;
+  // `document.fullscreenEnabled` doesn't change over a tab's lifetime, so
+  // this is decided once, here, rather than on every render (slice 3.5c).
+  fullscreenBtn.hidden = !isFullscreenSupported(document);
   const devicesEl = root.querySelector<HTMLDivElement>("#devices")!;
   const deviceListEl = root.querySelector<HTMLUListElement>("#device-list")!;
 
@@ -303,6 +321,7 @@ export function mount(root: Element | null): void {
   // so `teardown` knows whether to remove it.
   let clipboardChangeAttached = false;
   let clipboardNoteTimer: ReturnType<typeof setTimeout> | undefined;
+  let fullscreenNoteTimer: ReturnType<typeof setTimeout> | undefined;
   // The owner's device list (slice 3.1e), from `Authenticated`/`Devices` --
   // drives `renderDeviceList`. Empty until the first of either arrives.
   let devices: DeviceEntry[] = [];
@@ -367,6 +386,29 @@ export function mount(root: Element | null): void {
       clipboardNoteEl.textContent = "";
       clipboardNoteTimer = undefined;
     }, CLIPBOARD_NOTE_MS);
+  }
+
+  /** Shows `note` in `#fullscreen-note` for `FULLSCREEN_NOTE_MS` -- the "for
+   * exit press/hold Esc" hint shown once on entering fullscreen (see the
+   * `fullscreenchange` listener below). */
+  function showFullscreenNote(note: string): void {
+    fullscreenNoteEl.textContent = note;
+    fullscreenNoteEl.hidden = false;
+    if (fullscreenNoteTimer !== undefined) clearTimeout(fullscreenNoteTimer);
+    fullscreenNoteTimer = setTimeout(() => {
+      hideFullscreenNote();
+    }, FULLSCREEN_NOTE_MS);
+  }
+
+  /** Hides `#fullscreen-note` right away, e.g. on exiting fullscreen (so a
+   * still-pending hint from a brief fullscreen stay doesn't linger). */
+  function hideFullscreenNote(): void {
+    if (fullscreenNoteTimer !== undefined) {
+      clearTimeout(fullscreenNoteTimer);
+      fullscreenNoteTimer = undefined;
+    }
+    fullscreenNoteEl.hidden = true;
+    fullscreenNoteEl.textContent = "";
   }
 
   function onClipboardFocusOrGesture(): void {
@@ -808,6 +850,17 @@ export function mount(root: Element | null): void {
     recoveryAttempt = 0;
     recoveryWaitingForSocket = false;
     deviceId = null;
+    // Slice 3.5c: a final end of session (unlike `handleSessionLost` starting
+    // a recovery attempt, which leaves the session screen -- and fullscreen
+    // -- up) shouldn't leave the tab stuck in fullscreen with the PIN/list
+    // screen behind it. `exitFullscreen` is async; the `fullscreenchange`
+    // listener below does the rest (button label, Keyboard Lock unlock,
+    // refocus) once it resolves.
+    if (document.fullscreenElement === sessionScreen) {
+      void document.exitFullscreen().catch((err: unknown) => {
+        console.error("failed to exit fullscreen", err);
+      });
+    }
     stopSessionResources();
     updateConnectionBanner();
     // Unlike before this slice, the signaling connection itself is *not*
@@ -1198,6 +1251,47 @@ export function mount(root: Element | null): void {
       signaling.send({ type: "bye", session_id: sessionId });
     }
     teardown("Отключено");
+  });
+
+  fullscreenBtn.addEventListener("click", () => {
+    if (document.fullscreenElement) {
+      void document.exitFullscreen().catch((err: unknown) => {
+        console.error("failed to exit fullscreen", err);
+      });
+    } else {
+      void sessionScreen.requestFullscreen().catch((err: unknown) => {
+        console.error("failed to enter fullscreen", err);
+      });
+    }
+  });
+
+  // Slice 3.5c: fires for every fullscreen transition, however it happened
+  // (the button above, a long-press Esc while Keyboard Lock is active, or
+  // the browser force-exiting because `#session-screen` got hidden -- see
+  // `teardown`). Handles Keyboard Lock (Chrome only, see
+  // `fullscreen.supportsKeyboardLock`) and the button label/hint/focus in one
+  // place instead of duplicating them at every call site that can change
+  // fullscreen state.
+  document.addEventListener("fullscreenchange", () => {
+    const isFullscreen = document.fullscreenElement === sessionScreen;
+    fullscreenBtn.textContent = fullscreenButtonLabel(isFullscreen);
+    const nav = navigator as Navigator & NavigatorWithKeyboard;
+    if (isFullscreen) {
+      const keyboardLockActive = supportsKeyboardLock(nav);
+      if (keyboardLockActive) {
+        void nav.keyboard?.lock?.().catch((err: unknown) => {
+          console.error("failed to lock keyboard", err);
+        });
+      }
+      showFullscreenNote(fullscreenHintLabel(keyboardLockActive));
+    } else {
+      nav.keyboard?.unlock?.();
+      hideFullscreenNote();
+    }
+    // Keyboard input is listened for on `video` itself (see `input.ts`'s
+    // `attachInput`) -- give it focus back after the transition either way,
+    // same reasoning as the `click`/`change` listeners elsewhere in this file.
+    video.focus();
   });
 
   displaySelect.addEventListener("change", () => {
