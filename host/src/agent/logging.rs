@@ -19,7 +19,7 @@ const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Rotates `log_path` if it exists and is over `MAX_LOG_BYTES`, then
 /// installs a `tracing_subscriber` writing to it (append mode) with the
-/// same env-filter default (`RUST_LOG` or `info`) the CLI uses, plus a panic
+/// same env-filter default (`RUST_LOG` or `crate::DEFAULT_LOG_FILTER`) the CLI uses, plus a panic
 /// hook that logs the payload/location via `tracing::error!` before
 /// chaining to whatever hook was previously installed. Returns `log_path`
 /// unchanged, for the caller (`agent_main`) to show in the "Open log" menu
@@ -37,9 +37,7 @@ pub fn init(log_dir: &Path) -> io::Result<PathBuf> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                // `enigo=warn`: `agent::permissions::probe_permissions` builds an
-                // `Enigo` every 10s and enigo logs an `info!` line each time.
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,enigo=warn")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(crate::DEFAULT_LOG_FILTER)),
         )
         .with_ansi(false)
         .with_writer(Mutex::new(file))

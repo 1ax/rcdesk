@@ -333,7 +333,9 @@ unsafe fn soft_set_property(
     // SAFETY: forwarded from this function's own safety contract.
     let status = unsafe { VTSessionSetProperty(session, key, Some(value)) };
     if status != 0 {
-        tracing::warn!(
+        // `debug`, not `warn`: by definition non-fatal, and M4 rejects
+        // `MaxFrameDelayCount` on every single session (debt D12).
+        tracing::debug!(
             name,
             status,
             "VideoToolbox property not accepted, continuing without it"
