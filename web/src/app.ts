@@ -54,6 +54,7 @@ import {
 } from "./sessionBar";
 import { reconnectBackoffMs } from "./reconnectBackoff";
 import {
+  byeOutcome,
   connectionBannerLabel,
   connectionStateOutcome,
   DISCONNECT_GRACE_MS,
@@ -1327,6 +1328,18 @@ export function mount(root: Element | null): void {
     // `server/src/ws.rs`, but an explicit `bye` can still race a reconnect).
     // Tearing down whatever session *is* now running would be wrong.
     if (msg.session_id !== sessionId) return;
+    // Slice 3.2a/D35: a `bye` arriving while this end is itself sitting in
+    // its own `DISCONNECT_GRACE_MS` window is the host's side of the same
+    // race giving up first (its `DisconnectTimeout`/`Failed`/`Closed` now
+    // sends `Bye` too -- see `host/src/signaling/mod.rs`), not a
+    // deliberate end of session -- treat it as a lost session worth
+    // auto-recovering instead of a final teardown (see `byeOutcome`'s doc
+    // comment).
+    if (byeOutcome(disconnectGraceTimer !== undefined) === "session-lost") {
+      clearDisconnectGraceTimer();
+      handleSessionLost();
+      return;
+    }
     setSessionStatus("disconnected");
     teardown("Сеанс завершён");
   });

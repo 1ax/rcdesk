@@ -88,6 +88,29 @@ export type ConnectionBannerPhase =
   | { kind: "reconnecting"; attempt: number }
   | { kind: "streaming" };
 
+/** What a `bye` for the current session means, given whether a
+ * `DISCONNECT_GRACE_MS` window is already running on this end (slice
+ * 3.2a/D35):
+ * - `"teardown"`: no grace window running -- an ordinary end of session (the
+ *   peer closed the tab, `pc.close()`, ...). Tear down to the PIN/list
+ *   screen, same as before.
+ * - `"session-lost"`: a grace window *is* running, so this `bye` didn't come
+ *   from a peer ending the call -- it's the host's own end of the same
+ *   `DISCONNECT_GRACE`/`DISCONNECT_GRACE_MS` race giving up first
+ *   (`DisconnectTimeout`, or `Failed`/`Closed`, on `host/src/signaling/mod.rs`)
+ *   and telling the server with its own `Bye` (also slice 3.2a/D35). That's
+ *   "the host gave up too", not "the host deliberately ended the session" --
+ *   treat it exactly like this end's own grace window expiring, i.e. as a
+ *   lost session worth auto-recovering (`handleSessionLost`), not a final
+ *   `teardown`. By the time this arrives, the host's `close_session_by_host`
+ *   has already freed the device server-side, so the recovery attempt's
+ *   `connect_device` won't race into `host busy`. */
+export type ByeOutcome = "teardown" | "session-lost";
+
+export function byeOutcome(inDisconnectGrace: boolean): ByeOutcome {
+  return inDisconnectGrace ? "session-lost" : "teardown";
+}
+
 /** The banner text for `phase`, or `null` for `"streaming"` (hide it). */
 export function connectionBannerLabel(phase: ConnectionBannerPhase): string | null {
   switch (phase.kind) {

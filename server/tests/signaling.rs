@@ -119,6 +119,7 @@ async fn host_and_joined_client(url: &str) -> (WsStream, WsStream, String, Strin
         &SignalMessage::HostRegister {
             name: "Test Host".to_string(),
             device: None,
+            session_id: None,
         },
     )
     .await;
@@ -153,6 +154,7 @@ async fn host_registers_and_receives_six_digit_pin() {
         &SignalMessage::HostRegister {
             name: "My Mac".to_string(),
             device: None,
+            session_id: None,
         },
     )
     .await;
@@ -186,6 +188,7 @@ async fn client_join_succeeds_and_host_is_notified() {
         &SignalMessage::HostRegister {
             name: "My Mac".to_string(),
             device: None,
+            session_id: None,
         },
     )
     .await;
@@ -422,6 +425,7 @@ async fn host_without_device_credentials_is_issued_fresh_ones() {
         &SignalMessage::HostRegister {
             name: "My Mac".to_string(),
             device: None,
+            session_id: None,
         },
     )
     .await;
@@ -450,6 +454,7 @@ async fn reconnecting_with_issued_credentials_reuses_host_id() {
         &SignalMessage::HostRegister {
             name: "My Mac".to_string(),
             device: None,
+            session_id: None,
         },
     )
     .await;
@@ -471,6 +476,7 @@ async fn reconnecting_with_issued_credentials_reuses_host_id() {
         &SignalMessage::HostRegister {
             name: "My Mac".to_string(),
             device: Some(credentials),
+            session_id: None,
         },
     )
     .await;
@@ -500,6 +506,7 @@ async fn reconnecting_with_wrong_secret_is_rejected() {
         &SignalMessage::HostRegister {
             name: "My Mac".to_string(),
             device: None,
+            session_id: None,
         },
     )
     .await;
@@ -521,6 +528,7 @@ async fn reconnecting_with_wrong_secret_is_rejected() {
                 device_id: credentials.device_id,
                 secret: format!("{}-wrong", credentials.secret),
             }),
+            session_id: None,
         },
     )
     .await;
@@ -547,6 +555,7 @@ async fn reconnecting_with_unknown_device_id_is_rejected() {
                 device_id: "no-such-device".to_string(),
                 secret: "whatever".to_string(),
             }),
+            session_id: None,
         },
     )
     .await;
@@ -573,6 +582,7 @@ async fn re_registering_same_device_displaces_old_connection_without_bye_to_its_
         &SignalMessage::HostRegister {
             name: "Test Host".to_string(),
             device: None,
+            session_id: None,
         },
     )
     .await;
@@ -609,6 +619,7 @@ async fn re_registering_same_device_displaces_old_connection_without_bye_to_its_
         &SignalMessage::HostRegister {
             name: "Test Host".to_string(),
             device: Some(credentials),
+            session_id: None,
         },
     )
     .await;
@@ -687,6 +698,7 @@ async fn joining_by_pin_after_client_auth_links_device_to_owner() {
         &SignalMessage::HostRegister {
             name: "Test Host".to_string(),
             device: None,
+            session_id: None,
         },
     )
     .await;
@@ -740,6 +752,7 @@ async fn connect_device_starts_a_session_for_a_linked_device() {
         &SignalMessage::HostRegister {
             name: "Test Host".to_string(),
             device: None,
+            session_id: None,
         },
     )
     .await;
@@ -841,6 +854,7 @@ async fn connect_device_for_offline_device_returns_error() {
         &SignalMessage::HostRegister {
             name: "Test Host".to_string(),
             device: None,
+            session_id: None,
         },
     )
     .await;
@@ -927,6 +941,7 @@ async fn rename_device_updates_alias_and_forget_device_removes_it() {
         &SignalMessage::HostRegister {
             name: "Test Host".to_string(),
             device: None,
+            session_id: None,
         },
     )
     .await;
@@ -990,6 +1005,7 @@ async fn bye_for_unknown_session_from_host_or_client_is_a_silent_no_op() {
         &SignalMessage::HostRegister {
             name: "Test Host".to_string(),
             device: None,
+            session_id: None,
         },
     )
     .await;
@@ -1016,4 +1032,129 @@ async fn bye_for_unknown_session_from_host_or_client_is_a_silent_no_op() {
     )
     .await;
     expect_silence(&mut client, SILENCE_TIMEOUT).await;
+}
+
+// (w) slice 3.2a (D35): a host reconnecting to signaling while it still has
+// a live P2P session (a `session_id` the server itself has no `SessionEntry`
+// for -- the same "detached" shape a real signaling-only reconnect leaves
+// behind, slice 3.5a) marks the device busy: the linked owner's device list
+// shows `busy: true`, a second client can't `ConnectDevice` to it, and only
+// the host's own `Bye` for that session frees it again.
+#[tokio::test]
+async fn host_reconnect_with_live_session_id_marks_device_busy_until_bye() {
+    let url = spawn_server().await;
+
+    let mut host = connect(&url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: None,
+            session_id: None,
+        },
+    )
+    .await;
+    let (host_id, pin, credentials) = match recv(&mut host).await {
+        SignalMessage::Registered {
+            host_id,
+            pin,
+            device,
+            ..
+        } => (
+            host_id,
+            pin,
+            device.expect("first registration issues device credentials"),
+        ),
+        other => panic!("expected registered, got {other:?}"),
+    };
+
+    // Link the device to an owner by joining once via PIN, then end that
+    // session normally so the host is free again -- same setup as
+    // `connect_device_starts_a_session_for_a_linked_device`.
+    let mut owner = connect(&url).await;
+    hello(&mut owner, Role::Client).await;
+    let (token, _devices) = client_auth(&mut owner, None).await;
+    send(&mut owner, &SignalMessage::Join { pin }).await;
+    let session_id = match recv(&mut owner).await {
+        SignalMessage::Joined { session_id, .. } => session_id,
+        other => panic!("expected joined, got {other:?}"),
+    };
+    match recv(&mut host).await {
+        SignalMessage::PeerJoined { .. } => {}
+        other => panic!("expected peer_joined, got {other:?}"),
+    }
+    send(&mut owner, &SignalMessage::Bye { session_id }).await;
+    match recv(&mut host).await {
+        SignalMessage::Bye { .. } => {}
+        other => panic!("expected bye, got {other:?}"),
+    }
+    drop(owner);
+    drop(host);
+
+    // The host reconnects to signaling reporting the P2P session it still
+    // has live ("s-live") -- this fresh registry entry has no `SessionEntry`
+    // for it, same as a real signaling-only reconnect (slice 3.5a) would
+    // leave behind before the P2P side later reports back in.
+    let mut host2 = connect(&url).await;
+    hello(&mut host2, Role::Host).await;
+    send(
+        &mut host2,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: Some(credentials),
+            session_id: Some("s-live".to_string()),
+        },
+    )
+    .await;
+    match recv(&mut host2).await {
+        SignalMessage::Registered {
+            host_id: reused_host_id,
+            ..
+        } => assert_eq!(reused_host_id, host_id),
+        other => panic!("expected registered, got {other:?}"),
+    }
+
+    let mut viewer = connect(&url).await;
+    hello(&mut viewer, Role::Client).await;
+    let (_token2, devices) = client_auth(&mut viewer, Some(token.clone())).await;
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].device_id, host_id);
+    assert!(devices[0].busy, "device must be busy after re-attaching");
+
+    let mut second_client = connect(&url).await;
+    hello(&mut second_client, Role::Client).await;
+    client_auth(&mut second_client, Some(token.clone())).await;
+    send(
+        &mut second_client,
+        &SignalMessage::ConnectDevice {
+            device_id: host_id.clone(),
+        },
+    )
+    .await;
+    match recv(&mut second_client).await {
+        SignalMessage::Error { message } => assert_eq!(message, "host busy"),
+        other => panic!("expected error, got {other:?}"),
+    }
+
+    send(
+        &mut host2,
+        &SignalMessage::Bye {
+            session_id: "s-live".to_string(),
+        },
+    )
+    .await;
+    expect_silence(&mut host2, SILENCE_TIMEOUT).await;
+
+    send(&mut viewer, &SignalMessage::ListDevices).await;
+    match recv(&mut viewer).await {
+        SignalMessage::Devices { devices } => {
+            assert_eq!(devices.len(), 1);
+            assert!(
+                !devices[0].busy,
+                "device must be free again after the host's bye"
+            );
+        }
+        other => panic!("expected devices, got {other:?}"),
+    }
 }

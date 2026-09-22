@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  byeOutcome,
   connectionBannerLabel,
   connectionStateOutcome,
   MAX_RECOVERY_ATTEMPTS,
@@ -75,6 +76,16 @@ describe("shouldAttemptRecovery", () => {
 
   it("is false without one (unknown or a pre-3.5b server)", () => {
     expect(shouldAttemptRecovery(null)).toBe(false);
+  });
+});
+
+describe("byeOutcome", () => {
+  it("is session-lost when a disconnect grace window is already running", () => {
+    expect(byeOutcome(true)).toBe("session-lost");
+  });
+
+  it("is teardown when no grace window is running", () => {
+    expect(byeOutcome(false)).toBe("teardown");
   });
 });
 

@@ -127,8 +127,12 @@ async fn run_host(
     ice: &IceConfig,
     db: &Db,
 ) {
-    let (name, device) = match next_message(stream, &tx).await {
-        Some(SignalMessage::HostRegister { name, device }) => (name, device),
+    let (name, device, session_id) = match next_message(stream, &tx).await {
+        Some(SignalMessage::HostRegister {
+            name,
+            device,
+            session_id,
+        }) => (name, device, session_id),
         Some(_) => {
             let _ = tx.send(SignalMessage::Error {
                 message: "expected host_register".to_string(),
@@ -169,8 +173,26 @@ async fn run_host(
         DeviceAuth::Known { device_id } => (device_id, None),
     };
 
-    let (pin, displaced) = registry.register_host(host_id.clone(), name, tx.clone());
+    let (pin, displaced) =
+        registry.register_host(host_id.clone(), name, tx.clone(), session_id.clone());
     tracing::info!(host_id = %host_id, "host registered");
+    // Slice 3.2a (D35): the host reported a still-live session_id at
+    // registration (survived a signaling-only reconnect, slice 3.5a).
+    // `peer_tx_for_host` after the fact is the cheapest way to tell the two
+    // cases apart for logging: `Some` means `register_host` found a
+    // `SessionEntry` for it under this host_id and re-attached it; `None`
+    // means it's "detached" -- unknown to the server, or belonging to a
+    // different host_id -- so the device just looks busy until a `Bye`.
+    if let Some(sid) = &session_id {
+        match registry.peer_tx_for_host(&host_id, sid) {
+            Some(_) => {
+                tracing::info!(host_id = %host_id, session_id = %sid, "session re-attached after host reconnect");
+            }
+            None => {
+                tracing::info!(host_id = %host_id, session_id = %sid, "host reports a live session unknown to the server");
+            }
+        }
+    }
     if let Some(displaced) = displaced {
         tracing::info!(host_id = %host_id, "displaced an existing connection for this host_id");
         let _ = displaced.host_tx.send(SignalMessage::Error {
@@ -242,9 +264,16 @@ async fn run_host(
             },
             SignalMessage::Bye { session_id } => {
                 match registry.close_session_by_host(&host_id, &session_id) {
-                    Some(client_tx) => {
+                    Some(Some(client_tx)) => {
                         tracing::info!(%session_id, "host ended session");
                         let _ = client_tx.send(SignalMessage::Bye { session_id });
+                    }
+                    Some(None) => {
+                        // Slice 3.2a (D35): a "detached" session -- reported
+                        // by the host at registration, never backed by a
+                        // `SessionEntry` here (or one that belonged to a
+                        // different host_id) -- there's no client to notify.
+                        tracing::debug!(%session_id, "host ended a detached session, nothing to notify");
                     }
                     None => {
                         // Unknown to the server -- most likely a stale

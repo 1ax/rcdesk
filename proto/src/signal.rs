@@ -63,10 +63,21 @@ pub enum SignalMessage {
     /// saved; `#[serde(default)]` so an older host that predates 3.1 (whose
     /// `HostRegister` has no `device` field) stays compatible with a newer
     /// server -- same reasoning as `PeerJoined.ice_servers` below.
+    /// `session_id` (slice 3.2a/D35) is the id of this host's still-live P2P
+    /// session, if it has one -- set when the host reconnects to signaling
+    /// (2.6a's backoff, a server restart) while a session survives the gap
+    /// (slice 3.5a: the session itself is peer-to-peer and outlives the
+    /// signaling socket). Lets the server re-attach that session to the new
+    /// connection, or at least mark the device busy, instead of treating the
+    /// host as freshly idle. `#[serde(default)]` so an older host that
+    /// predates 3.2a (whose `HostRegister` has no `session_id` field) stays
+    /// compatible with a newer server.
     HostRegister {
         name: String,
         #[serde(default)]
         device: Option<DeviceCredentials>,
+        #[serde(default)]
+        session_id: Option<String>,
     },
     /// server -> host. `device` carries freshly issued credentials (slice
     /// 3.1) only on a host's very first registration; on a successful
@@ -231,6 +242,35 @@ mod tests {
             SignalMessage::HostRegister {
                 name: "My Mac".to_string(),
                 device: None,
+                session_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn host_register_with_session_id_round_trips_through_json() {
+        let host_register = SignalMessage::HostRegister {
+            name: "My Mac".to_string(),
+            device: None,
+            session_id: Some("sess-live".to_string()),
+        };
+
+        let json = serde_json::to_string(&host_register).expect("serialize");
+        let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, host_register);
+    }
+
+    #[test]
+    fn host_register_without_session_id_field_deserializes_to_none() {
+        let json = r#"{"type":"host_register","name":"My Mac","device":null}"#;
+
+        let msg: SignalMessage = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            msg,
+            SignalMessage::HostRegister {
+                name: "My Mac".to_string(),
+                device: None,
+                session_id: None,
             }
         );
     }

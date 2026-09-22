@@ -88,29 +88,73 @@ impl Registry {
     /// connection, that connection is displaced: its session (if any) is
     /// closed and its `tx`/session info is returned in `Displaced` so the
     /// caller can notify it. A fresh PIN is generated either way.
+    ///
+    /// `session_id` (slice 3.2a/D35) is the still-live P2P session the host
+    /// reports having, if any (`HostRegister.session_id`, set when the host
+    /// reconnects to signaling while a session survives the gap -- slice
+    /// 3.5a). Three cases:
+    /// - `Some(sid)` and the server still has a `SessionEntry` for `sid`
+    ///   under this exact `host_id` (the typical case: the old connection
+    ///   for this `host_id` is the one being displaced right here, its
+    ///   socket just hadn't been noticed dead yet) -- the session is
+    ///   re-attached: kept in `inner.sessions`, just re-pointed at the new
+    ///   `tx`, and `Displaced.session` comes back `None` since nothing was
+    ///   actually lost.
+    /// - `Some(sid)` but the server doesn't know `sid` under this `host_id`
+    ///   (an expired signaling-only session, or an id that happens to belong
+    ///   to a *different* host_id) -- the new `HostEntry` still records
+    ///   `session_id: Some(sid)`, "detached": `host_presence` reports busy,
+    ///   `join`/`join_by_host_id` refuse new joins, but there's no
+    ///   `SessionEntry` (and, in the foreign-id case, that other host_id's
+    ///   own session is left untouched) -- only the host's own `Bye` for
+    ///   `sid` (`close_session_by_host`) frees it.
+    /// - `None` -- unchanged from before 3.2a: the new registration starts
+    ///   with no session.
     pub fn register_host(
         &self,
         host_id: String,
         name: String,
         tx: Tx,
+        session_id: Option<String>,
     ) -> (String, Option<Displaced>) {
         let mut inner = self.inner.lock().expect("registry mutex poisoned");
 
-        let displaced = if let Some(old) = inner.hosts.remove(&host_id) {
+        let old = inner.hosts.remove(&host_id);
+        if let Some(old) = &old {
             inner.pin_to_host.remove(&old.pin);
-            let session = old.session_id.and_then(|session_id| {
-                inner
-                    .sessions
-                    .remove(&session_id)
-                    .map(|s| (session_id, s.client_tx))
-            });
-            Some(Displaced {
+        }
+
+        let reattach = session_id.as_ref().is_some_and(|sid| {
+            inner
+                .sessions
+                .get(sid)
+                .is_some_and(|session| session.host_id == host_id)
+        });
+        if reattach {
+            let sid = session_id.as_ref().expect("reattach implies Some(sid)");
+            if let Some(session) = inner.sessions.get_mut(sid) {
+                session.host_tx = tx.clone();
+            }
+        }
+
+        let displaced = old.map(|old| {
+            let session = if reattach {
+                // The old connection's session lives on, re-attached to the
+                // new one above -- nothing was actually lost.
+                None
+            } else {
+                old.session_id.and_then(|old_sid| {
+                    inner
+                        .sessions
+                        .remove(&old_sid)
+                        .map(|s| (old_sid, s.client_tx))
+                })
+            };
+            Displaced {
                 host_tx: old.tx,
                 session,
-            })
-        } else {
-            None
-        };
+            }
+        });
 
         let pin = loop {
             let candidate = random_pin();
@@ -126,7 +170,7 @@ impl Registry {
                 name,
                 pin: pin.clone(),
                 tx,
-                session_id: None,
+                session_id,
             },
         );
 
@@ -153,11 +197,25 @@ impl Registry {
         let host = inner.hosts.remove(host_id)?;
         inner.pin_to_host.remove(&host.pin);
 
-        if let Some(session_id) = host.session_id {
-            let session = inner.sessions.remove(&session_id);
-            return session.map(|s| (session_id, s.client_tx));
+        // Slice 3.2a/D35: `session_id` may be "detached" -- reported by the
+        // host at registration (`register_host`) but never actually backed
+        // by a `SessionEntry` here, or one that belongs to a *different*
+        // host_id (a foreign session id the departing host happened to
+        // claim). Either way there's nothing of this host_id's own to
+        // remove; `?` below returns `None` for both, same as the
+        // no-session case.
+        let session_id = host.session_id?;
+        let owns_session = inner
+            .sessions
+            .get(&session_id)
+            .is_some_and(|s| s.host_id == host_id);
+        if !owns_session {
+            return None;
         }
-        None
+        inner
+            .sessions
+            .remove(&session_id)
+            .map(|s| (session_id, s.client_tx))
     }
 
     /// A client joins a host by PIN. Returns the new session id, the host's
@@ -255,14 +313,23 @@ impl Registry {
     }
 
     /// Looks up the client tx for a session, validating that `host_id` is
-    /// currently the host of `session_id`.
+    /// currently the host of `session_id`. The extra `s.host_id == host_id`
+    /// filter (slice 3.2a/D35) matters once `register_host` can leave a
+    /// `HostEntry.session_id` pointing at a `session_id` that's either
+    /// unknown to `inner.sessions` or that belongs to a *different*
+    /// host_id ("detached" -- see `register_host`'s doc comment): without
+    /// it, this would incorrectly hand back another host's live session.
     pub fn peer_tx_for_host(&self, host_id: &str, session_id: &str) -> Option<Tx> {
         let inner = self.inner.lock().expect("registry mutex poisoned");
         let host = inner.hosts.get(host_id)?;
         if host.session_id.as_deref() != Some(session_id) {
             return None;
         }
-        inner.sessions.get(session_id).map(|s| s.client_tx.clone())
+        inner
+            .sessions
+            .get(session_id)
+            .filter(|s| s.host_id == host_id)
+            .map(|s| s.client_tx.clone())
     }
 
     /// Looks up the host tx for a session, validating that `client_tx` is the
@@ -277,20 +344,35 @@ impl Registry {
     }
 
     /// Ends a session initiated by the host side (explicit `Bye`), freeing
-    /// the host for a new session. Returns the client's tx to notify.
-    pub fn close_session_by_host(&self, host_id: &str, session_id: &str) -> Option<Tx> {
+    /// the host for a new session. `None` means `host_id` isn't registered,
+    /// or isn't currently attached to `session_id` at all (nothing to free).
+    /// Otherwise `Some`, wrapping the client's tx to notify -- `Some(None)`
+    /// for a "detached" session (slice 3.2a/D35: `session_id` came from the
+    /// host's own `HostRegister` at registration and the server never had a
+    /// matching `SessionEntry` for it under this host_id, so there's no
+    /// client on the other end to tell), `Some(Some(tx))` for a session the
+    /// server actually has on record.
+    pub fn close_session_by_host(&self, host_id: &str, session_id: &str) -> Option<Option<Tx>> {
         let mut inner = self.inner.lock().expect("registry mutex poisoned");
         let host = inner.hosts.get(host_id)?;
         if host.session_id.as_deref() != Some(session_id) {
             return None;
         }
-        let session = inner.sessions.remove(session_id)?;
+        let owns_session = inner
+            .sessions
+            .get(session_id)
+            .is_some_and(|s| s.host_id == host_id);
+        let client_tx = if owns_session {
+            inner.sessions.remove(session_id).map(|s| s.client_tx)
+        } else {
+            None
+        };
         inner
             .hosts
             .get_mut(host_id)
             .expect("host still present")
             .session_id = None;
-        Some(session.client_tx)
+        Some(client_tx)
     }
 
     /// Ends a session initiated by the client side (explicit `Bye`, or the
@@ -364,7 +446,8 @@ mod tests {
     fn register_host_with_given_id_generates_six_digit_pin_and_no_displaced() {
         let registry = Registry::new();
         let (tx, _rx) = channel();
-        let (pin, displaced) = registry.register_host("host1".to_string(), "host".to_string(), tx);
+        let (pin, displaced) =
+            registry.register_host("host1".to_string(), "host".to_string(), tx, None);
 
         assert_eq!(pin.len(), PIN_LEN);
         assert!(pin.chars().all(|c| c.is_ascii_digit()));
@@ -384,7 +467,7 @@ mod tests {
         let registry = Registry::new();
         let (host_tx, _host_rx) = channel();
         let (pin, _displaced) =
-            registry.register_host("host1".to_string(), "host".to_string(), host_tx);
+            registry.register_host("host1".to_string(), "host".to_string(), host_tx, None);
 
         let (client_tx_1, _rx1) = channel();
         registry.join(&pin, client_tx_1).expect("first join ok");
@@ -399,7 +482,7 @@ mod tests {
         let registry = Registry::new();
         let (host_tx, _host_rx) = channel();
         let (pin, _displaced) =
-            registry.register_host("host1".to_string(), "host".to_string(), host_tx);
+            registry.register_host("host1".to_string(), "host".to_string(), host_tx, None);
 
         let (client_tx, _rx) = channel();
         let (session_id, _host_id, _name, _host_tx) =
@@ -421,13 +504,17 @@ mod tests {
     fn re_registering_same_host_id_displaces_old_connection_and_invalidates_old_pin() {
         let registry = Registry::new();
         let (old_tx, _old_rx) = channel();
-        let (old_pin, displaced) =
-            registry.register_host("host1".to_string(), "host".to_string(), old_tx.clone());
+        let (old_pin, displaced) = registry.register_host(
+            "host1".to_string(),
+            "host".to_string(),
+            old_tx.clone(),
+            None,
+        );
         assert!(displaced.is_none());
 
         let (new_tx, _new_rx) = channel();
         let (new_pin, displaced) =
-            registry.register_host("host1".to_string(), "host".to_string(), new_tx);
+            registry.register_host("host1".to_string(), "host".to_string(), new_tx, None);
 
         let displaced = displaced.expect("second registration displaces the first");
         assert!(displaced.host_tx.same_channel(&old_tx));
@@ -450,7 +537,7 @@ mod tests {
         let registry = Registry::new();
         let (host_tx, _host_rx) = channel();
         let (pin, _displaced) =
-            registry.register_host("host1".to_string(), "host".to_string(), host_tx);
+            registry.register_host("host1".to_string(), "host".to_string(), host_tx, None);
 
         let (client_tx, _client_rx) = channel();
         let (session_id, _host_id, _name, _host_tx) =
@@ -458,7 +545,7 @@ mod tests {
 
         let (new_tx, _new_rx) = channel();
         let (_new_pin, displaced) =
-            registry.register_host("host1".to_string(), "host".to_string(), new_tx);
+            registry.register_host("host1".to_string(), "host".to_string(), new_tx, None);
 
         let displaced = displaced.expect("re-registration while in session displaces");
         let (displaced_session_id, displaced_client_tx) =
@@ -476,12 +563,16 @@ mod tests {
     fn unregister_host_with_stale_tx_is_a_no_op() {
         let registry = Registry::new();
         let (old_tx, _old_rx) = channel();
-        let (_old_pin, _displaced) =
-            registry.register_host("host1".to_string(), "host".to_string(), old_tx.clone());
+        let (_old_pin, _displaced) = registry.register_host(
+            "host1".to_string(),
+            "host".to_string(),
+            old_tx.clone(),
+            None,
+        );
 
         let (new_tx, _new_rx) = channel();
         let (new_pin, _displaced) =
-            registry.register_host("host1".to_string(), "host".to_string(), new_tx);
+            registry.register_host("host1".to_string(), "host".to_string(), new_tx, None);
 
         // the stale (displaced) tx unregistering must not remove the new
         // registration
@@ -498,7 +589,7 @@ mod tests {
         let registry = Registry::new();
         let (tx, _rx) = channel();
         let (pin, _displaced) =
-            registry.register_host("host1".to_string(), "host".to_string(), tx.clone());
+            registry.register_host("host1".to_string(), "host".to_string(), tx.clone(), None);
 
         // No session was active, so a successful unregister also returns
         // `None` here -- verify success via the pin no longer working.
@@ -525,7 +616,7 @@ mod tests {
     fn join_by_host_id_for_busy_device_fails_with_host_busy() {
         let registry = Registry::new();
         let (host_tx, _host_rx) = channel();
-        registry.register_host("host1".to_string(), "host".to_string(), host_tx);
+        registry.register_host("host1".to_string(), "host".to_string(), host_tx, None);
 
         let (client_tx_1, _rx1) = channel();
         registry
@@ -541,7 +632,7 @@ mod tests {
     fn join_by_host_id_success_is_visible_via_peer_tx_for_host() {
         let registry = Registry::new();
         let (host_tx, _host_rx) = channel();
-        registry.register_host("host1".to_string(), "host".to_string(), host_tx);
+        registry.register_host("host1".to_string(), "host".to_string(), host_tx, None);
 
         let (client_tx, _rx) = channel();
         let (session_id, host_name, _host_tx) = registry
@@ -557,7 +648,7 @@ mod tests {
         let registry = Registry::new();
         let (host_tx, _host_rx) = channel();
         let (pin, _displaced) =
-            registry.register_host("host1".to_string(), "host".to_string(), host_tx);
+            registry.register_host("host1".to_string(), "host".to_string(), host_tx, None);
 
         let (client_tx, _rx) = channel();
         let (_session_id, host_id, host_name, _host_tx) =
@@ -573,7 +664,7 @@ mod tests {
         assert_eq!(registry.host_presence("host1"), None);
 
         let (host_tx, _host_rx) = channel();
-        registry.register_host("host1".to_string(), "host".to_string(), host_tx);
+        registry.register_host("host1".to_string(), "host".to_string(), host_tx, None);
         assert_eq!(registry.host_presence("host1"), Some(false));
 
         let (client_tx, _rx) = channel();
@@ -581,5 +672,149 @@ mod tests {
             .join_by_host_id("host1", client_tx)
             .expect("join ok");
         assert_eq!(registry.host_presence("host1"), Some(true));
+    }
+
+    /// Slice 3.2a/D35 (a): a host registering with a `session_id` the
+    /// server doesn't know about (e.g. a P2P session that survived a
+    /// signaling-only reconnect the server itself never saw) is "detached"
+    /// -- the device is busy until the host's own `Bye` frees it, not until
+    /// some client happens to end a session the server was never tracking.
+    #[test]
+    fn register_host_with_unknown_session_id_marks_it_busy_until_close_session_by_host() {
+        let registry = Registry::new();
+        let (host_tx, _host_rx) = channel();
+        let (pin, displaced) = registry.register_host(
+            "host1".to_string(),
+            "host".to_string(),
+            host_tx,
+            Some("s-live".to_string()),
+        );
+        assert!(displaced.is_none());
+        assert_eq!(registry.host_presence("host1"), Some(true));
+
+        let (client_tx, _rx) = channel();
+        assert_eq!(
+            registry.join(&pin, client_tx).unwrap_err(),
+            JoinError::HostBusy
+        );
+
+        assert!(matches!(
+            registry.close_session_by_host("host1", "s-live"),
+            Some(None)
+        ));
+        assert_eq!(registry.host_presence("host1"), Some(false));
+
+        let (client_tx_2, _rx2) = channel();
+        registry
+            .join(&pin, client_tx_2)
+            .expect("host is free again after close_session_by_host");
+    }
+
+    /// Slice 3.2a/D35 (b): a host re-registering with the *same*
+    /// `session_id` it was last known to have (the ordinary case: its old
+    /// signaling socket hadn't been noticed dead yet) re-attaches to the
+    /// live session instead of losing it -- `Displaced.session` comes back
+    /// `None`, the session's client tx is unchanged, and the client's own
+    /// `Bye` still frees the host normally.
+    #[test]
+    fn re_registering_with_the_same_live_session_id_reattaches_without_losing_it() {
+        let registry = Registry::new();
+        let (host_tx, _host_rx) = channel();
+        registry.register_host("host1".to_string(), "host".to_string(), host_tx, None);
+
+        let (client_tx, _client_rx) = channel();
+        let (session_id, _name, _host_tx) = registry
+            .join_by_host_id("host1", client_tx.clone())
+            .expect("join ok");
+
+        let (new_tx, _new_rx) = channel();
+        let (_new_pin, displaced) = registry.register_host(
+            "host1".to_string(),
+            "host".to_string(),
+            new_tx,
+            Some(session_id.clone()),
+        );
+
+        let displaced = displaced.expect("re-registration displaces the old connection");
+        assert!(
+            displaced.session.is_none(),
+            "a re-attached session must not be reported as lost"
+        );
+        assert_eq!(registry.host_presence("host1"), Some(true));
+
+        let reattached_client_tx = registry
+            .peer_tx_for_host("host1", &session_id)
+            .expect("the session must still be reachable after re-attaching");
+        assert!(reattached_client_tx.same_channel(&client_tx));
+
+        assert!(registry
+            .close_session_by_client(&session_id, &client_tx)
+            .is_some());
+        assert_eq!(registry.host_presence("host1"), Some(false));
+    }
+
+    /// Slice 3.2a/D35 (c): a host re-registering with `session_id: None`
+    /// behaves exactly as before 3.2a -- the old connection's session (if
+    /// any) is lost/displaced, not kept.
+    #[test]
+    fn re_registering_with_no_session_id_still_displaces_and_loses_the_session() {
+        let registry = Registry::new();
+        let (host_tx, _host_rx) = channel();
+        registry.register_host("host1".to_string(), "host".to_string(), host_tx, None);
+
+        let (client_tx, _client_rx) = channel();
+        let (session_id, _name, _host_tx) = registry
+            .join_by_host_id("host1", client_tx.clone())
+            .expect("join ok");
+
+        let (new_tx, _new_rx) = channel();
+        let (_new_pin, displaced) =
+            registry.register_host("host1".to_string(), "host".to_string(), new_tx, None);
+
+        let displaced = displaced.expect("re-registration displaces the old connection");
+        let (displaced_session_id, displaced_client_tx) = displaced
+            .session
+            .expect("the session must be reported as lost");
+        assert_eq!(displaced_session_id, session_id);
+        assert!(displaced_client_tx.same_channel(&client_tx));
+
+        assert_eq!(registry.host_presence("host1"), Some(false));
+    }
+
+    /// Slice 3.2a/D35 (d): a `session_id` that belongs to a *different*
+    /// host_id (contrived -- session ids are random, this shouldn't happen
+    /// in practice, but the registry must not misattribute another host's
+    /// live session) leaves that other host's session untouched, and marks
+    /// the registering host "detached"/busy without a real session behind
+    /// it.
+    #[test]
+    fn register_host_with_another_hosts_session_id_leaves_it_untouched_and_is_detached() {
+        let registry = Registry::new();
+        let (host1_tx, _host1_rx) = channel();
+        registry.register_host("host1".to_string(), "host one".to_string(), host1_tx, None);
+        let (client_tx, _client_rx) = channel();
+        let (host1_session_id, _name, _host_tx) = registry
+            .join_by_host_id("host1", client_tx.clone())
+            .expect("join ok");
+
+        let (host2_tx, _host2_rx) = channel();
+        registry.register_host(
+            "host2".to_string(),
+            "host two".to_string(),
+            host2_tx,
+            Some(host1_session_id.clone()),
+        );
+
+        // host1's own session is untouched.
+        assert_eq!(registry.host_presence("host1"), Some(true));
+        assert!(registry
+            .peer_tx_for_host("host1", &host1_session_id)
+            .is_some());
+
+        // host2 looks busy but has no real session behind it.
+        assert_eq!(registry.host_presence("host2"), Some(true));
+        assert!(registry
+            .peer_tx_for_host("host2", &host1_session_id)
+            .is_none());
     }
 }

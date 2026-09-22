@@ -451,11 +451,17 @@ pub async fn run_agent(
     loop {
         let _ = status.send(AgentStatus::Connecting);
         let device = device_store.load();
+        // Slice 3.2a/D35: if a session survived from before this connect
+        // attempt (the slot's own `run_while_offline`, just above this
+        // loop's body, keeps it alive across the gap), report it in
+        // `HostRegister` so the server marks the device busy / re-attaches
+        // it instead of treating this host as freshly idle.
+        let live_session_id = slot.current_session_id();
         let connect_result = slot
             .run_while_offline(
                 ctx,
                 &mut commands,
-                SignalingClient::connect(server, name, device),
+                SignalingClient::connect(server, name, device, live_session_id),
             )
             .await;
         match connect_result {

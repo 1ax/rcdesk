@@ -241,11 +241,15 @@ pub struct SignalingClient {
 impl SignalingClient {
     /// Connects to the signaling server, sends `Hello` + `HostRegister`
     /// (carrying `device`, if the caller has saved credentials from a
-    /// previous registration -- slice 3.1c), and waits for `Registered`.
+    /// previous registration -- slice 3.1c -- and `session_id`, if the
+    /// caller's `SessionSlot` still has a live session from before this
+    /// reconnect -- slice 3.2a/D35, see `SessionSlot::current_session_id`),
+    /// and waits for `Registered`.
     pub async fn connect(
         url: &str,
         name: &str,
         device: Option<DeviceCredentials>,
+        session_id: Option<String>,
     ) -> Result<Self, ConnectError> {
         let (ws_stream, _response) = tokio_tungstenite::connect_async(url)
             .await
@@ -265,6 +269,7 @@ impl SignalingClient {
             &SignalMessage::HostRegister {
                 name: name.to_string(),
                 device,
+                session_id,
             },
         )
         .await?;
@@ -936,6 +941,16 @@ impl SessionSlot {
         self.active.is_some()
     }
 
+    /// The id of the session currently in this slot, if any (slice
+    /// 3.2a/D35). `app::run_agent` passes this into `SignalingClient::connect`
+    /// so a host reconnecting to signaling while its P2P session is still up
+    /// reports it in `HostRegister`, letting the server mark the device busy
+    /// (or re-attach the session, if it's the same server instance that set
+    /// it up) instead of looking freshly idle.
+    pub fn current_session_id(&self) -> Option<String> {
+        self.current_session_id.clone()
+    }
+
     /// Drains this slot's session events and `AgentCommand`s while `future`
     /// runs, for stretches with no live signaling connection to hand them to
     /// -- `app::run_agent` mid-`connect` attempt, or sleeping out its
@@ -1237,7 +1252,13 @@ async fn handle_session_event(
                         pin: pin.to_string(),
                     });
                 }
-                *current_session_id = None;
+                // Slice 3.2a/D35: the session just ended on this end
+                // (`Failed`/`Closed`), not via a `Bye` from the peer or an
+                // `EndSession` command -- tell the server so it doesn't keep
+                // the device marked busy for a session that's actually over.
+                if let Some(session_id) = current_session_id.take() {
+                    let _ = out_tx.send(SignalMessage::Bye { session_id });
+                }
             }
         }
         SessionEvent::DisconnectTimeout {
@@ -1256,7 +1277,11 @@ async fn handle_session_event(
                         pin: pin.to_string(),
                     });
                 }
-                *current_session_id = None;
+                // Slice 3.2a/D35: same reasoning as `Failed`/`Closed` above
+                // -- the session ended locally, tell the server.
+                if let Some(session_id) = current_session_id.take() {
+                    let _ = out_tx.send(SignalMessage::Bye { session_id });
+                }
             } else {
                 tracing::debug!(%session_id, generation, "stale disconnect timeout, ignoring");
             }
@@ -1280,7 +1305,11 @@ async fn handle_session_event(
                         pin: pin.to_string(),
                     });
                 }
-                *current_session_id = None;
+                // Slice 3.2a/D35: same reasoning as `Failed`/`Closed` above
+                // -- the session ended locally, tell the server.
+                if let Some(session_id) = current_session_id.take() {
+                    let _ = out_tx.send(SignalMessage::Bye { session_id });
+                }
             } else {
                 // Fix to slice 3.5b: same reasoning as `ConnectionState`'s
                 // tag check above -- this is the *old* session's `control`
@@ -2625,7 +2654,7 @@ mod tests {
             drop(ws);
         });
 
-        let client = SignalingClient::connect(&url, "test-host", None)
+        let client = SignalingClient::connect(&url, "test-host", None, None)
             .await
             .expect("connect");
         let ctx = test_ctx();
@@ -2655,6 +2684,63 @@ mod tests {
         if let Some(active) = slot.active.take() {
             active.shutdown().await;
         }
+    }
+
+    /// Slice 3.2a/D35: `connect` puts the `session_id` argument into
+    /// `HostRegister.session_id` -- `Some` when the caller (`app::run_agent`,
+    /// via `SessionSlot::current_session_id`) has a live session from before
+    /// this reconnect, `None` when it doesn't.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_puts_the_session_id_argument_into_host_register() {
+        async fn fake_server_expecting_session_id(
+            listener: tokio::net::TcpListener,
+            expected: Option<String>,
+        ) {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = ws.next().await; // Hello
+            let host_register = match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    serde_json::from_str::<SignalMessage>(&text).expect("valid HostRegister json")
+                }
+                other => panic!("expected HostRegister, got {other:?}"),
+            };
+            match host_register {
+                SignalMessage::HostRegister { session_id, .. } => {
+                    assert_eq!(session_id, expected);
+                }
+                other => panic!("expected host_register, got {other:?}"),
+            }
+            let registered = serde_json::to_string(&SignalMessage::Registered {
+                host_id: "host-1".to_string(),
+                pin: "111111".to_string(),
+                ice_servers: vec![],
+                device: None,
+            })
+            .unwrap();
+            ws.send(Message::text(registered)).await.unwrap();
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}/ws");
+        let server = tokio::spawn(fake_server_expecting_session_id(
+            listener,
+            Some("s-1".to_string()),
+        ));
+        let _client = SignalingClient::connect(&url, "test-host", None, Some("s-1".to_string()))
+            .await
+            .expect("connect");
+        server.await.expect("server task");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}/ws");
+        let server = tokio::spawn(fake_server_expecting_session_id(listener, None));
+        let _client = SignalingClient::connect(&url, "test-host", None, None)
+            .await
+            .expect("connect");
+        server.await.expect("server task");
     }
 
     /// Slice 3.5a: `SessionSlot::run_while_offline` must still drain and act
@@ -2867,7 +2953,9 @@ mod tests {
     /// The real `DISCONNECT_GRACE` timer isn't waited out here (this
     /// workspace doesn't enable tokio's `test-util` feature needed to pause
     /// the clock) -- the event is injected directly, exercising exactly the
-    /// same handler code the real timer's `send` would reach.
+    /// same handler code the real timer's `send` would reach. Slice
+    /// 3.2a/D35: also checks that ending the session this way sends the
+    /// server a `Bye`, so it doesn't keep the device marked busy.
     #[tokio::test(flavor = "multi_thread")]
     async fn disconnect_timeout_with_matching_generation_ends_the_session() {
         let (
@@ -2875,11 +2963,12 @@ mod tests {
             mut active,
             mut current_session_id,
             out_tx,
-            _out_rx,
+            mut out_rx,
             event_tx,
             status_tx,
             status_rx,
         ) = started_session("sess-1").await;
+        let _ = out_rx.try_recv(); // the Offer
 
         handle_session_event(
             SessionEvent::ConnectionState {
@@ -2919,6 +3008,12 @@ mod tests {
             *status_rx.borrow(),
             AgentStatus::Registered {
                 pin: "111111".to_string()
+            }
+        );
+        assert_eq!(
+            out_rx.try_recv().expect("expected a Bye message"),
+            SignalMessage::Bye {
+                session_id: "sess-1".to_string()
             }
         );
     }
@@ -3192,6 +3287,10 @@ mod tests {
 
     /// Slice 3.5b: the `control` data channel closing ends the session
     /// immediately, without waiting for a `Disconnected` grace window.
+    /// Slice 3.2a/D35: also checks that ending the session this way sends
+    /// the server a `Bye`, so it doesn't keep the device marked busy -- and
+    /// that the second, superseded `DataChannelClosed` (see below) does not
+    /// send a second one.
     #[tokio::test(flavor = "multi_thread")]
     async fn control_data_channel_closed_ends_the_session_immediately() {
         let (
@@ -3199,11 +3298,12 @@ mod tests {
             mut active,
             mut current_session_id,
             out_tx,
-            _out_rx,
+            mut out_rx,
             event_tx,
             status_tx,
             status_rx,
         ) = started_session("sess-1").await;
+        let _ = out_rx.try_recv(); // the Offer
         let tag = active.as_ref().unwrap().session_tag;
 
         handle_session_event(
@@ -3229,12 +3329,18 @@ mod tests {
                 pin: "111111".to_string()
             }
         );
+        assert_eq!(
+            out_rx.try_recv().expect("expected a Bye message"),
+            SignalMessage::Bye {
+                session_id: "sess-1".to_string()
+            }
+        );
 
         // Our own `ActiveSession::shutdown` (called above) closing the peer
         // connection can deliver a second `DataChannelClosed` for the same
         // channel once the slot is already empty -- must be a quiet no-op,
-        // not a double status flip or a panic. Same `tag` as before: from
-        // the *now-gone* session's own control channel.
+        // not a double status flip, a panic, or a second `Bye`. Same `tag`
+        // as before: from the *now-gone* session's own control channel.
         handle_session_event(
             SessionEvent::DataChannelClosed {
                 label: "control".to_string(),
@@ -3250,6 +3356,7 @@ mod tests {
         )
         .await;
         assert!(active.is_none());
+        assert!(out_rx.try_recv().is_err(), "no second Bye should be sent");
     }
 
     /// A non-`control` data channel closing (e.g. `input`) must not end the
