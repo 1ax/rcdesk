@@ -244,6 +244,9 @@ async fn offer_answer_and_ice_are_forwarded_between_session_peers() {
         &SignalMessage::Offer {
             session_id: session_id.clone(),
             sdp: "offer-sdp".to_string(),
+            // Slice 3.2e: `auth` is relayed opaquely, same as `sdp` -- the
+            // server never interprets it, only forwards it.
+            auth: Some("t".to_string()),
         },
     )
     .await;
@@ -251,9 +254,11 @@ async fn offer_answer_and_ice_are_forwarded_between_session_peers() {
         SignalMessage::Offer {
             session_id: sid,
             sdp,
+            auth,
         } => {
             assert_eq!(sid, session_id);
             assert_eq!(sdp, "offer-sdp");
+            assert_eq!(auth, Some("t".to_string()));
         }
         other => panic!("expected offer, got {other:?}"),
     }
@@ -263,6 +268,7 @@ async fn offer_answer_and_ice_are_forwarded_between_session_peers() {
         &SignalMessage::Answer {
             session_id: session_id.clone(),
             sdp: "answer-sdp".to_string(),
+            auth: None,
         },
     )
     .await;
@@ -270,9 +276,11 @@ async fn offer_answer_and_ice_are_forwarded_between_session_peers() {
         SignalMessage::Answer {
             session_id: sid,
             sdp,
+            auth,
         } => {
             assert_eq!(sid, session_id);
             assert_eq!(sdp, "answer-sdp");
+            assert_eq!(auth, None);
         }
         other => panic!("expected answer, got {other:?}"),
     }

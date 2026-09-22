@@ -23,6 +23,7 @@ pub mod capture;
 pub mod clipboard;
 pub mod cursor;
 pub mod device;
+pub mod dtls_bind;
 pub mod encode;
 mod fsutil;
 pub mod input;

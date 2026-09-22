@@ -71,6 +71,7 @@ import {
   wrongPasswordPhase,
 } from "./hostAuth";
 import type { AuthPhase } from "./hostAuth";
+import { authTag, decodeBase64Url, fingerprintFromSdp, verifyAuthTag } from "./dtlsBind";
 import type { ControlMessage } from "./generated/ControlMessage";
 import type { DisplayEntry } from "./generated/DisplayEntry";
 import type { DeviceEntry } from "./generated/DeviceEntry";
@@ -1479,12 +1480,11 @@ export function mount(root: Element | null): void {
         authPasswordInput.focus();
         return;
       }
+      // Slice 3.2e: kept until the session ends (see
+      // `stopSessionResources`) and read below, in `signaling.on("offer")`/
+      // `session.acceptOffer(...).then(...)`, to bind the offer/answer to
+      // this session key.
       authSessionKey = result.sessionKey;
-      // Not read anywhere yet -- slice 3.2e wires it into the post-auth data
-      // channel; for now it's only held until the session ends (see
-      // `stopSessionResources`). Referenced here so it isn't flagged as an
-      // unused local before that slice lands.
-      void authSessionKey;
       resetAuthAttempt();
       signaling.send({
         type: "pake_finish",
@@ -1531,18 +1531,63 @@ export function mount(root: Element | null): void {
       authPhase = null;
       renderAuthDialog();
     }
-    session
-      .acceptOffer(msg.sdp)
-      .then((sdp) => {
-        if (sessionId) {
-          signaling.send({ type: "answer", session_id: sessionId, sdp });
+    const currentSession = session;
+    // Captured for the async body below (a nested closure loses the outer
+    // `let`'s narrowing) -- same reason `pake_response` above captures
+    // `authState`/`authPassword` into locals before its own `await`.
+    const sessionKeyB64 = authSessionKey;
+    void (async () => {
+      // Slice 3.2e: when this session was gated by a password, the offer
+      // must carry a dtls-binding tag over its own fingerprint, verifiable
+      // with this client's copy of the OPAQUE session key -- otherwise a
+      // signaling-server-in-the-middle could swap in its own offer
+      // undetected. Checked *before* `acceptOffer` (which calls
+      // `setRemoteDescription`) so a forged offer is never applied. No
+      // password (`sessionKeyB64 === null`) -- unchanged behavior from
+      // before this slice.
+      if (sessionKeyB64 !== null) {
+        const fingerprint = fingerprintFromSdp(msg.sdp);
+        const ok =
+          fingerprint !== null &&
+          msg.auth !== null &&
+          (await verifyAuthTag(decodeBase64Url(sessionKeyB64), "offer", fingerprint, msg.auth));
+        if (!ok) {
+          console.error("offer failed dtls binding check");
+          if (sessionId) {
+            signaling.send({ type: "bye", session_id: sessionId });
+          }
+          setSessionStatus("error");
+          teardown("Хост не подтверждён: возможна подмена соединения");
+          return;
         }
-      })
-      .catch((err: unknown) => {
+      }
+      try {
+        const sdp = await currentSession.acceptOffer(msg.sdp);
+        let auth: string | null = null;
+        if (sessionKeyB64 !== null) {
+          // Same binding, the other direction: this client's own answer
+          // fingerprint, tagged with the shared session key.
+          const answerFingerprint = fingerprintFromSdp(sdp);
+          if (answerFingerprint === null) {
+            console.error("answer sdp has no dtls fingerprint");
+            if (sessionId) {
+              signaling.send({ type: "bye", session_id: sessionId });
+            }
+            setSessionStatus("error");
+            teardown("Хост не подтверждён: возможна подмена соединения");
+            return;
+          }
+          auth = await authTag(decodeBase64Url(sessionKeyB64), "answer", answerFingerprint);
+        }
+        if (sessionId) {
+          signaling.send({ type: "answer", session_id: sessionId, sdp, auth });
+        }
+      } catch (err: unknown) {
         console.error("failed to negotiate session", err);
         setSessionStatus("error");
         teardown("Не удалось согласовать сеанс");
-      });
+      }
+    })();
   });
 
   signaling.on("ice", (msg) => {

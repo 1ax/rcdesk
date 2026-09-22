@@ -120,10 +120,31 @@ pub enum SignalMessage {
         #[serde(default)]
         ice_servers: Vec<IceServer>,
     },
-    /// forwarded by server to the other side of the session
-    Offer { session_id: String, sdp: String },
-    /// forwarded by server to the other side of the session
-    Answer { session_id: String, sdp: String },
+    /// forwarded by server to the other side of the session. `auth` (slice
+    /// 3.2e) is the host's proof that this offer's DTLS fingerprint is
+    /// bound to the OPAQUE session key from login -- `HMAC-SHA256(session_key,
+    /// "rcdesk-dtls-v1|offer|" + fingerprint)`, base64 (URL-safe, no
+    /// padding). `Some` only when the host has an access password set (a
+    /// session key exists); `None` otherwise, same as before this slice.
+    /// `#[serde(default)]` so an older host/server that predates 3.2e (whose
+    /// `Offer` has no `auth` field) stays compatible with a newer peer.
+    Offer {
+        session_id: String,
+        sdp: String,
+        #[serde(default)]
+        auth: Option<String>,
+    },
+    /// forwarded by server to the other side of the session. `auth` (slice
+    /// 3.2e) is the client's matching proof for its answer's DTLS
+    /// fingerprint, same construction as `Offer.auth` but with role
+    /// `"answer"`. `#[serde(default)]` for the same compatibility reason as
+    /// `Offer.auth`.
+    Answer {
+        session_id: String,
+        sdp: String,
+        #[serde(default)]
+        auth: Option<String>,
+    },
     /// forwarded by server to the other side of the session
     Ice {
         session_id: String,
@@ -303,6 +324,24 @@ mod tests {
                 name: "My Mac".to_string(),
                 device: None,
                 session_id: None,
+            }
+        );
+    }
+
+    /// Slice 3.2e: `Offer.auth` is new, so a peer that predates this slice
+    /// (or simply an unauthenticated session, where the host never sets it)
+    /// must still decode -- `#[serde(default)]` falls back to `None`.
+    #[test]
+    fn offer_without_auth_field_deserializes_to_none() {
+        let json = r#"{"type":"offer","session_id":"sess-1","sdp":"v=0"}"#;
+
+        let msg: SignalMessage = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            msg,
+            SignalMessage::Offer {
+                session_id: "sess-1".to_string(),
+                sdp: "v=0".to_string(),
+                auth: None,
             }
         );
     }

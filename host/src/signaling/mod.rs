@@ -1204,15 +1204,49 @@ async fn handle_signal_message(
                 .await;
             }
         }
-        SignalMessage::Answer { session_id, sdp } => {
-            if current_session_id.as_deref() == Some(session_id.as_str()) {
-                if let Some(active) = active.as_ref() {
-                    if let Err(err) = active.peer.set_answer(sdp).await {
-                        tracing::warn!(?err, "failed to apply remote answer");
-                    }
-                }
-            } else {
+        SignalMessage::Answer {
+            session_id,
+            sdp,
+            auth,
+        } => {
+            if current_session_id.as_deref() != Some(session_id.as_str()) {
                 tracing::debug!(%session_id, "answer for unknown/stale session, ignoring");
+                return;
+            }
+            // Slice 3.2e: when this session was gated by a password, the
+            // client's answer must carry a valid dtls-binding tag for its
+            // own fingerprint before the host applies it -- otherwise a
+            // signaling-server-in-the-middle could swap in its own answer
+            // undetected. No password (`session_key: None`) -- unchanged
+            // behavior from before this slice.
+            if let Some(session_key) = active.as_ref().and_then(|s| s.session_key.as_ref()) {
+                let ok = crate::dtls_bind::fingerprint_from_sdp(&sdp)
+                    .zip(auth.as_deref())
+                    .is_some_and(|(fingerprint, tag)| {
+                        crate::dtls_bind::verify_auth_tag(
+                            session_key.as_bytes(),
+                            "answer",
+                            &fingerprint,
+                            tag,
+                        )
+                    });
+                if !ok {
+                    tracing::warn!(%session_id, "answer failed dtls binding check, ending session");
+                    if let Some(old) = active.take() {
+                        old.shutdown().await;
+                        let _ = status.send(AgentStatus::Registered {
+                            pin: pin.to_string(),
+                        });
+                    }
+                    *current_session_id = None;
+                    let _ = out_tx.send(SignalMessage::Bye { session_id });
+                    return;
+                }
+            }
+            if let Some(active) = active.as_ref() {
+                if let Err(err) = active.peer.set_answer(sdp).await {
+                    tracing::warn!(?err, "failed to apply remote answer");
+                }
             }
         }
         SignalMessage::Ice {
@@ -1440,9 +1474,43 @@ async fn begin_session(
     match start_session(ctx, chosen_ice_servers, event_tx).await {
         Ok(parts) => match parts.peer.create_offer().await {
             Ok(sdp) => {
+                // Slice 3.2e: when this session was gated by a password,
+                // bind the offer to the OPAQUE session key -- extract this
+                // host's own DTLS fingerprint from the offer it just built
+                // and tag it. `create_offer` always produces an SDP with a
+                // fingerprint (`webrtc-rs` always sets up DTLS), so `None`
+                // here would mean something is badly wrong with the SDP;
+                // treat it the same as a `create_offer` failure rather than
+                // silently offering an unbound session.
+                let auth = match session_key.as_ref() {
+                    Some(key) => match crate::dtls_bind::fingerprint_from_sdp(&sdp) {
+                        Some(fingerprint) => Some(crate::dtls_bind::auth_tag(
+                            key.as_bytes(),
+                            "offer",
+                            &fingerprint,
+                        )),
+                        None => {
+                            tracing::warn!(
+                                "offer sdp has no dtls fingerprint, refusing to start session"
+                            );
+                            parts.video.stop();
+                            parts.cursor_task.abort();
+                            if let Some(task) = parts.clipboard_task {
+                                task.abort();
+                            }
+                            if let Some(task) = parts.elevation_task {
+                                task.abort();
+                            }
+                            let _ = out_tx.send(SignalMessage::Bye { session_id });
+                            return;
+                        }
+                    },
+                    None => None,
+                };
                 let _ = out_tx.send(SignalMessage::Offer {
                     session_id: session_id.clone(),
                     sdp,
+                    auth,
                 });
                 *current_session_id = Some(session_id);
                 let session_tag = parts.peer.tag();
@@ -2948,12 +3016,261 @@ mod tests {
         .await;
 
         match out_rx.try_recv().expect("expected offer") {
-            SignalMessage::Offer { session_id, .. } => assert_eq!(session_id, "sess-1"),
+            SignalMessage::Offer {
+                session_id,
+                sdp,
+                auth,
+            } => {
+                assert_eq!(session_id, "sess-1");
+                // Slice 3.2e: this session was gated by a password, so the
+                // offer must carry a dtls-binding tag over its own
+                // fingerprint, verifiable with the *client's* copy of the
+                // session key (`client_finish.session_key`) -- the two
+                // sides derive the same key from a real OPAQUE login, same
+                // as `access::tests::register_then_login_with_the_same_password_yields_equal_session_keys`.
+                let tag = auth.expect("offer must carry a dtls-binding tag when a password is set");
+                let fingerprint = crate::dtls_bind::fingerprint_from_sdp(&sdp)
+                    .expect("real webrtc-rs offer sdp must have a dtls fingerprint");
+                assert!(crate::dtls_bind::verify_auth_tag(
+                    &client_finish.session_key[..],
+                    "offer",
+                    &fingerprint,
+                    &tag,
+                ));
+            }
             other => panic!("expected offer, got {other:?}"),
         }
         assert!(active.is_some(), "session must have started successfully");
         assert_eq!(auth_failures, 0);
         assert!(pending_auth.is_none());
+
+        if let Some(active) = active.take() {
+            active.shutdown().await;
+        }
+    }
+
+    /// Runs a full real OPAQUE login (same steps as `full_opaque_login_then_offer`)
+    /// up through the host's `Offer`, for the two `Answer`-side dtls-binding
+    /// tests below (slice 3.2e), which only care about what happens next.
+    /// Returns the context (so the session stays valid for `handle_signal_message`
+    /// calls with it), the loop state after the `Offer`, and the client's
+    /// session key -- the client's own proof it holds the same key the host
+    /// does, exactly as a real browser client would after `finishLogin`.
+    #[allow(clippy::type_complexity)]
+    async fn logged_in_awaiting_answer(
+        name: &str,
+    ) -> (
+        HostContext,
+        Option<ActiveSession>,
+        Option<String>,
+        mpsc::UnboundedSender<SignalMessage>,
+        mpsc::UnboundedReceiver<SignalMessage>,
+        mpsc::Sender<SessionEvent>,
+        watch::Sender<AgentStatus>,
+        Vec<u8>,
+    ) {
+        use opaque_ke::{
+            ClientLogin, ClientLoginFinishParameters, CredentialResponse, Identifiers,
+        };
+        use rand_core::OsRng;
+
+        let password = "correct horse battery staple";
+        let ctx = test_ctx_with_password(name, password);
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+        let mut pending_auth: Option<PendingAuth> = None;
+        let mut auth_failures = 0u32;
+        let mut auth_locked_until: Option<Instant> = None;
+        let (status_tx, _status_rx) = watch::channel(AgentStatus::Connecting);
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        let _ = out_rx.try_recv(); // auth_required
+
+        let mut rng = OsRng;
+        let client_start =
+            ClientLogin::<crate::access::RcdeskCipherSuite>::start(&mut rng, password.as_bytes())
+                .expect("client login start");
+        handle_signal_message(
+            SignalMessage::PakeStart {
+                session_id: "sess-1".to_string(),
+                payload: BASE64_URL_SAFE_NO_PAD.encode(client_start.message.serialize()),
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        let response_payload = match out_rx.try_recv().expect("expected pake_response") {
+            SignalMessage::PakeResponse { payload, .. } => payload,
+            other => panic!("expected pake_response, got {other:?}"),
+        };
+        let response = CredentialResponse::<crate::access::RcdeskCipherSuite>::deserialize(
+            &BASE64_URL_SAFE_NO_PAD
+                .decode(response_payload)
+                .expect("decode pake_response payload"),
+        )
+        .expect("deserialize credential response");
+        let ksf = crate::access::CustomKsf::default();
+        let client_finish = client_start
+            .state
+            .finish(
+                &mut rng,
+                password.as_bytes(),
+                response,
+                ClientLoginFinishParameters::new(None, Identifiers::default(), Some(&ksf)),
+            )
+            .expect("client login finish");
+        let session_key = client_finish.session_key[..].to_vec();
+
+        handle_signal_message(
+            SignalMessage::PakeFinish {
+                session_id: "sess-1".to_string(),
+                payload: BASE64_URL_SAFE_NO_PAD.encode(client_finish.message.serialize()),
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        let _ = out_rx.try_recv(); // the Offer
+        assert!(active.is_some(), "session must have started successfully");
+
+        (
+            ctx,
+            active,
+            current_session_id,
+            out_tx,
+            out_rx,
+            event_tx,
+            status_tx,
+            session_key,
+        )
+    }
+
+    /// Slice 3.2e: an `Answer` with no `auth` at all, while the session was
+    /// gated by a password, must be rejected -- the host ends the session
+    /// (`Bye`) instead of applying an unbound answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn answer_without_auth_ends_session_when_a_password_is_set() {
+        let (ctx, mut active, mut current_session_id, out_tx, mut out_rx, event_tx, status_tx, _) =
+            logged_in_awaiting_answer("answer-no-auth").await;
+
+        handle_signal_message(
+            SignalMessage::Answer {
+                session_id: "sess-1".to_string(),
+                sdp: "v=0\r\na=fingerprint:sha-256 AA:BB:CC\r\n".to_string(),
+                auth: None,
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx,
+            &mut active,
+            &mut current_session_id,
+            &mut None,
+            &mut 0,
+            &mut None,
+        )
+        .await;
+
+        assert_eq!(
+            out_rx.try_recv().expect("expected bye"),
+            SignalMessage::Bye {
+                session_id: "sess-1".to_string()
+            }
+        );
+        assert!(active.is_none(), "session must have been ended");
+        assert_eq!(current_session_id, None);
+    }
+
+    /// Slice 3.2e: an `Answer` whose `auth` tag verifies against the
+    /// client's session key and the answer's own fingerprint must *not* be
+    /// rejected -- the host goes on to try `set_answer` (which fails here,
+    /// since this is a synthetic SDP rather than a real DTLS answer;
+    /// `set_answer`'s failure path is untouched by this slice and only
+    /// `tracing::warn!`s, it does not end the session -- see the `Answer`
+    /// arm's non-3.2e code below the dtls-binding check).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn answer_with_a_valid_auth_tag_is_not_rejected() {
+        let (
+            ctx,
+            mut active,
+            mut current_session_id,
+            out_tx,
+            mut out_rx,
+            event_tx,
+            status_tx,
+            session_key,
+        ) = logged_in_awaiting_answer("answer-valid-auth").await;
+
+        let sdp = "v=0\r\na=fingerprint:sha-256 AA:BB:CC\r\n".to_string();
+        let fingerprint =
+            crate::dtls_bind::fingerprint_from_sdp(&sdp).expect("sdp has a fingerprint");
+        let tag = crate::dtls_bind::auth_tag(&session_key, "answer", &fingerprint);
+
+        handle_signal_message(
+            SignalMessage::Answer {
+                session_id: "sess-1".to_string(),
+                sdp,
+                auth: Some(tag),
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx,
+            &mut active,
+            &mut current_session_id,
+            &mut None,
+            &mut 0,
+            &mut None,
+        )
+        .await;
+
+        assert!(
+            out_rx.try_recv().is_err(),
+            "a valid auth tag must not trigger a Bye"
+        );
+        assert!(active.is_some(), "session must not have been ended");
+        assert_eq!(current_session_id.as_deref(), Some("sess-1"));
 
         if let Some(active) = active.take() {
             active.shutdown().await;
@@ -4313,7 +4630,13 @@ mod tests {
             status_tx,
             status_rx,
         ) = started_session("sess-1").await;
-        let _ = out_rx.try_recv(); // the Offer
+        // Slice 3.2e: `started_session` uses `test_ctx()`, which has no
+        // access password set -- the offer must carry no dtls-binding tag,
+        // same behavior as before this slice.
+        match out_rx.try_recv().expect("expected the Offer") {
+            SignalMessage::Offer { auth, .. } => assert_eq!(auth, None),
+            other => panic!("expected offer, got {other:?}"),
+        }
 
         handle_session_event(
             SessionEvent::ConnectionState {

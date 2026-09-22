@@ -33,3 +33,4 @@ opaque-ke = { version = "4.0", features = ["argon2"] }
 argon2 = "0.5"
 sha2 = "0.10"
 rpassword = "7"
+hmac = "0.12"

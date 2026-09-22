@@ -219,32 +219,44 @@ async fn run_host(
         };
 
         match msg {
-            SignalMessage::Offer { session_id, sdp } => {
-                match registry.peer_tx_for_host(&host_id, &session_id) {
-                    Some(peer) => {
-                        tracing::debug!(%session_id, "forwarding offer host -> client");
-                        let _ = peer.send(SignalMessage::Offer { session_id, sdp });
-                    }
-                    None => {
-                        let _ = tx.send(SignalMessage::Error {
-                            message: "not in session".to_string(),
-                        });
-                    }
+            SignalMessage::Offer {
+                session_id,
+                sdp,
+                auth,
+            } => match registry.peer_tx_for_host(&host_id, &session_id) {
+                Some(peer) => {
+                    tracing::debug!(%session_id, "forwarding offer host -> client");
+                    let _ = peer.send(SignalMessage::Offer {
+                        session_id,
+                        sdp,
+                        auth,
+                    });
                 }
-            }
-            SignalMessage::Answer { session_id, sdp } => {
-                match registry.peer_tx_for_host(&host_id, &session_id) {
-                    Some(peer) => {
-                        tracing::debug!(%session_id, "forwarding answer host -> client");
-                        let _ = peer.send(SignalMessage::Answer { session_id, sdp });
-                    }
-                    None => {
-                        let _ = tx.send(SignalMessage::Error {
-                            message: "not in session".to_string(),
-                        });
-                    }
+                None => {
+                    let _ = tx.send(SignalMessage::Error {
+                        message: "not in session".to_string(),
+                    });
                 }
-            }
+            },
+            SignalMessage::Answer {
+                session_id,
+                sdp,
+                auth,
+            } => match registry.peer_tx_for_host(&host_id, &session_id) {
+                Some(peer) => {
+                    tracing::debug!(%session_id, "forwarding answer host -> client");
+                    let _ = peer.send(SignalMessage::Answer {
+                        session_id,
+                        sdp,
+                        auth,
+                    });
+                }
+                None => {
+                    let _ = tx.send(SignalMessage::Error {
+                        message: "not in session".to_string(),
+                    });
+                }
+            },
             SignalMessage::Ice {
                 session_id,
                 candidate,
@@ -583,32 +595,44 @@ async fn run_client(
                     });
                 }
             },
-            SignalMessage::Offer { session_id, sdp } => {
-                match registry.peer_tx_for_client(&session_id, &tx) {
-                    Some(peer) => {
-                        tracing::debug!(%session_id, "forwarding offer client -> host");
-                        let _ = peer.send(SignalMessage::Offer { session_id, sdp });
-                    }
-                    None => {
-                        let _ = tx.send(SignalMessage::Error {
-                            message: "not in session".to_string(),
-                        });
-                    }
+            SignalMessage::Offer {
+                session_id,
+                sdp,
+                auth,
+            } => match registry.peer_tx_for_client(&session_id, &tx) {
+                Some(peer) => {
+                    tracing::debug!(%session_id, "forwarding offer client -> host");
+                    let _ = peer.send(SignalMessage::Offer {
+                        session_id,
+                        sdp,
+                        auth,
+                    });
                 }
-            }
-            SignalMessage::Answer { session_id, sdp } => {
-                match registry.peer_tx_for_client(&session_id, &tx) {
-                    Some(peer) => {
-                        tracing::debug!(%session_id, "forwarding answer client -> host");
-                        let _ = peer.send(SignalMessage::Answer { session_id, sdp });
-                    }
-                    None => {
-                        let _ = tx.send(SignalMessage::Error {
-                            message: "not in session".to_string(),
-                        });
-                    }
+                None => {
+                    let _ = tx.send(SignalMessage::Error {
+                        message: "not in session".to_string(),
+                    });
                 }
-            }
+            },
+            SignalMessage::Answer {
+                session_id,
+                sdp,
+                auth,
+            } => match registry.peer_tx_for_client(&session_id, &tx) {
+                Some(peer) => {
+                    tracing::debug!(%session_id, "forwarding answer client -> host");
+                    let _ = peer.send(SignalMessage::Answer {
+                        session_id,
+                        sdp,
+                        auth,
+                    });
+                }
+                None => {
+                    let _ = tx.send(SignalMessage::Error {
+                        message: "not in session".to_string(),
+                    });
+                }
+            },
             SignalMessage::Ice {
                 session_id,
                 candidate,

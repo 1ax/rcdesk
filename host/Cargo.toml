@@ -53,6 +53,7 @@ opaque-ke = { workspace = true }
 argon2 = { workspace = true }
 sha2 = { workspace = true }
 rpassword = { workspace = true }
+hmac = { workspace = true }
 # opaque-ke 4.0.1 is generic over `rand_core` 0.6's `RngCore + CryptoRng`
 # (it pins `rand = "0.8", default-features = false`, which on its own
 # doesn't expose `OsRng` -- see access.rs). This workspace's own `rand`
