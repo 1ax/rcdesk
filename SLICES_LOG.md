@@ -21,9 +21,12 @@
   (`opaque-ke` 4.0.1) с шифронабором `@serenity-kit/opaque`, `access.json` рядом с `device.json`,
   `rcdesk-host password set|clear|status`. Гейты: host `185 passed; 0 failed; 2 ignored`, proto `42`,
   server `40` + `23`, loopback `1`, web `Tests 201 passed (201)`. Живой проверки не требовал.
-- ▶️ **Следующее: 3.2c** — контракт (`AuthRequired`/`PakeStart`/`PakeResponse`/`PakeFinish`/`AuthFailed`),
-  ретрансляция на сервере, поток входа на хосте до `start_session`, ограничитель попыток. Затем 3.2d клиент
-  (`@serenity-kit/opaque`, окно пароля), 3.2e привязка отпечатков DTLS, живая проверка и деплой.
+- ✅ **3.2c вход OPAQUE через сигналинг `85ee627`** (см. запись 3.2c): пять сообщений по `session_id`, сервер
+  ретранслирует; хост с паролем держит ожидающий сеанс до `login_finish`, лимит 5 попыток и блокировка
+  5→60 с. Гейты: host `193 passed; 0 failed; 2 ignored`, proto `45`, server `40` + `24`, loopback `1`,
+  web `Tests 201 passed (201)`. **Деплоить нельзя до 3.2d:** старый клиент на `AuthRequired` не ответит.
+- ▶️ **Следующее: 3.2d** — клиент: `@serenity-kit/opaque`, окно пароля, поток `auth_required` → `pake_*`,
+  `auth_failed` с `retry_after`; затем 3.2e привязка отпечатков DTLS, живая проверка локально и на стенде, деплой.
 - **Решения владельца 2026-09-22:** порядок фазы 3 — 3.2, затем 3.4 (файлы); D35 первым под-шагом 3.2.
   Развилки 3.2 (все по рекомендации): OPAQUE через `opaque-ke` + `@serenity-kit/opaque`; пароль обязателен и
   при входе по PIN; в браузере не запоминается; ввод только через CLI на машине хоста. Дизайн — ARCHITECTURE §6.
@@ -135,7 +138,7 @@
   экрана; `git add` только явными путями, пока работает исполнитель.
 
 **За владельцем:**
-- `git push` (кодовые и docs-коммиты 3.5g/3.5h, 3.2a, 3.2b).
+- `git push` — **пока не пушить**: 3.2c без 3.2d ломает подключение к хосту с паролем; push после 3.2e.
 - **Push `main` и живая проверка 2.6** (после зелёного Deploy, артефакт с `rcdesk-host` + `rcdesk-agent`):
   1. Стенд Win10: двойной клик `rcdesk-agent.exe` → без консоли, значок в трее (серый монитор), меню: `PIN …`,
      Copy PIN (вставить в Блокнот), Open log. Подключиться с Mac → значок зелёный, `Session active`; End session
@@ -159,6 +162,9 @@
 - ✅ TLS 1.3 на nginx включён (2026-09-13, `/etc/nginx/conf.d/ssl.conf`, файл не принадлежит пакету).
 
 **Открытые долги:**
+- ⚪ D37: тест хоста `run_leaves_the_slot_session_active_when_the_connection_drops` роняет панику в оторванной
+  задаче («connection ended before an Offer arrived: Ping») — фейковый сервер теста не отвечает на `Ping`;
+  тест зелёный, шум в выводе. Починить фейковый сервер.
 - ⚪ D36: **подбор PIN на сервере не ограничен** (разведка 3.2b): `Join` с неверным PIN отвечает ошибкой без
   задержки и счётчика; PIN шестизначный. После 3.2 PIN защищает только привязку, но перебор всё равно стоит
   ограничить на сервере (задержка/лимит по IP или по соединению).
@@ -1255,4 +1261,26 @@ base64 URL_SAFE_NO_PAD в JSON), `AccessStore` (`access.json`, `load` толер
 `185 passed; 0 failed; 2 ignored`, proto `42`, server `40` + `23`, loopback `1`, web `Tests 201 passed (201)`.
 **Проверить в 3.2d:** дефолтные параметры argon2 клиента `@serenity-kit/opaque` совпадают с константами
 хоста (иначе вход не сойдётся) — сверить по исходнику пакета, а не по README.
+
+#### 3.2c Вход OPAQUE через сигналинг — `85ee627` (2026-09-22)
+
+Контракт (`proto`): `AuthRequired { session_id }` хост → клиент; `PakeStart`/`PakeFinish { session_id,
+payload }` клиент → хост; `PakeResponse` хост → клиент; `AuthFailed { session_id, retry_after_secs:
+Option<u32> }`. Полезная нагрузка — base64 URL-safe без набивки, как у serenity-kit. Сервер: пять веток
+пересылки по образцу `Offer`/`Ice`, содержимое не читает. Хост: `HostContext.access_store` (тот же каталог,
+что `device.json`); в `SessionSlot` — `pending_auth` (session_id, ICE-серверы из `PeerJoined`, состояние
+`ServerLogin`, generation), `auth_failures`, `auth_locked_until`. Блок `start_session → Offer → active`
+вынесен в `begin_session(.., session_key)`; без пароля вызывается сразу, с паролем — только после
+`login_finish`. Каждый `PakeStart` — попытка (в OPAQUE неверный пароль виден клиенту на его `finish`, а хосту
+попытка стоит одной OPRF-оценки, офлайн-перебор без неё невозможен); после пяти — `AuthFailed { Some(n) }`
+без запуска протокола, задержка 5→10→20→40→60 с, сброс только успехом. Ожидание снимают `Bye`, `End session`
+из трея (фикс по сверке: иначе висело до таймаута), новый `PeerJoined`, обрыв WS и таймаут 120 с
+(`SessionEvent::AuthTimeout` в `transport/mod.rs` — единственная правка там, скоуп расширен по запросу
+исполнителя) с `Bye` серверу. Общий ключ кладётся в `ActiveSession.session_key` для 3.2e. Тесты: proto +3,
+сервер +1 сквозной, хост +8 (запрос пароля без Offer; полный вход клиентской стороной на Rust → Offer; чужой
+пароль валится на клиенте, ожидание живёт; мусорная финализация → `AuthFailed`; шесть стартов → блокировка;
+`Bye`, `End session` и таймаут снимают ожидание). Гейты: host `193 passed; 0 failed; 2 ignored`, proto `45`,
+server `40` + `24`, loopback `1`, web `Tests 201 passed (201)`. **Грабли:** тест
+`run_leaves_the_slot_session_active_when_the_connection_drops` печатает панику из оторванной задачи
+(фейковый сервер не пропускает `Ping`) — было и до 3.2c, тест зелёный; долг D37.
 
