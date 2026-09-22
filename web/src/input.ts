@@ -12,6 +12,7 @@
 import type { InputMessage } from "./generated/InputMessage";
 import type { PointerButton } from "./generated/PointerButton";
 import { isCopyShortcut, isPasteShortcut } from "./clipboard";
+import { remapCode } from "./keyRemap";
 
 /** The two data channels `attachInput` needs, opened by the host and handed
  * to the client via `PeerSession`'s `onDataChannel` callback (see
@@ -106,10 +107,21 @@ export function normalizeWheel(
 
 /** Builds the `Key` message for a keydown/keyup, or `null` for an
  * auto-repeat keydown -- the OS/host repeats a held key on its own once, so
- * forwarding every repeat event would double it up. */
-export function keyToMessage(code: string, pressed: boolean, repeat: boolean): InputMessage | null {
+ * forwarding every repeat event would double it up. `cmdAsCtrl` (slice
+ * 3.5f, default `false`) is applied to `code` via `keyRemap.remapCode`
+ * before the message is built -- the same call, with the same flag, for
+ * both a keydown and the matching keyup (see `attachInput`'s `onKeyDown`/
+ * `onKeyUp`) so a held key can't desync into "Meta down, Ctrl up" on the
+ * host if the setting changes mid-press (`app.ts`'s toggle also sends a
+ * `release_all` on change, belt and suspenders). */
+export function keyToMessage(
+  code: string,
+  pressed: boolean,
+  repeat: boolean,
+  cmdAsCtrl = false,
+): InputMessage | null {
   if (repeat) return null;
-  return { type: "key", code, pressed };
+  return { type: "key", code: remapCode(code, cmdAsCtrl), pressed };
 }
 
 const POINTER_BUTTON_NAMES: readonly PointerButton[] = ["left", "middle", "right", "back", "forward"];
@@ -196,6 +208,11 @@ export function attachInput(
   video: HTMLVideoElement,
   channels: InputChannels,
   hooks?: InputHooks,
+  // Slice 3.5f: a getter, not a plain `boolean`, since the owner can flip
+  // the "Cmd как Ctrl" toggle (`app.ts`) mid-session -- every keydown/keyup
+  // reads the current value at the moment it fires, rather than capturing
+  // whatever was true when `attachInput` was called.
+  getCmdAsCtrl?: () => boolean,
 ): () => void {
   let rafHandle: number | null = null;
   let pendingMove: { x: number; y: number } | null = null;
@@ -263,7 +280,7 @@ export function attachInput(
 
   function onKeyDown(e: KeyboardEvent): void {
     e.preventDefault();
-    const msg = keyToMessage(e.code, true, e.repeat);
+    const msg = keyToMessage(e.code, true, e.repeat, getCmdAsCtrl?.());
 
     if (msg && isPasteShortcut(e) && hooks?.beforePaste) {
       // Open the gate *before* queueing this keydown, so it -- and every
@@ -290,7 +307,7 @@ export function attachInput(
 
   function onKeyUp(e: KeyboardEvent): void {
     e.preventDefault();
-    const msg = keyToMessage(e.code, false, e.repeat);
+    const msg = keyToMessage(e.code, false, e.repeat, getCmdAsCtrl?.());
     if (msg) sendGatedInput(msg);
   }
 

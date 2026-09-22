@@ -39,6 +39,12 @@ import {
   QUALITY_PRESET_LABELS,
   saveQualityPreset,
 } from "./qualityPreset";
+import {
+  cmdAsCtrlApplies,
+  isMacClient,
+  loadCmdAsCtrlSetting,
+  saveCmdAsCtrlSetting,
+} from "./keyRemap";
 import { reconnectBackoffMs } from "./reconnectBackoff";
 import {
   connectionBannerLabel,
@@ -52,6 +58,8 @@ import type { ConnectionBannerPhase } from "./sessionRecovery";
 import type { ControlMessage } from "./generated/ControlMessage";
 import type { DisplayEntry } from "./generated/DisplayEntry";
 import type { DeviceEntry } from "./generated/DeviceEntry";
+import type { HostOs } from "./generated/HostOs";
+import type { InputMessage } from "./generated/InputMessage";
 import type { QualityPreset } from "./generated/QualityPreset";
 
 /** Slice 3.5b adds `disconnecting` (a `DISCONNECT_GRACE_MS` window is
@@ -228,6 +236,10 @@ export function mount(root: Element | null): void {
       <div class="controls">
         <select id="display-select" class="display-select" hidden></select>
         <select id="quality-select" class="quality-select" title="Качество"></select>
+        <label id="cmd-as-ctrl-label" class="cmd-as-ctrl-toggle" hidden>
+          <input type="checkbox" id="cmd-as-ctrl-checkbox" />
+          Cmd как Ctrl
+        </label>
         <span id="view-only" class="status view-only" hidden></span>
         <span id="input-blocked" class="status input-blocked" hidden></span>
         <span id="clipboard-note" class="status clipboard-note" hidden></span>
@@ -284,6 +296,17 @@ export function mount(root: Element | null): void {
     el.textContent = label;
     qualitySelect.appendChild(el);
   }
+  const cmdAsCtrlLabel = root.querySelector<HTMLLabelElement>("#cmd-as-ctrl-label")!;
+  const cmdAsCtrlCheckbox = root.querySelector<HTMLInputElement>("#cmd-as-ctrl-checkbox")!;
+  // Decided once per tab (the physical keyboard doesn't change mid-session),
+  // unlike `hostOs` below, which is per-session and arrives from the host.
+  const clientIsMac = isMacClient(navigator);
+  // Slice 3.5f: a global (not per-device) setting -- see `keyRemap.ts`'s
+  // `CMD_AS_CTRL_STORAGE_KEY` doc comment for why. Loaded once here rather
+  // than per-session, like `qualitySelect`'s per-device choice is.
+  const initialStorage = ownerStorage();
+  let cmdAsCtrl = initialStorage ? loadCmdAsCtrlSetting(initialStorage) : true;
+  cmdAsCtrlCheckbox.checked = cmdAsCtrl;
   const viewOnlyEl = root.querySelector<HTMLSpanElement>("#view-only")!;
   const inputBlockedEl = root.querySelector<HTMLSpanElement>("#input-blocked")!;
   const clipboardNoteEl = root.querySelector<HTMLSpanElement>("#clipboard-note")!;
@@ -327,6 +350,12 @@ export function mount(root: Element | null): void {
   // The `control` data channel, kept around so the picker's `change`
   // handler can send `ControlMessage::SelectDisplay` on it directly.
   let controlChannel: RTCDataChannel | null = null;
+  // The host's OS for this session (slice 3.5f), from
+  // `ControlMessage::HostInfo` -- `null` until it arrives (or once
+  // `stopSessionResources` resets it for the next session). Drives whether
+  // the "Cmd как Ctrl" toggle is shown (`updateCmdAsCtrlVisibility`) and, via
+  // `maybeAttachInput`'s `getCmdAsCtrl`, whether it has any effect at all.
+  let hostOs: HostOs | null = null;
   // Whether the host reported it can't inject input for this session (slice
   // 2.5a, debt D26), from `ControlMessage::InputStatus`. While true, input
   // is never attached (see `maybeAttachInput`) and `#view-only` shows why.
@@ -640,7 +669,32 @@ export function mount(root: Element | null): void {
             onCopyShortcut: () => bridge.beginDeferredCopy(),
           }
         : undefined,
+      // Slice 3.5f: a getter, not `cmdAsCtrl` itself, so a later toggle
+      // (see the checkbox's `change` listener below) is picked up by every
+      // keydown/keyup without re-attaching.
+      () => cmdAsCtrl,
     );
+  }
+
+  /** Shows/hides `#cmd-as-ctrl-label` for the current `hostOs`/`clientIsMac`
+   * (slice 3.5f) -- called whenever either could have changed: the host's
+   * `host_info` arriving, and `stopSessionResources` resetting `hostOs` back
+   * to `null` between sessions. */
+  function updateCmdAsCtrlVisibility(): void {
+    cmdAsCtrlLabel.hidden = !cmdAsCtrlApplies(clientIsMac, hostOs);
+  }
+
+  /** Sends `InputMessage::ReleaseAll` on the `input` channel directly (a
+   * no-op if it isn't open) -- used when the "Cmd как Ctrl" setting changes
+   * mid-session (see the checkbox's `change` listener below), so a Cmd/Ctrl
+   * held down through the flip can't get stuck pressed on the host (its
+   * `code` on the wire would otherwise switch mid-press, e.g. "Meta down,
+   * Ctrl up"). */
+  function releaseAllKeys(): void {
+    if (inputChannel?.readyState === "open") {
+      const msg: InputMessage = { type: "release_all" };
+      inputChannel.send(JSON.stringify(msg));
+    }
   }
 
   function stopPingLoop(): void {
@@ -714,6 +768,11 @@ export function mount(root: Element | null): void {
         displays = msg.displays;
         currentDisplay = msg.current;
         renderDisplayPicker();
+        return;
+      }
+      if (msg.type === "host_info") {
+        hostOs = msg.os;
+        updateCmdAsCtrlVisibility();
         return;
       }
       if (msg.type === "input_status") {
@@ -851,6 +910,8 @@ export function mount(root: Element | null): void {
     controlChannel = null;
     displaySelect.hidden = true;
     displaySelect.innerHTML = "";
+    hostOs = null;
+    updateCmdAsCtrlVisibility();
     inputBlocked = false;
     viewOnlyEl.hidden = true;
     viewOnlyEl.textContent = "";
@@ -1370,6 +1431,18 @@ export function mount(root: Element | null): void {
     if (controlChannel) sendQualityPreset(controlChannel, preset);
     // Give focus back to the video, same reasoning as `displaySelect`'s
     // change listener above.
+    video.focus();
+  });
+
+  cmdAsCtrlCheckbox.addEventListener("change", () => {
+    cmdAsCtrl = cmdAsCtrlCheckbox.checked;
+    const storage = ownerStorage();
+    if (storage) saveCmdAsCtrlSetting(storage, cmdAsCtrl);
+    // A held Cmd/Ctrl must not get stuck on the host mid-flip -- see
+    // `releaseAllKeys`'s doc comment.
+    releaseAllKeys();
+    // Give focus back to the video, same reasoning as `displaySelect`'s/
+    // `qualitySelect`'s change listeners above.
     video.focus();
   });
 

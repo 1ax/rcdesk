@@ -37,6 +37,23 @@ pub enum QualityPreset {
     Smooth,
 }
 
+/// The host's operating system, as reported in `ControlMessage::HostInfo`
+/// (slice 3.5f). Used by the client to decide whether Cmd should be remapped
+/// to Ctrl (`web/src/keyRemap.ts`'s `cmdAsCtrlApplies`: a Mac client talking
+/// to a Windows host, where the physical Cmd key would otherwise arrive as
+/// the Windows key -- see that module's doc comment for the full story).
+/// `Other` covers every non-macOS, non-Windows target (only relevant to
+/// `cargo test --workspace` on CI's `ubuntu-latest` job -- `rcdesk-agent`
+/// itself only ships for macOS/Windows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum HostOs {
+    Macos,
+    Windows,
+    Other,
+}
+
 /// A single `control`-channel message, JSON-encoded on the wire (see
 /// ARCHITECTURE.md §5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -132,6 +149,11 @@ pub enum ControlMessage {
     /// pipeline's controller). With `--no-adapt`, the host ignores this with
     /// a `debug` log -- there is no controller to switch.
     SetQuality { preset: QualityPreset },
+    /// host -> client: the host's operating system (slice 3.5f). Sent once,
+    /// alongside `Displays`, when the `control` channel opens -- like
+    /// `InputStatus`, this never changes mid-session, so it's never re-sent
+    /// later.
+    HostInfo { os: HostOs },
 }
 
 #[cfg(test)]
@@ -345,6 +367,23 @@ mod tests {
                 json,
                 format!(r#"{{"type":"set_quality","preset":"{wire}"}}"#)
             );
+
+            let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(round_tripped, msg);
+        }
+    }
+
+    #[test]
+    fn host_info_round_trips_through_json_with_exact_shape() {
+        for (os, wire) in [
+            (HostOs::Macos, "macos"),
+            (HostOs::Windows, "windows"),
+            (HostOs::Other, "other"),
+        ] {
+            let msg = ControlMessage::HostInfo { os };
+
+            let json = serde_json::to_string(&msg).expect("serialize");
+            assert_eq!(json, format!(r#"{{"type":"host_info","os":"{wire}"}}"#));
 
             let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(round_tripped, msg);

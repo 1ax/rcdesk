@@ -61,6 +61,38 @@ describe("keyToMessage", () => {
       pressed: false,
     });
   });
+
+  // Slice 3.5f: `cmdAsCtrl` remaps Meta codes for both keydown and keyup,
+  // the same way (`code: remapCode(code, cmdAsCtrl)`) -- see `keyRemap.ts`'s
+  // own tests for the remap rule itself.
+  it("remaps MetaLeft to ControlLeft on keydown when cmdAsCtrl is true", () => {
+    expect(keyToMessage("MetaLeft", true, false, true)).toEqual({
+      type: "key",
+      code: "ControlLeft",
+      pressed: true,
+    });
+  });
+
+  it("remaps MetaRight to ControlRight on keyup when cmdAsCtrl is true", () => {
+    expect(keyToMessage("MetaRight", false, false, true)).toEqual({
+      type: "key",
+      code: "ControlRight",
+      pressed: false,
+    });
+  });
+
+  it("leaves Meta codes alone when cmdAsCtrl is false or omitted", () => {
+    expect(keyToMessage("MetaLeft", true, false, false)).toEqual({
+      type: "key",
+      code: "MetaLeft",
+      pressed: true,
+    });
+    expect(keyToMessage("MetaLeft", true, false)).toEqual({
+      type: "key",
+      code: "MetaLeft",
+      pressed: true,
+    });
+  });
 });
 
 describe("KeyMessageGate", () => {

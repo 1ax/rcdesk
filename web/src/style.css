@@ -354,6 +354,24 @@ body {
   opacity: 0.6;
 }
 
+.cmd-as-ctrl-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgb(0 0 0 / 55%);
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+
+.cmd-as-ctrl-toggle input {
+  margin: 0;
+  cursor: pointer;
+}
+
 .controls .btn {
   width: auto;
   margin-top: 0;

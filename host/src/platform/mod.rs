@@ -86,6 +86,29 @@ pub fn computer_name() -> Option<String> {
     other::computer_name()
 }
 
+/// This host's OS as reported to the client over the `control` channel
+/// (`ControlMessage::HostInfo`, slice 3.5f) -- e.g. so the client can decide
+/// whether Cmd should act as Ctrl for this session (Mac client, Windows
+/// host only; see `web/src/keyRemap.ts`'s `cmdAsCtrlApplies`). Re-exported
+/// the same cfg-free-path way `name()`/`computer_name()` above are, even
+/// though (unlike those) its whole body already lives here rather than in a
+/// per-platform submodule -- there's nothing platform-specific to call into,
+/// just a different `proto::control::HostOs` value per `cfg`.
+#[cfg(target_os = "macos")]
+pub fn host_os() -> proto::control::HostOs {
+    proto::control::HostOs::Macos
+}
+
+#[cfg(target_os = "windows")]
+pub fn host_os() -> proto::control::HostOs {
+    proto::control::HostOs::Windows
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn host_os() -> proto::control::HostOs {
+    proto::control::HostOs::Other
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +136,23 @@ mod tests {
     fn computer_name_returns_something_on_windows() {
         let name = computer_name().expect("COMPUTERNAME should be set on any real Windows box");
         assert!(!name.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_os_is_macos_on_macos() {
+        assert_eq!(host_os(), proto::control::HostOs::Macos);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn host_os_is_windows_on_windows() {
+        assert_eq!(host_os(), proto::control::HostOs::Windows);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn host_os_is_other_elsewhere() {
+        assert_eq!(host_os(), proto::control::HostOs::Other);
     }
 }

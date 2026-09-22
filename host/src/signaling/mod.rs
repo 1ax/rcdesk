@@ -1435,6 +1435,16 @@ async fn handle_session_event(
                         tracing::warn!(?err, "failed to send initial displays list");
                     }
                 }
+                let host_info = host_info_message();
+                match active.peer.send_control(&host_info).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!("control channel not open yet, dropped host info");
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, "failed to send host info");
+                    }
+                }
                 let status = ControlMessage::InputStatus {
                     available: active.input_available,
                     reason: active.input_reason.clone(),
@@ -1476,6 +1486,14 @@ fn apply_remote_clipboard_text(clipboard: Option<&Arc<Mutex<ClipboardSync>>>, te
                 "clipboard sync unavailable for this session, ignoring incoming clipboard text"
             );
         }
+    }
+}
+
+/// Builds the `ControlMessage::HostInfo` announcement (slice 3.5f), sent
+/// alongside `displays_message` when the `control` channel opens.
+fn host_info_message() -> ControlMessage {
+    ControlMessage::HostInfo {
+        os: crate::platform::host_os(),
     }
 }
 
@@ -2106,6 +2124,19 @@ mod tests {
                     },
                 ],
                 current: 2,
+            }
+        );
+    }
+
+    /// The `control` channel's opening announcements (slice 3.5f) include
+    /// the host's own OS, matching `platform::host_os()` -- what the client
+    /// uses to decide whether Cmd should act as Ctrl (`web/src/keyRemap.ts`).
+    #[test]
+    fn host_info_message_reports_this_hosts_os() {
+        assert_eq!(
+            host_info_message(),
+            ControlMessage::HostInfo {
+                os: crate::platform::host_os()
             }
         );
     }
