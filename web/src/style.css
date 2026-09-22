@@ -402,6 +402,93 @@ body {
   pointer-events: none;
 }
 
+/* Slice 3.2d: the OPAQUE-login dialog for a host that has an access
+   password set (see `hostAuth.ts` and `app.ts`'s `renderAuthDialog`) -- a
+   full-screen overlay above everything in `.session-screen` (including the
+   session bar, deliberately: nothing behind it is meant to be clickable
+   until the login settles one way or another). */
+.auth-dialog {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgb(0 0 0 / 70%);
+}
+
+.auth-dialog-card {
+  width: 100%;
+  max-width: 320px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 32px 24px;
+  text-align: center;
+}
+
+.auth-dialog-card h2 {
+  margin: 0 0 8px;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.auth-dialog-host {
+  margin: 0 0 20px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.auth-password-input {
+  width: 100%;
+  font-size: 16px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+}
+
+.auth-password-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.auth-password-input:disabled {
+  opacity: 0.6;
+}
+
+.auth-dialog-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.auth-dialog-actions .btn {
+  margin-top: 0;
+}
+
+@media (max-width: 600px) {
+  .auth-dialog {
+    padding: 0;
+  }
+
+  .auth-dialog-card {
+    max-width: none;
+    height: 100%;
+    border-radius: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+
+  .auth-password-input {
+    padding: 16px;
+  }
+}
+
 .controls {
   display: flex;
   align-items: center;
