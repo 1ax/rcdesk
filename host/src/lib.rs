@@ -15,6 +15,7 @@
 pub const DEFAULT_LOG_FILTER: &str =
     "info,rtc=error,rtc_dtls=error,rtc_ice=error,rtc_ice::agent::agent_proto=off,enigo=warn";
 
+pub mod access;
 pub mod adapt;
 pub mod agent;
 pub mod app;
@@ -23,6 +24,7 @@ pub mod clipboard;
 pub mod cursor;
 pub mod device;
 pub mod encode;
+mod fsutil;
 pub mod input;
 pub mod pipeline;
 pub mod platform;

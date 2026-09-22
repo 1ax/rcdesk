@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::watch;
 
+use rcdesk_host::access::{self, AccessStore};
 use rcdesk_host::agent;
 use rcdesk_host::app::{self, CaptureBackend, EncoderBackend, ReconnectPolicy, ServeOptions};
 use rcdesk_host::capture::{self, FrameSource};
@@ -127,6 +128,13 @@ enum Command {
         #[command(subcommand)]
         action: AutostartAction,
     },
+    /// Управление паролем доступа к хосту (слайс 3.2): пароль хранится на
+    /// хосте только в виде записи OPAQUE (`access.json` рядом с
+    /// `device.json`) -- сам пароль хост не сохраняет.
+    Password {
+        #[command(subcommand)]
+        action: PasswordAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -136,6 +144,16 @@ enum AutostartAction {
     /// Remove the "start at login" registration.
     Off,
     /// Print whether autostart is currently on, and for which path.
+    Status,
+}
+
+#[derive(Subcommand)]
+enum PasswordAction {
+    /// Задать (или сменить) пароль доступа.
+    Set,
+    /// Убрать пароль доступа.
+    Clear,
+    /// Показать, задан ли пароль доступа.
     Status,
 }
 
@@ -207,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
             run_serve(opts).await
         }
         Command::Autostart { action } => run_autostart(action),
+        Command::Password { action } => run_password(action),
     }
 }
 
@@ -234,6 +253,64 @@ fn run_autostart(action: AutostartAction) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `rcdesk-host password set|clear|status` -- see `rcdesk_host::access`'s
+/// module doc comment for what's actually stored (an OPAQUE registration
+/// record, never the password itself). Uses the same data directory as
+/// `DeviceStore` (`agent::paths::data_dir()`).
+fn run_password(action: PasswordAction) -> anyhow::Result<()> {
+    let store = AccessStore::new(&agent::paths::data_dir());
+    match action {
+        PasswordAction::Set => {
+            let password = read_new_password()?;
+            if let Err(message) = access::validate_password(&password) {
+                anyhow::bail!(message);
+            }
+            let record = access::register(&password)?;
+            store.save(&record)?;
+            println!("Пароль задан: {}", store.path().display());
+            println!("Хост применит его при следующем подключении -- перезапуск агента не нужен.");
+        }
+        PasswordAction::Clear => {
+            let had_password = store.load().is_some();
+            store.clear()?;
+            if had_password {
+                println!("Пароль снят");
+            } else {
+                println!("Пароль не был задан");
+            }
+        }
+        PasswordAction::Status => {
+            if store.load().is_some() {
+                println!("Пароль: задан ({})", store.path().display());
+            } else {
+                println!("Пароль: не задан");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reads the new password: one line from stdin when it isn't a terminal
+/// (scripts/tests -- e.g. this sub-step's own manual CLI check pipes a
+/// password in), or `rpassword`'s hidden-input prompt plus a confirmation
+/// repeat when it is a real terminal.
+fn read_new_password() -> anyhow::Result<String> {
+    use std::io::IsTerminal as _;
+
+    if std::io::stdin().is_terminal() {
+        let first = rpassword::prompt_password("Пароль доступа: ")?;
+        let second = rpassword::prompt_password("Ещё раз: ")?;
+        if first != second {
+            anyhow::bail!("Пароли не совпадают");
+        }
+        Ok(first)
+    } else {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok(line.trim_end_matches(['\n', '\r']).to_string())
+    }
 }
 
 fn run_list_displays() -> anyhow::Result<()> {

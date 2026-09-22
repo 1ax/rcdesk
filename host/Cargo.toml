@@ -49,6 +49,18 @@ tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std", "logging"] }
 futures-util = "0.3"
 base64 = { workspace = true }
+opaque-ke = { workspace = true }
+argon2 = { workspace = true }
+sha2 = { workspace = true }
+rpassword = { workspace = true }
+# opaque-ke 4.0.1 is generic over `rand_core` 0.6's `RngCore + CryptoRng`
+# (it pins `rand = "0.8", default-features = false`, which on its own
+# doesn't expose `OsRng` -- see access.rs). This workspace's own `rand`
+# (0.10) uses a different, incompatible `rand_core` major version, so this
+# direct, narrowly-scoped dependency is the only way to get an `OsRng` that
+# actually satisfies opaque-ke's trait bounds. Not in slice 3.2b's planned
+# dependency list -- see the sub-step report for why it's needed anyway.
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 scap = { workspace = true }

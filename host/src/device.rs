@@ -67,41 +67,12 @@ impl DeviceStore {
         }
     }
 
-    /// Writes `credentials` atomically: a temporary file next to `path`,
-    /// then `rename` over it, so a crash or power loss mid-write never
-    /// leaves a half-written `device.json` behind. Mode `0600` on Unix (see
-    /// this module's doc comment); the parent directory is created if it
-    /// doesn't exist yet, the same as `agent::logging::init`/`agent::lock::acquire`.
+    /// Writes `credentials` atomically with mode `0600` on Unix -- see this
+    /// module's doc comment, and `fsutil::write_private_atomic` (slice
+    /// 3.2b) for how.
     pub fn save(&self, credentials: &DeviceCredentials) -> anyhow::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let mut tmp_name = self.path.file_name().unwrap_or_default().to_os_string();
-        tmp_name.push(".tmp");
-        let tmp_path = self.path.with_file_name(tmp_name);
-
         let json = serde_json::to_vec_pretty(credentials)?;
-
-        // The mode is set when the file is *created*, not after it already
-        // holds the secret: writing first and `set_permissions` after leaves
-        // a window in which the temporary file is world-readable (umask),
-        // and it holds exactly the bytes this mode is meant to protect.
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        {
-            use std::io::Write as _;
-            let mut file = options.open(&tmp_path)?;
-            file.write_all(&json)?;
-            file.sync_all()?;
-        }
-
-        std::fs::rename(&tmp_path, &self.path)?;
+        crate::fsutil::write_private_atomic(&self.path, &json)?;
         Ok(())
     }
 
