@@ -311,6 +311,11 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
         build_cursor_source: Box::new(build_real_cursor_source),
         build_clipboard,
         runtime,
+        // Slice 3.2c: same data directory as `DeviceStore`
+        // (`main.rs`/`agent_main.rs` both build one over
+        // `agent::paths::data_dir()`); `AccessStore::new` doesn't touch the
+        // filesystem, so this is safe even before the directory exists.
+        access_store: crate::access::AccessStore::new(&crate::agent::paths::data_dir()),
     })
 }
 

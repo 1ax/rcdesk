@@ -322,6 +322,65 @@ async fn offer_answer_and_ice_are_forwarded_between_session_peers() {
     }
 }
 
+// Slice 3.2c: AuthRequired/PakeStart/AuthFailed are forwarded between the
+// two sides of a session, same as Offer/Ice -- the server never interprets
+// their `payload`.
+#[tokio::test]
+async fn auth_required_pake_start_and_auth_failed_are_forwarded_between_session_peers() {
+    let url = spawn_server().await;
+    let (mut host, mut client, session_id, _pin) = host_and_joined_client(&url).await;
+
+    send(
+        &mut host,
+        &SignalMessage::AuthRequired {
+            session_id: session_id.clone(),
+        },
+    )
+    .await;
+    match recv(&mut client).await {
+        SignalMessage::AuthRequired { session_id: sid } => assert_eq!(sid, session_id),
+        other => panic!("expected auth_required, got {other:?}"),
+    }
+
+    send(
+        &mut client,
+        &SignalMessage::PakeStart {
+            session_id: session_id.clone(),
+            payload: "client-credential-request".to_string(),
+        },
+    )
+    .await;
+    match recv(&mut host).await {
+        SignalMessage::PakeStart {
+            session_id: sid,
+            payload,
+        } => {
+            assert_eq!(sid, session_id);
+            assert_eq!(payload, "client-credential-request");
+        }
+        other => panic!("expected pake_start, got {other:?}"),
+    }
+
+    send(
+        &mut host,
+        &SignalMessage::AuthFailed {
+            session_id: session_id.clone(),
+            retry_after_secs: Some(30),
+        },
+    )
+    .await;
+    match recv(&mut client).await {
+        SignalMessage::AuthFailed {
+            session_id: sid,
+            retry_after_secs,
+        } => {
+            assert_eq!(sid, session_id);
+            assert_eq!(retry_after_secs, Some(30));
+        }
+        other => panic!("expected auth_failed, got {other:?}"),
+    }
+}
+
 // (d) unknown PIN -> Error{"unknown pin"}.
 #[tokio::test]
 async fn join_with_unknown_pin_returns_error() {

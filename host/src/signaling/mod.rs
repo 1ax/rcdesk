@@ -17,11 +17,12 @@
 //! (`SessionSlot::run_while_offline`) even while there's no connection to
 //! reconnect on.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -143,6 +144,14 @@ pub struct HostContext {
     /// never take the session down).
     pub build_clipboard: Option<BuildClipboard>,
     pub runtime: Arc<dyn Runtime>,
+    /// Slice 3.2c: the host's access password, if one is set (`access::AccessStore::load`
+    /// returns `Some` -- see `access.rs`'s module doc comment). When present,
+    /// `handle_signal_message`'s `PeerJoined` arm asks the joining client to
+    /// complete an OPAQUE login (`AuthRequired`/`PakeStart`/`PakeResponse`/
+    /// `PakeFinish`) before offering a session, instead of offering right
+    /// away. `main.rs`/`app::build_host_context` point this at the same
+    /// data directory as `device::DeviceStore` (`agent::paths::data_dir()`).
+    pub access_store: crate::access::AccessStore,
 }
 
 /// One host agent's current phase, as reported through the `watch` channel
@@ -172,6 +181,44 @@ pub enum AgentStatus {
 /// session. See `handle_session_event`'s `ConnectionState`/
 /// `DisconnectTimeout` arms.
 const DISCONNECT_GRACE: Duration = Duration::from_secs(15);
+
+/// Slice 3.2c: how long a `PendingAuth` (armed on `AuthRequired`, see
+/// `handle_signal_message`'s `PeerJoined` arm) waits for the client to
+/// finish its OPAQUE login before the host gives up and sends `Bye`. Same
+/// self-timer pattern as `DISCONNECT_GRACE`/`SessionEvent::DisconnectTimeout`.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Slice 3.2c: how many consecutive failed `PakeStart` attempts a client may
+/// make before the host locks out further attempts for a while -- see
+/// `auth_lockout_duration`. `SessionSlot::auth_failures` counts *starts*,
+/// not finishes: each `PakeStart` costs the host one OPRF evaluation
+/// regardless of whether the client's password was right, and a wrong
+/// password is only ever caught client-side (see `access::LoginServer::login_finish`'s
+/// doc comment), so counting starts is what actually limits the attacker's
+/// cost.
+const MAX_AUTH_ATTEMPTS: u32 = 5;
+
+/// Slice 3.2c: hands out a fresh, process-wide unique generation for a
+/// `PendingAuth`'s `AuthTimeout` timer -- same pattern as
+/// `transport::next_session_tag`, for the same reason: distinguishing a
+/// timeout for a `PendingAuth` that's since been replaced (a new
+/// `PeerJoined`) or resolved (a successful `PakeFinish`) from the one
+/// actually still pending.
+static NEXT_AUTH_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_auth_generation() -> u64 {
+    NEXT_AUTH_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Slice 3.2c: the lockout duration after `auth_failures` consecutive failed
+/// `PakeStart` attempts -- only meaningful once `auth_failures > MAX_AUTH_ATTEMPTS`
+/// (i.e. `auth_failures >= 6`, the caller's guard): 5s on the 6th attempt,
+/// doubling on each further attempt, capped at 60s.
+fn auth_lockout_duration(auth_failures: u32) -> Duration {
+    let exponent = auth_failures.saturating_sub(6).min(63);
+    let secs = 5u64.saturating_mul(1u64 << exponent);
+    Duration::from_secs(secs.min(60))
+}
 
 /// How often `SignalingClient::run` pings the signaling server, and how long
 /// it tolerates silence (no incoming frame of any kind) before deciding the
@@ -447,14 +494,17 @@ impl SignalingClient {
                         slot.event_tx.clone(),
                         &mut slot.active,
                         &mut slot.current_session_id,
+                        &mut slot.pending_auth,
+                        &mut slot.auth_failures,
+                        &mut slot.auth_locked_until,
                     )
                     .await;
                 }
                 Some(event) = slot.event_rx.recv() => {
-                    handle_session_event(event, ctx, &pin, status, &out_tx, &slot.event_tx, &mut slot.active, &mut slot.current_session_id).await;
+                    handle_session_event(event, ctx, &pin, status, &out_tx, &slot.event_tx, &mut slot.active, &mut slot.current_session_id, &mut slot.pending_auth).await;
                 }
                 Some(cmd) = commands.recv() => {
-                    handle_agent_command(cmd, &pin, status, &out_tx, &mut slot.active, &mut slot.current_session_id).await;
+                    handle_agent_command(cmd, &pin, status, &out_tx, &mut slot.active, &mut slot.current_session_id, &mut slot.pending_auth).await;
                 }
                 _ = timeout_checker.tick() => {
                     let silence = last_incoming.elapsed();
@@ -470,6 +520,13 @@ impl SignalingClient {
         // Deliberately no `slot.active` shutdown here (slice 3.5a): the
         // session is peer-to-peer and outlives this signaling connection --
         // `run_agent` keeps it alive across the reconnect that follows.
+        //
+        // `slot.pending_auth`, on the other hand, has no P2P channel of its
+        // own yet (slice 3.2c) -- the OPAQUE handshake only ever exists
+        // relayed through this very socket -- so it cannot survive the
+        // reconnect that follows; clear it rather than leave a stale wait
+        // for `AuthTimeout` to eventually clean up on its own.
+        slot.pending_auth = None;
         drop(out_tx);
         // On a dead (half-open) connection the writer's close handshake can
         // block on the socket; don't let that stall the reconnect.
@@ -785,6 +842,12 @@ struct ActiveSession {
     /// doc comment and `handle_session_event`'s `ConnectionState`/
     /// `DisconnectTimeout` arms, its only caller.
     disconnect_grace: DisconnectGrace,
+    /// The OPAQUE session key from a successful login (slice 3.2c), when
+    /// this session was gated by an access password -- `None` when the
+    /// host has no password set. Unused today beyond being kept here;
+    /// slice 3.2e will feed it into the data channel encryption.
+    #[allow(dead_code)]
+    session_key: Option<crate::access::SessionKey>,
 }
 
 /// Slice 3.5b: pure decision logic for the `RTCPeerConnectionState::Disconnected`
@@ -904,6 +967,33 @@ impl ActiveSession {
     }
 }
 
+/// One session waiting on an OPAQUE login (slice 3.2c) before the host will
+/// offer it, armed by `handle_signal_message`'s `PeerJoined` arm when
+/// `HostContext::access_store` has a password set. Lives in `SessionSlot`
+/// separately from `active`/`current_session_id` -- unlike an `ActiveSession`,
+/// there is no `PeerSession`/video pipeline yet, nothing to shut down, only
+/// state to remember while the client works through `PakeStart`/`PakeFinish`.
+struct PendingAuth {
+    /// The session id from the `PeerJoined` that armed this wait -- matched
+    /// against every incoming `PakeStart`/`PakeFinish`/`Bye` so a message
+    /// for some other (already superseded) session id is ignored.
+    session_id: String,
+    /// This `PeerJoined`'s `ice_servers`, kept so a successful `PakeFinish`
+    /// can start the session with the same credentials `PeerJoined`
+    /// carried, exactly as the no-password path would have used right away.
+    ice_servers: Vec<proto::signal::IceServer>,
+    /// The server half of the in-progress OPAQUE login, set by a successful
+    /// `PakeStart` and consumed by the next `PakeFinish`. `None` before the
+    /// first `PakeStart`, and again right after a `PakeFinish` that failed
+    /// (see `access::LoginServer::login_finish`'s doc comment) -- the wait
+    /// stays armed, but the client must start over with a fresh `PakeStart`.
+    login: Option<crate::access::LoginServer>,
+    /// This wait's `AuthTimeout` generation (see `next_auth_generation`) --
+    /// matched by `handle_session_event`'s `AuthTimeout` arm against a timer
+    /// armed for it, same reasoning as `DisconnectGrace`'s `epoch`.
+    generation: u64,
+}
+
 /// The one active session's state (if any), owned by `app::run_agent`
 /// across every signaling reconnect (slice 3.5a). A session is
 /// peer-to-peer once its `RTCPeerConnection` is up -- signaling only sets it
@@ -917,6 +1007,22 @@ pub struct SessionSlot {
     current_session_id: Option<String>,
     event_tx: mpsc::Sender<SessionEvent>,
     event_rx: mpsc::Receiver<SessionEvent>,
+    /// Slice 3.2c: the session currently waiting on an OPAQUE login, if
+    /// any -- see `PendingAuth`'s doc comment. Unlike `active`, this has no
+    /// P2P channel of its own yet, so it does not survive losing this
+    /// signaling connection (see `SignalingClient::run`'s exit path).
+    pending_auth: Option<PendingAuth>,
+    /// Slice 3.2c: consecutive failed `PakeStart` attempts against this
+    /// host's access password, across every `PendingAuth` -- deliberately
+    /// *not* reset by a fresh `PeerJoined` (only a successful `PakeFinish`
+    /// resets it): it lives in the slot and survives a signaling reconnect,
+    /// so a client can't dodge the lockout below by reconnecting.
+    auth_failures: u32,
+    /// Slice 3.2c: set once `auth_failures` crosses `MAX_AUTH_ATTEMPTS`;
+    /// while in the future, every `PakeStart` is rejected with
+    /// `AuthFailed { retry_after_secs: Some(..) } }` without spending an
+    /// OPRF evaluation or touching `auth_failures` further.
+    auth_locked_until: Option<Instant>,
 }
 
 impl SessionSlot {
@@ -931,6 +1037,9 @@ impl SessionSlot {
             current_session_id: None,
             event_tx,
             event_rx,
+            pending_auth: None,
+            auth_failures: 0,
+            auth_locked_until: None,
         }
     }
 
@@ -991,6 +1100,7 @@ impl SessionSlot {
                         &self.event_tx,
                         &mut self.active,
                         &mut self.current_session_id,
+                        &mut self.pending_auth,
                     )
                     .await;
                 }
@@ -1002,6 +1112,7 @@ impl SessionSlot {
                         &discard_out_tx,
                         &mut self.active,
                         &mut self.current_session_id,
+                        &mut self.pending_auth,
                     )
                     .await;
                 }
@@ -1027,6 +1138,9 @@ async fn handle_signal_message(
     event_tx: mpsc::Sender<SessionEvent>,
     active: &mut Option<ActiveSession>,
     current_session_id: &mut Option<String>,
+    pending_auth: &mut Option<PendingAuth>,
+    auth_failures: &mut u32,
+    auth_locked_until: &mut Option<Instant>,
 ) {
     match msg {
         SignalMessage::PeerJoined {
@@ -1041,52 +1155,45 @@ async fn handle_signal_message(
                 });
             }
             *current_session_id = None;
+            // Slice 3.2c: a new `PeerJoined` supersedes any login the
+            // previous joining peer was in the middle of.
+            *pending_auth = None;
 
-            let chosen_ice_servers = peer_ice_servers(&ice_servers, registered_ice_servers);
-            match start_session(ctx, chosen_ice_servers, event_tx).await {
-                Ok(parts) => match parts.peer.create_offer().await {
-                    Ok(sdp) => {
-                        let _ = out_tx.send(SignalMessage::Offer {
-                            session_id: session_id.clone(),
-                            sdp,
-                        });
-                        *current_session_id = Some(session_id);
-                        let session_tag = parts.peer.tag();
-                        *active = Some(ActiveSession {
-                            peer: parts.peer,
-                            video: parts.video,
-                            video_tx: parts.video_tx,
-                            keyframe_flag: parts.keyframe_flag,
-                            displays: parts.displays,
-                            router: parts.router,
-                            cursor_task: parts.cursor_task,
-                            input_available: parts.input_available,
-                            input_reason: parts.input_reason,
-                            clipboard: parts.clipboard,
-                            clipboard_task: parts.clipboard_task,
-                            elevation_task: parts.elevation_task,
-                            session_tag,
-                            quality_preset: QualityPreset::Auto,
-                            disconnect_grace: DisconnectGrace::default(),
-                        });
-                    }
-                    Err(err) => {
-                        tracing::warn!(?err, "failed to create offer");
-                        parts.video.stop();
-                        parts.cursor_task.abort();
-                        if let Some(task) = parts.clipboard_task {
-                            task.abort();
-                        }
-                        if let Some(task) = parts.elevation_task {
-                            task.abort();
-                        }
-                        let _ = out_tx.send(SignalMessage::Bye { session_id });
-                    }
-                },
-                Err(err) => {
-                    tracing::warn!(?err, "failed to start session pipeline");
-                    let _ = out_tx.send(SignalMessage::Bye { session_id });
-                }
+            if ctx.access_store.load().is_some() {
+                let generation = next_auth_generation();
+                *pending_auth = Some(PendingAuth {
+                    session_id: session_id.clone(),
+                    ice_servers,
+                    login: None,
+                    generation,
+                });
+                tracing::info!(%session_id, "password required, waiting for client authentication");
+                let _ = out_tx.send(SignalMessage::AuthRequired {
+                    session_id: session_id.clone(),
+                });
+                let timer_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(AUTH_TIMEOUT).await;
+                    let _ = timer_tx
+                        .send(SessionEvent::AuthTimeout {
+                            session_id,
+                            generation,
+                        })
+                        .await;
+                });
+            } else {
+                begin_session(
+                    ctx,
+                    session_id,
+                    ice_servers,
+                    None,
+                    registered_ice_servers,
+                    out_tx,
+                    event_tx,
+                    active,
+                    current_session_id,
+                )
+                .await;
             }
         }
         SignalMessage::Answer { session_id, sdp } => {
@@ -1114,6 +1221,157 @@ async fn handle_signal_message(
                 tracing::debug!(%session_id, "ice candidate for unknown/stale session, ignoring");
             }
         }
+        // Slice 3.2c: the client's half of the OPAQUE login started by this
+        // `PeerJoined`'s `AuthRequired`. Never logs `payload` (an encoded
+        // OPAQUE protocol message) or any derived key material, only sizes
+        // where useful for debugging.
+        SignalMessage::PakeStart {
+            session_id,
+            payload,
+        } => {
+            let matches_pending = pending_auth
+                .as_ref()
+                .is_some_and(|p| p.session_id == session_id);
+            if !matches_pending {
+                tracing::debug!(%session_id, "pake_start for no/unknown pending auth, ignoring");
+                return;
+            }
+
+            if let Some(locked_until) = *auth_locked_until {
+                let now = Instant::now();
+                if locked_until > now {
+                    let retry_after_secs = (locked_until - now).as_secs_f64().ceil() as u32;
+                    tracing::debug!(%session_id, retry_after_secs, "pake_start while locked out");
+                    let _ = out_tx.send(SignalMessage::AuthFailed {
+                        session_id,
+                        retry_after_secs: Some(retry_after_secs.max(1)),
+                    });
+                    return;
+                }
+            }
+
+            *auth_failures += 1;
+            if *auth_failures > MAX_AUTH_ATTEMPTS {
+                let lockout = auth_lockout_duration(*auth_failures);
+                *auth_locked_until = Some(Instant::now() + lockout);
+                tracing::warn!(%session_id, auth_failures = *auth_failures, lockout_secs = lockout.as_secs(), "too many failed login attempts, locking out");
+                let _ = out_tx.send(SignalMessage::AuthFailed {
+                    session_id,
+                    retry_after_secs: Some(lockout.as_secs() as u32),
+                });
+                return;
+            }
+
+            // Re-read rather than reuse anything cached from `PeerJoined`:
+            // the owner may have cleared the password since (`password
+            // clear`), and this must reflect that right away.
+            let Some(record) = ctx.access_store.load() else {
+                tracing::warn!("password file disappeared mid-auth");
+                let _ = out_tx.send(SignalMessage::AuthFailed {
+                    session_id,
+                    retry_after_secs: None,
+                });
+                return;
+            };
+
+            let request_bytes = match BASE64_URL_SAFE_NO_PAD.decode(&payload) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::warn!(?err, "invalid base64 in pake_start payload");
+                    let _ = out_tx.send(SignalMessage::AuthFailed {
+                        session_id,
+                        retry_after_secs: None,
+                    });
+                    return;
+                }
+            };
+
+            match crate::access::login_start(&record, &request_bytes) {
+                Ok((login, response_bytes)) => {
+                    if let Some(pending) = pending_auth.as_mut() {
+                        pending.login = Some(login);
+                    }
+                    let _ = out_tx.send(SignalMessage::PakeResponse {
+                        session_id,
+                        payload: BASE64_URL_SAFE_NO_PAD.encode(response_bytes),
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(?err, "opaque login_start failed");
+                    let _ = out_tx.send(SignalMessage::AuthFailed {
+                        session_id,
+                        retry_after_secs: None,
+                    });
+                }
+            }
+        }
+        // Slice 3.2c: completes the login `PakeStart` above started. Same
+        // "never log the payload/key material" rule as `PakeStart`.
+        SignalMessage::PakeFinish {
+            session_id,
+            payload,
+        } => {
+            let matches_pending = pending_auth
+                .as_ref()
+                .is_some_and(|p| p.session_id == session_id && p.login.is_some());
+            if !matches_pending {
+                tracing::debug!(%session_id, "pake_finish with no pending login, ignoring");
+                return;
+            }
+            // Taken here (not just borrowed): on both a successful and a
+            // failed `login_finish`, the client must start a fresh
+            // `PakeStart` to try again -- `opaque_ke::ServerLogin::finish`
+            // consumes its state either way.
+            let login = pending_auth.as_mut().and_then(|p| p.login.take());
+            let Some(login) = login else {
+                return;
+            };
+
+            let finalization_bytes = match BASE64_URL_SAFE_NO_PAD.decode(&payload) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::warn!(?err, "invalid base64 in pake_finish payload");
+                    let _ = out_tx.send(SignalMessage::AuthFailed {
+                        session_id,
+                        retry_after_secs: None,
+                    });
+                    return;
+                }
+            };
+
+            match login.login_finish(&finalization_bytes) {
+                Ok(session_key) => {
+                    *auth_failures = 0;
+                    *auth_locked_until = None;
+                    let pending = pending_auth
+                        .take()
+                        .expect("checked Some via matches_pending above");
+                    tracing::info!(%session_id, "client authenticated");
+                    begin_session(
+                        ctx,
+                        session_id,
+                        pending.ice_servers,
+                        Some(session_key),
+                        registered_ice_servers,
+                        out_tx,
+                        event_tx,
+                        active,
+                        current_session_id,
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    // The wait stays armed (`pending_auth` is still `Some`,
+                    // just with `login` now `None`) -- the client can retry
+                    // with a fresh `PakeStart`.
+                    tracing::warn!(?err, %session_id, "opaque login_finish failed");
+                    let _ = out_tx.send(SignalMessage::AuthFailed {
+                        session_id,
+                        retry_after_secs: None,
+                    });
+                }
+            }
+        }
         SignalMessage::Bye { session_id } => {
             if current_session_id.as_deref() == Some(session_id.as_str()) {
                 tracing::info!(%session_id, "session ended by peer");
@@ -1124,6 +1382,12 @@ async fn handle_signal_message(
                     });
                 }
                 *current_session_id = None;
+            } else if pending_auth
+                .as_ref()
+                .is_some_and(|p| p.session_id == session_id)
+            {
+                tracing::info!(%session_id, "pending auth ended by peer");
+                *pending_auth = None;
             }
         }
         SignalMessage::Error { message } => {
@@ -1131,6 +1395,72 @@ async fn handle_signal_message(
         }
         other => {
             tracing::debug!(?other, "unexpected signal message, ignoring");
+        }
+    }
+}
+
+/// Starts the actual `PeerSession`/video pipeline and offers it to the
+/// client (slice 3.2c): factored out of `handle_signal_message`'s
+/// `PeerJoined` arm so it can be called either right away (no access
+/// password set) or after a successful OPAQUE login (`PakeFinish`)
+/// completes. `session_key` is `Some` only in the latter case.
+#[allow(clippy::too_many_arguments)]
+async fn begin_session(
+    ctx: &HostContext,
+    session_id: String,
+    ice_servers: Vec<proto::signal::IceServer>,
+    session_key: Option<crate::access::SessionKey>,
+    registered_ice_servers: &[proto::signal::IceServer],
+    out_tx: &mpsc::UnboundedSender<SignalMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+    active: &mut Option<ActiveSession>,
+    current_session_id: &mut Option<String>,
+) {
+    let chosen_ice_servers = peer_ice_servers(&ice_servers, registered_ice_servers);
+    match start_session(ctx, chosen_ice_servers, event_tx).await {
+        Ok(parts) => match parts.peer.create_offer().await {
+            Ok(sdp) => {
+                let _ = out_tx.send(SignalMessage::Offer {
+                    session_id: session_id.clone(),
+                    sdp,
+                });
+                *current_session_id = Some(session_id);
+                let session_tag = parts.peer.tag();
+                *active = Some(ActiveSession {
+                    peer: parts.peer,
+                    video: parts.video,
+                    video_tx: parts.video_tx,
+                    keyframe_flag: parts.keyframe_flag,
+                    displays: parts.displays,
+                    router: parts.router,
+                    cursor_task: parts.cursor_task,
+                    input_available: parts.input_available,
+                    input_reason: parts.input_reason,
+                    clipboard: parts.clipboard,
+                    clipboard_task: parts.clipboard_task,
+                    elevation_task: parts.elevation_task,
+                    session_tag,
+                    quality_preset: QualityPreset::Auto,
+                    disconnect_grace: DisconnectGrace::default(),
+                    session_key,
+                });
+            }
+            Err(err) => {
+                tracing::warn!(?err, "failed to create offer");
+                parts.video.stop();
+                parts.cursor_task.abort();
+                if let Some(task) = parts.clipboard_task {
+                    task.abort();
+                }
+                if let Some(task) = parts.elevation_task {
+                    task.abort();
+                }
+                let _ = out_tx.send(SignalMessage::Bye { session_id });
+            }
+        },
+        Err(err) => {
+            tracing::warn!(?err, "failed to start session pipeline");
+            let _ = out_tx.send(SignalMessage::Bye { session_id });
         }
     }
 }
@@ -1147,11 +1477,28 @@ async fn handle_agent_command(
     out_tx: &mpsc::UnboundedSender<SignalMessage>,
     active: &mut Option<ActiveSession>,
     current_session_id: &mut Option<String>,
+    pending_auth: &mut Option<PendingAuth>,
 ) {
     match cmd {
         AgentCommand::EndSession => {
             let Some(old) = active.take() else {
-                tracing::debug!("EndSession command received with no active session, ignoring");
+                // Slice 3.2c: no `active` session yet, but the owner may
+                // still be waiting on a client's OPAQUE login
+                // (`pending_auth`) -- "End session" should give up on that
+                // wait too, not just silently no-op, even though there's no
+                // `ActiveSession` to shut down and nothing to change
+                // `status` to (it was never anything but `Registered` while
+                // only a login was pending).
+                let Some(pending) = pending_auth.take() else {
+                    tracing::debug!(
+                        "EndSession command received with no active session or pending auth, ignoring"
+                    );
+                    return;
+                };
+                tracing::info!(session_id = %pending.session_id, "ending pending auth (End session command)");
+                let _ = out_tx.send(SignalMessage::Bye {
+                    session_id: pending.session_id,
+                });
                 return;
             };
             let session_id = current_session_id.take();
@@ -1177,6 +1524,7 @@ async fn handle_session_event(
     event_tx: &mpsc::Sender<SessionEvent>,
     active: &mut Option<ActiveSession>,
     current_session_id: &mut Option<String>,
+    pending_auth: &mut Option<PendingAuth>,
 ) {
     match event {
         SessionEvent::LocalIce(candidate) => {
@@ -1284,6 +1632,23 @@ async fn handle_session_event(
                 }
             } else {
                 tracing::debug!(%session_id, generation, "stale disconnect timeout, ignoring");
+            }
+        }
+        // Slice 3.2c: a `PendingAuth` (armed on `AuthRequired`) waited out
+        // `AUTH_TIMEOUT` without the client completing its login.
+        SessionEvent::AuthTimeout {
+            session_id,
+            generation,
+        } => {
+            let matches_pending = pending_auth
+                .as_ref()
+                .is_some_and(|p| p.session_id == session_id && p.generation == generation);
+            if matches_pending {
+                tracing::info!(%session_id, "auth wait timed out, ending pending session");
+                *pending_auth = None;
+                let _ = out_tx.send(SignalMessage::Bye { session_id });
+            } else {
+                tracing::debug!(%session_id, generation, "stale auth timeout, ignoring");
             }
         }
         SessionEvent::DataChannelClosed { label, tag } => {
@@ -1989,6 +2354,17 @@ pub(crate) fn test_ctx() -> HostContext {
         }),
         build_clipboard: None,
         runtime: webrtc::runtime::default_runtime().expect("runtime-tokio feature must be enabled"),
+        // Slice 3.2c: a fresh, per-test scratch directory under the system
+        // temp dir that's never written to here, mirroring
+        // `access::tests::scratch_dir`/`app::tests::scratch_device_store` --
+        // no file at this path means `access_store.load()` is `None`, i.e.
+        // "no password set", so every existing test built on `test_ctx()`
+        // keeps behaving exactly as before this slice.
+        access_store: crate::access::AccessStore::new(&std::env::temp_dir().join(format!(
+            "rcdesk-host-signaling-test-ctx-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))),
     }
 }
 
@@ -2351,6 +2727,9 @@ mod tests {
             event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
+            &mut 0,
+            &mut None,
         )
         .await;
 
@@ -2358,6 +2737,736 @@ mod tests {
         assert_eq!(current_session_id, None);
         assert_eq!(
             out_rx.try_recv().expect("expected a Bye message"),
+            SignalMessage::Bye {
+                session_id: "sess-1".to_string()
+            }
+        );
+    }
+
+    /// A `test_ctx()` with an access password registered under a fresh
+    /// scratch directory (slice 3.2c) -- mirrors
+    /// `access::tests::scratch_dir`/`app::tests::scratch_device_store`: a
+    /// unique name is enough, `tempfile` is not an approved dependency.
+    /// Unlike `test_ctx()` itself, this one *does* write a file (the
+    /// `access::register`ed record), so every caller needs its own
+    /// directory -- hence the `name` parameter.
+    fn test_ctx_with_password(name: &str, password: &str) -> HostContext {
+        let mut ctx = test_ctx();
+        let dir = std::env::temp_dir().join(format!(
+            "rcdesk-host-signaling-test-ctx-pw-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let store = crate::access::AccessStore::new(&dir);
+        store
+            .save(&crate::access::register(password).expect("opaque registration"))
+            .expect("save access record");
+        ctx.access_store = store;
+        ctx
+    }
+
+    /// Slice 3.2c: `PeerJoined` on a host with a password set must ask the
+    /// client to authenticate (`AuthRequired`) instead of offering a
+    /// session right away.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_joined_with_a_password_asks_for_auth_and_does_not_offer() {
+        let ctx = test_ctx_with_password("asks-for-auth", "correct horse battery staple");
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+        let mut pending_auth: Option<PendingAuth> = None;
+        let mut auth_failures = 0u32;
+        let mut auth_locked_until: Option<Instant> = None;
+        let (status_tx, _status_rx) = watch::channel(AgentStatus::Connecting);
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx,
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+
+        assert_eq!(
+            out_rx.try_recv().expect("expected auth_required"),
+            SignalMessage::AuthRequired {
+                session_id: "sess-1".to_string()
+            }
+        );
+        assert!(
+            out_rx.try_recv().is_err(),
+            "no Offer must be sent while waiting for auth"
+        );
+        assert!(active.is_none());
+        assert!(pending_auth.is_some());
+    }
+
+    /// Slice 3.2c: a full, real OPAQUE login (client side via `opaque_ke`
+    /// directly, same as `access::tests`) through `AuthRequired`/
+    /// `PakeStart`/`PakeResponse`/`PakeFinish` ends with the host offering
+    /// a session, exactly as the no-password path would have.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_opaque_login_then_offer() {
+        use opaque_ke::{
+            ClientLogin, ClientLoginFinishParameters, CredentialResponse, Identifiers,
+        };
+        use rand_core::OsRng;
+
+        let password = "correct horse battery staple";
+        let ctx = test_ctx_with_password("full-login", password);
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+        let mut pending_auth: Option<PendingAuth> = None;
+        let mut auth_failures = 0u32;
+        let mut auth_locked_until: Option<Instant> = None;
+        let (status_tx, _status_rx) = watch::channel(AgentStatus::Connecting);
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        assert_eq!(
+            out_rx.try_recv().expect("expected auth_required"),
+            SignalMessage::AuthRequired {
+                session_id: "sess-1".to_string()
+            }
+        );
+
+        let mut rng = OsRng;
+        let client_start =
+            ClientLogin::<crate::access::RcdeskCipherSuite>::start(&mut rng, password.as_bytes())
+                .expect("client login start");
+        let request_payload = BASE64_URL_SAFE_NO_PAD.encode(client_start.message.serialize());
+
+        handle_signal_message(
+            SignalMessage::PakeStart {
+                session_id: "sess-1".to_string(),
+                payload: request_payload,
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        let response_payload = match out_rx.try_recv().expect("expected pake_response") {
+            SignalMessage::PakeResponse { payload, .. } => payload,
+            other => panic!("expected pake_response, got {other:?}"),
+        };
+        let response_bytes = BASE64_URL_SAFE_NO_PAD
+            .decode(response_payload)
+            .expect("decode pake_response payload");
+        let response =
+            CredentialResponse::<crate::access::RcdeskCipherSuite>::deserialize(&response_bytes)
+                .expect("deserialize credential response");
+
+        let ksf = crate::access::CustomKsf::default();
+        let client_finish = client_start
+            .state
+            .finish(
+                &mut rng,
+                password.as_bytes(),
+                response,
+                ClientLoginFinishParameters::new(None, Identifiers::default(), Some(&ksf)),
+            )
+            .expect("client login finish");
+        let finish_payload = BASE64_URL_SAFE_NO_PAD.encode(client_finish.message.serialize());
+
+        handle_signal_message(
+            SignalMessage::PakeFinish {
+                session_id: "sess-1".to_string(),
+                payload: finish_payload,
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx,
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+
+        match out_rx.try_recv().expect("expected offer") {
+            SignalMessage::Offer { session_id, .. } => assert_eq!(session_id, "sess-1"),
+            other => panic!("expected offer, got {other:?}"),
+        }
+        assert!(active.is_some(), "session must have started successfully");
+        assert_eq!(auth_failures, 0);
+        assert!(pending_auth.is_none());
+
+        if let Some(active) = active.take() {
+            active.shutdown().await;
+        }
+    }
+
+    /// Slice 3.2c: a client that gets its password wrong fails locally
+    /// (`ClientLogin::finish`, same as `access::tests::login_with_a_wrong_password_fails`)
+    /// and never even produces a `PakeFinish` to send -- the host's wait
+    /// must survive that (no `Offer`, `pending_auth` still armed), and a
+    /// second, correct attempt afterwards must still succeed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wrong_password_client_finish_fails_and_host_stays_pending() {
+        use opaque_ke::{
+            ClientLogin, ClientLoginFinishParameters, CredentialResponse, Identifiers,
+        };
+        use rand_core::OsRng;
+
+        let password = "correct horse battery staple";
+        let ctx = test_ctx_with_password("wrong-then-right", password);
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+        let mut pending_auth: Option<PendingAuth> = None;
+        let mut auth_failures = 0u32;
+        let mut auth_locked_until: Option<Instant> = None;
+        let (status_tx, _status_rx) = watch::channel(AgentStatus::Connecting);
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        let _ = out_rx.try_recv(); // auth_required
+
+        // First, wrong-password attempt: the host's `PakeStart` handling
+        // can't tell it's wrong yet (OPAQUE's OPRF step is password-blind),
+        // so it still answers `PakeResponse` -- the mismatch is only ever
+        // caught client-side, in `ClientLogin::finish` below.
+        let mut rng = OsRng;
+        let wrong_client_start =
+            ClientLogin::<crate::access::RcdeskCipherSuite>::start(&mut rng, b"wrong password")
+                .expect("client login start");
+        handle_signal_message(
+            SignalMessage::PakeStart {
+                session_id: "sess-1".to_string(),
+                payload: BASE64_URL_SAFE_NO_PAD.encode(wrong_client_start.message.serialize()),
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        let wrong_response_payload = match out_rx.try_recv().expect("expected pake_response") {
+            SignalMessage::PakeResponse { payload, .. } => payload,
+            other => panic!("expected pake_response, got {other:?}"),
+        };
+        let wrong_response = CredentialResponse::<crate::access::RcdeskCipherSuite>::deserialize(
+            &BASE64_URL_SAFE_NO_PAD
+                .decode(wrong_response_payload)
+                .expect("decode pake_response payload"),
+        )
+        .expect("deserialize credential response");
+        let ksf = crate::access::CustomKsf::default();
+        let wrong_finish_result = wrong_client_start.state.finish(
+            &mut rng,
+            b"wrong password",
+            wrong_response,
+            ClientLoginFinishParameters::new(None, Identifiers::default(), Some(&ksf)),
+        );
+        assert!(
+            wrong_finish_result.is_err(),
+            "a wrong password must fail on the client side"
+        );
+
+        // No `PakeFinish` was ever sent (there is nothing valid to send),
+        // so the host must still be waiting, with no `Offer` sent.
+        assert!(out_rx.try_recv().is_err());
+        assert!(active.is_none());
+        assert!(pending_auth.is_some());
+
+        // A second, correct attempt must still succeed.
+        let right_client_start =
+            ClientLogin::<crate::access::RcdeskCipherSuite>::start(&mut rng, password.as_bytes())
+                .expect("client login start");
+        handle_signal_message(
+            SignalMessage::PakeStart {
+                session_id: "sess-1".to_string(),
+                payload: BASE64_URL_SAFE_NO_PAD.encode(right_client_start.message.serialize()),
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        let right_response_payload = match out_rx.try_recv().expect("expected pake_response") {
+            SignalMessage::PakeResponse { payload, .. } => payload,
+            other => panic!("expected pake_response, got {other:?}"),
+        };
+        let right_response = CredentialResponse::<crate::access::RcdeskCipherSuite>::deserialize(
+            &BASE64_URL_SAFE_NO_PAD
+                .decode(right_response_payload)
+                .expect("decode pake_response payload"),
+        )
+        .expect("deserialize credential response");
+        let right_client_finish = right_client_start
+            .state
+            .finish(
+                &mut rng,
+                password.as_bytes(),
+                right_response,
+                ClientLoginFinishParameters::new(None, Identifiers::default(), Some(&ksf)),
+            )
+            .expect("client login finish");
+
+        handle_signal_message(
+            SignalMessage::PakeFinish {
+                session_id: "sess-1".to_string(),
+                payload: BASE64_URL_SAFE_NO_PAD.encode(right_client_finish.message.serialize()),
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx,
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+
+        match out_rx.try_recv().expect("expected offer") {
+            SignalMessage::Offer { session_id, .. } => assert_eq!(session_id, "sess-1"),
+            other => panic!("expected offer, got {other:?}"),
+        }
+        assert!(active.is_some(), "session must have started successfully");
+
+        if let Some(active) = active.take() {
+            active.shutdown().await;
+        }
+    }
+
+    /// Slice 3.2c: a `PakeFinish` that isn't a valid OPAQUE finalization
+    /// (garbage payload, not this attacker's actual login attempt) is
+    /// rejected with `AuthFailed { retry_after_secs: None }`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn garbage_finalization_yields_auth_failed() {
+        use opaque_ke::ClientLogin;
+        use rand_core::OsRng;
+
+        let password = "correct horse battery staple";
+        let ctx = test_ctx_with_password("garbage-finalization", password);
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+        let mut pending_auth: Option<PendingAuth> = None;
+        let mut auth_failures = 0u32;
+        let mut auth_locked_until: Option<Instant> = None;
+        let (status_tx, _status_rx) = watch::channel(AgentStatus::Connecting);
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        let _ = out_rx.try_recv(); // auth_required
+
+        let mut rng = OsRng;
+        let client_start =
+            ClientLogin::<crate::access::RcdeskCipherSuite>::start(&mut rng, password.as_bytes())
+                .expect("client login start");
+        handle_signal_message(
+            SignalMessage::PakeStart {
+                session_id: "sess-1".to_string(),
+                payload: BASE64_URL_SAFE_NO_PAD.encode(client_start.message.serialize()),
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        let _ = out_rx.try_recv(); // pake_response
+                                   // `login` is `Some` now -- a `PakeFinish` matches and is attempted,
+                                   // but its payload isn't even valid base64.
+        handle_signal_message(
+            SignalMessage::PakeFinish {
+                session_id: "sess-1".to_string(),
+                payload: "not valid base64 at all!!".to_string(),
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx,
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+
+        assert_eq!(
+            out_rx.try_recv().expect("expected auth_failed"),
+            SignalMessage::AuthFailed {
+                session_id: "sess-1".to_string(),
+                retry_after_secs: None,
+            }
+        );
+        assert!(active.is_none());
+        assert!(
+            pending_auth.is_some(),
+            "the wait stays armed for a fresh PakeStart"
+        );
+    }
+
+    /// Slice 3.2c: six consecutive failed `PakeStart` attempts lock the
+    /// host out; a seventh right after is rejected too, without spending
+    /// another attempt against the counter.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn six_pake_starts_in_a_row_lock_the_host() {
+        let ctx = test_ctx_with_password("six-in-a-row", "correct horse battery staple");
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+        let mut pending_auth: Option<PendingAuth> = None;
+        let mut auth_failures = 0u32;
+        let mut auth_locked_until: Option<Instant> = None;
+        let (status_tx, _status_rx) = watch::channel(AgentStatus::Connecting);
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        let _ = out_rx.try_recv(); // auth_required
+
+        // Not a real OPAQUE credential request -- `access::login_start`
+        // rejects it at deserialize time, same failure every attempt.
+        let garbage_payload = BASE64_URL_SAFE_NO_PAD.encode(b"not a real credential request");
+
+        for attempt in 1..=5u32 {
+            handle_signal_message(
+                SignalMessage::PakeStart {
+                    session_id: "sess-1".to_string(),
+                    payload: garbage_payload.clone(),
+                },
+                &ctx,
+                &[],
+                "111111",
+                &status_tx,
+                &out_tx,
+                event_tx.clone(),
+                &mut active,
+                &mut current_session_id,
+                &mut pending_auth,
+                &mut auth_failures,
+                &mut auth_locked_until,
+            )
+            .await;
+            assert_eq!(
+                out_rx.try_recv().unwrap(),
+                SignalMessage::AuthFailed {
+                    session_id: "sess-1".to_string(),
+                    retry_after_secs: None,
+                },
+                "attempt {attempt} must fail on the bad credential request, not lock out yet"
+            );
+        }
+        assert_eq!(auth_failures, 5);
+        assert!(auth_locked_until.is_none());
+
+        // Sixth: crosses `MAX_AUTH_ATTEMPTS`, locks out for 5s.
+        handle_signal_message(
+            SignalMessage::PakeStart {
+                session_id: "sess-1".to_string(),
+                payload: garbage_payload.clone(),
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        assert_eq!(
+            out_rx.try_recv().unwrap(),
+            SignalMessage::AuthFailed {
+                session_id: "sess-1".to_string(),
+                retry_after_secs: Some(5),
+            }
+        );
+        assert_eq!(auth_failures, 6);
+
+        // Seventh, right away: still locked out, counter untouched.
+        handle_signal_message(
+            SignalMessage::PakeStart {
+                session_id: "sess-1".to_string(),
+                payload: garbage_payload,
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx,
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        match out_rx.try_recv().unwrap() {
+            SignalMessage::AuthFailed {
+                retry_after_secs: Some(_),
+                ..
+            } => {}
+            other => panic!("expected auth_failed with Some(_), got {other:?}"),
+        }
+        assert_eq!(
+            auth_failures, 6,
+            "a locked-out attempt must not increment the counter"
+        );
+    }
+
+    /// Slice 3.2c: `Bye` for the session a `PendingAuth` is waiting on
+    /// clears the wait (there's no `active` session to shut down).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bye_for_a_pending_session_clears_it() {
+        let ctx = test_ctx_with_password("bye-clears", "correct horse battery staple");
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+        let mut pending_auth: Option<PendingAuth> = None;
+        let mut auth_failures = 0u32;
+        let mut auth_locked_until: Option<Instant> = None;
+        let (status_tx, _status_rx) = watch::channel(AgentStatus::Connecting);
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        let _ = out_rx.try_recv(); // auth_required
+        assert!(pending_auth.is_some());
+
+        handle_signal_message(
+            SignalMessage::Bye {
+                session_id: "sess-1".to_string(),
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx,
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+
+        assert!(pending_auth.is_none());
+        assert!(active.is_none());
+    }
+
+    /// Slice 3.2c: `SessionEvent::AuthTimeout` for the wait currently
+    /// pending ends it with a `Bye`; one for a generation that's already
+    /// been superseded is ignored.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auth_timeout_sends_bye() {
+        let ctx = test_ctx_with_password("auth-timeout", "correct horse battery staple");
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, _event_rx) = mpsc::channel::<SessionEvent>(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+        let mut pending_auth: Option<PendingAuth> = None;
+        let mut auth_failures = 0u32;
+        let mut auth_locked_until: Option<Instant> = None;
+        let (status_tx, _status_rx) = watch::channel(AgentStatus::Connecting);
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        let _ = out_rx.try_recv(); // auth_required
+        let generation = pending_auth.as_ref().expect("armed above").generation;
+
+        // A stale generation (not the one currently pending) is ignored.
+        handle_session_event(
+            SessionEvent::AuthTimeout {
+                session_id: "sess-1".to_string(),
+                generation: generation + 1,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+        )
+        .await;
+        assert!(pending_auth.is_some());
+        assert!(out_rx.try_recv().is_err());
+
+        // The current generation ends the wait with a `Bye`.
+        handle_session_event(
+            SessionEvent::AuthTimeout {
+                session_id: "sess-1".to_string(),
+                generation,
+            },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+        )
+        .await;
+        assert!(pending_auth.is_none());
+        assert_eq!(
+            out_rx.try_recv().unwrap(),
             SignalMessage::Bye {
                 session_id: "sess-1".to_string()
             }
@@ -2397,6 +3506,9 @@ mod tests {
             event_tx.clone(),
             &mut active,
             &mut current_session_id,
+            &mut None,
+            &mut 0,
+            &mut None,
         )
         .await;
         assert!(active.is_some(), "session must have started successfully");
@@ -2419,6 +3531,7 @@ mod tests {
             &event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
 
@@ -2461,6 +3574,9 @@ mod tests {
             event_tx.clone(),
             &mut active,
             &mut current_session_id,
+            &mut None,
+            &mut 0,
+            &mut None,
         )
         .await;
         assert!(active.is_some(), "session must have started successfully");
@@ -2489,6 +3605,7 @@ mod tests {
             &event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
 
@@ -2542,6 +3659,9 @@ mod tests {
             event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
+            &mut 0,
+            &mut None,
         )
         .await;
         assert!(active.is_some(), "session must have started successfully");
@@ -2554,6 +3674,7 @@ mod tests {
             &out_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
 
@@ -2573,8 +3694,8 @@ mod tests {
         );
     }
 
-    /// `AgentCommand::EndSession` with no active session is a no-op: no
-    /// `Bye`, no status change.
+    /// `AgentCommand::EndSession` with no active session and no pending auth
+    /// is a no-op: no `Bye`, no status change.
     #[tokio::test(flavor = "multi_thread")]
     async fn end_session_command_with_no_active_session_is_a_no_op() {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
@@ -2591,6 +3712,7 @@ mod tests {
             &out_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
 
@@ -2598,6 +3720,73 @@ mod tests {
         assert!(
             !status_rx.has_changed().unwrap(),
             "status must not change when there was no active session"
+        );
+    }
+
+    /// Fix to slice 3.2c: `AgentCommand::EndSession` while a client is
+    /// still waiting on `AuthRequired` (no `ActiveSession` yet, but a
+    /// `PendingAuth` is armed) must give up on that wait too -- not just
+    /// silently no-op, as it used to before this fix -- clearing
+    /// `pending_auth` and telling the server `Bye` for its session id.
+    /// Status is not touched: it was never anything but `Registered` while
+    /// only a login was pending.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_session_command_clears_pending_auth_and_sends_bye() {
+        let ctx =
+            test_ctx_with_password("end-session-clears-pending", "correct horse battery staple");
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+        let mut pending_auth: Option<PendingAuth> = None;
+        let mut auth_failures = 0u32;
+        let mut auth_locked_until: Option<Instant> = None;
+        let (status_tx, status_rx) = watch::channel(AgentStatus::Registered {
+            pin: "111111".to_string(),
+        });
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx,
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        let _ = out_rx.try_recv(); // auth_required
+        assert!(pending_auth.is_some());
+
+        handle_agent_command(
+            AgentCommand::EndSession,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+        )
+        .await;
+
+        assert!(pending_auth.is_none());
+        assert_eq!(
+            out_rx.try_recv().expect("expected a Bye message"),
+            SignalMessage::Bye {
+                session_id: "sess-1".to_string()
+            }
+        );
+        assert!(
+            !status_rx.has_changed().unwrap(),
+            "status must not change -- it was already Registered"
         );
     }
 
@@ -2772,6 +3961,9 @@ mod tests {
             slot.event_tx.clone(),
             &mut slot.active,
             &mut slot.current_session_id,
+            &mut slot.pending_auth,
+            &mut slot.auth_failures,
+            &mut slot.auth_locked_until,
         )
         .await;
         assert!(slot.is_active(), "session must have started successfully");
@@ -2836,6 +4028,9 @@ mod tests {
             event_tx.clone(),
             &mut active,
             &mut current_session_id,
+            &mut None,
+            &mut 0,
+            &mut None,
         )
         .await;
         assert!(active.is_some(), "session must have started successfully");
@@ -2871,6 +4066,7 @@ mod tests {
             &event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
 
@@ -2913,6 +4109,7 @@ mod tests {
             &event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
         handle_session_event(
@@ -2927,6 +4124,7 @@ mod tests {
             &event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
 
@@ -2982,6 +4180,7 @@ mod tests {
             &event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
         handle_session_event(
@@ -2996,6 +4195,7 @@ mod tests {
             &event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
 
@@ -3037,6 +4237,7 @@ mod tests {
             &event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
         handle_session_event(
@@ -3051,6 +4252,7 @@ mod tests {
             &event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
         handle_session_event(
@@ -3065,6 +4267,7 @@ mod tests {
             &event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
 
@@ -3098,6 +4301,7 @@ mod tests {
             &event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
 
@@ -3117,6 +4321,9 @@ mod tests {
             event_tx.clone(),
             &mut active,
             &mut current_session_id,
+            &mut None,
+            &mut 0,
+            &mut None,
         )
         .await;
         assert_eq!(current_session_id.as_deref(), Some("sess-2"));
@@ -3136,6 +4343,7 @@ mod tests {
             &event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
 
@@ -3185,6 +4393,9 @@ mod tests {
             event_tx.clone(),
             &mut active,
             &mut current_session_id,
+            &mut None,
+            &mut 0,
+            &mut None,
         )
         .await;
         assert_eq!(current_session_id.as_deref(), Some("sess-2"));
@@ -3209,6 +4420,7 @@ mod tests {
             &event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
 
@@ -3251,6 +4463,9 @@ mod tests {
             event_tx.clone(),
             &mut active,
             &mut current_session_id,
+            &mut None,
+            &mut 0,
+            &mut None,
         )
         .await;
         assert_eq!(current_session_id.as_deref(), Some("sess-2"));
@@ -3271,6 +4486,7 @@ mod tests {
             &event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
 
@@ -3318,6 +4534,7 @@ mod tests {
             &event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
 
@@ -3353,6 +4570,7 @@ mod tests {
             &event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
         assert!(active.is_none());
@@ -3378,6 +4596,7 @@ mod tests {
             &event_tx,
             &mut active,
             &mut current_session_id,
+            &mut None,
         )
         .await;
 

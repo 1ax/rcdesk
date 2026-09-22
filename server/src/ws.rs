@@ -262,6 +262,57 @@ async fn run_host(
                     });
                 }
             },
+            // Slice 3.2c: OPAQUE login messages the host sends toward the
+            // client during `PeerJoined`-triggered authentication. Same
+            // opaque-relay shape as `Offer`/`Ice` above -- the server never
+            // interprets `payload`.
+            SignalMessage::AuthRequired { session_id } => {
+                match registry.peer_tx_for_host(&host_id, &session_id) {
+                    Some(peer) => {
+                        tracing::debug!(%session_id, "forwarding auth_required host -> client");
+                        let _ = peer.send(SignalMessage::AuthRequired { session_id });
+                    }
+                    None => {
+                        let _ = tx.send(SignalMessage::Error {
+                            message: "not in session".to_string(),
+                        });
+                    }
+                }
+            }
+            SignalMessage::PakeResponse {
+                session_id,
+                payload,
+            } => match registry.peer_tx_for_host(&host_id, &session_id) {
+                Some(peer) => {
+                    tracing::debug!(%session_id, "forwarding pake_response host -> client");
+                    let _ = peer.send(SignalMessage::PakeResponse {
+                        session_id,
+                        payload,
+                    });
+                }
+                None => {
+                    let _ = tx.send(SignalMessage::Error {
+                        message: "not in session".to_string(),
+                    });
+                }
+            },
+            SignalMessage::AuthFailed {
+                session_id,
+                retry_after_secs,
+            } => match registry.peer_tx_for_host(&host_id, &session_id) {
+                Some(peer) => {
+                    tracing::debug!(%session_id, "forwarding auth_failed host -> client");
+                    let _ = peer.send(SignalMessage::AuthFailed {
+                        session_id,
+                        retry_after_secs,
+                    });
+                }
+                None => {
+                    let _ = tx.send(SignalMessage::Error {
+                        message: "not in session".to_string(),
+                    });
+                }
+            },
             SignalMessage::Bye { session_id } => {
                 match registry.close_session_by_host(&host_id, &session_id) {
                     Some(Some(client_tx)) => {
@@ -567,6 +618,43 @@ async fn run_client(
                     let _ = peer.send(SignalMessage::Ice {
                         session_id,
                         candidate,
+                    });
+                }
+                None => {
+                    let _ = tx.send(SignalMessage::Error {
+                        message: "not in session".to_string(),
+                    });
+                }
+            },
+            // Slice 3.2c: OPAQUE login messages the client sends toward the
+            // host in response to `AuthRequired`. Same opaque-relay shape as
+            // `Offer`/`Ice` above -- the server never interprets `payload`.
+            SignalMessage::PakeStart {
+                session_id,
+                payload,
+            } => match registry.peer_tx_for_client(&session_id, &tx) {
+                Some(peer) => {
+                    tracing::debug!(%session_id, "forwarding pake_start client -> host");
+                    let _ = peer.send(SignalMessage::PakeStart {
+                        session_id,
+                        payload,
+                    });
+                }
+                None => {
+                    let _ = tx.send(SignalMessage::Error {
+                        message: "not in session".to_string(),
+                    });
+                }
+            },
+            SignalMessage::PakeFinish {
+                session_id,
+                payload,
+            } => match registry.peer_tx_for_client(&session_id, &tx) {
+                Some(peer) => {
+                    tracing::debug!(%session_id, "forwarding pake_finish client -> host");
+                    let _ = peer.send(SignalMessage::PakeFinish {
+                        session_id,
+                        payload,
                     });
                 }
                 None => {

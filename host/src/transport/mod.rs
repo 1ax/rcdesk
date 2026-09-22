@@ -341,6 +341,17 @@ pub enum SessionEvent {
     /// grace window this is for, so a timeout from a window a later
     /// `Connected` already cancelled is recognized as stale and ignored.
     DisconnectTimeout { session_id: String, generation: u64 },
+    /// Slice 3.2c: a pending OPAQUE login (`crate::signaling::PendingAuth`,
+    /// armed on `AuthRequired` while waiting for the client to complete
+    /// `PakeStart`/`PakeFinish`) has been waiting too long. Not sent by
+    /// anything in this module -- same self-timer pattern as
+    /// `DisconnectTimeout` above: the signaling layer arms a timer that
+    /// sends this back to itself over the same `SessionEvent` channel.
+    /// `generation` identifies which pending login this is for, so a
+    /// timeout from a login a later `PakeFinish` already completed (or a
+    /// new `PeerJoined` already superseded) is recognized as stale and
+    /// ignored.
+    AuthTimeout { session_id: String, generation: u64 },
 }
 
 fn ice_candidate_from_rtc(c: RTCIceCandidateInit) -> proto::signal::IceCandidate {

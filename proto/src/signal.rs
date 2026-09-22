@@ -159,6 +159,38 @@ pub enum SignalMessage {
     /// client -> server: убрать устройство из своего списка. В ответ сервер
     /// шлёт обновлённый `Devices`.
     ForgetDevice { device_id: String },
+    /// host -> client (slice 3.2c), sent right after `PeerJoined` when the
+    /// host has an access password set (`access::AccessStore::load`
+    /// returns `Some`): the client must complete an OPAQUE login (`PakeStart`
+    /// / `PakeResponse` / `PakeFinish` below) before the host will offer a
+    /// session. The server only relays this, same as `Offer`/`Ice`.
+    AuthRequired { session_id: String },
+    /// client -> host (slice 3.2c), forwarded by the server. `payload` is
+    /// the client's serialized OPAQUE `CredentialRequest`, base64
+    /// (URL-safe, no padding -- see `host::access::AccessRecordFile`'s doc
+    /// comment for why that alphabet). Opaque to the server and to this
+    /// message's own type: it never decodes it, only relays it.
+    PakeStart { session_id: String, payload: String },
+    /// host -> client (slice 3.2c), forwarded by the server: the host's
+    /// serialized OPAQUE `CredentialResponse` to the client's `PakeStart`,
+    /// base64 (URL-safe, no padding), in reply to `PakeStart`.
+    PakeResponse { session_id: String, payload: String },
+    /// client -> host (slice 3.2c), forwarded by the server: the client's
+    /// serialized OPAQUE `CredentialFinalization`, base64 (URL-safe, no
+    /// padding), completing the login started by `PakeStart`.
+    PakeFinish { session_id: String, payload: String },
+    /// host -> client (slice 3.2c), forwarded by the server: the login
+    /// attempt was rejected. `retry_after_secs` is `None` when this
+    /// particular attempt was simply wrong (the client may retry right
+    /// away with a new `PakeStart`) and `Some(n)` when the host has locked
+    /// out further attempts for `n` seconds after too many failures in a
+    /// row. `#[serde(default)]` so a client that only checks for the
+    /// field's presence on decode still works if a future host omits it.
+    AuthFailed {
+        session_id: String,
+        #[serde(default)]
+        retry_after_secs: Option<u32>,
+    },
     /// server -> either side
     Error { message: String },
 }
@@ -348,5 +380,43 @@ mod tests {
         let json = serde_json::to_string(&registered).expect("serialize");
         let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, registered);
+    }
+
+    #[test]
+    fn pake_start_round_trips_through_json() {
+        let pake_start = SignalMessage::PakeStart {
+            session_id: "sess-1".to_string(),
+            payload: "YWJjMTIz".to_string(),
+        };
+
+        let json = serde_json::to_string(&pake_start).expect("serialize");
+        let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, pake_start);
+    }
+
+    #[test]
+    fn auth_failed_with_retry_after_secs_round_trips_through_json() {
+        let auth_failed = SignalMessage::AuthFailed {
+            session_id: "sess-1".to_string(),
+            retry_after_secs: Some(30),
+        };
+
+        let json = serde_json::to_string(&auth_failed).expect("serialize");
+        let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, auth_failed);
+    }
+
+    #[test]
+    fn auth_failed_without_retry_after_secs_field_deserializes_to_none() {
+        let json = r#"{"type":"auth_failed","session_id":"sess-1"}"#;
+
+        let msg: SignalMessage = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            msg,
+            SignalMessage::AuthFailed {
+                session_id: "sess-1".to_string(),
+                retry_after_secs: None,
+            }
+        );
     }
 }
