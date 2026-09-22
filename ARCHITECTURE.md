@@ -303,7 +303,12 @@ at login» или `rcdesk-host autostart on`. `launchctl` не вызывает�
 ## 10. Известные ограничения браузеров
 
 - Safari: нет Keyboard Lock API → Cmd+Tab/Cmd+W/Cmd+Q остаются локальными.
-  Chrome в fullscreen перехватывает их.
+  Chrome в fullscreen перехватывает Esc и браузерные сочетания (Cmd+W и т.п.), но **Cmd+Tab на macOS
+  забирает сама ОС** даже при выданном разрешении `keyboard-lock` (проверено владельцем 2026-09-22,
+  Chrome 153) — из веб-страницы не обойти. При этом нажатие/отпускание Cmd до хоста доходит.
+- Mac-клиент → Windows-хост (3.5f): Cmd по умолчанию уходит как Ctrl (переключатель «Cmd как Ctrl»,
+  глобальный, в `localStorage`); выключен — Cmd = клавиша Win. ОС хоста клиент узнаёт из
+  `ControlMessage::HostInfo`.
 - Safari: Clipboard API только по жесту пользователя; синхронизация буфера —
   «по кнопке/по Cmd+V», не фоновая.
   Реализовано (2.5): копирование с хоста — `clipboard.write` с `ClipboardItem`-промисом внутри жеста Ctrl/Cmd+C;
