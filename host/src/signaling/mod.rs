@@ -189,13 +189,17 @@ const DISCONNECT_GRACE: Duration = Duration::from_secs(15);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Slice 3.2c: how many consecutive failed `PakeStart` attempts a client may
-/// make before the host locks out further attempts for a while -- see
-/// `auth_lockout_duration`. `SessionSlot::auth_failures` counts *starts*,
-/// not finishes: each `PakeStart` costs the host one OPRF evaluation
-/// regardless of whether the client's password was right, and a wrong
-/// password is only ever caught client-side (see `access::LoginServer::login_finish`'s
-/// doc comment), so counting starts is what actually limits the attacker's
-/// cost.
+/// make before the host starts throttling further attempts -- see
+/// `auth_lockout_duration`. This is a pace limit, not a hard lockout: once
+/// `auth_failures` crosses this, every later `PakeStart` still runs, just
+/// after an ever-growing pause before it (see `handle_signal_message`'s
+/// `PakeStart` arm's doc comment for why it must still run -- refusing it
+/// outright would mean the owner could never log in again after this many
+/// failures). `SessionSlot::auth_failures` counts *starts*, not finishes:
+/// each `PakeStart` costs the host one OPRF evaluation regardless of
+/// whether the client's password was right, and a wrong password is only
+/// ever caught client-side (see `access::LoginServer::login_finish`'s doc
+/// comment), so counting starts is what actually paces the attacker's cost.
 const MAX_AUTH_ATTEMPTS: u32 = 5;
 
 /// Slice 3.2c: hands out a fresh, process-wide unique generation for a
@@ -210,10 +214,11 @@ fn next_auth_generation() -> u64 {
     NEXT_AUTH_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Slice 3.2c: the lockout duration after `auth_failures` consecutive failed
-/// `PakeStart` attempts -- only meaningful once `auth_failures > MAX_AUTH_ATTEMPTS`
-/// (i.e. `auth_failures >= 6`, the caller's guard): 5s on the 6th attempt,
-/// doubling on each further attempt, capped at 60s.
+/// Slice 3.2c: the throttling pause armed before the *next* `PakeStart`,
+/// given `auth_failures` consecutive failed attempts so far -- only
+/// meaningful once `auth_failures > MAX_AUTH_ATTEMPTS` (i.e.
+/// `auth_failures >= 6`, the caller's guard): 5s after the 6th attempt,
+/// doubling after each further attempt, capped at 60s.
 fn auth_lockout_duration(auth_failures: u32) -> Duration {
     let exponent = auth_failures.saturating_sub(6).min(63);
     let secs = 5u64.saturating_mul(1u64 << exponent);
@@ -1016,12 +1021,15 @@ pub struct SessionSlot {
     /// host's access password, across every `PendingAuth` -- deliberately
     /// *not* reset by a fresh `PeerJoined` (only a successful `PakeFinish`
     /// resets it): it lives in the slot and survives a signaling reconnect,
-    /// so a client can't dodge the lockout below by reconnecting.
+    /// so a client can't dodge the throttle below by reconnecting.
     auth_failures: u32,
-    /// Slice 3.2c: set once `auth_failures` crosses `MAX_AUTH_ATTEMPTS`;
-    /// while in the future, every `PakeStart` is rejected with
+    /// Slice 3.2c: armed once `auth_failures` crosses `MAX_AUTH_ATTEMPTS`,
+    /// as a *pace limit* on the next `PakeStart`, not a hard lockout: while
+    /// in the future, a `PakeStart` is rejected with
     /// `AuthFailed { retry_after_secs: Some(..) } }` without spending an
-    /// OPRF evaluation or touching `auth_failures` further.
+    /// OPRF evaluation or touching `auth_failures` further, but once it's in
+    /// the past the next attempt runs as normal (and, if it also fails,
+    /// re-arms this for a longer pause -- see `auth_lockout_duration`).
     auth_locked_until: Option<Instant>,
 }
 
@@ -1241,7 +1249,7 @@ async fn handle_signal_message(
                 let now = Instant::now();
                 if locked_until > now {
                     let retry_after_secs = (locked_until - now).as_secs_f64().ceil() as u32;
-                    tracing::debug!(%session_id, retry_after_secs, "pake_start while locked out");
+                    tracing::debug!(%session_id, retry_after_secs, "pake_start throttled, too soon after a previous failed attempt");
                     let _ = out_tx.send(SignalMessage::AuthFailed {
                         session_id,
                         retry_after_secs: Some(retry_after_secs.max(1)),
@@ -1250,16 +1258,28 @@ async fn handle_signal_message(
                 }
             }
 
+            // Slice 3.2c fix: this is throttling, not a hard lockout -- it
+            // paces how often an attempt may be *started*, it does not
+            // refuse to run this one. Past `MAX_AUTH_ATTEMPTS`, arm
+            // `auth_locked_until` for the *next* `PakeStart` (checked above,
+            // before this one is even counted) and fall straight through to
+            // running this attempt as usual. A hard refuse-and-return here
+            // (the pre-fix behavior) meant the owner could never actually
+            // log in again after `MAX_AUTH_ATTEMPTS` failures: every later
+            // attempt would hit its own freshly re-armed lockout before
+            // ever reaching `login_start`.
             *auth_failures += 1;
             if *auth_failures > MAX_AUTH_ATTEMPTS {
                 let lockout = auth_lockout_duration(*auth_failures);
                 *auth_locked_until = Some(Instant::now() + lockout);
-                tracing::warn!(%session_id, auth_failures = *auth_failures, lockout_secs = lockout.as_secs(), "too many failed login attempts, locking out");
-                let _ = out_tx.send(SignalMessage::AuthFailed {
-                    session_id,
-                    retry_after_secs: Some(lockout.as_secs() as u32),
-                });
-                return;
+                tracing::warn!(
+                    %session_id,
+                    auth_failures = *auth_failures,
+                    lockout_secs = lockout.as_secs(),
+                    "login attempt {}, next attempt allowed in {} s",
+                    *auth_failures,
+                    lockout.as_secs()
+                );
             }
 
             // Re-read rather than reuse anything cached from `PeerJoined`:
@@ -3206,12 +3226,20 @@ mod tests {
         );
     }
 
-    /// Slice 3.2c: six consecutive failed `PakeStart` attempts lock the
-    /// host out; a seventh right after is rejected too, without spending
-    /// another attempt against the counter.
+    /// Fix to slice 3.2c: this is throttling, not a hard lockout -- six
+    /// consecutive `PakeStart`s (even ones that fail to finish) must all
+    /// still run and get a `PakeResponse`; only a *seventh*, sent right
+    /// after the sixth crossed `MAX_AUTH_ATTEMPTS`, is throttled. The
+    /// pre-fix behavior refused the sixth attempt itself, which meant the
+    /// owner could never log in again after five failures -- every later
+    /// attempt re-armed its own lockout before ever reaching `login_start`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn six_pake_starts_in_a_row_lock_the_host() {
-        let ctx = test_ctx_with_password("six-in-a-row", "correct horse battery staple");
+    async fn six_pake_starts_in_a_row_throttle_the_host() {
+        use opaque_ke::ClientLogin;
+        use rand_core::OsRng;
+
+        let password = "correct horse battery staple";
+        let ctx = test_ctx_with_password("six-in-a-row", password);
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
         let (event_tx, _event_rx) = mpsc::channel(64);
         let mut active: Option<ActiveSession> = None;
@@ -3241,15 +3269,22 @@ mod tests {
         .await;
         let _ = out_rx.try_recv(); // auth_required
 
-        // Not a real OPAQUE credential request -- `access::login_start`
-        // rejects it at deserialize time, same failure every attempt.
-        let garbage_payload = BASE64_URL_SAFE_NO_PAD.encode(b"not a real credential request");
-
-        for attempt in 1..=5u32 {
+        // A structurally valid `CredentialRequest` every time (a fresh
+        // client start per attempt, same password) -- `login_start` must
+        // succeed and answer `PakeResponse` for all six; only `PakeFinish`
+        // is ever what actually completes a login, so none of these six
+        // resolves the wait.
+        let mut rng = OsRng;
+        for attempt in 1..=6u32 {
+            let client_start = ClientLogin::<crate::access::RcdeskCipherSuite>::start(
+                &mut rng,
+                password.as_bytes(),
+            )
+            .expect("client login start");
             handle_signal_message(
                 SignalMessage::PakeStart {
                     session_id: "sess-1".to_string(),
-                    payload: garbage_payload.clone(),
+                    payload: BASE64_URL_SAFE_NO_PAD.encode(client_start.message.serialize()),
                 },
                 &ctx,
                 &[],
@@ -3264,51 +3299,28 @@ mod tests {
                 &mut auth_locked_until,
             )
             .await;
-            assert_eq!(
-                out_rx.try_recv().unwrap(),
-                SignalMessage::AuthFailed {
-                    session_id: "sess-1".to_string(),
-                    retry_after_secs: None,
-                },
-                "attempt {attempt} must fail on the bad credential request, not lock out yet"
-            );
-        }
-        assert_eq!(auth_failures, 5);
-        assert!(auth_locked_until.is_none());
-
-        // Sixth: crosses `MAX_AUTH_ATTEMPTS`, locks out for 5s.
-        handle_signal_message(
-            SignalMessage::PakeStart {
-                session_id: "sess-1".to_string(),
-                payload: garbage_payload.clone(),
-            },
-            &ctx,
-            &[],
-            "111111",
-            &status_tx,
-            &out_tx,
-            event_tx.clone(),
-            &mut active,
-            &mut current_session_id,
-            &mut pending_auth,
-            &mut auth_failures,
-            &mut auth_locked_until,
-        )
-        .await;
-        assert_eq!(
-            out_rx.try_recv().unwrap(),
-            SignalMessage::AuthFailed {
-                session_id: "sess-1".to_string(),
-                retry_after_secs: Some(5),
+            match out_rx.try_recv() {
+                Ok(SignalMessage::PakeResponse { session_id, .. }) => {
+                    assert_eq!(session_id, "sess-1")
+                }
+                other => panic!("attempt {attempt} expected pake_response, got {other:?}"),
             }
-        );
+        }
         assert_eq!(auth_failures, 6);
+        assert!(
+            auth_locked_until.is_some(),
+            "the sixth attempt must arm a throttle for the next one"
+        );
 
-        // Seventh, right away: still locked out, counter untouched.
+        // Seventh, right away: throttled -- no `PakeResponse`, no further
+        // increment.
+        let client_start =
+            ClientLogin::<crate::access::RcdeskCipherSuite>::start(&mut rng, password.as_bytes())
+                .expect("client login start");
         handle_signal_message(
             SignalMessage::PakeStart {
                 session_id: "sess-1".to_string(),
-                payload: garbage_payload,
+                payload: BASE64_URL_SAFE_NO_PAD.encode(client_start.message.serialize()),
             },
             &ctx,
             &[],
@@ -3323,17 +3335,152 @@ mod tests {
             &mut auth_locked_until,
         )
         .await;
-        match out_rx.try_recv().unwrap() {
+        assert_eq!(
+            out_rx.try_recv().unwrap(),
             SignalMessage::AuthFailed {
-                retry_after_secs: Some(_),
-                ..
-            } => {}
-            other => panic!("expected auth_failed with Some(_), got {other:?}"),
-        }
+                session_id: "sess-1".to_string(),
+                retry_after_secs: Some(5),
+            }
+        );
         assert_eq!(
             auth_failures, 6,
-            "a locked-out attempt must not increment the counter"
+            "a throttled attempt must not increment the counter"
         );
+    }
+
+    /// Fix to slice 3.2c: once the throttle armed by a run of failures has
+    /// expired, the next attempt runs normally -- and, if it's the owner's
+    /// actual password this time, a full login still succeeds and resets
+    /// both `auth_failures` and `auth_locked_until`, proving the owner can
+    /// always eventually get back in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn login_after_expired_throttle_succeeds_and_resets_the_counter() {
+        use opaque_ke::{
+            ClientLogin, ClientLoginFinishParameters, CredentialResponse, Identifiers,
+        };
+        use rand_core::OsRng;
+
+        let password = "correct horse battery staple";
+        let ctx = test_ctx_with_password("after-expired-throttle", password);
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+        let mut pending_auth: Option<PendingAuth> = None;
+        let mut auth_failures = 0u32;
+        let mut auth_locked_until: Option<Instant> = None;
+        let (status_tx, _status_rx) = watch::channel(AgentStatus::Connecting);
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        let _ = out_rx.try_recv(); // auth_required
+
+        // Simulate six prior failed attempts whose throttle has since
+        // expired (set directly in the slot, same as the real timer would
+        // leave it once `Instant::now()` passes it).
+        auth_failures = 6;
+        auth_locked_until = Some(Instant::now() - Duration::from_secs(1));
+
+        let mut rng = OsRng;
+        let client_start =
+            ClientLogin::<crate::access::RcdeskCipherSuite>::start(&mut rng, password.as_bytes())
+                .expect("client login start");
+        handle_signal_message(
+            SignalMessage::PakeStart {
+                session_id: "sess-1".to_string(),
+                payload: BASE64_URL_SAFE_NO_PAD.encode(client_start.message.serialize()),
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+        let response_payload = match out_rx.try_recv().expect("expected pake_response") {
+            SignalMessage::PakeResponse { payload, .. } => payload,
+            other => panic!("expected pake_response, got {other:?}"),
+        };
+        assert_eq!(
+            auth_failures, 7,
+            "the expired-throttle attempt still counts and re-arms a longer throttle"
+        );
+
+        let response_bytes = BASE64_URL_SAFE_NO_PAD
+            .decode(response_payload)
+            .expect("decode pake_response payload");
+        let response =
+            CredentialResponse::<crate::access::RcdeskCipherSuite>::deserialize(&response_bytes)
+                .expect("deserialize credential response");
+        let ksf = crate::access::CustomKsf::default();
+        let client_finish = client_start
+            .state
+            .finish(
+                &mut rng,
+                password.as_bytes(),
+                response,
+                ClientLoginFinishParameters::new(None, Identifiers::default(), Some(&ksf)),
+            )
+            .expect("client login finish");
+
+        handle_signal_message(
+            SignalMessage::PakeFinish {
+                session_id: "sess-1".to_string(),
+                payload: BASE64_URL_SAFE_NO_PAD.encode(client_finish.message.serialize()),
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx,
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+
+        match out_rx.try_recv().expect("expected offer") {
+            SignalMessage::Offer { session_id, .. } => assert_eq!(session_id, "sess-1"),
+            other => panic!("expected offer, got {other:?}"),
+        }
+        assert!(active.is_some(), "session must have started successfully");
+        assert_eq!(
+            auth_failures, 0,
+            "a successful login resets the failure counter"
+        );
+        assert!(
+            auth_locked_until.is_none(),
+            "a successful login clears the throttle too"
+        );
+
+        if let Some(active) = active.take() {
+            active.shutdown().await;
+        }
     }
 
     /// Slice 3.2c: `Bye` for the session a `PendingAuth` is waiting on
