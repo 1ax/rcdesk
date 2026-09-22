@@ -363,8 +363,10 @@ export function mount(root: Element | null): void {
   /** Applies `collapsed` to the session bar/handle (hidden state, title/
    * aria-label) and saves the choice (slice 3.5g) -- used both to apply the
    * setting loaded from storage at mount, and by `#bar-collapse-btn`'s and
-   * `#session-bar-handle`'s click listeners below. */
+   * `#session-bar-handle`'s click listeners below. The `is-collapsed` class
+   * on `#session-screen` is read by the fullscreen CSS rules (slice 3.5h). */
   function applyBarCollapsed(collapsed: boolean): void {
+    sessionScreen.classList.toggle("is-collapsed", collapsed);
     sessionBarEl.hidden = collapsed;
     sessionBarHandle.hidden = !collapsed;
     const title = collapseButtonTitle(collapsed);

@@ -345,10 +345,31 @@ body {
   background: var(--danger);
 }
 
+/* Slice 3.5h: in fullscreen, the top edge is where macOS and Chrome reveal
+   the menu bar, tab strip and the "press Esc to exit" bubble on mouseover,
+   so a collapsed handle docked there is unreachable. Move it to the right
+   edge instead, as a vertical strip running the full height. Windowed mode
+   keeps the handle at the top (no `.is-collapsed` rule there), and the
+   expanded bar stays on top in fullscreen too -- only the collapsed handle
+   relocates. Safari 16.4+ supports unprefixed `:fullscreen` (see
+   `fullscreen.ts`). */
+.session-screen.is-collapsed:fullscreen {
+  flex-direction: row;
+}
+
+.session-screen.is-collapsed:fullscreen .session-bar-handle {
+  order: 2;
+  width: 8px;
+  height: 100%;
+  border-bottom: none;
+  border-left: 1px solid var(--border);
+}
+
 .session-video {
   position: relative;
   flex: 1 1 auto;
   min-height: 0;
+  min-width: 0;
 }
 
 .session-video video {
