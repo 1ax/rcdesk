@@ -45,6 +45,13 @@ import {
   loadCmdAsCtrlSetting,
   saveCmdAsCtrlSetting,
 } from "./keyRemap";
+import {
+  collapseButtonTitle,
+  loadSessionBarCollapsed,
+  loadStatsVisible,
+  saveSessionBarCollapsed,
+  saveStatsVisible,
+} from "./sessionBar";
 import { reconnectBackoffMs } from "./reconnectBackoff";
 import {
   connectionBannerLabel,
@@ -230,23 +237,46 @@ export function mount(root: Element | null): void {
       </div>
     </div>
     <div class="session-screen" id="session-screen" hidden>
-      <video id="video" autoplay playsinline muted></video>
-      <div class="connection-banner" id="connection-banner" hidden></div>
-      <div class="overlay" id="stats-overlay"></div>
-      <div class="controls">
-        <select id="display-select" class="display-select" hidden></select>
-        <select id="quality-select" class="quality-select" title="Качество"></select>
-        <label id="cmd-as-ctrl-label" class="cmd-as-ctrl-toggle" hidden>
-          <input type="checkbox" id="cmd-as-ctrl-checkbox" />
-          Cmd как Ctrl
-        </label>
-        <span id="view-only" class="status view-only" hidden></span>
-        <span id="input-blocked" class="status input-blocked" hidden></span>
-        <span id="clipboard-note" class="status clipboard-note" hidden></span>
-        <span id="fullscreen-note" class="status fullscreen-note" hidden></span>
-        <span id="session-status" class="status"></span>
-        <button id="fullscreen-btn" class="btn btn-secondary" hidden>На весь экран</button>
-        <button id="disconnect-btn" class="btn btn-secondary">Отключиться</button>
+      <div class="session-bar" id="session-bar">
+        <div class="session-bar-left">
+          <label class="stats-toggle" title="Показывать статистику видеопотока">
+            <input type="checkbox" id="stats-checkbox" />
+            Статистика
+          </label>
+          <span class="overlay" id="stats-overlay" hidden></span>
+        </div>
+        <div class="controls">
+          <select id="display-select" class="display-select" hidden></select>
+          <select id="quality-select" class="quality-select" title="Качество"></select>
+          <label id="cmd-as-ctrl-label" class="cmd-as-ctrl-toggle" hidden>
+            <input type="checkbox" id="cmd-as-ctrl-checkbox" />
+            Cmd как Ctrl
+          </label>
+          <span id="view-only" class="status view-only" hidden></span>
+          <span id="input-blocked" class="status input-blocked" hidden></span>
+          <span id="clipboard-note" class="status clipboard-note" hidden></span>
+          <span id="fullscreen-note" class="status fullscreen-note" hidden></span>
+          <span id="session-status" class="status"></span>
+          <button id="fullscreen-btn" class="btn btn-secondary" hidden>На весь экран</button>
+          <button id="disconnect-btn" class="btn btn-secondary">Отключиться</button>
+          <button
+            id="bar-collapse-btn"
+            class="btn btn-secondary bar-collapse-btn"
+            title="Свернуть панель"
+            aria-label="Свернуть панель"
+          >▲</button>
+        </div>
+      </div>
+      <button
+        class="session-bar-handle"
+        id="session-bar-handle"
+        title="Показать панель"
+        aria-label="Показать панель"
+        hidden
+      ></button>
+      <div class="session-video">
+        <video id="video" autoplay playsinline muted></video>
+        <div class="connection-banner" id="connection-banner" hidden></div>
       </div>
     </div>
   `;
@@ -280,7 +310,7 @@ export function mount(root: Element | null): void {
     firstFrameShown = true;
     updateConnectionBanner();
   });
-  const overlay = root.querySelector<HTMLDivElement>("#stats-overlay")!;
+  const overlay = root.querySelector<HTMLSpanElement>("#stats-overlay")!;
   const connectionBannerEl = root.querySelector<HTMLDivElement>("#connection-banner")!;
   const sessionStatus = root.querySelector<HTMLSpanElement>("#session-status")!;
   const disconnectBtn = root.querySelector<HTMLButtonElement>("#disconnect-btn")!;
@@ -317,6 +347,36 @@ export function mount(root: Element | null): void {
   fullscreenBtn.hidden = !isFullscreenSupported(document);
   const devicesEl = root.querySelector<HTMLDivElement>("#devices")!;
   const deviceListEl = root.querySelector<HTMLUListElement>("#device-list")!;
+
+  // Slice 3.5g: the session bar, its collapse-to-a-strip control, and the
+  // "Статистика" checkbox gating the overlay's text -- both choices are
+  // global settings (see `sessionBar.ts`'s doc comments), loaded once here
+  // from `initialStorage`, same as `cmdAsCtrl` above.
+  const sessionBarEl = root.querySelector<HTMLDivElement>("#session-bar")!;
+  const sessionBarHandle = root.querySelector<HTMLButtonElement>("#session-bar-handle")!;
+  const barCollapseBtn = root.querySelector<HTMLButtonElement>("#bar-collapse-btn")!;
+  const statsCheckbox = root.querySelector<HTMLInputElement>("#stats-checkbox")!;
+  let statsVisible = initialStorage ? loadStatsVisible(initialStorage) : false;
+  statsCheckbox.checked = statsVisible;
+  overlay.hidden = !statsVisible;
+
+  /** Applies `collapsed` to the session bar/handle (hidden state, title/
+   * aria-label) and saves the choice (slice 3.5g) -- used both to apply the
+   * setting loaded from storage at mount, and by `#bar-collapse-btn`'s and
+   * `#session-bar-handle`'s click listeners below. */
+  function applyBarCollapsed(collapsed: boolean): void {
+    sessionBarEl.hidden = collapsed;
+    sessionBarHandle.hidden = !collapsed;
+    const title = collapseButtonTitle(collapsed);
+    barCollapseBtn.title = title;
+    barCollapseBtn.setAttribute("aria-label", title);
+    sessionBarHandle.title = title;
+    sessionBarHandle.setAttribute("aria-label", title);
+    const storage = ownerStorage();
+    if (storage) saveSessionBarCollapsed(storage, collapsed);
+  }
+
+  applyBarCollapsed(initialStorage ? loadSessionBarCollapsed(initialStorage) : false);
 
   // One long-lived signaling connection for the whole tab (slice 3.1e): the
   // server remembers which owner a socket authenticated as (and which
@@ -813,6 +873,10 @@ export function mount(root: Element | null): void {
   function setSessionStatus(status: SessionStatus): void {
     sessionStatus.textContent = SESSION_STATUS_LABELS[status];
     sessionStatus.dataset.status = status;
+    // Slice 3.5g: the collapsed bar's handle strip mirrors the status via
+    // color (`.session-bar-handle[data-status=...]` in style.css) since its
+    // text isn't visible while collapsed.
+    sessionBarHandle.dataset.status = status;
   }
 
   function showPinScreen(): void {
@@ -845,7 +909,12 @@ export function mount(root: Element | null): void {
           const now = Date.now();
           const summary = summarizeStats(report.values(), prevSnapshot, now);
           prevSnapshot = takeSnapshot(report.values(), now);
-          overlay.textContent = formatOverlay(summary, appRttMs, quality);
+          const text = formatOverlay(summary, appRttMs, quality);
+          overlay.textContent = text;
+          // Slice 3.5g: the bar no longer has room to show the full line
+          // unclipped at every viewport width (`text-overflow: ellipsis` in
+          // style.css) -- the tooltip keeps the whole string reachable.
+          overlay.title = text;
         })
         .catch((err: unknown) => {
           console.error("failed to read stats", err);
@@ -1441,6 +1510,29 @@ export function mount(root: Element | null): void {
     // A held Cmd/Ctrl must not get stuck on the host mid-flip -- see
     // `releaseAllKeys`'s doc comment.
     releaseAllKeys();
+    // Give focus back to the video, same reasoning as `displaySelect`'s/
+    // `qualitySelect`'s change listeners above.
+    video.focus();
+  });
+
+  // Slice 3.5g: collapses the session bar to its thin handle strip, which
+  // becomes the only layout element left above the video -- not a pixel of
+  // the remote screen is covered either way.
+  barCollapseBtn.addEventListener("click", () => {
+    applyBarCollapsed(true);
+    video.focus();
+  });
+
+  sessionBarHandle.addEventListener("click", () => {
+    applyBarCollapsed(false);
+    video.focus();
+  });
+
+  statsCheckbox.addEventListener("change", () => {
+    statsVisible = statsCheckbox.checked;
+    overlay.hidden = !statsVisible;
+    const storage = ownerStorage();
+    if (storage) saveStatsVisible(storage, statsVisible);
     // Give focus back to the video, same reasoning as `displaySelect`'s/
     // `qualitySelect`'s change listeners above.
     video.focus();
