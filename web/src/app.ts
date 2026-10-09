@@ -15,6 +15,13 @@ import { summarizeStats, takeSnapshot } from "./stats";
 import type { Snapshot, StatsSummary } from "./stats";
 import { attachInput } from "./input";
 import { ClipboardBridge, isSafari } from "./clipboard";
+import {
+  FileSender,
+  chooseChunkSize,
+  dragHasFiles,
+  failReasonLabel,
+  pickDroppedFiles,
+} from "./fileTransfer";
 import { applyCursor } from "./cursor";
 import { displayOptions, parseDisplayId, shouldShowPicker } from "./displays";
 import {
@@ -256,6 +263,12 @@ export function mount(root: Element | null): void {
           <span class="overlay" id="stats-overlay" hidden></span>
         </div>
         <div class="controls">
+          <span id="file-status" class="status file-status" hidden>
+            <span id="file-status-text" class="file-status-text"></span>
+            <button id="file-cancel-btn" class="btn btn-secondary" title="Отменить передачу" aria-label="Отменить передачу">✕</button>
+          </span>
+          <button id="file-send-btn" class="btn btn-secondary" hidden>Отправить файлы</button>
+          <input id="file-input" type="file" multiple hidden />
           <select id="display-select" class="display-select" hidden></select>
           <select id="quality-select" class="quality-select" title="Качество"></select>
           <label id="cmd-as-ctrl-label" class="cmd-as-ctrl-toggle" hidden>
@@ -287,6 +300,7 @@ export function mount(root: Element | null): void {
       <div class="session-video">
         <video id="video" autoplay playsinline muted></video>
         <div class="connection-banner" id="connection-banner" hidden></div>
+        <div class="file-drop-hint" id="file-drop-hint" hidden>Отпустите, чтобы отправить на хост</div>
       </div>
       <div class="auth-dialog" id="auth-dialog" hidden>
         <div class="auth-dialog-card">
@@ -368,6 +382,13 @@ export function mount(root: Element | null): void {
   const inputBlockedEl = root.querySelector<HTMLSpanElement>("#input-blocked")!;
   const clipboardNoteEl = root.querySelector<HTMLSpanElement>("#clipboard-note")!;
   const fullscreenNoteEl = root.querySelector<HTMLSpanElement>("#fullscreen-note")!;
+  const fileStatusEl = root.querySelector<HTMLSpanElement>("#file-status")!;
+  const fileStatusTextEl = root.querySelector<HTMLSpanElement>("#file-status-text")!;
+  const fileCancelBtn = root.querySelector<HTMLButtonElement>("#file-cancel-btn")!;
+  const fileSendBtn = root.querySelector<HTMLButtonElement>("#file-send-btn")!;
+  const fileInput = root.querySelector<HTMLInputElement>("#file-input")!;
+  const fileDropHint = root.querySelector<HTMLDivElement>("#file-drop-hint")!;
+  const sessionVideoEl = root.querySelector<HTMLDivElement>(".session-video")!;
   const fullscreenBtn = root.querySelector<HTMLButtonElement>("#fullscreen-btn")!;
   // `document.fullscreenEnabled` doesn't change over a tab's lifetime, so
   // this is decided once, here, rather than on every render (slice 3.5c).
@@ -466,6 +487,12 @@ export function mount(root: Element | null): void {
   // `navigator.clipboard` (only where `clipboardchange` exists -- Chrome),
   // so `teardown` knows whether to remove it.
   let clipboardChangeAttached = false;
+  // Slice 3.4b: file upload to the host. `filesEnabled` is the host's
+  // `host_info.files_enabled`; `fileSender` exists once the `file` channel
+  // arrived. Both are reset in `stopSessionResources`.
+  let filesEnabled = false;
+  let fileSender: FileSender | null = null;
+  let fileDragDepth = 0;
   let clipboardNoteTimer: ReturnType<typeof setTimeout> | undefined;
   let fullscreenNoteTimer: ReturnType<typeof setTimeout> | undefined;
   // The owner's device list (slice 3.1e), from `Authenticated`/`Devices` --
@@ -554,6 +581,51 @@ export function mount(root: Element | null): void {
       clipboardNoteEl.textContent = "";
       clipboardNoteTimer = undefined;
     }, CLIPBOARD_NOTE_MS);
+  }
+
+  /** Whether file upload can be used right now (host allows it and the
+   * `file` channel is in hand). */
+  function filesAvailable(): boolean {
+    return filesEnabled && fileSender !== null;
+  }
+
+  function updateFileUi(): void {
+    fileSendBtn.hidden = !filesAvailable();
+    if (!filesAvailable()) {
+      fileStatusEl.hidden = true;
+      fileStatusTextEl.textContent = "";
+    }
+  }
+
+  function hideFileDropHint(): void {
+    fileDragDepth = 0;
+    fileDropHint.hidden = true;
+  }
+
+  /** Queues `files` for upload and reports skipped folders (slice 3.4b). */
+  function submitFiles(files: File[], folders: number): void {
+    if (!fileSender || !filesEnabled) return;
+    if (folders > 0) showClipboardNote(`Папки пока не поддерживаются: пропущено ${folders}`);
+    fileSender.enqueue(files);
+  }
+
+  function setupFileChannel(dc: RTCDataChannel): void {
+    fileSender?.dispose();
+    fileSender = new FileSender(dc, chooseChunkSize(session?.maxMessageSize()), {
+      onProgress: (p) => {
+        const pct = p.size > 0 ? Math.floor((p.sent / p.size) * 100) : 0;
+        fileStatusTextEl.textContent = `⬆ ${p.name} ${pct}% (${p.index}/${p.total})`;
+        fileStatusEl.hidden = false;
+      },
+      onSaved: (name) => showClipboardNote(`Сохранено в Загрузки: ${name}`),
+      onError: (name, reason) =>
+        showClipboardNote(`Не отправлено: ${name} — ${failReasonLabel(reason)}`),
+      onDone: () => {
+        fileStatusEl.hidden = true;
+        fileStatusTextEl.textContent = "";
+      },
+    });
+    updateFileUi();
   }
 
   /** Shows `note` in `#fullscreen-note` for `FULLSCREEN_NOTE_MS` -- the "for
@@ -893,6 +965,8 @@ export function mount(root: Element | null): void {
       if (msg.type === "host_info") {
         hostOs = msg.os;
         updateCmdAsCtrlVisibility();
+        filesEnabled = msg.files_enabled;
+        updateFileUi();
         return;
       }
       if (msg.type === "input_status") {
@@ -929,6 +1003,50 @@ export function mount(root: Element | null): void {
       applyCursor(video, msg);
     });
   }
+
+  fileSendBtn.addEventListener("click", () => {
+    fileInput.click();
+  });
+  fileInput.addEventListener("change", () => {
+    const files = Array.from(fileInput.files ?? []);
+    // Reset so picking the same file again fires `change` again.
+    fileInput.value = "";
+    submitFiles(files, 0);
+  });
+  fileCancelBtn.addEventListener("click", () => {
+    fileSender?.cancelAll();
+  });
+  // Drag-and-drop onto the video area. These are HTML5 drag events, which
+  // are separate from the pointer/mouse events `input.ts` listens to on
+  // `video` (the browser does not fire pointermove/pointerdown during an
+  // OS-level file drag), so nothing is sent to the host's `input` channel.
+  // File drags are always `preventDefault`ed over the video so a stray drop
+  // never navigates the tab to the file; the hint shows only when uploads
+  // are available.
+  sessionVideoEl.addEventListener("dragenter", (e) => {
+    if (!dragHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    fileDragDepth += 1;
+    if (filesAvailable()) fileDropHint.hidden = false;
+  });
+  sessionVideoEl.addEventListener("dragover", (e) => {
+    if (!dragHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = filesAvailable() ? "copy" : "none";
+  });
+  sessionVideoEl.addEventListener("dragleave", (e) => {
+    if (!dragHasFiles(e.dataTransfer)) return;
+    fileDragDepth = Math.max(0, fileDragDepth - 1);
+    if (fileDragDepth === 0) fileDropHint.hidden = true;
+  });
+  sessionVideoEl.addEventListener("drop", (e) => {
+    if (!dragHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    hideFileDropHint();
+    if (!filesAvailable() || !e.dataTransfer) return;
+    const { files, folders } = pickDroppedFiles(e.dataTransfer);
+    submitFiles(files, folders);
+  });
 
   function setSessionStatus(status: SessionStatus): void {
     sessionStatus.textContent = SESSION_STATUS_LABELS[status];
@@ -1125,6 +1243,14 @@ export function mount(root: Element | null): void {
     displaySelect.innerHTML = "";
     hostOs = null;
     updateCmdAsCtrlVisibility();
+    if (fileSender) {
+      fileSender.cancelAll();
+      fileSender.dispose();
+      fileSender = null;
+    }
+    filesEnabled = false;
+    hideFileDropHint();
+    updateFileUi();
     inputBlocked = false;
     viewOnlyEl.hidden = true;
     viewOnlyEl.textContent = "";
@@ -1418,6 +1544,7 @@ export function mount(root: Element | null): void {
           if (label === "input") inputChannel = dc;
           else if (label === "pointer") pointerChannel = dc;
           else if (label === "control") setupControlChannel(dc);
+          else if (label === "file") setupFileChannel(dc);
           maybeAttachInput();
         },
         onConnectionStateChange: (state) => {

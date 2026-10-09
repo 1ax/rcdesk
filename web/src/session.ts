@@ -22,6 +22,7 @@ export interface RTCPeerConnectionLike {
   ondatachannel: ((event: RTCDataChannelEvent) => void) | null;
   onconnectionstatechange: (() => void) | null;
   connectionState: RTCPeerConnectionState;
+  sctp?: { maxMessageSize: number } | null;
 }
 
 export type RTCPeerConnectionFactory = (
@@ -126,6 +127,11 @@ export class PeerSession {
   /** The data channels opened by the host, keyed by label. */
   getDataChannel(label: string): RTCDataChannel | undefined {
     return this.dataChannels.get(label);
+  }
+
+  /** The SCTP `maxMessageSize` negotiated for the data channels, if known. */
+  maxMessageSize(): number | undefined {
+    return this.pc.sctp?.maxMessageSize;
   }
 
   getStats(): Promise<RTCStatsReport> {

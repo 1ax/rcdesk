@@ -533,6 +533,38 @@ body {
   text-transform: none;
 }
 
+/* Slice 3.4b: upload progress ("⬆ name 45% (2/5)" + cancel) in the bar. */
+.file-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  text-transform: none;
+}
+
+.file-status-text {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Slice 3.4b: translucent drop hint over the video while files are dragged;
+   `pointer-events: none` so it never intercepts the drag events. */
+.file-drop-hint {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text);
+  background: rgb(79 140 255 / 30%);
+  border: 3px dashed var(--accent);
+  pointer-events: none;
+}
+
+
 .display-select,
 .quality-select {
   font-size: 12px;
