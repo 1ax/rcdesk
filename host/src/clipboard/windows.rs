@@ -47,6 +47,19 @@ impl ClipboardBackend for WinClipboardBackend {
         }
     }
 
+    fn get_file_list(&mut self) -> Option<Vec<std::path::PathBuf>> {
+        match self.clipboard.get().file_list() {
+            Ok(list) if list.is_empty() => None,
+            Ok(list) => Some(list),
+            // No files on the clipboard: normal, not logged.
+            Err(arboard::Error::ContentNotAvailable) => None,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to read clipboard file list");
+                None
+            }
+        }
+    }
+
     fn set_text(&mut self, text: &str) -> anyhow::Result<()> {
         self.clipboard.set_text(text)?;
         Ok(())

@@ -16,12 +16,15 @@ import type { Snapshot, StatsSummary } from "./stats";
 import { attachInput } from "./input";
 import { ClipboardBridge, isSafari } from "./clipboard";
 import {
+  FileReceiver,
   FileSender,
   chooseChunkSize,
+  downloadFailLabel,
   dragHasFiles,
   failReasonLabel,
   pickDroppedFiles,
 } from "./fileTransfer";
+import type { OfferedFile } from "./generated/OfferedFile";
 import { applyCursor } from "./cursor";
 import { displayOptions, parseDisplayId, shouldShowPicker } from "./displays";
 import {
@@ -219,6 +222,8 @@ const DEVICE_LIST_INTERVAL_MS = 10000;
 /** How long `#clipboard-note` stays visible after `ClipboardBridge.notify`
  * reports a too-large clipboard text (slice 2.5c, decision 5). */
 const CLIPBOARD_NOTE_MS = 4000;
+/** How long a downloaded file's object URL stays valid (slice 3.4c). */
+const DOWNLOAD_URL_REVOKE_MS = 60_000;
 
 /** How long `#fullscreen-note` (the "for exit press/hold Esc" hint) stays
  * visible after entering fullscreen (slice 3.5c). */
@@ -267,6 +272,11 @@ export function mount(root: Element | null): void {
             <span id="file-status-text" class="file-status-text"></span>
             <button id="file-cancel-btn" class="btn btn-secondary" title="Отменить передачу" aria-label="Отменить передачу">✕</button>
           </span>
+          <span id="download-status" class="status file-status" hidden>
+            <span id="download-status-text" class="file-status-text"></span>
+            <button id="download-cancel-btn" class="btn btn-secondary" title="Отменить скачивание" aria-label="Отменить скачивание">✕</button>
+          </span>
+          <button id="file-fetch-btn" class="btn btn-secondary" hidden>Скачать</button>
           <button id="file-send-btn" class="btn btn-secondary" hidden>Отправить файлы</button>
           <input id="file-input" type="file" multiple hidden />
           <select id="display-select" class="display-select" hidden></select>
@@ -385,6 +395,10 @@ export function mount(root: Element | null): void {
   const fileStatusEl = root.querySelector<HTMLSpanElement>("#file-status")!;
   const fileStatusTextEl = root.querySelector<HTMLSpanElement>("#file-status-text")!;
   const fileCancelBtn = root.querySelector<HTMLButtonElement>("#file-cancel-btn")!;
+  const downloadStatusEl = root.querySelector<HTMLSpanElement>("#download-status")!;
+  const downloadStatusTextEl = root.querySelector<HTMLSpanElement>("#download-status-text")!;
+  const downloadCancelBtn = root.querySelector<HTMLButtonElement>("#download-cancel-btn")!;
+  const fileFetchBtn = root.querySelector<HTMLButtonElement>("#file-fetch-btn")!;
   const fileSendBtn = root.querySelector<HTMLButtonElement>("#file-send-btn")!;
   const fileInput = root.querySelector<HTMLInputElement>("#file-input")!;
   const fileDropHint = root.querySelector<HTMLDivElement>("#file-drop-hint")!;
@@ -492,6 +506,11 @@ export function mount(root: Element | null): void {
   // arrived. Both are reset in `stopSessionResources`.
   let filesEnabled = false;
   let fileSender: FileSender | null = null;
+  // Slice 3.4c: files the host user copied, offered for download.
+  let fileReceiver: FileReceiver | null = null;
+  let offeredFiles: OfferedFile[] = [];
+  let offeredFolders = 0;
+  let downloading = false;
   let fileDragDepth = 0;
   let clipboardNoteTimer: ReturnType<typeof setTimeout> | undefined;
   let fullscreenNoteTimer: ReturnType<typeof setTimeout> | undefined;
@@ -594,7 +613,29 @@ export function mount(root: Element | null): void {
     if (!filesAvailable()) {
       fileStatusEl.hidden = true;
       fileStatusTextEl.textContent = "";
+      offeredFiles = [];
+      offeredFolders = 0;
+      downloading = false;
+      downloadStatusEl.hidden = true;
+      downloadStatusTextEl.textContent = "";
     }
+    const canFetch = filesAvailable() && offeredFiles.length > 0 && !downloading;
+    fileFetchBtn.hidden = !canFetch;
+    fileFetchBtn.textContent = `Скачать (${offeredFiles.length})`;
+    fileFetchBtn.title = offeredFiles.map((f) => f.name).join("\n");
+  }
+
+  /** Hands a downloaded file to the browser as an ordinary download. */
+  function saveDownloadedFile(name: string, blob: Blob): void {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), DOWNLOAD_URL_REVOKE_MS);
   }
 
   function hideFileDropHint(): void {
@@ -611,6 +652,38 @@ export function mount(root: Element | null): void {
 
   function setupFileChannel(dc: RTCDataChannel): void {
     fileSender?.dispose();
+    fileReceiver?.dispose();
+    fileReceiver = new FileReceiver(dc, {
+      onOffer: (files, skippedFolders) => {
+        offeredFiles = files;
+        offeredFolders = skippedFolders;
+        if (files.length === 0 && skippedFolders > 0) {
+          showClipboardNote(`Папки пока не поддерживаются: пропущено ${skippedFolders}`);
+        }
+        updateFileUi();
+      },
+      onProgress: (p) => {
+        const pct = p.size > 0 ? Math.floor((p.sent / p.size) * 100) : 0;
+        downloadStatusTextEl.textContent = `⬇ ${p.name} ${pct}% (${p.index}/${p.total})`;
+        downloadStatusEl.hidden = false;
+      },
+      onFile: (name, blob) => {
+        saveDownloadedFile(name, blob);
+        showClipboardNote(`Скачано: ${name}`);
+      },
+      onError: (name, reason) =>
+        showClipboardNote(
+          name === ""
+            ? `Не скачано: ${downloadFailLabel(reason)}`
+            : `Не скачано: ${name} — ${downloadFailLabel(reason)}`,
+        ),
+      onDone: () => {
+        downloading = false;
+        downloadStatusEl.hidden = true;
+        downloadStatusTextEl.textContent = "";
+        updateFileUi();
+      },
+    });
     fileSender = new FileSender(dc, chooseChunkSize(session?.maxMessageSize()), {
       onProgress: (p) => {
         const pct = p.size > 0 ? Math.floor((p.sent / p.size) * 100) : 0;
@@ -1016,6 +1089,19 @@ export function mount(root: Element | null): void {
   fileCancelBtn.addEventListener("click", () => {
     fileSender?.cancelAll();
   });
+  fileFetchBtn.addEventListener("click", () => {
+    if (!fileReceiver || offeredFiles.length === 0) return;
+    if (offeredFolders > 0) {
+      showClipboardNote(`Папки пока не поддерживаются: пропущено ${offeredFolders}`);
+    }
+    if (fileReceiver.fetch()) {
+      downloading = true;
+      updateFileUi();
+    }
+  });
+  downloadCancelBtn.addEventListener("click", () => {
+    fileReceiver?.cancel();
+  });
   // Drag-and-drop onto the video area. These are HTML5 drag events, which
   // are separate from the pointer/mouse events `input.ts` listens to on
   // `video` (the browser does not fire pointermove/pointerdown during an
@@ -1247,6 +1333,11 @@ export function mount(root: Element | null): void {
       fileSender.cancelAll();
       fileSender.dispose();
       fileSender = null;
+    }
+    if (fileReceiver) {
+      fileReceiver.cancel();
+      fileReceiver.dispose();
+      fileReceiver = null;
     }
     filesEnabled = false;
     hideFileDropHint();

@@ -39,9 +39,10 @@ use webrtc::runtime::Runtime;
 
 use crate::adapt::{AdaptConfig, Controller, Feedback};
 use crate::capture::{self, DisplayInfo, FrameSource};
-use crate::clipboard::{self, ClipboardBackend, ClipboardSync};
+use crate::clipboard::{self, ClipboardBackend, ClipboardEvent, ClipboardSync};
 use crate::cursor::{self, CursorSource, CursorState};
 use crate::encode::{build_encoder, EncodedFrame, EncoderConfig, EncoderKind, RateTarget};
+use crate::files::FilesCommand;
 use crate::input::{Injector, InputRouter, NoopInjector};
 use crate::pipeline::Pipeline;
 #[cfg(target_os = "windows")]
@@ -2255,21 +2256,56 @@ async fn start_session(
         }
     });
 
+    // The `file` channel gets its own task (slice 3.4a), fed by the
+    // transport's dedicated mpsc rather than `handle_session_event`. A
+    // disabled or folder-less session still runs the task so the client
+    // gets a clean `Abort { Disabled }` instead of silence.
+    let files_dir = if ctx.files_enabled {
+        match crate::files::receive_dir() {
+            Ok(dir) => Some(dir),
+            Err(err) => {
+                tracing::warn!(error = %err, "download folder unavailable, file transfer disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let files_enabled = files_dir.is_some();
+    // Copied-file offers travel from the clipboard watcher to the files task
+    // (slice 3.4c); without a clipboard the sender is simply dropped.
+    let (files_cmd_tx, files_cmd_rx) = mpsc::channel::<crate::files::FilesCommand>(8);
+
     // A failed/absent clipboard builder must not take the session down
     // either -- same lesson as the injector fallback above (debt D26): the
     // session just runs without clipboard sync.
     let (clipboard, clipboard_task) = match &ctx.build_clipboard {
         Some(build_clipboard) => match build_clipboard() {
             Ok(backend) => {
-                let sync = Arc::new(Mutex::new(ClipboardSync::new(backend)));
+                let mut clipboard_sync = ClipboardSync::new(backend);
+                clipboard_sync.set_files_enabled(files_enabled);
+                let sync = Arc::new(Mutex::new(clipboard_sync));
                 let mut clipboard_watcher =
                     clipboard::watch(Arc::clone(&sync), clipboard::CLIPBOARD_POLL_INTERVAL);
                 let clipboard_peer = Arc::clone(&peer);
                 let task = tokio::spawn(async move {
-                    while let Some(text) = clipboard_watcher.rx.recv().await {
-                        let msg = ControlMessage::ClipboardText { text };
-                        if let Err(err) = clipboard_peer.send_control(&msg).await {
-                            tracing::warn!(?err, "failed to send clipboard control message");
+                    while let Some(event) = clipboard_watcher.rx.recv().await {
+                        match event {
+                            ClipboardEvent::Text(text) => {
+                                let msg = ControlMessage::ClipboardText { text };
+                                if let Err(err) = clipboard_peer.send_control(&msg).await {
+                                    tracing::warn!(
+                                        ?err,
+                                        "failed to send clipboard control message"
+                                    );
+                                }
+                            }
+                            ClipboardEvent::Files(paths) => {
+                                let _ = files_cmd_tx.send(FilesCommand::Offer(paths)).await;
+                            }
+                            ClipboardEvent::NoFiles => {
+                                let _ = files_cmd_tx.send(FilesCommand::Clear).await;
+                            }
                         }
                     }
                 });
@@ -2293,22 +2329,6 @@ async fn start_session(
     #[cfg(not(target_os = "windows"))]
     let elevation_task: Option<tokio::task::JoinHandle<()>> = None;
 
-    // The `file` channel gets its own task (slice 3.4a), fed by the
-    // transport's dedicated mpsc rather than `handle_session_event`. A
-    // disabled or folder-less session still runs the task so the client
-    // gets a clean `Abort { Disabled }` instead of silence.
-    let files_dir = if ctx.files_enabled {
-        match crate::files::receive_dir() {
-            Ok(dir) => Some(dir),
-            Err(err) => {
-                tracing::warn!(error = %err, "download folder unavailable, file transfer disabled");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let files_enabled = files_dir.is_some();
     let (file_channel, file_rx) = peer
         .take_file_channel()
         .ok_or_else(|| anyhow::anyhow!("file channel already taken"))?;
@@ -2316,6 +2336,7 @@ async fn start_session(
         Arc::new(file_channel) as Arc<dyn crate::files::FileChannel>,
         file_rx,
         files_dir,
+        files_cmd_rx,
     ));
 
     Ok(SessionParts {

@@ -2,13 +2,18 @@ import { describe, expect, it } from "vitest";
 import {
   BUFFER_HIGH_BYTES,
   BUFFER_LOW_BYTES,
+  FileReceiver,
   FileSender,
+  HOST_ID_BASE,
+  MAX_DOWNLOAD_BYTES,
   chooseChunkSize,
+  downloadFailLabel,
   dragHasFiles,
   failReasonLabel,
   pickDroppedFiles,
   type DataTransferLike,
   type FileChannelLike,
+  type DownloadFailReason,
   type FileFailReason,
   type FileLike,
 } from "./fileTransfer";
@@ -307,5 +312,223 @@ describe("pickDroppedFiles", () => {
     expect(dragHasFiles({ types: ["Files"] })).toBe(true);
     expect(dragHasFiles({ types: ["text/plain"] })).toBe(false);
     expect(dragHasFiles(null)).toBe(false);
+  });
+});
+
+describe("FileReceiver", () => {
+  const H = HOST_ID_BASE;
+
+  function setupRecv() {
+    const ch = new FakeChannel() as FakeChannel & { binaryType?: string };
+    const ev = {
+      offers: [] as Array<[Array<{ name: string; size: number }>, number]>,
+      files: [] as Array<{ name: string; blob: Blob }>,
+      errors: [] as Array<[string, DownloadFailReason]>,
+      progress: [] as string[],
+      done: 0,
+    };
+    const rx = new FileReceiver(ch, {
+      onOffer: (files, skipped) => ev.offers.push([files, skipped]),
+      onFile: (name, blob) => ev.files.push({ name, blob }),
+      onError: (name, reason) => ev.errors.push([name, reason]),
+      onProgress: (p) => ev.progress.push(`${p.name} ${p.sent}/${p.size} ${p.index}/${p.total}`),
+      onDone: () => ev.done++,
+    });
+    return { ch, ev, rx };
+  }
+
+  const bin = (...bytes: number[]): ArrayBuffer => new Uint8Array(bytes).buffer;
+  const hostChunk = (ch: FakeChannel, data: ArrayBuffer): void =>
+    ch.emit("message", { data });
+  const offerMsg = (listId: number, files: Array<[string, number]>, skipped = 0) => ({
+    type: "offer",
+    list_id: listId,
+    files: files.map(([name, size]) => ({ name, size })),
+    skipped_folders: skipped,
+  });
+
+  it("asks for arraybuffer chunks and reports an offer", () => {
+    const { ch, ev } = setupRecv();
+    expect(ch.binaryType).toBe("arraybuffer");
+    ch.hostSays(offerMsg(3, [["a.txt", 5]], 2));
+    expect(ev.offers).toEqual([[[{ name: "a.txt", size: 5 }], 2]]);
+  });
+
+  it("fetch sends the list id of the last offer", () => {
+    const { ch, rx } = setupRecv();
+    expect(rx.fetch()).toBe(false);
+    ch.hostSays(offerMsg(3, [["a.txt", 5]]));
+    ch.hostSays(offerMsg(4, [["b.txt", 1]]));
+    expect(rx.fetch()).toBe(true);
+    expect(ch.trace()).toEqual([{ type: "fetch", list_id: 4 }]);
+    // A second fetch while downloading is ignored.
+    expect(rx.fetch()).toBe(false);
+    expect(ch.trace().length).toBe(1);
+  });
+
+  it("an empty offer withdraws the previous one", () => {
+    const { ch, ev, rx } = setupRecv();
+    ch.hostSays(offerMsg(3, [["a.txt", 5]]));
+    ch.hostSays(offerMsg(4, []));
+    expect(ev.offers[1]).toEqual([[], 0]);
+    expect(rx.fetch()).toBe(false);
+    expect(ch.trace()).toEqual([]);
+  });
+
+  it("refuses a download above the limit", () => {
+    const { ch, ev, rx } = setupRecv();
+    ch.hostSays(offerMsg(1, [["a", MAX_DOWNLOAD_BYTES], ["b", 1]]));
+    expect(rx.fetch()).toBe(false);
+    expect(ch.trace()).toEqual([]);
+    expect(ev.errors).toEqual([["", "too_large"]]);
+    ch.hostSays(offerMsg(2, [["a", MAX_DOWNLOAD_BYTES]]));
+    expect(rx.fetch()).toBe(true);
+  });
+
+  it("assembles files into blobs with the right size and content", async () => {
+    const { ch, ev, rx } = setupRecv();
+    ch.hostSays(offerMsg(1, [["a.bin", 5], ["b.txt", 0]]));
+    rx.fetch();
+    ch.hostSays({ type: "start", id: H, name: "a.bin", size: 5 });
+    hostChunk(ch, bin(1, 2, 3));
+    hostChunk(ch, bin(4, 5));
+    ch.hostSays({ type: "end", id: H });
+    ch.hostSays({ type: "start", id: H + 1, name: "b.txt", size: 0 });
+    ch.hostSays({ type: "end", id: H + 1 });
+    expect(ev.files.map((f) => [f.name, f.blob.size])).toEqual([
+      ["a.bin", 5],
+      ["b.txt", 0],
+    ]);
+    expect(new Uint8Array(await ev.files[0]!.blob.arrayBuffer())).toEqual(
+      new Uint8Array([1, 2, 3, 4, 5]),
+    );
+    expect(ev.done).toBe(1);
+    expect(ev.progress).toContain("a.bin 3/5 1/2");
+    expect(ev.progress).toContain("b.txt 0/0 2/2");
+  });
+
+  it("drops a file the host aborts and waits for the next one", () => {
+    const { ch, ev, rx } = setupRecv();
+    ch.hostSays(offerMsg(1, [["a", 3], ["b", 1]]));
+    rx.fetch();
+    ch.hostSays({ type: "start", id: H, name: "a", size: 3 });
+    hostChunk(ch, bin(1));
+    ch.hostSays({ type: "abort", id: H, reason: "io" });
+    ch.hostSays({ type: "start", id: H + 1, name: "b", size: 1 });
+    hostChunk(ch, bin(9));
+    ch.hostSays({ type: "end", id: H + 1 });
+    expect(ev.errors).toEqual([["a", "io"]]);
+    expect(ev.files.map((f) => f.name)).toEqual(["b"]);
+    expect(ev.done).toBe(1);
+  });
+
+  it("cancel aborts the current file and ignores the rest", () => {
+    const { ch, ev, rx } = setupRecv();
+    ch.hostSays(offerMsg(1, [["a", 3], ["b", 1]]));
+    rx.fetch();
+    ch.hostSays({ type: "start", id: H, name: "a", size: 3 });
+    hostChunk(ch, bin(1));
+    rx.cancel();
+    expect(ch.trace()[1]).toEqual({ type: "abort", id: H, reason: "cancelled" });
+    expect(ev.done).toBe(1);
+    // The host had not seen the abort yet.
+    hostChunk(ch, bin(2, 3));
+    ch.hostSays({ type: "end", id: H });
+    ch.hostSays({ type: "start", id: H + 1, name: "b", size: 1 });
+    hostChunk(ch, bin(9));
+    ch.hostSays({ type: "end", id: H + 1 });
+    expect(ev.files).toEqual([]);
+    expect(ev.errors).toEqual([]);
+    // A new fetch works again.
+    expect(rx.fetch()).toBe(true);
+  });
+
+  it("aborts with protocol when the size does not match", () => {
+    const { ch, ev, rx } = setupRecv();
+    ch.hostSays(offerMsg(1, [["a", 3]]));
+    rx.fetch();
+    ch.hostSays({ type: "start", id: H, name: "a", size: 3 });
+    hostChunk(ch, bin(1, 2));
+    ch.hostSays({ type: "end", id: H });
+    expect(ev.errors).toEqual([["a", "protocol"]]);
+    expect(ev.files).toEqual([]);
+    expect(ch.trace()[1]).toEqual({ type: "abort", id: H, reason: "protocol" });
+    expect(ev.done).toBe(1);
+  });
+
+  it("aborts with protocol when more data arrives than announced", () => {
+    const { ch, ev, rx } = setupRecv();
+    ch.hostSays(offerMsg(1, [["a", 2]]));
+    rx.fetch();
+    ch.hostSays({ type: "start", id: H, name: "a", size: 2 });
+    hostChunk(ch, bin(1, 2, 3));
+    expect(ev.errors).toEqual([["a", "protocol"]]);
+  });
+
+  it("reports a closed channel mid-download", () => {
+    const { ch, ev, rx } = setupRecv();
+    ch.hostSays(offerMsg(1, [["a", 2]]));
+    rx.fetch();
+    ch.hostSays({ type: "start", id: H, name: "a", size: 2 });
+    ch.emit("close");
+    expect(ev.errors).toEqual([["a", "closed"]]);
+    expect(ev.done).toBe(1);
+  });
+
+  it("ignores data without a started download", () => {
+    const { ch, ev } = setupRecv();
+    ch.hostSays({ type: "start", id: H, name: "a", size: 1 });
+    hostChunk(ch, bin(1));
+    ch.hostSays({ type: "end", id: H });
+    expect(ev.files).toEqual([]);
+    expect(ev.progress).toEqual([]);
+  });
+
+  it("sender and receiver on one channel do not disturb each other", async () => {
+    const ch = new FakeChannel() as FakeChannel & { binaryType?: string };
+    const saved: string[] = [];
+    const senderErrors: Array<[string, FileFailReason]> = [];
+    const files: string[] = [];
+    const recvErrors: Array<[string, DownloadFailReason]> = [];
+    const sender = new FileSender(ch, 4, {
+      onSaved: (n) => saved.push(n),
+      onError: (n, r) => senderErrors.push([n, r]),
+    });
+    const rx = new FileReceiver(ch, {
+      onFile: (n) => files.push(n),
+      onError: (n, r) => recvErrors.push([n, r]),
+    });
+    ch.hostSays({ type: "offer", list_id: 1, files: [{ name: "d", size: 2 }], skipped_folders: 0 });
+    rx.fetch();
+    sender.enqueue([fakeFile("up.bin", 4)]);
+    await flush();
+    // Upload id 1 is in flight while download id H starts.
+    ch.hostSays({ type: "start", id: H, name: "d", size: 2 });
+    ch.emit("message", { data: bin(1, 2) });
+    // Host aborts its own download: must not touch the upload.
+    ch.hostSays({ type: "abort", id: H, reason: "io" });
+    expect(senderErrors).toEqual([]);
+    expect(recvErrors).toEqual([["d", "io"]]);
+    // Host answers the upload: must not touch the receiver.
+    ch.hostSays({ type: "saved", id: 1, name: "up.bin" });
+    await flush();
+    expect(saved).toEqual(["up.bin"]);
+    expect(files).toEqual([]);
+    // An upload abort with a small id is not a download abort either.
+    ch.hostSays({ type: "offer", list_id: 2, files: [{ name: "e", size: 1 }], skipped_folders: 0 });
+    rx.fetch();
+    ch.hostSays({ type: "start", id: H + 1, name: "e", size: 1 });
+    ch.hostSays({ type: "abort", id: 1, reason: "io" });
+    ch.emit("message", { data: bin(7) });
+    ch.hostSays({ type: "end", id: H + 1 });
+    expect(files).toEqual(["e"]);
+  });
+});
+
+describe("downloadFailLabel", () => {
+  it("covers every reason", () => {
+    for (const r of ["cancelled", "disabled", "io", "protocol", "closed", "too_large"] as const) {
+      expect(downloadFailLabel(r).length).toBeGreaterThan(0);
+    }
   });
 });

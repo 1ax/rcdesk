@@ -6,15 +6,44 @@
 //! `FileMessage`s. Binary messages are raw file chunks with no header, at
 //! most 64 KiB each.
 //!
-//! Protocol rule: in each direction only one transfer is in flight at a
-//! time. The channel is ordered, so a binary chunk always belongs to the
-//! most recent `Start` sent by that side. A transfer is `Start`, any number
-//! of binary chunks, then `End`. A receiver that itself sent `Abort` for the
-//! current transfer silently drops chunks until the sender's `End`, `Abort`
-//! or a new `Start` arrives (the sender may not have seen the `Abort` yet).
+//! Protocol rule: the two directions are independent. An upload (client ->
+//! host) and a download (host -> client) may run at the same time over the
+//! one ordered channel. In each direction only one transfer is in flight at
+//! a time. A binary chunk always belongs to the most recent `Start` sent by
+//! the SAME side that sent the chunk; this is unambiguous for each receiver
+//! because it only ever gets chunks from the other side. A transfer is
+//! `Start`, any number of binary chunks, then `End`. A receiver that itself
+//! sent `Abort` for the current transfer silently drops chunks until the
+//! sender's `End`, `Abort` or a new `Start` arrives (the sender may not have
+//! seen the `Abort` yet).
+//!
+//! Transfer ids: the client numbers its uploads from 1, the host numbers its
+//! downloads from `HOST_ID_BASE` (0x8000_0000), so an `Abort { id }` is
+//! never ambiguous between the two directions.
+//!
+//! Download flow (slice 3.4c): when the host user copies files, the host
+//! sends `Offer`; the client asks for them with `Fetch`; the host then sends
+//! every file as `Start` / chunks / `End`. The client may `Abort` the current
+//! file with `Cancelled`, which also drops the rest of the list. The host
+//! may `Abort` a single file with `Io` (vanished, shorter than announced,
+//! read error); the client discards it and waits for the next `Start`.
+//! `Saved` is not used for downloads.
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
+
+/// First transfer id used by the host for downloads (host -> client); the
+/// client numbers its uploads from 1. See the module docs.
+pub const HOST_ID_BASE: u32 = 0x8000_0000;
+
+/// One file in a host -> client `Offer`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct OfferedFile {
+    pub name: String,
+    #[ts(type = "number")]
+    pub size: u64,
+}
 
 /// Why a transfer was aborted, carried in `FileMessage::Abort`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -53,6 +82,17 @@ pub enum FileMessage {
     /// Host -> client: the host saved the received transfer `id` under
     /// `name`, the final name after sanitizing and de-duplication.
     Saved { id: u32, name: String },
+    /// Host -> client: the host user copied files; they can be downloaded
+    /// with `Fetch { list_id }`. Folders are not supported and only counted
+    /// in `skipped_folders`. An empty `files` with `skipped_folders == 0`
+    /// means "no offer any more".
+    Offer {
+        list_id: u32,
+        files: Vec<OfferedFile>,
+        skipped_folders: u32,
+    },
+    /// Client -> host: send all files of offer `list_id`.
+    Fetch { list_id: u32 },
 }
 
 #[cfg(test)]
@@ -106,6 +146,43 @@ mod tests {
                 name: "a (1).txt".to_string(),
             },
             r#"{"type":"saved","id":2,"name":"a (1).txt"}"#,
+        );
+    }
+
+    #[test]
+    fn offer_has_exact_shape() {
+        check(
+            FileMessage::Offer {
+                list_id: 4,
+                files: vec![
+                    OfferedFile {
+                        name: "a.txt".to_string(),
+                        size: 12,
+                    },
+                    OfferedFile {
+                        name: "b.bin".to_string(),
+                        size: 0,
+                    },
+                ],
+                skipped_folders: 2,
+            },
+            r#"{"type":"offer","list_id":4,"files":[{"name":"a.txt","size":12},{"name":"b.bin","size":0}],"skipped_folders":2}"#,
+        );
+        check(
+            FileMessage::Offer {
+                list_id: 5,
+                files: vec![],
+                skipped_folders: 0,
+            },
+            r#"{"type":"offer","list_id":5,"files":[],"skipped_folders":0}"#,
+        );
+    }
+
+    #[test]
+    fn fetch_has_exact_shape() {
+        check(
+            FileMessage::Fetch { list_id: 4 },
+            r#"{"type":"fetch","list_id":4}"#,
         );
     }
 }

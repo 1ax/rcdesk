@@ -1,14 +1,21 @@
 //! File transfer over the `file` data channel (slice 3.4, see
-//! `proto::file` for the wire protocol). This sub-step (3.4a) implements the
-//! client -> host direction: the host receives a file into the user's
-//! Downloads folder.
+//! `proto::file` for the wire protocol). Client -> host (3.4a): the host
+//! receives a file into the user's Downloads folder. Host -> client (3.4c):
+//! files the host user copied (see `crate::clipboard`) are offered to the
+//! client and, on its `Fetch`, streamed to it.
 //!
 //! The channel is served by one task per session (`run`), fed by the
 //! transport's dedicated `file` mpsc (`transport::FileChannelMessage`)
 //! instead of `SessionEvent::DataChannelMessage`, so disk writes never run
 //! inside `signaling::handle_session_event`. Replies go out through the
-//! `FileChannel` trait so the logic is testable without WebRTC; the host ->
-//! client direction (3.4c) will reuse the same task and trait.
+//! `FileChannel` trait so the logic is testable without WebRTC.
+//!
+//! Receiving and sending share the one task: `run` selects over the incoming
+//! channel messages and the offer commands, while a download runs in its own
+//! spawned task (`Outgoing`, cancelled through a flag, aborted on drop), so a
+//! long download never blocks incoming messages (client `Abort`, a parallel
+//! upload, ...). Download ids start at `proto::file::HOST_ID_BASE`, upload
+//! ids (client) at 1, so `Abort` ids never clash.
 //!
 //! Disk safety: data is written to `<name>.rcdesk-part`; the final name is
 //! reserved up front with `create_new` (an empty placeholder, so two
@@ -21,8 +28,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use proto::file::{AbortReason, FileMessage};
-use tokio::io::AsyncWriteExt;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
+
+use bytes::BytesMut;
+use proto::file::{AbortReason, FileMessage, OfferedFile, HOST_ID_BASE};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use webrtc::data_channel::DataChannel;
 
@@ -56,10 +67,31 @@ pub fn receive_dir() -> anyhow::Result<PathBuf> {
     }
 }
 
+/// Size of one download chunk (the protocol maximum).
+const CHUNK_BYTES: usize = 64 * 1024;
+
+/// A download waits while the channel has more than this many bytes queued.
+const SEND_HIGH_WATER: usize = 1024 * 1024;
+
+/// How long a download sleeps between checks of the queued byte count.
+const BACKPRESSURE_POLL: Duration = Duration::from_millis(5);
+
+/// What the clipboard watcher tells the `file` task (slice 3.4c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilesCommand {
+    /// The host user copied these paths: offer them to the client.
+    Offer(Vec<PathBuf>),
+    /// The copied files are gone from the clipboard: withdraw the offer.
+    Clear,
+}
+
 /// The sending half of the `file` channel as the transfer logic sees it.
 #[async_trait::async_trait]
 pub trait FileChannel: Send + Sync {
     async fn send_text(&self, text: &str) -> anyhow::Result<()>;
+    async fn send_binary(&self, data: &[u8]) -> anyhow::Result<()>;
+    /// Bytes handed to the channel that the peer has not yet acknowledged.
+    async fn outstanding_bytes(&self) -> usize;
 }
 
 #[async_trait::async_trait]
@@ -67,6 +99,17 @@ impl FileChannel for Arc<dyn DataChannel> {
     async fn send_text(&self, text: &str) -> anyhow::Result<()> {
         DataChannel::send_text(self.as_ref(), text).await?;
         Ok(())
+    }
+
+    async fn send_binary(&self, data: &[u8]) -> anyhow::Result<()> {
+        DataChannel::send(self.as_ref(), BytesMut::from(data)).await?;
+        Ok(())
+    }
+
+    async fn outstanding_bytes(&self) -> usize {
+        DataChannel::outstanding_bytes(self.as_ref())
+            .await
+            .unwrap_or(0)
     }
 }
 
@@ -233,17 +276,6 @@ impl Receiver {
         self.send(&FileMessage::Abort { id, reason }).await;
     }
 
-    async fn on_message(&mut self, msg: FileChannelMessage) {
-        if msg.is_string {
-            match serde_json::from_slice::<FileMessage>(&msg.data) {
-                Ok(m) => self.on_control(m).await,
-                Err(err) => tracing::warn!(?err, "invalid file channel message, ignoring"),
-            }
-        } else {
-            self.on_chunk(&msg.data).await;
-        }
-    }
-
     async fn on_control(&mut self, msg: FileMessage) {
         match msg {
             FileMessage::Start { id, name, size } => self.on_start(id, name, size).await,
@@ -254,8 +286,8 @@ impl Receiver {
                     self.active = None;
                 }
             }
-            FileMessage::Saved { .. } => {
-                tracing::trace!("unexpected saved message from client, ignoring");
+            FileMessage::Saved { .. } | FileMessage::Offer { .. } | FileMessage::Fetch { .. } => {
+                tracing::trace!("message not meant for the upload receiver, ignoring");
             }
         }
     }
@@ -383,25 +415,352 @@ impl Receiver {
     }
 }
 
+/// One file of the current offer.
+struct OfferEntry {
+    path: PathBuf,
+    name: String,
+    size: u64,
+}
+
+/// A running download of one offer. Dropping it stops the task.
+struct Outgoing {
+    handle: tokio::task::JoinHandle<()>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for Outgoing {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+impl Outgoing {
+    fn is_running(&self) -> bool {
+        !self.handle.is_finished()
+    }
+}
+
+/// Host -> client direction: offers and downloads.
+struct Downloader {
+    channel: Arc<dyn FileChannel>,
+    /// Id and files of the latest offer only.
+    list: Option<(u32, Vec<OfferEntry>)>,
+    next_list_id: u32,
+    /// Next download file id, shared with the running download task.
+    next_file_id: Arc<AtomicU32>,
+    sending: Option<Outgoing>,
+}
+
+async fn send_msg(channel: &dyn FileChannel, msg: &FileMessage) -> anyhow::Result<()> {
+    let json = serde_json::to_string(msg)?;
+    channel.send_text(&json).await
+}
+
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string())
+}
+
+impl Downloader {
+    fn new(channel: Arc<dyn FileChannel>) -> Self {
+        Self {
+            channel,
+            list: None,
+            next_list_id: 1,
+            next_file_id: Arc::new(AtomicU32::new(HOST_ID_BASE)),
+            sending: None,
+        }
+    }
+
+    async fn command(&mut self, cmd: FilesCommand) {
+        match cmd {
+            FilesCommand::Offer(paths) => self.offer(paths).await,
+            FilesCommand::Clear => self.clear().await,
+        }
+    }
+
+    async fn clear(&mut self) {
+        if self.list.take().is_some() {
+            let list_id = self.take_list_id();
+            let msg = FileMessage::Offer {
+                list_id,
+                files: vec![],
+                skipped_folders: 0,
+            };
+            if let Err(err) = send_msg(self.channel.as_ref(), &msg).await {
+                tracing::debug!(?err, "failed to withdraw file offer");
+            }
+        }
+    }
+
+    fn take_list_id(&mut self) -> u32 {
+        let id = self.next_list_id;
+        self.next_list_id = self.next_list_id.wrapping_add(1);
+        id
+    }
+
+    async fn offer(&mut self, paths: Vec<PathBuf>) {
+        let mut entries = Vec::new();
+        let mut skipped_folders = 0u32;
+        for path in paths {
+            match tokio::fs::metadata(&path).await {
+                Ok(meta) if meta.is_file() => entries.push(OfferEntry {
+                    name: file_name_of(&path),
+                    size: meta.len(),
+                    path,
+                }),
+                Ok(meta) if meta.is_dir() => skipped_folders += 1,
+                Ok(_) => tracing::debug!(path = %path.display(), "not a regular file, skipping"),
+                Err(err) => {
+                    tracing::debug!(path = %path.display(), ?err, "cannot stat copied path, skipping")
+                }
+            }
+        }
+        if entries.is_empty() && skipped_folders == 0 {
+            // Nothing offerable: same as no files at all.
+            self.clear().await;
+            return;
+        }
+        let list_id = self.take_list_id();
+        let files = entries
+            .iter()
+            .map(|e| OfferedFile {
+                name: e.name.clone(),
+                size: e.size,
+            })
+            .collect();
+        tracing::debug!(
+            list_id,
+            files = entries.len(),
+            skipped_folders,
+            "offering copied files"
+        );
+        self.list = Some((list_id, entries));
+        let msg = FileMessage::Offer {
+            list_id,
+            files,
+            skipped_folders,
+        };
+        if let Err(err) = send_msg(self.channel.as_ref(), &msg).await {
+            tracing::debug!(?err, "failed to send file offer");
+        }
+    }
+
+    fn fetch(&mut self, list_id: u32) {
+        if self.sending.as_ref().is_some_and(Outgoing::is_running) {
+            tracing::debug!(list_id, "fetch while a download is running, ignoring");
+            return;
+        }
+        let Some((current, entries)) = self.list.as_ref() else {
+            tracing::debug!(list_id, "fetch without an offer, ignoring");
+            return;
+        };
+        if *current != list_id || entries.is_empty() {
+            tracing::debug!(list_id, "fetch for a stale or empty offer, ignoring");
+            return;
+        }
+        let entries: Vec<OfferEntry> = entries
+            .iter()
+            .map(|e| OfferEntry {
+                path: e.path.clone(),
+                name: e.name.clone(),
+                size: e.size,
+            })
+            .collect();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(send_files(
+            Arc::clone(&self.channel),
+            entries,
+            Arc::clone(&self.next_file_id),
+            Arc::clone(&cancel),
+        ));
+        self.sending = Some(Outgoing { handle, cancel });
+    }
+
+    /// The client aborted transfer `id`. Ids from `HOST_ID_BASE` up are
+    /// downloads; while one runs, the current file and the rest of the list
+    /// are dropped. (The id may name a file the host has already left
+    /// behind -- the client cannot know -- so it is not compared further.)
+    fn client_abort(&mut self, id: u32, reason: AbortReason) {
+        let Some(out) = self.sending.as_ref().filter(|o| o.is_running()) else {
+            return;
+        };
+        if id >= HOST_ID_BASE && matches!(reason, AbortReason::Cancelled | AbortReason::Protocol) {
+            tracing::debug!(id, "download aborted by client");
+            out.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Streams `entries` over `channel`, one file after another, until done,
+/// cancelled or the channel fails.
+async fn send_files(
+    channel: Arc<dyn FileChannel>,
+    entries: Vec<OfferEntry>,
+    next_file_id: Arc<AtomicU32>,
+    cancel: Arc<AtomicBool>,
+) {
+    for entry in entries {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let id = next_file_id.fetch_add(1, Ordering::Relaxed);
+        match send_one(channel.as_ref(), id, &entry, &cancel).await {
+            Ok(()) => {}
+            Err(err) => {
+                tracing::debug!(?err, id, "download stopped, channel failed");
+                return;
+            }
+        }
+    }
+}
+
+/// Sends one file. `Err` only when the channel itself failed; a file-level
+/// problem is reported to the client with `Abort { Io }` and is `Ok`.
+async fn send_one(
+    channel: &dyn FileChannel,
+    id: u32,
+    entry: &OfferEntry,
+    cancel: &AtomicBool,
+) -> anyhow::Result<()> {
+    let opened = async {
+        let file = tokio::fs::File::open(&entry.path).await?;
+        let meta = file.metadata().await?;
+        if !meta.is_file() {
+            return Err(std::io::Error::other("not a regular file"));
+        }
+        Ok((file, meta.len()))
+    }
+    .await;
+    let (mut file, size) = match opened {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::debug!(path = %entry.path.display(), ?err, "cannot open file for download");
+            // The client has no other way to learn which file failed: the
+            // `Start` carries the offered name and size.
+            send_msg(
+                channel,
+                &FileMessage::Start {
+                    id,
+                    name: entry.name.clone(),
+                    size: entry.size,
+                },
+            )
+            .await?;
+            send_msg(
+                channel,
+                &FileMessage::Abort {
+                    id,
+                    reason: AbortReason::Io,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    send_msg(
+        channel,
+        &FileMessage::Start {
+            id,
+            name: entry.name.clone(),
+            size,
+        },
+    )
+    .await?;
+    let mut remaining = size;
+    let mut buf = vec![0u8; CHUNK_BYTES];
+    while remaining > 0 {
+        while channel.outstanding_bytes().await > SEND_HIGH_WATER {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            tokio::time::sleep(BACKPRESSURE_POLL).await;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let want = remaining.min(CHUNK_BYTES as u64) as usize;
+        if let Err(err) = file.read_exact(&mut buf[..want]).await {
+            tracing::debug!(?err, id, "download read failed");
+            send_msg(
+                channel,
+                &FileMessage::Abort {
+                    id,
+                    reason: AbortReason::Io,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+        channel.send_binary(&buf[..want]).await?;
+        remaining -= want as u64;
+    }
+    send_msg(channel, &FileMessage::End { id }).await?;
+    tracing::info!(size, "file sent");
+    Ok(())
+}
+
+/// Both directions of the `file` channel for one session.
+struct Session {
+    receiver: Receiver,
+    downloader: Downloader,
+}
+
+impl Session {
+    async fn on_message(&mut self, msg: FileChannelMessage) {
+        if msg.is_string {
+            match serde_json::from_slice::<FileMessage>(&msg.data) {
+                Ok(FileMessage::Fetch { list_id }) => self.downloader.fetch(list_id),
+                Ok(m) => {
+                    if let FileMessage::Abort { id, reason } = &m {
+                        self.downloader.client_abort(*id, *reason);
+                    }
+                    self.receiver.on_control(m).await;
+                }
+                Err(err) => tracing::warn!(?err, "invalid file channel message, ignoring"),
+            }
+        } else {
+            self.receiver.on_chunk(&msg.data).await;
+        }
+    }
+}
+
 /// Serves the `file` channel for one session until `rx` closes (the channel
 /// or the session ended) or the task is aborted; either way an unfinished
-/// transfer is cleaned up. `dir` is the receive folder, or `None` when file
-/// transfer is disabled -- every `Start` is then answered with
-/// `Abort { Disabled }` and nothing is created.
+/// transfer is cleaned up and a running download stopped. `dir` is the
+/// receive folder, or `None` when file transfer is disabled -- every `Start`
+/// is then answered with `Abort { Disabled }` and nothing is created.
+/// `commands` carries the clipboard watcher's file offers (host -> client);
+/// when it closes the task keeps serving the channel.
 pub async fn run(
     channel: Arc<dyn FileChannel>,
     mut rx: mpsc::Receiver<FileChannelMessage>,
     dir: Option<PathBuf>,
+    mut commands: mpsc::Receiver<FilesCommand>,
 ) {
-    let mut receiver = Receiver {
-        channel,
-        dir,
-        active: None,
+    let mut session = Session {
+        receiver: Receiver {
+            channel: Arc::clone(&channel),
+            dir,
+            active: None,
+        },
+        downloader: Downloader::new(channel),
     };
-    while let Some(msg) = rx.recv().await {
-        receiver.on_message(msg).await;
+    let mut commands_open = true;
+    loop {
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                Some(msg) => session.on_message(msg).await,
+                None => break,
+            },
+            cmd = commands.recv(), if commands_open => match cmd {
+                Some(cmd) => session.downloader.command(cmd).await,
+                None => commands_open = false,
+            },
+        }
     }
-    if receiver.active.take().is_some() {
+    if session.receiver.active.take().is_some() {
         tracing::debug!("file channel ended mid-transfer, partial file removed");
     }
 }
@@ -410,7 +769,7 @@ pub async fn run(
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
     use std::sync::Mutex;
 
     #[test]
@@ -469,8 +828,15 @@ mod tests {
         assert_eq!(with_suffix(".bashrc", 1), ".bashrc (1)");
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Sent {
+        Msg(FileMessage),
+        Chunk(Vec<u8>),
+    }
+
     struct FakeChannel {
-        sent: Mutex<Vec<FileMessage>>,
+        sent: Mutex<Vec<Sent>>,
+        outstanding: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -479,8 +845,17 @@ mod tests {
             self.sent
                 .lock()
                 .unwrap()
-                .push(serde_json::from_str(text).unwrap());
+                .push(Sent::Msg(serde_json::from_str(text).unwrap()));
             Ok(())
+        }
+
+        async fn send_binary(&self, data: &[u8]) -> anyhow::Result<()> {
+            self.sent.lock().unwrap().push(Sent::Chunk(data.to_vec()));
+            Ok(())
+        }
+
+        async fn outstanding_bytes(&self) -> usize {
+            self.outstanding.load(Ordering::Relaxed)
         }
     }
 
@@ -518,7 +893,7 @@ mod tests {
     }
 
     struct Harness {
-        receiver: Receiver,
+        session: Session,
         fake: Arc<FakeChannel>,
         dir: PathBuf,
     }
@@ -528,27 +903,76 @@ mod tests {
             let dir = scratch_dir();
             let fake = Arc::new(FakeChannel {
                 sent: Mutex::new(vec![]),
+                outstanding: std::sync::atomic::AtomicUsize::new(0),
             });
-            let receiver = Receiver {
-                channel: Arc::clone(&fake) as Arc<dyn FileChannel>,
-                dir: enabled.then(|| dir.clone()),
-                active: None,
+            let channel = Arc::clone(&fake) as Arc<dyn FileChannel>;
+            let session = Session {
+                receiver: Receiver {
+                    channel: Arc::clone(&channel),
+                    dir: enabled.then(|| dir.clone()),
+                    active: None,
+                },
+                downloader: Downloader::new(channel),
             };
-            Self {
-                receiver,
-                fake,
-                dir,
-            }
+            Self { session, fake, dir }
         }
 
         async fn feed(&mut self, msgs: Vec<FileChannelMessage>) {
             for m in msgs {
-                self.receiver.on_message(m).await;
+                self.session.on_message(m).await;
             }
         }
 
+        /// Control messages only (chunks left out).
         fn sent(&self) -> Vec<FileMessage> {
+            self.log()
+                .into_iter()
+                .filter_map(|s| match s {
+                    Sent::Msg(m) => Some(m),
+                    Sent::Chunk(_) => None,
+                })
+                .collect()
+        }
+
+        /// Everything sent, in order.
+        fn log(&self) -> Vec<Sent> {
             self.fake.sent.lock().unwrap().clone()
+        }
+
+        async fn command(&mut self, cmd: FilesCommand) {
+            self.session.downloader.command(cmd).await;
+        }
+
+        fn set_outstanding(&self, n: usize) {
+            self.fake.outstanding.store(n, Ordering::Relaxed);
+        }
+
+        /// Waits until the running download task has finished.
+        async fn wait_download_done(&self) {
+            for _ in 0..1000 {
+                if !self
+                    .session
+                    .downloader
+                    .sending
+                    .as_ref()
+                    .is_some_and(Outgoing::is_running)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("download did not finish");
+        }
+
+        /// Waits until `n` entries are in the log.
+        async fn wait_log_len(&self, n: usize) {
+            for _ in 0..1000 {
+                if self.log().len() >= n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("log did not reach {n}: {:?}", self.log());
         }
 
         fn files(&self) -> Vec<String> {
@@ -739,10 +1163,12 @@ mod tests {
         let h = Harness::new(true);
         let dir = h.dir.clone();
         let (tx, rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
         let task = tokio::spawn(run(
             Arc::clone(&h.fake) as Arc<dyn FileChannel>,
             rx,
             Some(dir.clone()),
+            cmd_rx,
         ));
         tx.send(start(1, "a.bin", 10)).await.unwrap();
         tx.send(chunk(b"abc")).await.unwrap();
@@ -764,10 +1190,12 @@ mod tests {
         let h = Harness::new(true);
         let dir = h.dir.clone();
         let (tx, rx) = mpsc::channel(8);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
         let task = tokio::spawn(run(
             Arc::clone(&h.fake) as Arc<dyn FileChannel>,
             rx,
             Some(dir.clone()),
+            cmd_rx,
         ));
         tx.send(start(1, "a.bin", 10)).await.unwrap();
         for _ in 0..200 {
@@ -794,5 +1222,244 @@ mod tests {
             }]
         );
         assert!(!h.dir.exists());
+    }
+
+    // ---- host -> client (3.4c) ----
+
+    fn msg(m: FileMessage) -> Sent {
+        Sent::Msg(m)
+    }
+
+    fn put(h: &Harness, name: &str, data: &[u8]) -> PathBuf {
+        std::fs::create_dir_all(&h.dir).unwrap();
+        let p = h.dir.join(name);
+        std::fs::write(&p, data).unwrap();
+        p
+    }
+
+    fn fetch(list_id: u32) -> FileChannelMessage {
+        text(&FileMessage::Fetch { list_id })
+    }
+
+    #[tokio::test]
+    async fn offer_lists_files_and_counts_folders() {
+        let mut h = Harness::new(true);
+        let file = put(&h, "a.txt", b"hello");
+        let sub = h.dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let missing = h.dir.join("gone.txt");
+        h.command(FilesCommand::Offer(vec![file, sub, missing]))
+            .await;
+        assert_eq!(
+            h.sent(),
+            vec![FileMessage::Offer {
+                list_id: 1,
+                files: vec![OfferedFile {
+                    name: "a.txt".into(),
+                    size: 5
+                }],
+                skipped_folders: 1,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_withdraws_only_an_existing_offer() {
+        let mut h = Harness::new(true);
+        h.command(FilesCommand::Clear).await;
+        assert!(h.sent().is_empty());
+        let file = put(&h, "a.txt", b"x");
+        h.command(FilesCommand::Offer(vec![file])).await;
+        h.command(FilesCommand::Clear).await;
+        assert_eq!(
+            h.sent()[1],
+            FileMessage::Offer {
+                list_id: 2,
+                files: vec![],
+                skipped_folders: 0
+            }
+        );
+        // The withdrawn list can no longer be fetched.
+        h.feed(vec![fetch(1)]).await;
+        assert_eq!(h.sent().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_sends_start_chunks_end_with_content() {
+        let mut h = Harness::new(true);
+        let big: Vec<u8> = (0..CHUNK_BYTES * 2 + 10).map(|i| (i % 251) as u8).collect();
+        let a = put(&h, "big.bin", &big);
+        let b = put(&h, "empty.txt", b"");
+        h.command(FilesCommand::Offer(vec![a, b])).await;
+        h.feed(vec![fetch(1)]).await;
+        h.wait_download_done().await;
+        let log = h.log();
+        assert_eq!(log.len(), 1 + 1 + 3 + 1 + 2);
+        assert_eq!(
+            log[1],
+            msg(FileMessage::Start {
+                id: HOST_ID_BASE,
+                name: "big.bin".into(),
+                size: big.len() as u64
+            })
+        );
+        let mut got = Vec::new();
+        for (i, expect_len) in [CHUNK_BYTES, CHUNK_BYTES, 10].into_iter().enumerate() {
+            match &log[2 + i] {
+                Sent::Chunk(c) => {
+                    assert_eq!(c.len(), expect_len);
+                    got.extend_from_slice(c);
+                }
+                other => panic!("expected chunk, got {other:?}"),
+            }
+        }
+        assert_eq!(got, big);
+        assert_eq!(log[5], msg(FileMessage::End { id: HOST_ID_BASE }));
+        assert_eq!(
+            log[6],
+            msg(FileMessage::Start {
+                id: HOST_ID_BASE + 1,
+                name: "empty.txt".into(),
+                size: 0
+            })
+        );
+        assert_eq!(
+            log[7],
+            msg(FileMessage::End {
+                id: HOST_ID_BASE + 1
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_list_id_is_ignored() {
+        let mut h = Harness::new(true);
+        let a = put(&h, "a.txt", b"x");
+        h.command(FilesCommand::Offer(vec![a.clone()])).await;
+        h.command(FilesCommand::Offer(vec![a])).await; // list 2
+        h.feed(vec![fetch(1), fetch(99)]).await;
+        assert!(h.session.downloader.sending.is_none());
+        assert_eq!(h.sent().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn client_abort_stops_current_file_and_rest_of_list() {
+        let mut h = Harness::new(true);
+        let a = put(&h, "a.bin", &[1u8; 1000]);
+        let b = put(&h, "b.bin", &[2u8; 1000]);
+        h.command(FilesCommand::Offer(vec![a, b])).await;
+        h.set_outstanding(SEND_HIGH_WATER + 1); // stall before the first chunk
+        h.feed(vec![fetch(1)]).await;
+        h.wait_log_len(2).await; // offer + start
+        h.feed(vec![text(&FileMessage::Abort {
+            id: HOST_ID_BASE,
+            reason: AbortReason::Cancelled,
+        })])
+        .await;
+        h.set_outstanding(0);
+        h.wait_download_done().await;
+        let log = h.log();
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert!(matches!(&log[1], Sent::Msg(FileMessage::Start { .. })));
+    }
+
+    #[tokio::test]
+    async fn file_vanished_after_offer_is_aborted_and_next_one_goes() {
+        let mut h = Harness::new(true);
+        let a = put(&h, "a.txt", b"aaa");
+        let b = put(&h, "b.txt", b"bb");
+        h.command(FilesCommand::Offer(vec![a.clone(), b])).await;
+        std::fs::remove_file(&a).unwrap();
+        h.feed(vec![fetch(1)]).await;
+        h.wait_download_done().await;
+        let sent = h.sent();
+        assert_eq!(
+            sent[1..],
+            [
+                FileMessage::Start {
+                    id: HOST_ID_BASE,
+                    name: "a.txt".into(),
+                    size: 3
+                },
+                FileMessage::Abort {
+                    id: HOST_ID_BASE,
+                    reason: AbortReason::Io
+                },
+                FileMessage::Start {
+                    id: HOST_ID_BASE + 1,
+                    name: "b.txt".into(),
+                    size: 2
+                },
+                FileMessage::End {
+                    id: HOST_ID_BASE + 1
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_during_download_goes_through() {
+        let mut h = Harness::new(true);
+        let a = put(&h, "down.bin", &[7u8; 100]);
+        h.command(FilesCommand::Offer(vec![a])).await;
+        h.set_outstanding(SEND_HIGH_WATER + 1);
+        h.feed(vec![fetch(1)]).await;
+        h.wait_log_len(2).await;
+        // The download is stalled; an upload must still complete.
+        h.feed(vec![
+            start(1, "up.txt", 2),
+            chunk(b"hi"),
+            text(&FileMessage::End { id: 1 }),
+        ])
+        .await;
+        assert!(h.sent().contains(&FileMessage::Saved {
+            id: 1,
+            name: "up.txt".into()
+        }));
+        assert_eq!(std::fs::read(h.dir.join("up.txt")).unwrap(), b"hi");
+        assert!(h.session.downloader.sending.as_ref().unwrap().is_running());
+        h.set_outstanding(0);
+        h.wait_download_done().await;
+        assert!(h.sent().contains(&FileMessage::End { id: HOST_ID_BASE }));
+    }
+
+    #[tokio::test]
+    async fn fetch_during_download_is_ignored() {
+        let mut h = Harness::new(true);
+        let a = put(&h, "a.bin", &[1u8; 10]);
+        h.command(FilesCommand::Offer(vec![a])).await;
+        h.set_outstanding(SEND_HIGH_WATER + 1);
+        h.feed(vec![fetch(1)]).await;
+        h.wait_log_len(2).await;
+        h.feed(vec![fetch(1)]).await;
+        h.set_outstanding(0);
+        h.wait_download_done().await;
+        let starts = h
+            .sent()
+            .iter()
+            .filter(|m| matches!(m, FileMessage::Start { .. }))
+            .count();
+        assert_eq!(starts, 1);
+    }
+
+    #[tokio::test]
+    async fn run_serves_commands_and_channel_together() {
+        let h = Harness::new(true);
+        let a = put(&h, "a.txt", b"abc");
+        let (tx, rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let task = tokio::spawn(run(
+            Arc::clone(&h.fake) as Arc<dyn FileChannel>,
+            rx,
+            Some(h.dir.join("recv")),
+            cmd_rx,
+        ));
+        cmd_tx.send(FilesCommand::Offer(vec![a])).await.unwrap();
+        h.wait_log_len(1).await;
+        tx.send(fetch(1)).await.unwrap();
+        h.wait_log_len(4).await;
+        assert_eq!(h.log()[2], Sent::Chunk(b"abc".to_vec()));
+        drop(tx);
+        task.await.unwrap();
     }
 }

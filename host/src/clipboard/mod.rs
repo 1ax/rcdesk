@@ -7,11 +7,20 @@
 //! on the `input` channel) is applied directly by `crate::signaling::handle_session_event`,
 //! not through this module's watcher.
 //!
+//! Since slice 3.4c the watcher also reports copied *files* (Finder/Explorer
+//! Cmd/Ctrl+C): when the clipboard holds a file list it is reported as
+//! `ClipboardEvent::Files` INSTEAD of text (Finder puts the file name on the
+//! clipboard as text too, which must not reach the client), and the owner
+//! forwards it to `crate::files` as a download offer. This needs both
+//! clipboard sync (no `--no-clipboard`) and file transfer (no `--no-files`);
+//! `ClipboardSync::set_files_enabled` switches it off otherwise.
+//!
 //! Privacy: clipboard *content* must never reach the logs, at any level,
 //! including `Debug` output of the wire messages -- only lengths are ever
 //! logged. See `crate::signaling` for how `ControlMessage`/`InputMessage`
 //! logging sites are guarded against printing a `ClipboardText` payload.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -47,8 +56,24 @@ pub trait ClipboardBackend: Send {
     /// platform failure is logged (`warn`, without any clipboard content) by
     /// the implementation itself before returning `None`.
     fn get_text(&mut self) -> Option<String>;
+    /// Reads the list of file paths currently copied on the clipboard
+    /// (slice 3.4c). `None` when there are no files (empty list, text or an
+    /// image on the clipboard); a genuine platform failure is logged (`warn`,
+    /// without any paths) by the implementation before returning `None`.
+    fn get_file_list(&mut self) -> Option<Vec<PathBuf>>;
     /// Writes `text` to the clipboard.
     fn set_text(&mut self, text: &str) -> anyhow::Result<()>;
+}
+
+/// What `ClipboardSync::poll` found on the clipboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardEvent {
+    /// New clipboard text to send to the client.
+    Text(String),
+    /// Files were copied: offer them for download.
+    Files(Vec<PathBuf>),
+    /// The clipboard no longer holds the files reported before.
+    NoFiles,
 }
 
 /// Pure change-detection/dedup logic over a `ClipboardBackend`, with no
@@ -65,6 +90,11 @@ pub struct ClipboardSync {
     /// (`apply_remote`), used to dedup identical text arriving again from
     /// either direction.
     last_text: Option<String>,
+    /// Whether file lists are reported (see `set_files_enabled`).
+    files_enabled: bool,
+    /// Whether the last reported file list is still on the clipboard as far
+    /// as we know (so a following change reports `NoFiles`).
+    had_files: bool,
 }
 
 impl ClipboardSync {
@@ -78,35 +108,65 @@ impl ClipboardSync {
             backend,
             last_count,
             last_text: None,
+            files_enabled: false,
+            had_files: false,
         }
     }
 
+    /// Enables reporting copied files (`ClipboardEvent::Files`/`NoFiles`).
+    /// Off by default: then a file copy is treated as plain text, as before.
+    pub fn set_files_enabled(&mut self, enabled: bool) {
+        self.files_enabled = enabled;
+    }
+
     /// Checks whether the clipboard changed since the last `poll`/`new`, and
-    /// if so, whether that change is worth sending: `None` in every case
-    /// that isn't a new, non-empty, size-limited, actually-different piece
-    /// of text (unchanged counter, read failure, empty, over
-    /// `MAX_CLIPBOARD_BYTES`, or identical to what was last seen).
-    pub fn poll(&mut self) -> Option<String> {
+    /// if so, what is worth sending. Empty in every case that isn't a new
+    /// file list, a "files are gone" notice, or a new, non-empty,
+    /// size-limited, actually-different piece of text (unchanged counter,
+    /// read failure, empty, over `MAX_CLIPBOARD_BYTES`, or identical to what
+    /// was last seen). A file list replaces the text of the same change.
+    pub fn poll(&mut self) -> Vec<ClipboardEvent> {
         let count = self.backend.change_count();
         if count == self.last_count {
-            return None;
+            return Vec::new();
         }
         self.last_count = count;
 
-        let text = self.backend.get_text()?;
+        let mut events = Vec::new();
+        if self.files_enabled {
+            match self.backend.get_file_list() {
+                Some(list) => {
+                    self.had_files = true;
+                    // The text of a file copy is never sent, so the same
+                    // text copied later must not look like a duplicate.
+                    self.last_text = None;
+                    return vec![ClipboardEvent::Files(list)];
+                }
+                None if self.had_files => {
+                    self.had_files = false;
+                    events.push(ClipboardEvent::NoFiles);
+                }
+                None => {}
+            }
+        }
+
+        let Some(text) = self.backend.get_text() else {
+            return events;
+        };
         if text.is_empty() || Some(&text) == self.last_text.as_ref() {
-            return None;
+            return events;
         }
         if text.len() > MAX_CLIPBOARD_BYTES {
             tracing::warn!(
                 len = text.len(),
                 "clipboard text too large to sync, skipping"
             );
-            return None;
+            return events;
         }
 
         self.last_text = Some(text.clone());
-        Some(text)
+        events.push(ClipboardEvent::Text(text));
+        events
     }
 
     /// Applies clipboard text that arrived from the remote side (client ->
@@ -140,8 +200,8 @@ impl ClipboardSync {
 /// Owns the dedicated thread started by `watch`. Dropping it stops the
 /// thread (mirrors `crate::cursor::CursorWatcher`).
 pub struct ClipboardWatcher {
-    /// Every text change `ClipboardSync::poll` reported, most recent last.
-    pub rx: mpsc::Receiver<String>,
+    /// Every event `ClipboardSync::poll` reported, most recent last.
+    pub rx: mpsc::Receiver<ClipboardEvent>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -156,7 +216,7 @@ impl Drop for ClipboardWatcher {
 }
 
 /// Starts a dedicated thread that calls `sync.poll()` every `period` and
-/// pushes every `Some(text)` result onto the returned watcher's `rx`.
+/// pushes every reported event onto the returned watcher's `rx`.
 ///
 /// The channel has capacity 4 and uses `try_send`, the same best-effort
 /// reasoning as `crate::cursor::watch`: if a consumer falls behind, only the
@@ -177,7 +237,7 @@ pub fn watch(sync: Arc<Mutex<ClipboardSync>>, period: Duration) -> ClipboardWatc
 fn watch_loop(
     sync: Arc<Mutex<ClipboardSync>>,
     period: Duration,
-    tx: &mpsc::Sender<String>,
+    tx: &mpsc::Sender<ClipboardEvent>,
     stop: &AtomicBool,
 ) {
     while !stop.load(Ordering::Relaxed) {
@@ -185,9 +245,9 @@ fn watch_loop(
             let mut sync = sync.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             sync.poll()
         };
-        if let Some(text) = changed {
+        for event in changed {
             // Best-effort: see `watch`'s doc comment.
-            let _ = tx.try_send(text);
+            let _ = tx.try_send(event);
         }
         thread::sleep(period);
     }
@@ -210,6 +270,7 @@ pub(crate) struct FakeClipboardBackend {
 struct FakeClipboardState {
     change_count: u64,
     text: Option<String>,
+    files: Option<Vec<PathBuf>>,
     set_calls: Vec<String>,
 }
 
@@ -226,6 +287,16 @@ impl FakeClipboardBackend {
         let mut state = self.state.lock().unwrap();
         state.change_count += 1;
         state.text = text.map(str::to_string);
+        state.files = None;
+    }
+
+    /// Simulates copying files in the file manager; `text` is the text
+    /// flavor that accompanies it (Finder puts the file name there).
+    pub(crate) fn set_remote_files(&self, files: &[&str], text: Option<&str>) {
+        let mut state = self.state.lock().unwrap();
+        state.change_count += 1;
+        state.text = text.map(str::to_string);
+        state.files = Some(files.iter().map(PathBuf::from).collect());
     }
 
     /// Every `text` ever passed to `set_text`, in call order.
@@ -244,8 +315,13 @@ impl ClipboardBackend for FakeClipboardBackend {
         self.state.lock().unwrap().text.clone()
     }
 
+    fn get_file_list(&mut self) -> Option<Vec<PathBuf>> {
+        self.state.lock().unwrap().files.clone()
+    }
+
     fn set_text(&mut self, text: &str) -> anyhow::Result<()> {
         let mut state = self.state.lock().unwrap();
+        state.files = None;
         state.set_calls.push(text.to_string());
         state.text = Some(text.to_string());
         // Real OSes bump their change counter on any write, including this
@@ -273,7 +349,7 @@ mod tests {
         // with something already on the clipboard.
         let mut sync = sync_with(backend);
 
-        assert_eq!(sync.poll(), None);
+        assert_eq!(sync.poll(), vec![]);
     }
 
     #[test]
@@ -281,8 +357,8 @@ mod tests {
         let backend = FakeClipboardBackend::new();
         let mut sync = sync_with(backend);
 
-        assert_eq!(sync.poll(), None);
-        assert_eq!(sync.poll(), None);
+        assert_eq!(sync.poll(), vec![]);
+        assert_eq!(sync.poll(), vec![]);
     }
 
     #[test]
@@ -293,8 +369,8 @@ mod tests {
         // `starting_clipboard_content_is_never_sent` for the "before" case.
         backend.set_remote_change(Some("hello"));
 
-        assert_eq!(sync.poll(), Some("hello".to_string()));
-        assert_eq!(sync.poll(), None);
+        assert_eq!(sync.poll(), vec![ClipboardEvent::Text("hello".to_string())]);
+        assert_eq!(sync.poll(), vec![]);
     }
 
     #[test]
@@ -302,12 +378,12 @@ mod tests {
         let backend = FakeClipboardBackend::new();
         let mut sync = sync_with(backend.clone());
         backend.set_remote_change(Some("same"));
-        assert_eq!(sync.poll(), Some("same".to_string()));
+        assert_eq!(sync.poll(), vec![ClipboardEvent::Text("same".to_string())]);
 
         // Counter changes again (e.g. re-copying the same selection) but the
         // text is identical to what was already sent.
         backend.set_remote_change(Some("same"));
-        assert_eq!(sync.poll(), None);
+        assert_eq!(sync.poll(), vec![]);
     }
 
     #[test]
@@ -317,7 +393,7 @@ mod tests {
         let huge = "x".repeat(MAX_CLIPBOARD_BYTES + 1);
         backend.set_remote_change(Some(&huge));
 
-        assert_eq!(sync.poll(), None);
+        assert_eq!(sync.poll(), vec![]);
     }
 
     #[test]
@@ -326,7 +402,7 @@ mod tests {
         let mut sync = sync_with(backend.clone());
         backend.set_remote_change(None);
 
-        assert_eq!(sync.poll(), None);
+        assert_eq!(sync.poll(), vec![]);
     }
 
     #[test]
@@ -353,7 +429,7 @@ mod tests {
         // The backend's `set_text` bumped its own change counter (as a real
         // OS clipboard would); `apply_remote` must have re-synced against
         // that so this doesn't look like an incoming remote change.
-        assert_eq!(sync.poll(), None);
+        assert_eq!(sync.poll(), vec![]);
     }
 
     #[test]
@@ -378,5 +454,85 @@ mod tests {
         sync.apply_remote(&huge);
 
         assert_eq!(calls_handle.set_calls(), Vec::<String>::new());
+    }
+
+    fn files_sync(backend: FakeClipboardBackend) -> ClipboardSync {
+        let mut sync = sync_with(backend);
+        sync.set_files_enabled(true);
+        sync
+    }
+
+    #[test]
+    fn copied_files_replace_the_text_of_the_same_change() {
+        let backend = FakeClipboardBackend::new();
+        let mut sync = files_sync(backend.clone());
+        backend.set_remote_files(&["/tmp/a.txt", "/tmp/b.txt"], Some("a.txt"));
+
+        assert_eq!(
+            sync.poll(),
+            vec![ClipboardEvent::Files(vec![
+                PathBuf::from("/tmp/a.txt"),
+                PathBuf::from("/tmp/b.txt")
+            ])]
+        );
+        assert_eq!(sync.poll(), vec![]);
+    }
+
+    #[test]
+    fn files_are_reported_as_text_when_files_are_disabled() {
+        let backend = FakeClipboardBackend::new();
+        let mut sync = sync_with(backend.clone());
+        backend.set_remote_files(&["/tmp/a.txt"], Some("a.txt"));
+
+        assert_eq!(sync.poll(), vec![ClipboardEvent::Text("a.txt".to_string())]);
+    }
+
+    #[test]
+    fn text_after_files_reports_no_files_and_the_text() {
+        let backend = FakeClipboardBackend::new();
+        let mut sync = files_sync(backend.clone());
+        backend.set_remote_files(&["/tmp/a.txt"], None);
+        assert_eq!(sync.poll().len(), 1);
+
+        backend.set_remote_change(Some("plain"));
+        assert_eq!(
+            sync.poll(),
+            vec![
+                ClipboardEvent::NoFiles,
+                ClipboardEvent::Text("plain".to_string())
+            ]
+        );
+        // Only reported once.
+        backend.set_remote_change(Some("other"));
+        assert_eq!(sync.poll(), vec![ClipboardEvent::Text("other".to_string())]);
+    }
+
+    #[test]
+    fn non_text_copy_after_files_reports_no_files() {
+        let backend = FakeClipboardBackend::new();
+        let mut sync = files_sync(backend.clone());
+        backend.set_remote_files(&["/tmp/a.txt"], None);
+        assert_eq!(sync.poll().len(), 1);
+
+        backend.set_remote_change(None);
+        assert_eq!(sync.poll(), vec![ClipboardEvent::NoFiles]);
+    }
+
+    #[test]
+    fn same_text_after_a_file_copy_is_sent() {
+        let backend = FakeClipboardBackend::new();
+        let mut sync = files_sync(backend.clone());
+        backend.set_remote_change(Some("a.txt"));
+        assert_eq!(sync.poll().len(), 1);
+        backend.set_remote_files(&["/tmp/a.txt"], Some("a.txt"));
+        assert_eq!(sync.poll().len(), 1);
+        backend.set_remote_change(Some("a.txt"));
+        assert_eq!(
+            sync.poll(),
+            vec![
+                ClipboardEvent::NoFiles,
+                ClipboardEvent::Text("a.txt".to_string())
+            ]
+        );
     }
 }
