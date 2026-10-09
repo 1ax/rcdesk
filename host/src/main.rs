@@ -165,6 +165,11 @@ async fn main() -> anyhow::Result<()> {
     rcdesk_host::platform::windows::dpi::set_dpi_aware();
 
     tracing_subscriber::fmt()
+        // Slice 3.2 fix: the classic Windows console (cmd.exe on the Win10
+        // stand) doesn't interpret ANSI escapes unless VT processing is
+        // switched on, so colors came out as raw `←[2m` noise. Plain text
+        // there; colors stay on macOS terminals.
+        .with_ansi(cfg!(not(target_os = "windows")))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 tracing_subscriber::EnvFilter::new(rcdesk_host::DEFAULT_LOG_FILTER)
@@ -300,8 +305,8 @@ fn read_new_password() -> anyhow::Result<String> {
     use std::io::IsTerminal as _;
 
     if std::io::stdin().is_terminal() {
-        let first = rpassword::prompt_password("Пароль доступа: ")?;
-        let second = rpassword::prompt_password("Ещё раз: ")?;
+        let first = prompt_hidden("Пароль доступа: ")?;
+        let second = prompt_hidden("Ещё раз: ")?;
         if first != second {
             anyhow::bail!("Пароли не совпадают");
         }
@@ -311,6 +316,20 @@ fn read_new_password() -> anyhow::Result<String> {
         std::io::stdin().read_line(&mut line)?;
         Ok(line.trim_end_matches(['\n', '\r']).to_string())
     }
+}
+
+/// Hidden password prompt (slice 3.2 fix). `rpassword::prompt_password`
+/// writes the prompt to the console as raw UTF-8 bytes, which the Windows
+/// console renders as mojibake under its OEM code page (cp866 on the
+/// stand). The prompt goes through `std::io::stderr` instead -- Rust's
+/// stdio converts to UTF-16 for a Windows console -- and only the hidden
+/// read is left to `rpassword`.
+fn prompt_hidden(prompt: &str) -> anyhow::Result<String> {
+    use std::io::Write as _;
+
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    Ok(rpassword::read_password()?)
 }
 
 fn run_list_displays() -> anyhow::Result<()> {
