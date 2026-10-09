@@ -25,6 +25,7 @@ pub mod cursor;
 pub mod device;
 pub mod dtls_bind;
 pub mod encode;
+pub mod files;
 mod fsutil;
 pub mod input;
 pub mod pipeline;

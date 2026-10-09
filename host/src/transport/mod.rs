@@ -274,6 +274,21 @@ fn next_session_tag() -> u64 {
     NEXT_SESSION_TAG.fetch_add(1, Ordering::Relaxed)
 }
 
+/// One message received on the `file` data channel (slice 3.4a). Unlike every
+/// other channel, `file` traffic does not go through `SessionEvent` /
+/// `handle_session_event` (bulk data must not queue up behind, or stall, the
+/// session's control loop): the reader delivers it to a dedicated mpsc that
+/// `crate::files` drains in its own task, see `PeerSession::take_file_channel`.
+#[derive(Debug, Clone)]
+pub struct FileChannelMessage {
+    pub data: Bytes,
+    pub is_string: bool,
+}
+
+/// Capacity of the `file` channel's incoming mpsc. A full queue blocks the
+/// reader task, which back-pressures the SCTP association -- intended.
+const FILE_QUEUE_CAPACITY: usize = 32;
+
 /// Events a `PeerSession` reports back to its owner (the signaling client).
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
@@ -431,6 +446,10 @@ pub struct PeerSession {
     /// ARCHITECTURE.md §5), kept aside from the other three so
     /// `send_control` can write to it directly.
     control_channel: Arc<dyn DataChannel>,
+    /// The `file` data channel and the receiving end of its incoming
+    /// messages (slice 3.4a), handed out once by `take_file_channel`.
+    file_channel: Arc<dyn DataChannel>,
+    file_rx: std::sync::Mutex<Option<mpsc::Receiver<FileChannelMessage>>>,
     /// This session's unique tag (fix to slice 3.5b) -- see
     /// `SessionEvent::ConnectionState`'s doc comment.
     tag: u64,
@@ -496,16 +515,30 @@ async fn open_data_channels(
     pc: &dyn PeerConnection,
     events: mpsc::Sender<SessionEvent>,
     tag: u64,
-) -> anyhow::Result<Arc<dyn DataChannel>> {
+    file_tx: mpsc::Sender<FileChannelMessage>,
+) -> anyhow::Result<(Arc<dyn DataChannel>, Arc<dyn DataChannel>)> {
     let mut control_channel = None;
+    let mut file_channel = None;
     for (label, init) in data_channel_specs() {
         let dc = pc.create_data_channel(label, Some(init)).await?;
+        let mut direct = None;
         if label == "control" {
             control_channel = Some(Arc::clone(&dc));
         }
-        spawn_data_channel_reader(label, dc, events.clone(), tag);
+        if label == "file" {
+            file_channel = Some(Arc::clone(&dc));
+            direct = Some(file_tx.clone());
+        }
+        spawn_data_channel_reader(label, dc, events.clone(), tag, direct);
     }
-    control_channel.ok_or_else(|| anyhow::anyhow!("data_channel_specs did not include \"control\""))
+    // `file_tx` itself is dropped here: only the reader task keeps a sender,
+    // so the receiver sees the end of the stream when the channel closes.
+    Ok((
+        control_channel
+            .ok_or_else(|| anyhow::anyhow!("data_channel_specs did not include \"control\""))?,
+        file_channel
+            .ok_or_else(|| anyhow::anyhow!("data_channel_specs did not include \"file\""))?,
+    ))
 }
 
 impl PeerSession {
@@ -607,7 +640,9 @@ impl PeerSession {
             .add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal>)
             .await?;
 
-        let control_channel = open_data_channels(pc.as_ref(), events.clone(), tag).await?;
+        let (file_tx, file_rx) = mpsc::channel(FILE_QUEUE_CAPACITY);
+        let (control_channel, file_channel) =
+            open_data_channels(pc.as_ref(), events.clone(), tag, file_tx).await?;
 
         let session = Arc::new(PeerSession {
             pc,
@@ -616,6 +651,8 @@ impl PeerSession {
             events: events.clone(),
             connected,
             control_channel,
+            file_channel,
+            file_rx: std::sync::Mutex::new(Some(file_rx)),
             tag,
         });
 
@@ -628,6 +665,20 @@ impl PeerSession {
     /// construction, to recognize a stale event from a superseded session.
     pub fn tag(&self) -> u64 {
         self.tag
+    }
+
+    /// Hands out the `file` data channel together with the receiver of its
+    /// incoming messages (slice 3.4a). Only the first call returns `Some`;
+    /// `crate::files::run` owns both for the rest of the session.
+    pub fn take_file_channel(
+        &self,
+    ) -> Option<(Arc<dyn DataChannel>, mpsc::Receiver<FileChannelMessage>)> {
+        let rx = self
+            .file_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()?;
+        Some((Arc::clone(&self.file_channel), rx))
     }
 
     /// Creates an SDP offer, sets it as the local description, and returns
@@ -938,6 +989,7 @@ fn spawn_data_channel_reader(
     dc: Arc<dyn DataChannel>,
     events: mpsc::Sender<SessionEvent>,
     tag: u64,
+    direct: Option<mpsc::Sender<FileChannelMessage>>,
 ) {
     tokio::spawn(async move {
         while let Some(event) = dc.poll().await {
@@ -962,6 +1014,17 @@ fn spawn_data_channel_reader(
                 }
                 DataChannelEvent::OnMessage(msg) => {
                     tracing::trace!(label, len = msg.data.len(), "data channel message");
+                    if let Some(direct) = &direct {
+                        // Bulk `file` traffic bypasses `SessionEvent`; see
+                        // `FileChannelMessage`.
+                        let _ = direct
+                            .send(FileChannelMessage {
+                                data: msg.data.freeze(),
+                                is_string: msg.is_string,
+                            })
+                            .await;
+                        continue;
+                    }
                     let _ = events
                         .send(SessionEvent::DataChannelMessage {
                             label: label.to_owned(),

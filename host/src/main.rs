@@ -103,6 +103,11 @@ enum Command {
         /// `docs/dev-run.md`.
         #[arg(long)]
         no_clipboard: bool,
+        /// Disable file transfer (slice 3.4): the host refuses every file the
+        /// client tries to send and tells the client up front
+        /// (`HostInfo.files_enabled = false`).
+        #[arg(long)]
+        no_files: bool,
         /// Disable the bitrate/fps adaptation controller (slice 2.3): the
         /// encoder keeps `--bitrate`/`--fps` for the whole session. For
         /// before/after measurements.
@@ -208,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
             stun,
             no_input,
             no_clipboard,
+            no_files,
             no_adapt,
             capture,
             encoder,
@@ -223,6 +229,7 @@ async fn main() -> anyhow::Result<()> {
                 stun,
                 no_input,
                 no_clipboard,
+                no_files,
                 no_adapt,
                 capture,
                 encoder,

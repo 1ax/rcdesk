@@ -120,6 +120,9 @@ windows = { version = "0.61", features = [
     # TokenIntegrityLevel label to detect a foreground window running
     # elevated relative to this agent (UIPI blocks SendInput into it).
     "Win32_Security",
+    # SHGetKnownFolderPath/FOLDERID_Downloads (files::windows, 3.4a) -- the
+    # user's Downloads folder, where received files are saved.
+    "Win32_UI_Shell",
 ] }
 # Буфер обмена (2.5b): текст только, default-features=false drops the
 # `image-data` feature (image crate, extra objc2-core-graphics on macOS).

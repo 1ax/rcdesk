@@ -137,6 +137,7 @@ mod imp {
             stun: vec![],
             no_input: false,
             no_clipboard: false,
+            no_files: false,
             no_adapt: false,
             capture: CaptureBackend::Auto,
             encoder: EncoderBackend::Auto,

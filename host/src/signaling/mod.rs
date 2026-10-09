@@ -143,6 +143,11 @@ pub struct HostContext {
     /// sync (same lesson as debt D26: a missing optional capability must
     /// never take the session down).
     pub build_clipboard: Option<BuildClipboard>,
+    /// Whether file transfer is allowed (slice 3.4a); `false` for
+    /// `serve --no-files`. The `files` task still runs and answers every
+    /// `Start` with `Abort { Disabled }`, and `HostInfo.files_enabled` tells
+    /// the client up front.
+    pub files_enabled: bool,
     pub runtime: Arc<dyn Runtime>,
     /// Slice 3.2c: the host's access password, if one is set (`access::AccessStore::load`
     /// returns `Some` -- see `access.rs`'s module doc comment). When present,
@@ -825,6 +830,13 @@ struct ActiveSession {
     /// has no real input injector (`input_available == false`) -- nothing
     /// to warn about when input isn't wired up at all.
     elevation_task: Option<tokio::task::JoinHandle<()>>,
+    /// The task serving the `file` channel (`crate::files::run`, slice
+    /// 3.4a). Aborting it drops any unfinished transfer, which removes the
+    /// partial file.
+    files_task: tokio::task::JoinHandle<()>,
+    /// Whether file transfer works for this session (`HostContext::files_enabled`
+    /// and a usable download folder); announced in `HostInfo`.
+    files_enabled: bool,
     /// This session's `PeerSession::tag()` (fix to slice 3.5b). Events that
     /// can end a session (`SessionEvent::ConnectionState`/`DataChannelClosed`)
     /// carry the tag of the `PeerSession` that produced them;
@@ -969,6 +981,7 @@ impl ActiveSession {
         if let Some(task) = self.elevation_task {
             task.abort();
         }
+        self.files_task.abort();
     }
 }
 
@@ -1501,6 +1514,7 @@ async fn begin_session(
                             if let Some(task) = parts.elevation_task {
                                 task.abort();
                             }
+                            parts.files_task.abort();
                             let _ = out_tx.send(SignalMessage::Bye { session_id });
                             return;
                         }
@@ -1527,6 +1541,8 @@ async fn begin_session(
                     clipboard: parts.clipboard,
                     clipboard_task: parts.clipboard_task,
                     elevation_task: parts.elevation_task,
+                    files_task: parts.files_task,
+                    files_enabled: parts.files_enabled,
                     session_tag,
                     quality_preset: QualityPreset::Auto,
                     disconnect_grace: DisconnectGrace::default(),
@@ -1917,7 +1933,7 @@ async fn handle_session_event(
                         tracing::warn!(?err, "failed to send initial displays list");
                     }
                 }
-                let host_info = host_info_message();
+                let host_info = host_info_message(active.files_enabled);
                 match active.peer.send_control(&host_info).await {
                     Ok(true) => {}
                     Ok(false) => {
@@ -1973,9 +1989,10 @@ fn apply_remote_clipboard_text(clipboard: Option<&Arc<Mutex<ClipboardSync>>>, te
 
 /// Builds the `ControlMessage::HostInfo` announcement (slice 3.5f), sent
 /// alongside `displays_message` when the `control` channel opens.
-fn host_info_message() -> ControlMessage {
+fn host_info_message(files_enabled: bool) -> ControlMessage {
     ControlMessage::HostInfo {
         os: crate::platform::host_os(),
+        files_enabled,
     }
 }
 
@@ -2091,6 +2108,10 @@ struct SessionParts {
     clipboard_task: Option<tokio::task::JoinHandle<()>>,
     /// See `ActiveSession::elevation_task`.
     elevation_task: Option<tokio::task::JoinHandle<()>>,
+    /// See `ActiveSession::files_task`.
+    files_task: tokio::task::JoinHandle<()>,
+    /// See `ActiveSession::files_enabled`.
+    files_enabled: bool,
 }
 
 /// Combines one session's ICE credentials with the extra `--stun` servers
@@ -2272,6 +2293,31 @@ async fn start_session(
     #[cfg(not(target_os = "windows"))]
     let elevation_task: Option<tokio::task::JoinHandle<()>> = None;
 
+    // The `file` channel gets its own task (slice 3.4a), fed by the
+    // transport's dedicated mpsc rather than `handle_session_event`. A
+    // disabled or folder-less session still runs the task so the client
+    // gets a clean `Abort { Disabled }` instead of silence.
+    let files_dir = if ctx.files_enabled {
+        match crate::files::receive_dir() {
+            Ok(dir) => Some(dir),
+            Err(err) => {
+                tracing::warn!(error = %err, "download folder unavailable, file transfer disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let files_enabled = files_dir.is_some();
+    let (file_channel, file_rx) = peer
+        .take_file_channel()
+        .ok_or_else(|| anyhow::anyhow!("file channel already taken"))?;
+    let files_task = tokio::spawn(crate::files::run(
+        Arc::new(file_channel) as Arc<dyn crate::files::FileChannel>,
+        file_rx,
+        files_dir,
+    ));
+
     Ok(SessionParts {
         peer,
         video,
@@ -2285,6 +2331,8 @@ async fn start_session(
         clipboard,
         clipboard_task,
         elevation_task,
+        files_task,
+        files_enabled,
     })
 }
 
@@ -2441,6 +2489,7 @@ pub(crate) fn test_ctx() -> HostContext {
             Box::new(crate::cursor::NoopCursorSource::new()) as Box<dyn CursorSource>
         }),
         build_clipboard: None,
+        files_enabled: false,
         runtime: webrtc::runtime::default_runtime().expect("runtime-tokio feature must be enabled"),
         // Slice 3.2c: a fresh, per-test scratch directory under the system
         // temp dir that's never written to here, mirroring
@@ -2627,9 +2676,17 @@ mod tests {
     #[test]
     fn host_info_message_reports_this_hosts_os() {
         assert_eq!(
-            host_info_message(),
+            host_info_message(true),
             ControlMessage::HostInfo {
-                os: crate::platform::host_os()
+                os: crate::platform::host_os(),
+                files_enabled: true
+            }
+        );
+        assert_eq!(
+            host_info_message(false),
+            ControlMessage::HostInfo {
+                os: crate::platform::host_os(),
+                files_enabled: false
             }
         );
     }

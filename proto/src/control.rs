@@ -152,8 +152,10 @@ pub enum ControlMessage {
     /// host -> client: the host's operating system (slice 3.5f). Sent once,
     /// alongside `Displays`, when the `control` channel opens -- like
     /// `InputStatus`, this never changes mid-session, so it's never re-sent
-    /// later.
-    HostInfo { os: HostOs },
+    /// later. `files_enabled` (slice 3.4a) is `false` when the host was
+    /// started with `serve --no-files`: the client hides its file-transfer
+    /// button instead of letting every transfer be refused.
+    HostInfo { os: HostOs, files_enabled: bool },
 }
 
 #[cfg(test)]
@@ -380,10 +382,16 @@ mod tests {
             (HostOs::Windows, "windows"),
             (HostOs::Other, "other"),
         ] {
-            let msg = ControlMessage::HostInfo { os };
+            let msg = ControlMessage::HostInfo {
+                os,
+                files_enabled: true,
+            };
 
             let json = serde_json::to_string(&msg).expect("serialize");
-            assert_eq!(json, format!(r#"{{"type":"host_info","os":"{wire}"}}"#));
+            assert_eq!(
+                json,
+                format!(r#"{{"type":"host_info","os":"{wire}","files_enabled":true}}"#)
+            );
 
             let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(round_tripped, msg);
