@@ -1,7 +1,7 @@
 # rcdesk — Архитектура
 
 > Документ решений. Меняется только осознанно, с записью в SLICES_LOG.md.
-> Актуально на 2026-09-21 (слайс 3.5).
+> Актуально на 2026-10-09 (слайс 3.4).
 
 ## 1. Цель и границы
 
@@ -176,7 +176,18 @@ TURN-креды выдаются в `Registered`, `Joined` и `PeerJoined`: хо
     движение не важно, следующее его заменит).
   - `control` — надёжный: буфер обмена хост → клиент, смена монитора, качество, курсор, пинг, статус ввода,
     предупреждение об окне с повышенными правами (Windows, `InputBlocked`, 2.6e).
-  - `file` — надёжный, чанки 64 КБ с backpressure по `bufferedAmount`.
+  - `file` — надёжный, чанки 64 КиБ (≤ `maxMessageSize`) с backpressure (браузер — `bufferedAmount` 1 МиБ/256 КиБ,
+    хост — `outstanding_bytes` > 1 МиБ). Протокол — `proto::file` (слайс 3.4): JSON `start`/`end`/`abort`/`saved`/
+    `offer`/`fetch`, чанки — бинарные сообщения без заголовка; в каждую сторону одна передача за раз, чанк относится к
+    последнему `start` от той же стороны; id клиента с 1, хоста с `0x8000_0000`. На хосте канал обслуживает своя
+    задача `files::run`, мимо `handle_session_event`.
+    **Решения владельца 2026-10-09:** клиент → хост — кнопка «Отправить файлы» и перетаскивание на видео, файлы
+    в системные «Загрузки» хоста (Windows — `FOLDERID_Downloads`), запись в `.rcdesk-part` + имя-заглушка через
+    `create_new`, чистка имени и суффикс `(N)`, в буфер хоста не кладутся; хост → клиент — файлы, скопированные в
+    буфер хоста (Cmd/Ctrl+C в Finder/Проводнике внутри сеанса): наблюдатель буфера отдаёт список файлов вместо
+    текста, клиент показывает «Скачать (N)», файл собирается в `Blob` (лимит 2 ГиБ на скачивание); папки не
+    поддерживаются (пропускаются с сообщением). Скачивание требует включённых и буфера, и файлов; `--no-files`
+    отключает обе стороны, клиент узнаёт из `HostInfo.files_enabled`.
 - **RTP-время видео:** отметка кадра = реальное время захвата (транспорт пакетизирует сам:
   `TrackLocalStaticRTP` + `Packetizer`, `skip_samples` на интервал между захватами). Фиксированный
   шаг `1/fps` недопустим: кадры идут только при изменении экрана, и Chrome копил ~850 мс в jitter-буфере.
@@ -434,7 +445,7 @@ Telegram-бот (`TRAFFIC_TG_BOT_TOKEN`/`TRAFFIC_TG_CHAT_ID` в `~/app/.env`); �
 - 3.2 Пароль хоста через PAKE, отпечаток DTLS в клиенте.
 - 3.3 ~~coturn + деплой на VPS, DNS, CI-деплой~~ — сделано в 1.6. Осталось: TURN-TLS (5349); ~~TLS 1.3 на nginx~~ ✅.
   Монитор трафика с уведомлениями по порогам бюджета 5 ТБ (§11) — вынесен вперёд как 2.4e.
-- 3.4 Передача файлов: канал `file`, drag-and-drop в клиенте, обе стороны.
+- 3.4 Передача файлов: канал `file`, drag-and-drop в клиенте, обе стороны. ✅ (код; стенд — 3.4d)
 - 3.5 Переподключение, настройки качества, fullscreen, Keyboard Lock (Chrome). ✅
 
 ### Фаза 4 — полный режим и расширения
@@ -471,10 +482,10 @@ Telegram-бот (`TRAFFIC_TG_BOT_TOKEN`/`TRAFFIC_TG_CHAT_ID` в `~/app/.env`); �
 | windows-capture =1.4.4 (пин) | host (Windows) | совместимость scap 0.0.8, см. docs/host-libs-api-notes.md |
 | base64 0.22 | host | RGBA курсора в JSON |
 | objc2 0.6, objc2-foundation 0.3, objc2-app-kit 0.3 | host (macOS) | NSCursor → NSBitmapImageRep (те же версии, что тянет enigo); фича `NSPasteboard` — счётчик изменений буфера обмена (2.5b, для arboard тоже) |
-| windows 0.61 | host (Windows) | курсор (GetCursorInfo/GetIconInfo/GetDIBits), клавиатура (`SendInput`, `MapVirtualKeyW`), GDI-захват (`BitBlt`, `CreateDIBSection`), проба D3D 11 (`D3D11CreateDevice`; фича Dxgi нужна из-за cfg-гейта), DPI (`SetProcessDpiAwarenessContext`), Media Foundation H.264 MFT (`Win32_Media_MediaFoundation`; `Win32_System_{Com,Ole,Variant}` — COM-инициализация и `VARIANT` для `ICodecAPI::SetValue`), буфер обмена (`Win32_System_DataExchange` — `GetClipboardSequenceNumber`, 2.5b). Та же версия, что у windows-capture |
+| windows 0.61 | host (Windows) | курсор (GetCursorInfo/GetIconInfo/GetDIBits), клавиатура (`SendInput`, `MapVirtualKeyW`), GDI-захват (`BitBlt`, `CreateDIBSection`), проба D3D 11 (`D3D11CreateDevice`; фича Dxgi нужна из-за cfg-гейта), DPI (`SetProcessDpiAwarenessContext`), Media Foundation H.264 MFT (`Win32_Media_MediaFoundation`; `Win32_System_{Com,Ole,Variant}` — COM-инициализация и `VARIANT` для `ICodecAPI::SetValue`), буфер обмена (`Win32_System_DataExchange` — `GetClipboardSequenceNumber`, 2.5b), папка «Загрузки» (`Win32_UI_Shell` — `SHGetKnownFolderPath`, 3.4a). Та же версия, что у windows-capture |
 | enigo 0.6 | host (macOS/Windows) | инъекция ввода: macOS — `raw()` = CGKeyCode; Windows — только мышь/колесо (`raw()` не принимает E0-префикс, клавиши идут через свой `SendInput`); `main_display()` для масштаба координат |
 | objc2-core-foundation, objc2-core-video, objc2-core-media, objc2-video-toolbox 0.3 | host (macOS) | VideoToolbox: `VTCompressionSession`, `CVPixelBuffer` (NV12 без конверсии), `CMSampleBuffer`/`CMBlockBuffer` (AVCC → Annex-B), CF-словари свойств. Минимальные фичи, без objc2-классов; сидят на тех же objc2 0.6 / core-foundation 0.3, что enigo |
-| arboard 3.6 (default-features = false) | host (macOS/Windows) | текст буфера обмена (2.5); изменения — по счётчику ОС (NSPasteboard changeCount / GetClipboardSequenceNumber) |
+| arboard 3.6 (default-features = false) | host (macOS/Windows) | текст буфера обмена (2.5); изменения — по счётчику ОС (NSPasteboard changeCount / GetClipboardSequenceNumber); список скопированных файлов `get().file_list()` для скачивания с хоста (3.4c) |
 | tray-icon 0.25 (default-features = false) | host (macOS/Windows) | трей/меню-бар `rcdesk-agent` (2.6c): иконка + меню через реэкспорт `tray_icon::menu` (`muda`, без отдельной зависимости). Без winit/tao — свой минимальный цикл событий (`platform::{macos,windows}::event_loop`) |
 | vite 8, typescript 7, vitest 5 | web | сборка, типы, тесты; `vite.config.ts` использует `defineConfig` из `vitest/config` |
 | rusqlite 0.40 (bundled) | server | постоянное состояние сигналинга: устройства, владельцы, привязки (слайс 3.1); SQLite статически в бинарнике, файл в томе `/data` |
