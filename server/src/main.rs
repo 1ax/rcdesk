@@ -26,7 +26,12 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("rcdesk-server listening on {addr}");
 
-    axum::serve(listener, app(Registry::new(), IceConfig::from_env(), db)).await?;
+    axum::serve(
+        listener,
+        app(Registry::new(), IceConfig::from_env(), db)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

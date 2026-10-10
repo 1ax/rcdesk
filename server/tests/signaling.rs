@@ -29,9 +29,12 @@ async fn spawn_server() -> String {
     let ice = IceConfig::from_env();
     let db = Db::in_memory().expect("open in-memory db");
     tokio::spawn(async move {
-        axum::serve(listener, app(registry, ice, db))
-            .await
-            .expect("serve");
+        axum::serve(
+            listener,
+            app(registry, ice, db).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("serve");
     });
     format!("ws://{addr}/ws")
 }
@@ -1223,5 +1226,82 @@ async fn host_reconnect_with_live_session_id_marks_device_busy_until_bye() {
             );
         }
         other => panic!("expected devices, got {other:?}"),
+    }
+}
+
+/// Like `connect`, but presents `X-Real-IP` the way nginx does in production.
+async fn connect_as(url: &str, real_ip: &str) -> WsStream {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = url.into_client_request().expect("build request");
+    request
+        .headers_mut()
+        .insert("x-real-ip", real_ip.parse().expect("header value"));
+    let (stream, _response) = timeout(TIMEOUT, connect_async(request))
+        .await
+        .expect("connect timed out")
+        .expect("connect failed");
+    stream
+}
+
+// Slice 3.6a (D36): wrong-PIN guesses are rate-limited per client IP. After
+// 10 misses the IP is blocked even for a correct PIN; another IP is unaffected.
+#[tokio::test]
+async fn wrong_pin_attempts_are_rate_limited_per_ip() {
+    let url = spawn_server().await;
+
+    let mut host = connect(&url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: None,
+            session_id: None,
+        },
+    )
+    .await;
+    let pin = match recv(&mut host).await {
+        SignalMessage::Registered { pin, .. } => pin,
+        other => panic!("expected registered, got {other:?}"),
+    };
+
+    let mut attacker = connect_as(&url, "198.51.100.1").await;
+    hello(&mut attacker, Role::Client).await;
+    for _ in 0..10 {
+        send(
+            &mut attacker,
+            &SignalMessage::Join {
+                pin: "000000".to_string(),
+            },
+        )
+        .await;
+        match recv(&mut attacker).await {
+            SignalMessage::Error { message } => assert_eq!(message, "unknown pin"),
+            other => panic!("expected unknown pin, got {other:?}"),
+        }
+    }
+    send(
+        &mut attacker,
+        &SignalMessage::Join {
+            pin: "000000".to_string(),
+        },
+    )
+    .await;
+    match recv(&mut attacker).await {
+        SignalMessage::Error { message } => assert_eq!(message, "too many attempts"),
+        other => panic!("expected too many attempts, got {other:?}"),
+    }
+    send(&mut attacker, &SignalMessage::Join { pin: pin.clone() }).await;
+    match recv(&mut attacker).await {
+        SignalMessage::Error { message } => assert_eq!(message, "too many attempts"),
+        other => panic!("expected too many attempts, got {other:?}"),
+    }
+
+    let mut other = connect_as(&url, "198.51.100.2").await;
+    hello(&mut other, Role::Client).await;
+    send(&mut other, &SignalMessage::Join { pin }).await;
+    match recv(&mut other).await {
+        SignalMessage::Joined { .. } => {}
+        other => panic!("expected joined, got {other:?}"),
     }
 }

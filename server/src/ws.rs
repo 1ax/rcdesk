@@ -7,11 +7,13 @@
 //! this one purely by holding a clone of its `Tx`.
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
 use proto::signal::{DeviceEntry, Role, SignalMessage};
+use std::net::{IpAddr, SocketAddr};
 use tokio::sync::mpsc;
 
 use crate::app::AppState;
@@ -19,13 +21,31 @@ use crate::db::Db;
 use crate::devices::{self, DeviceAuth};
 use crate::ice::{self, IceConfig};
 use crate::owners;
-use crate::registry::{Registry, Tx};
+use crate::pin_limit::PinLimiter;
+use crate::registry::{JoinError, Registry, Tx};
 
-pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+/// The client's IP: the first valid `X-Real-IP` value (the server sits behind
+/// nginx, so the socket peer is the proxy), otherwise the socket peer.
+pub fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+    headers
+        .get_all("x-real-ip")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| value.trim().parse::<IpAddr>().ok())
+        .unwrap_or_else(|| peer.ip())
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let ip = client_ip(&headers, peer);
+    ws.on_upgrade(move |socket| handle_socket(socket, state, ip))
+}
+
+async fn handle_socket(socket: WebSocket, state: AppState, ip: IpAddr) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<SignalMessage>();
 
@@ -52,6 +72,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         &state.registry,
         &state.ice,
         &state.db,
+        &state.pin_limiter,
+        ip,
     )
     .await;
     tracing::info!("websocket connection closed");
@@ -102,6 +124,8 @@ async fn run_connection(
     registry: &Registry,
     ice: &IceConfig,
     db: &Db,
+    pin_limiter: &PinLimiter,
+    ip: IpAddr,
 ) {
     let role = match next_message(stream, &tx).await {
         Some(SignalMessage::Hello { role, .. }) => role,
@@ -116,7 +140,7 @@ async fn run_connection(
 
     match role {
         Role::Host => run_host(stream, tx, registry, ice, db).await,
-        Role::Client => run_client(stream, tx, registry, ice, db).await,
+        Role::Client => run_client(stream, tx, registry, ice, db, pin_limiter, ip).await,
     }
 }
 
@@ -397,6 +421,8 @@ async fn run_client(
     registry: &Registry,
     ice: &IceConfig,
     db: &Db,
+    pin_limiter: &PinLimiter,
+    ip: IpAddr,
 ) {
     // The owner this connection has authenticated as (slice 3.1), if any --
     // `ClientAuth` is optional, so an older client that never sends it stays
@@ -565,36 +591,50 @@ async fn run_client(
                     }
                 }
             }
-            SignalMessage::Join { pin } => match registry.join(&pin, tx.clone()) {
-                Ok((session_id, host_id, host_name, host_tx)) => {
-                    tracing::info!(%session_id, "client joined");
-                    let _ = tx.send(SignalMessage::Joined {
-                        session_id: session_id.clone(),
-                        host_name,
-                        ice_servers: ice.ice_servers(ice::now_unix()),
-                        // `host_id` is the device's persistent id (slice
-                        // 3.1: every registered host is one) -- carried
-                        // back so the client can reconnect to the same
-                        // device later without a PIN (slice 3.5b).
-                        device_id: Some(host_id.clone()),
+            SignalMessage::Join { pin } => {
+                if !pin_limiter.check(ip) {
+                    tracing::warn!(%ip, "pin attempts rate-limited");
+                    let _ = tx.send(SignalMessage::Error {
+                        message: "too many attempts".to_string(),
                     });
-                    let _ = host_tx.send(SignalMessage::PeerJoined {
-                        session_id,
-                        ice_servers: ice.ice_servers(ice::now_unix()),
-                    });
-                    if let Some(owner_id) = &owner {
-                        if let Err(err) = db.link_device(owner_id, &host_id, ice::now_unix() as i64)
-                        {
-                            tracing::error!(?err, "failed to link device to owner");
+                    continue;
+                }
+                match registry.join(&pin, tx.clone()) {
+                    Ok((session_id, host_id, host_name, host_tx)) => {
+                        tracing::info!(%session_id, "client joined");
+                        let _ = tx.send(SignalMessage::Joined {
+                            session_id: session_id.clone(),
+                            host_name,
+                            ice_servers: ice.ice_servers(ice::now_unix()),
+                            // `host_id` is the device's persistent id (slice
+                            // 3.1: every registered host is one) -- carried
+                            // back so the client can reconnect to the same
+                            // device later without a PIN (slice 3.5b).
+                            device_id: Some(host_id.clone()),
+                        });
+                        let _ = host_tx.send(SignalMessage::PeerJoined {
+                            session_id,
+                            ice_servers: ice.ice_servers(ice::now_unix()),
+                        });
+                        if let Some(owner_id) = &owner {
+                            if let Err(err) =
+                                db.link_device(owner_id, &host_id, ice::now_unix() as i64)
+                            {
+                                tracing::error!(?err, "failed to link device to owner");
+                            }
                         }
                     }
+                    Err(err) => {
+                        if err == JoinError::UnknownPin {
+                            pin_limiter.record_failure(ip);
+                            tracing::info!(%ip, "wrong pin");
+                        }
+                        let _ = tx.send(SignalMessage::Error {
+                            message: err.message().to_string(),
+                        });
+                    }
                 }
-                Err(err) => {
-                    let _ = tx.send(SignalMessage::Error {
-                        message: err.message().to_string(),
-                    });
-                }
-            },
+            }
             SignalMessage::Offer {
                 session_id,
                 sdp,
@@ -715,5 +755,36 @@ async fn run_client(
         // Same reasoning as the host-side disconnect above: the socket
         // closing doesn't mean the P2P session is over, so no `Bye`.
         tracing::info!(%session_id, "session left to p2p after signaling loss");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer() -> SocketAddr {
+        "127.0.0.1:5555".parse().unwrap()
+    }
+
+    #[test]
+    fn client_ip_prefers_x_real_ip_over_socket() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", " 203.0.113.7 ".parse().unwrap());
+        assert_eq!(
+            client_ip(&headers, peer()),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn client_ip_falls_back_to_socket_on_garbage_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "not-an-ip".parse().unwrap());
+        assert_eq!(client_ip(&headers, peer()), peer().ip());
+    }
+
+    #[test]
+    fn client_ip_uses_socket_without_header() {
+        assert_eq!(client_ip(&HeaderMap::new(), peer()), peer().ip());
     }
 }

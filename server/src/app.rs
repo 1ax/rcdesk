@@ -3,6 +3,7 @@ use axum::Router;
 
 use crate::db::Db;
 use crate::ice::IceConfig;
+use crate::pin_limit::PinLimiter;
 use crate::registry::Registry;
 use crate::ws::ws_handler;
 
@@ -14,13 +15,20 @@ pub struct AppState {
     pub registry: Registry,
     pub ice: IceConfig,
     pub db: Db,
+    /// Per-IP limit on wrong-PIN guesses (slice 3.6a).
+    pub pin_limiter: PinLimiter,
 }
 
 pub fn app(registry: Registry, ice: IceConfig, db: Db) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/ws", get(ws_handler))
-        .with_state(AppState { registry, ice, db })
+        .with_state(AppState {
+            registry,
+            ice,
+            db,
+            pin_limiter: PinLimiter::new(),
+        })
 }
 
 async fn healthz() -> &'static str {

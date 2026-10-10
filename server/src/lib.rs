@@ -3,5 +3,6 @@ pub mod db;
 pub mod devices;
 pub mod ice;
 pub mod owners;
+pub mod pin_limit;
 pub mod registry;
 pub mod ws;
