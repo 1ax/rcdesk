@@ -4347,6 +4347,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let url = format!("ws://{addr}/ws");
 
+        let (offer_tx, mut offer_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -4370,6 +4371,9 @@ mod tests {
 
             // Wait for the host's Offer (proof the session actually
             // started) before dropping the connection out from under it.
+            // The host also sends keepalive WS pings (and may send other
+            // text messages) first -- skip everything that isn't the Offer;
+            // only a closed/failed connection is a real failure.
             loop {
                 match ws.next().await {
                     Some(Ok(Message::Text(text))) => {
@@ -4379,9 +4383,12 @@ mod tests {
                             break;
                         }
                     }
+                    Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)))
+                    | Some(Ok(Message::Binary(_))) => continue,
                     other => panic!("connection ended before an Offer arrived: {other:?}"),
                 }
             }
+            let _ = offer_tx.send(());
             drop(ws);
         });
 
@@ -4406,6 +4413,11 @@ mod tests {
             result.is_err(),
             "run must return once the server drops the connection"
         );
+
+        tokio::time::timeout(Duration::from_secs(5), &mut offer_rx)
+            .await
+            .expect("the fake server must report the Offer in time")
+            .expect("the fake server must have received an Offer");
 
         assert!(
             slot.is_active(),
