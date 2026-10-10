@@ -158,9 +158,22 @@ const SIGNAL_ERROR_LABELS: Record<string, string> = {
   "device offline": "Устройство сейчас не в сети — попробуйте позже",
   "device not linked": "Это устройство не привязано к вашему аккаунту",
   "not authenticated": "Не удалось подтвердить вход — обновите страницу",
+  "too many attempts": "Слишком много неверных PIN — подождите минуту и попробуйте снова",
   "internal error": "Внутренняя ошибка сервера — попробуйте ещё раз",
   "replaced by a new connection": "Вы вошли с этим аккаунтом в другой вкладке — эта отключена",
 };
+
+/**
+ * A "not in session" error with no live session is the server answering a
+ * late ICE candidate sent after the host's `bye` -- noise that must not
+ * overwrite the "session ended" caption (D38).
+ */
+export function isStaleSessionError(
+  message: string,
+  sessionId: string | null,
+): boolean {
+  return sessionId === null && message === "not in session";
+}
 
 export function signalErrorLabel(message: string): string {
   return SIGNAL_ERROR_LABELS[message] ?? `Ошибка: ${message}`;
@@ -1848,6 +1861,10 @@ export function mount(root: Element | null): void {
       // attempt count (the banner/status already show that).
       console.warn("recovery attempt failed", msg.message);
       scheduleRecoveryAttempt();
+      return;
+    }
+    if (isStaleSessionError(msg.message, sessionId)) {
+      console.debug("ignored stale 'not in session' error");
       return;
     }
     if (sessionId === null) {

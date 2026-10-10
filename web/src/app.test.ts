@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatBuildBadge, signalErrorLabel } from "./app";
+import { formatBuildBadge, isStaleSessionError, signalErrorLabel } from "./app";
 
 describe("formatBuildBadge", () => {
   it("formats a short commit sha", () => {
@@ -30,5 +30,19 @@ describe("signalErrorLabel", () => {
     expect(signalErrorLabel("replaced by a new connection")).not.toBe(
       "Ошибка: replaced by a new connection",
     );
+  });
+});
+
+describe("too many attempts / stale session errors", () => {
+  it("labels the server's PIN rate-limit code", () => {
+    expect(signalErrorLabel("too many attempts")).toBe(
+      "Слишком много неверных PIN — подождите минуту и попробуйте снова",
+    );
+  });
+
+  it("treats 'not in session' without a session as stale (D38)", () => {
+    expect(isStaleSessionError("not in session", null)).toBe(true);
+    expect(isStaleSessionError("not in session", "abc")).toBe(false);
+    expect(isStaleSessionError("unknown pin", null)).toBe(false);
   });
 });
