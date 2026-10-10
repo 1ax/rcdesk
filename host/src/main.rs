@@ -123,6 +123,12 @@ enum Command {
         /// hardware encoder if available, openh264 otherwise.
         #[arg(long, value_enum, default_value_t = EncoderBackend::Auto)]
         encoder: EncoderBackend,
+        /// Windows, полный режим (слайс 4.1a): помощник службы `rcdesk`. Данные
+        /// -- в `%ProgramData%\rcdesk\`, лог -- `helper.log`, PIN -- в `pin.txt`
+        /// вместо stdout. Запускается только службой.
+        #[cfg(target_os = "windows")]
+        #[arg(long, hide = true)]
+        machine: bool,
     },
     /// Manage `rcdesk-agent`'s "start at login" registration (a LaunchAgent
     /// plist on macOS, an `HKCU\...\Run` value on Windows) -- no admin
@@ -139,6 +145,39 @@ enum Command {
     Password {
         #[command(subcommand)]
         action: PasswordAction,
+    },
+    /// Windows, полный режим (слайс 4.1a): служба SYSTEM `rcdesk` + помощник
+    /// в консольной сессии. install/uninstall/start/stop требуют cmd от имени
+    /// администратора.
+    #[cfg(target_os = "windows")]
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Установить службу (автозапуск, перезапуск при сбое) и запустить её.
+    Install {
+        /// Signaling server WebSocket URL.
+        #[arg(long, default_value = "wss://rcdesk.app/ws")]
+        server: String,
+    },
+    /// Остановить и удалить службу; данные в %ProgramData%\rcdesk не трогаются.
+    Uninstall,
+    /// Запустить установленную службу.
+    Start,
+    /// Остановить службу.
+    Stop,
+    /// Состояние службы, PIN и пути данных.
+    Status,
+    /// Точка входа SCM (binpath службы); руками не запускается.
+    #[command(hide = true)]
+    Run {
+        #[arg(long, default_value = "wss://rcdesk.app/ws")]
+        server: String,
     },
 }
 
@@ -169,24 +208,13 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
     rcdesk_host::platform::windows::dpi::set_dpi_aware();
 
-    tracing_subscriber::fmt()
-        // Slice 3.2 fix: the classic Windows console (cmd.exe on the Win10
-        // stand) doesn't interpret ANSI escapes unless VT processing is
-        // switched on, so colors came out as raw `←[2m` noise. Plain text
-        // there; colors stay on macOS terminals.
-        .with_ansi(cfg!(not(target_os = "windows")))
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(rcdesk_host::DEFAULT_LOG_FILTER)
-            }),
-        )
-        .init();
+    let cli = Cli::parse();
+    init_logging(&cli.command);
 
     let version = env!("CARGO_PKG_VERSION");
     let platform = platform::name();
     tracing::info!("rcdesk-host {version} on {platform}");
 
-    let cli = Cli::parse();
     match cli.command {
         Command::ListDisplays => run_list_displays(),
         Command::Bench {
@@ -217,7 +245,13 @@ async fn main() -> anyhow::Result<()> {
             no_adapt,
             capture,
             encoder,
+            #[cfg(target_os = "windows")]
+            machine,
         } => {
+            #[cfg(target_os = "windows")]
+            let data_dir = machine.then(agent::paths::machine_data_dir);
+            #[cfg(not(target_os = "windows"))]
+            let data_dir = None;
             let opts = ServeOptions {
                 server,
                 name,
@@ -233,11 +267,86 @@ async fn main() -> anyhow::Result<()> {
                 no_adapt,
                 capture,
                 encoder,
+                data_dir,
             };
             run_serve(opts).await
         }
         Command::Autostart { action } => run_autostart(action),
         Command::Password { action } => run_password(action),
+        #[cfg(target_os = "windows")]
+        Command::Service { action } => run_service(action),
+    }
+}
+
+/// Лог-приёмник по команде. Обычные команды -- stderr, как раньше. Полный
+/// режим Windows (4.1a) пишет в файлы машинного каталога логов: `service run`
+/// -- `service.log` (инициализирует сама `platform::windows::service::run`),
+/// `serve --machine` -- `helper.log`. Консоли у них нет.
+fn init_logging(command: &Command) {
+    #[cfg(target_os = "windows")]
+    {
+        match command {
+            Command::Service {
+                action: ServiceAction::Run { .. },
+            } => return,
+            Command::Serve { machine: true, .. } => {
+                let dir = agent::paths::machine_log_dir();
+                if let Err(err) = agent::logging::init_named(&dir, rcdesk_host::service::HELPER_LOG)
+                {
+                    eprintln!(
+                        "rcdesk-host: не удалось открыть лог в {}: {err}",
+                        dir.display()
+                    );
+                    std::process::exit(1);
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = command;
+
+    tracing_subscriber::fmt()
+        // Slice 3.2 fix: the classic Windows console (cmd.exe on the Win10
+        // stand) doesn't interpret ANSI escapes unless VT processing is
+        // switched on, so colors came out as raw `←[2m` noise. Plain text
+        // there; colors stay on macOS terminals.
+        .with_ansi(cfg!(not(target_os = "windows")))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(rcdesk_host::DEFAULT_LOG_FILTER)
+            }),
+        )
+        .init();
+}
+
+/// `rcdesk-host service ...` (Windows, слайс 4.1a).
+#[cfg(target_os = "windows")]
+fn run_service(action: ServiceAction) -> anyhow::Result<()> {
+    use rcdesk_host::platform::windows::service as svc;
+    use rcdesk_host::service as common;
+
+    match action {
+        ServiceAction::Install { server } => svc::install(&server),
+        ServiceAction::Uninstall => svc::uninstall(),
+        ServiceAction::Start => svc::start(),
+        ServiceAction::Stop => svc::stop(),
+        ServiceAction::Run { server } => svc::run(&server),
+        ServiceAction::Status => {
+            let state = svc::status()?;
+            println!("Служба {}: {}", common::SERVICE_NAME, state.label());
+            let data = agent::paths::machine_data_dir();
+            match common::read_pin(&data) {
+                Some(pin) => println!("PIN: {pin}"),
+                None => println!(
+                    "PIN: нет (помощник ещё не зарегистрирован, либо нужны права администратора)"
+                ),
+            }
+            println!("Данные: {}", data.display());
+            println!("Логи: {}", agent::paths::machine_log_dir().display());
+            Ok(())
+        }
     }
 }
 
@@ -270,9 +379,19 @@ fn run_autostart(action: AutostartAction) -> anyhow::Result<()> {
 /// `rcdesk-host password set|clear|status` -- see `rcdesk_host::access`'s
 /// module doc comment for what's actually stored (an OPAQUE registration
 /// record, never the password itself). Uses the same data directory as
-/// `DeviceStore` (`agent::paths::data_dir()`).
+/// `DeviceStore` (`agent::paths::data_dir()`). На Windows при установленной
+/// службе (полный режим, 4.1a) -- машинный каталог `%ProgramData%\rcdesk`:
+/// туда смотрит помощник; запись требует прав администратора.
 fn run_password(action: PasswordAction) -> anyhow::Result<()> {
-    let store = AccessStore::new(&agent::paths::data_dir());
+    let (data_dir, machine) = password_data_dir();
+    let store = AccessStore::new(&data_dir);
+    let admin_hint = |err: anyhow::Error| -> anyhow::Error {
+        if machine {
+            err.context("служба установлена, пароль хранится в машинном каталоге: запустите cmd от имени администратора")
+        } else {
+            err
+        }
+    };
     match action {
         PasswordAction::Set => {
             let password = read_new_password()?;
@@ -280,13 +399,13 @@ fn run_password(action: PasswordAction) -> anyhow::Result<()> {
                 anyhow::bail!(message);
             }
             let record = access::register(&password)?;
-            store.save(&record)?;
+            store.save(&record).map_err(admin_hint)?;
             println!("Пароль задан: {}", store.path().display());
             println!("Хост применит его при следующем подключении -- перезапуск агента не нужен.");
         }
         PasswordAction::Clear => {
             let had_password = store.load().is_some();
-            store.clear()?;
+            store.clear().map_err(admin_hint)?;
             if had_password {
                 println!("Пароль снят");
             } else {
@@ -302,6 +421,18 @@ fn run_password(action: PasswordAction) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Каталог для `password`: машинный, если на Windows установлена служба
+/// (второе значение `true`), иначе пользовательский.
+fn password_data_dir() -> (PathBuf, bool) {
+    #[cfg(target_os = "windows")]
+    {
+        if rcdesk_host::platform::windows::service::is_installed() {
+            return (agent::paths::machine_data_dir(), true);
+        }
+    }
+    (agent::paths::data_dir(), false)
 }
 
 /// Reads the new password: one line from stdin when it isn't a terminal
@@ -519,17 +650,49 @@ async fn run_serve(opts: ServeOptions) -> anyhow::Result<()> {
     // sends on it.
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let device_store = DeviceStore::new(&agent::paths::data_dir());
+    let device_store = DeviceStore::new(&opts.resolved_data_dir());
+
+    // Машинный режим (`--machine`, 4.1a): PIN уходит в `pin.txt` каталога
+    // данных, а не в stdout (у помощника службы консоли нет).
+    let machine_dir = opts.data_dir.clone();
+    // Windows, машинный режим: удержание системы от сна на время сеанса из
+    // одного выделенного потока (`SetThreadExecutionState` потоковый).
+    #[cfg(target_os = "windows")]
+    let power = machine_dir
+        .is_some()
+        .then(rcdesk_host::platform::windows::power::SessionActivityThread::spawn);
 
     let (status_tx, mut status_rx) = watch::channel(AgentStatus::Connecting);
     let print_task = tokio::spawn(async move {
         let mut last_printed: Option<String> = None;
+        let mut in_session = false;
         while status_rx.changed().await.is_ok() {
-            if let AgentStatus::Registered { pin } = &*status_rx.borrow() {
-                if last_printed.as_deref() != Some(pin.as_str()) {
-                    println!("PIN: {pin}");
-                    last_printed = Some(pin.clone());
+            let now_in_session;
+            {
+                let status = status_rx.borrow();
+                now_in_session = matches!(&*status, AgentStatus::InSession { .. });
+                if let AgentStatus::Registered { pin } = &*status {
+                    if last_printed.as_deref() != Some(pin.as_str()) {
+                        match &machine_dir {
+                            Some(dir) => {
+                                if let Err(err) = rcdesk_host::service::write_pin(dir, pin) {
+                                    tracing::warn!(error = %err, "не удалось записать pin.txt");
+                                }
+                            }
+                            None => println!("PIN: {pin}"),
+                        }
+                        last_printed = Some(pin.clone());
+                    }
                 }
+            }
+            if now_in_session != in_session {
+                #[cfg(target_os = "windows")]
+                {
+                    if let Some(power) = &power {
+                        power.set(now_in_session);
+                    }
+                }
+                in_session = now_in_session;
             }
         }
     });

@@ -30,5 +30,6 @@ mod fsutil;
 pub mod input;
 pub mod pipeline;
 pub mod platform;
+pub mod service;
 pub mod signaling;
 pub mod transport;

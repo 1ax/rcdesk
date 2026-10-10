@@ -25,8 +25,15 @@ const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 /// unchanged, for the caller (`agent_main`) to show in the "Open log" menu
 /// item and startup log line.
 pub fn init(log_dir: &Path) -> io::Result<PathBuf> {
+    init_named(log_dir, "agent.log")
+}
+
+/// То же, что [`init`], но с произвольным именем файла (`service.log`,
+/// `helper.log` полного режима Windows, слайс 4.1a). Ротация -- в
+/// `<file_name>.1`.
+pub fn init_named(log_dir: &Path, file_name: &str) -> io::Result<PathBuf> {
     std::fs::create_dir_all(log_dir)?;
-    let log_path = log_dir.join("agent.log");
+    let log_path = log_dir.join(file_name);
     rotate_if_too_large(&log_path)?;
 
     let file = OpenOptions::new()

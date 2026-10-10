@@ -40,6 +40,23 @@ pub fn data_dir() -> PathBuf {
     }
 }
 
+/// Машинный каталог данных полного режима (слайс 4.1a):
+/// `%ProgramData%\rcdesk\`. Берётся из переменной окружения `ProgramData`
+/// (как `LOCALAPPDATA` выше, без Win32-вызова): она задана и у службы
+/// SYSTEM, и у пользователя; запасной вариант -- `C:\ProgramData`.
+/// Каталог создаётся и закрывается DACL командой `service install`.
+#[cfg(target_os = "windows")]
+pub fn machine_data_dir() -> PathBuf {
+    PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".to_string()))
+        .join("rcdesk")
+}
+
+/// Логи полного режима: `%ProgramData%\rcdesk\logs\`.
+#[cfg(target_os = "windows")]
+pub fn machine_log_dir() -> PathBuf {
+    machine_data_dir().join("logs")
+}
+
 #[cfg(target_os = "macos")]
 fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))

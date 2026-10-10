@@ -41,3 +41,40 @@ pub fn end_session_activity() {
         let _ = SetThreadExecutionState(ES_CONTINUOUS);
     }
 }
+
+/// Выделенный std-поток для `SetThreadExecutionState` (слайс 4.1a).
+/// Состояние выполнения привязано к потоку, а tokio-задачи переезжают между
+/// потоками рантайма -- поэтому `serve --machine` не зовёт `begin`/`end`
+/// из задач, а шлёт сюда флаг «сессия идёт». Закрытие отправителя (drop)
+/// завершает поток; перед выходом он снимает флаги.
+pub struct SessionActivityThread {
+    tx: std::sync::mpsc::Sender<bool>,
+}
+
+impl SessionActivityThread {
+    pub fn spawn() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        let spawned = std::thread::Builder::new()
+            .name("session-activity".to_string())
+            .spawn(move || {
+                while let Ok(active) = rx.recv() {
+                    if active {
+                        begin_session_activity();
+                    } else {
+                        end_session_activity();
+                    }
+                }
+                end_session_activity();
+            });
+        if let Err(err) = spawned {
+            tracing::warn!(error = %err, "не удалось запустить поток удержания от сна");
+        }
+        Self { tx }
+    }
+
+    /// `true` -- сессия началась (держать систему от сна), `false` -- закончилась.
+    pub fn set(&self, active: bool) {
+        // Поток мог не стартовать -- тогда отправка молча не удаётся.
+        let _ = self.tx.send(active);
+    }
+}

@@ -88,6 +88,16 @@ mod imp {
             }
         };
 
+        // Windows, полный режим (4.1a): пока работает служба `rcdesk`, её
+        // помощник держит хост в консольной сессии -- второй агент не нужен.
+        #[cfg(target_os = "windows")]
+        {
+            if platform::windows::service::is_running() {
+                tracing::info!("служба rcdesk работает (полный режим), агент не нужен");
+                std::process::exit(0);
+            }
+        }
+
         let data_dir = agent::paths::data_dir();
         let _lock = match agent::lock::acquire(&data_dir) {
             Ok(Some(lock)) => lock,
@@ -141,6 +151,7 @@ mod imp {
             no_adapt: false,
             capture: CaptureBackend::Auto,
             encoder: EncoderBackend::Auto,
+            data_dir: None,
         };
         let host_name = app::resolve_host_name(cli.name.as_deref());
         let ctx = match app::build_host_context(&opts) {

@@ -218,6 +218,19 @@ pub struct ServeOptions {
     pub no_adapt: bool,
     pub capture: CaptureBackend,
     pub encoder: EncoderBackend,
+    /// Каталог `device.json`/`access.json`. `None` -- `agent::paths::data_dir()`
+    /// (пользовательский); `Some` -- машинный каталог полного режима Windows
+    /// (`serve --machine`, слайс 4.1a).
+    pub data_dir: Option<std::path::PathBuf>,
+}
+
+impl ServeOptions {
+    /// Каталог данных этого запуска: явный или пользовательский по умолчанию.
+    pub fn resolved_data_dir(&self) -> std::path::PathBuf {
+        self.data_dir
+            .clone()
+            .unwrap_or_else(crate::agent::paths::data_dir)
+    }
 }
 
 /// Builds the long-lived `HostContext` for a `serve` run: everything a
@@ -315,9 +328,9 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
         runtime,
         // Slice 3.2c: same data directory as `DeviceStore`
         // (`main.rs`/`agent_main.rs` both build one over
-        // `agent::paths::data_dir()`); `AccessStore::new` doesn't touch the
+        // `opts.resolved_data_dir()`); `AccessStore::new` doesn't touch the
         // filesystem, so this is safe even before the directory exists.
-        access_store: crate::access::AccessStore::new(&crate::agent::paths::data_dir()),
+        access_store: crate::access::AccessStore::new(&opts.resolved_data_dir()),
     })
 }
 

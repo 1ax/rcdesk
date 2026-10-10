@@ -123,6 +123,21 @@ windows = { version = "0.61", features = [
     # SHGetKnownFolderPath/FOLDERID_Downloads (files::windows, 3.4a) -- the
     # user's Downloads folder, where received files are saved.
     "Win32_UI_Shell",
+    # OpenSCManagerW/CreateServiceW/StartServiceCtrlDispatcherW/SetServiceStatus
+    # и др. (platform::windows::service, 4.1a) -- служба SYSTEM `rcdesk` и
+    # управление ею из CLI (`service install|uninstall|start|stop|status`).
+    "Win32_System_Services",
+    # WTSGetActiveConsoleSessionId (platform::windows::service, 4.1a) --
+    # номер активной консольной сессии, в которой служба запускает помощника.
+    "Win32_System_RemoteDesktop",
+    # CreateJobObjectW/SetInformationJobObject/AssignProcessToJobObject
+    # (platform::windows::service, 4.1a) -- Job с KILL_ON_JOB_CLOSE: умерла
+    # служба -- умер и помощник.
+    "Win32_System_JobObjects",
+    # ConvertStringSecurityDescriptorToSecurityDescriptorW/SetNamedSecurityInfoW
+    # (platform::windows::service, 4.1a) -- защищённый DACL (SYSTEM +
+    # Administrators) на машинный каталог данных %ProgramData%\rcdesk.
+    "Win32_Security_Authorization",
 ] }
 # Буфер обмена (2.5b): текст только, default-features=false drops the
 # `image-data` feature (image crate, extra objc2-core-graphics on macOS).

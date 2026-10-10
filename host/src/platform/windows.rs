@@ -7,6 +7,7 @@ pub mod keyboard;
 pub mod monitors;
 pub mod mouse;
 pub mod power;
+pub mod service;
 
 pub(super) fn name() -> &'static str {
     "windows"
