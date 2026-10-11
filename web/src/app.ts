@@ -242,6 +242,24 @@ const DOWNLOAD_URL_REVOKE_MS = 60_000;
  * visible after entering fullscreen (slice 3.5c). */
 const FULLSCREEN_NOTE_MS = 3000;
 
+const DOWNLOAD_BASE = "https://github.com/1ax/rcdesk/releases";
+
+/** The "download the host" block of the start screen (slice 4.3e). Static
+ * markup; the agent's "update available" menu opens the page at `#download`. */
+export function downloadBlockHtml(): string {
+  return `
+        <div class="download" id="download">
+          <p class="download-title">Скачать rcdesk для этого компьютера</p>
+          <p class="download-links">
+            <a href="${DOWNLOAD_BASE}/latest/download/rcdesk-setup.exe">Windows</a>
+            <a href="${DOWNLOAD_BASE}/latest/download/rcdesk-macos.pkg">macOS (Apple Silicon)</a>
+          </p>
+          <p class="download-note">Windows: установщик не подписан — SmartScreen: «Подробнее → Выполнить в любом случае».</p>
+          <p class="download-note">macOS: если система не даёт открыть — «Системные настройки → Конфиденциальность и безопасность → Всё равно открыть».</p>
+          <p class="download-note"><a href="${DOWNLOAD_BASE}">Все версии</a></p>
+        </div>`;
+}
+
 /** Builds the PIN/session UI inside `root` and wires it up. `root` may be
  * `null` (e.g. in an environment without the expected markup) -- a no-op. */
 export function mount(root: Element | null): void {
@@ -268,7 +286,7 @@ export function mount(root: Element | null): void {
           autocomplete="one-time-code"
         />
         <button id="connect-btn" class="btn">Подключиться</button>
-        <p id="pin-status" class="hint"></p>
+        <p id="pin-status" class="hint"></p>${downloadBlockHtml()}
       </div>
     </div>
     <div class="session-screen" id="session-screen" hidden>
@@ -353,6 +371,12 @@ export function mount(root: Element | null): void {
   buildBadge.textContent = formatBuildBadge(__BUILD_ID__);
 
   const pinScreen = root.querySelector<HTMLDivElement>("#pin-screen")!;
+  // `#download` (opened from the agent's menu): the markup is inserted by JS
+  // after load, so the browser's own fragment scroll can miss it. The client
+  // uses no other `location.hash`.
+  if (typeof location !== "undefined" && location.hash === "#download") {
+    root.querySelector("#download")?.scrollIntoView?.();
+  }
   const sessionScreen = root.querySelector<HTMLDivElement>("#session-screen")!;
   const pinInput = root.querySelector<HTMLInputElement>("#pin-input")!;
   const connectBtn = root.querySelector<HTMLButtonElement>("#connect-btn")!;

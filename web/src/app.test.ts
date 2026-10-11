@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatBuildBadge, isStaleSessionError, signalErrorLabel } from "./app";
+import { downloadBlockHtml, formatBuildBadge, isStaleSessionError, signalErrorLabel } from "./app";
 
 describe("formatBuildBadge", () => {
   it("formats a short commit sha", () => {
@@ -44,5 +44,25 @@ describe("too many attempts / stale session errors", () => {
     expect(isStaleSessionError("not in session", null)).toBe(true);
     expect(isStaleSessionError("not in session", "abc")).toBe(false);
     expect(isStaleSessionError("unknown pin", null)).toBe(false);
+  });
+});
+
+describe("downloadBlockHtml (slice 4.3e)", () => {
+  const html = downloadBlockHtml();
+
+  it("is anchored at #download", () => {
+    expect(html).toContain('id="download"');
+  });
+
+  it("links to the latest installers and all releases", () => {
+    const base = "https://github.com/1ax/rcdesk/releases";
+    expect(html).toContain(`href="${base}/latest/download/rcdesk-setup.exe"`);
+    expect(html).toContain(`href="${base}/latest/download/rcdesk-macos.pkg"`);
+    expect(html).toContain(`href="${base}"`);
+  });
+
+  it("explains the unsigned-installer warnings", () => {
+    expect(html).toContain("SmartScreen");
+    expect(html).toContain("Всё равно открыть");
   });
 });

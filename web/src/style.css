@@ -39,9 +39,12 @@ body {
 .pin-screen {
   height: 100%;
   display: flex;
-  align-items: center;
-  justify-content: center;
   padding: 16px;
+  overflow-y: auto;
+}
+
+.pin-screen > .card {
+  margin: auto;
 }
 
 .card {
@@ -242,6 +245,47 @@ body {
 .pin-hint {
   margin-top: 0;
   margin-bottom: 8px;
+}
+
+.download {
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  scroll-margin: 16px;
+}
+
+.download:target {
+  border-top-color: var(--accent);
+}
+
+.download-title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.download-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 4px 16px;
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+
+.download a {
+  color: var(--accent);
+}
+
+.download a:hover {
+  color: var(--accent-hover);
+}
+
+.download-note {
+  margin: 4px 0 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--muted);
 }
 
 .session-screen {
