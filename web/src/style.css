@@ -569,6 +569,17 @@ body {
   text-transform: none;
 }
 
+.curtain-status {
+  color: var(--danger);
+  text-transform: none;
+}
+
+/* Slice 4.2c3: the "Шторка" button while the curtain is on. */
+.btn.curtain-btn.is-active {
+  background: var(--accent);
+  color: #fff;
+}
+
 .clipboard-note {
   text-transform: none;
 }

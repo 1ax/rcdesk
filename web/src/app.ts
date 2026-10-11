@@ -37,6 +37,14 @@ import type { NavigatorWithKeyboard } from "./fullscreen";
 import { inputBlockedLabel } from "./inputBlocked";
 import { viewOnlyLabel } from "./inputStatus";
 import {
+  type CurtainState,
+  curtainOnClick,
+  curtainOnHostInfo,
+  curtainOnStatus,
+  curtainView,
+  initialCurtainState,
+} from "./curtain";
+import {
   canConnect,
   deviceLabel,
   deviceStatusLabel,
@@ -318,9 +326,19 @@ export function mount(root: Element | null): void {
           </label>
           <span id="view-only" class="status view-only" hidden></span>
           <span id="input-blocked" class="status input-blocked" hidden></span>
+          <span id="curtain-status" class="status curtain-status" hidden></span>
           <span id="clipboard-note" class="status clipboard-note" hidden></span>
           <span id="fullscreen-note" class="status fullscreen-note" hidden></span>
           <span id="session-status" class="status"></span>
+          <button
+            id="curtain-btn"
+            class="btn btn-secondary curtain-btn"
+            title="Скрыть экран Mac от тех, кто рядом с ним; при отключении Mac заблокируется"
+            aria-pressed="false"
+            hidden
+          >
+            Шторка
+          </button>
           <button id="fullscreen-btn" class="btn btn-secondary" hidden>На весь экран</button>
           <button id="disconnect-btn" class="btn btn-secondary">Отключиться</button>
           <button
@@ -441,6 +459,30 @@ export function mount(root: Element | null): void {
   const fileDropHint = root.querySelector<HTMLDivElement>("#file-drop-hint")!;
   const sessionVideoEl = root.querySelector<HTMLDivElement>(".session-video")!;
   const fullscreenBtn = root.querySelector<HTMLButtonElement>("#fullscreen-btn")!;
+  const curtainBtn = root.querySelector<HTMLButtonElement>("#curtain-btn")!;
+  const curtainStatusEl = root.querySelector<HTMLSpanElement>("#curtain-status")!;
+  // Slice 4.2c3: reset in `stopSessionResources`; see `curtain.ts`.
+  let curtain: CurtainState = initialCurtainState();
+  function renderCurtain(): void {
+    const v = curtainView(curtain);
+    curtainBtn.hidden = v.hidden;
+    curtainBtn.disabled = v.disabled;
+    curtainBtn.textContent = v.text;
+    curtainBtn.setAttribute("aria-pressed", String(v.pressed));
+    curtainBtn.classList.toggle("is-active", v.pressed);
+    curtainStatusEl.textContent = v.statusText ?? "";
+    curtainStatusEl.hidden = v.statusText === null;
+  }
+  curtainBtn.addEventListener("click", () => {
+    const dc = controlChannel;
+    if (!dc || dc.readyState !== "open") return;
+    const { state, send } = curtainOnClick(curtain);
+    if (send === null) return;
+    const msg: ControlMessage = { type: "set_curtain", on: send };
+    dc.send(JSON.stringify(msg));
+    curtain = state;
+    renderCurtain();
+  });
   // `document.fullscreenEnabled` doesn't change over a tab's lifetime, so
   // this is decided once, here, rather than on every render (slice 3.5c).
   fullscreenBtn.hidden = !isFullscreenSupported(document);
@@ -1077,6 +1119,13 @@ export function mount(root: Element | null): void {
         updateCmdAsCtrlVisibility();
         filesEnabled = msg.files_enabled;
         updateFileUi();
+        curtain = curtainOnHostInfo(curtain, msg.curtain_available);
+        renderCurtain();
+        return;
+      }
+      if (msg.type === "curtain_status") {
+        curtain = curtainOnStatus(curtain, msg);
+        renderCurtain();
         return;
       }
       if (msg.type === "input_status") {
@@ -1366,6 +1415,8 @@ export function mount(root: Element | null): void {
     displaySelect.innerHTML = "";
     hostOs = null;
     updateCmdAsCtrlVisibility();
+    curtain = initialCurtainState();
+    renderCurtain();
     if (fileSender) {
       fileSender.cancelAll();
       fileSender.dispose();
