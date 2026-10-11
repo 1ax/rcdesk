@@ -560,6 +560,26 @@ mod tests {
         out
     }
 
+    /// Collects frames until `done(&frames)` holds or `timeout` passes --
+    /// for tests that only need "enough frames eventually", not a rate, so a
+    /// slow CI runner doesn't fail them.
+    fn drain_until(
+        handle: &mut PipelineHandle,
+        timeout: Duration,
+        done: impl Fn(&[EncodedFrame]) -> bool,
+    ) -> Vec<EncodedFrame> {
+        let deadline = Instant::now() + timeout;
+        let mut out = Vec::new();
+        while Instant::now() < deadline && !done(&out) {
+            match handle.frames.try_recv() {
+                Ok(frame) => out.push(frame),
+                Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        out
+    }
+
     #[test]
     fn synthetic_pipeline_produces_frames_and_honours_keyframe_requests() {
         let _guard = serialized();
@@ -584,14 +604,15 @@ mod tests {
             },
         );
 
-        // Loose lower bound on purpose: a 30 fps synthetic source on a busy
-        // 3-vCPU CI VM (`macos-latest`) has delivered 18 frames in this
-        // second (slice 2.4 Deploy); the exact pacing is covered by the
-        // deterministic `pacer_*` tests, this one only proves the path runs.
-        let received = drain_for(&mut handle, Duration::from_secs(1));
+        // No rate check here: a busy 3-vCPU CI VM (`macos-latest`) has
+        // delivered 18, then 11, then 8 frames in one second (slices 2.4,
+        // 4.1). The exact pacing is covered by the deterministic `pacer_*`
+        // tests; this one only proves the path runs, so it waits up to 5 s
+        // for 12 frames.
+        let received = drain_until(&mut handle, Duration::from_secs(5), |f| f.len() >= 12);
         assert!(
             received.len() >= 12,
-            "expected >= 12 frames in ~1s, got {}",
+            "expected >= 12 frames within 5s, got {}",
             received.len()
         );
         assert!(
@@ -600,7 +621,9 @@ mod tests {
         );
 
         handle.request_keyframe();
-        let more = drain_for(&mut handle, Duration::from_millis(300));
+        let more = drain_until(&mut handle, Duration::from_secs(2), |f| {
+            f.iter().any(|frame| frame.keyframe)
+        });
         assert!(
             more.iter().any(|f| f.keyframe),
             "expected a keyframe shortly after request_keyframe()"
