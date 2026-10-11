@@ -4,6 +4,9 @@ name: Build host
 # deploy.yml (промежуточные сборки -- артефакты Actions) и release.yml (релизы).
 on:
   workflow_call:
+  # Ручной запуск с любой ветки (`gh workflow run build-host.yml --ref wip/…`):
+  # установщик для живой проверки на стенде до слияния в main.
+  workflow_dispatch:
 
 jobs:
   # Кросс-компиляции нет: openh264 собирается из исходников под MSVC, поэтому
