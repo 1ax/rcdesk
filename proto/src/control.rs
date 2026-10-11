@@ -155,7 +155,23 @@ pub enum ControlMessage {
     /// later. `files_enabled` (slice 3.4a) is `false` when the host was
     /// started with `serve --no-files`: the client hides its file-transfer
     /// button instead of letting every transfer be refused.
-    HostInfo { os: HostOs, files_enabled: bool },
+    HostInfo {
+        os: HostOs,
+        files_enabled: bool,
+        /// Шторка доступна на этом хосте (слайс 4.2c) -- сейчас только
+        /// агент macOS. Клиент показывает кнопку шторки только при `true`.
+        curtain_available: bool,
+    },
+    /// client -> host: включить (`on: true`) или выключить шторку (слайс
+    /// 4.2c). Шторка закрывает физический монитор хоста чёрным окном
+    /// (в видео оно не попадает) и блокирует локальный ввод. Хост всегда
+    /// отвечает `CurtainStatus`.
+    SetCurtain { on: bool },
+    /// host -> client: итоговое состояние шторки (слайс 4.2c). Шлётся в
+    /// ответ на каждый `SetCurtain` и когда хост снял шторку сам, из-за
+    /// ошибки. `reason` -- человекочитаемая причина, когда запрошенное
+    /// состояние не достигнуто (или шторка снята по ошибке), иначе `None`.
+    CurtainStatus { on: bool, reason: Option<String> },
 }
 
 #[cfg(test)]
@@ -385,16 +401,54 @@ mod tests {
             let msg = ControlMessage::HostInfo {
                 os,
                 files_enabled: true,
+                curtain_available: false,
             };
 
             let json = serde_json::to_string(&msg).expect("serialize");
             assert_eq!(
                 json,
-                format!(r#"{{"type":"host_info","os":"{wire}","files_enabled":true}}"#)
+                format!(
+                    r#"{{"type":"host_info","os":"{wire}","files_enabled":true,"curtain_available":false}}"#
+                )
             );
 
             let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(round_tripped, msg);
         }
+    }
+
+    #[test]
+    fn set_curtain_round_trips_through_json_with_exact_shape() {
+        let msg = ControlMessage::SetCurtain { on: true };
+
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(json, r#"{"type":"set_curtain","on":true}"#);
+
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, msg);
+    }
+
+    #[test]
+    fn curtain_status_round_trips_through_json_with_exact_shape() {
+        let off = ControlMessage::CurtainStatus {
+            on: false,
+            reason: Some("нет прав".to_string()),
+        };
+        let json = serde_json::to_string(&off).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"curtain_status","on":false,"reason":"нет прав"}"#
+        );
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, off);
+
+        let on = ControlMessage::CurtainStatus {
+            on: true,
+            reason: None,
+        };
+        let json = serde_json::to_string(&on).expect("serialize");
+        assert_eq!(json, r#"{"type":"curtain_status","on":true,"reason":null}"#);
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, on);
     }
 }

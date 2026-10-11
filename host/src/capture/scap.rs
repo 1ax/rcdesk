@@ -29,7 +29,15 @@ pub struct ScapSource {
 unsafe impl Send for ScapSource {}
 
 impl ScapSource {
-    pub fn new(display_id: Option<u32>, fps: u32) -> Result<Self, CaptureError> {
+    /// `exclude_windows` -- CGWindowID окон, которые не попадают в захват
+    /// (окна шторки, слайс 4.2c). Работает только на macOS (scap
+    /// документирует исключение лишь там); на Windows аргумент игнорируется.
+    /// Окна должны существовать к моменту `Capturer::build`.
+    pub fn new(
+        display_id: Option<u32>,
+        fps: u32,
+        exclude_windows: &[u32],
+    ) -> Result<Self, CaptureError> {
         if !is_supported() {
             return Err(CaptureError::Unsupported);
         }
@@ -53,6 +61,43 @@ impl ScapSource {
         #[cfg(target_os = "windows")]
         let output_type = FrameType::BGRAFrame;
 
+        // `scap::Window` не реэкспортирован из крейта (модуль `targets`
+        // приватный), поэтому литерал структуры не написать: берём любое
+        // реальное окно из `get_all_targets()` как заготовку и подменяем в
+        // клоне `id`/`raw_handle`. scap сверяет исключаемые окна только по
+        // `id` (см. `capturer::engine::mac`).
+        #[cfg(target_os = "macos")]
+        let excluded_targets = if exclude_windows.is_empty() {
+            None
+        } else {
+            let template = get_all_targets()
+                .into_iter()
+                .find(|t| matches!(t, Target::Window(_)))
+                .ok_or_else(|| {
+                    CaptureError::Backend(
+                        "нет ни одного окна-заготовки для исключения окон шторки".to_string(),
+                    )
+                })?;
+            Some(
+                exclude_windows
+                    .iter()
+                    .map(|&id| {
+                        let mut target = template.clone();
+                        if let Target::Window(w) = &mut target {
+                            w.id = id;
+                            w.raw_handle = id;
+                        }
+                        target
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let excluded_targets = {
+            let _ = exclude_windows;
+            None
+        };
+
         let options = Options {
             fps,
             show_cursor: false,
@@ -61,7 +106,7 @@ impl ScapSource {
             crop_area: None,
             output_type,
             output_resolution: Resolution::Captured,
-            excluded_targets: None,
+            excluded_targets,
         };
 
         let mut capturer = Capturer::build(options).map_err(|err| match err {

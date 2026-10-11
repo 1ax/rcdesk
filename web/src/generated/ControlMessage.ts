@@ -7,4 +7,9 @@ import type { QualityPreset } from "./QualityPreset";
  * A single `control`-channel message, JSON-encoded on the wire (see
  * ARCHITECTURE.md §5).
  */
-export type ControlMessage = { "type": "cursor_shape", width: number, height: number, hotspot_x: number, hotspot_y: number, scale: number, rgba: string, } | { "type": "cursor_hidden" } | { "type": "ping", ts: number, } | { "type": "pong", ts: number, } | { "type": "quality", bitrate_kbps: number, fps: number, reason: string, } | { "type": "displays", displays: Array<DisplayEntry>, current: number, } | { "type": "select_display", id: number, } | { "type": "input_status", available: boolean, reason: string | null, } | { "type": "input_blocked", blocked: boolean, reason: string | null, } | { "type": "clipboard_text", text: string, } | { "type": "set_quality", preset: QualityPreset, } | { "type": "host_info", os: HostOs, files_enabled: boolean, };
+export type ControlMessage = { "type": "cursor_shape", width: number, height: number, hotspot_x: number, hotspot_y: number, scale: number, rgba: string, } | { "type": "cursor_hidden" } | { "type": "ping", ts: number, } | { "type": "pong", ts: number, } | { "type": "quality", bitrate_kbps: number, fps: number, reason: string, } | { "type": "displays", displays: Array<DisplayEntry>, current: number, } | { "type": "select_display", id: number, } | { "type": "input_status", available: boolean, reason: string | null, } | { "type": "input_blocked", blocked: boolean, reason: string | null, } | { "type": "clipboard_text", text: string, } | { "type": "set_quality", preset: QualityPreset, } | { "type": "host_info", os: HostOs, files_enabled: boolean, 
+/**
+ * Шторка доступна на этом хосте (слайс 4.2c) -- сейчас только
+ * агент macOS. Клиент показывает кнопку шторки только при `true`.
+ */
+curtain_available: boolean, } | { "type": "set_curtain", on: boolean, } | { "type": "curtain_status", on: boolean, reason: string | null, };

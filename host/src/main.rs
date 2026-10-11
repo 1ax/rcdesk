@@ -500,7 +500,7 @@ fn run_bench(
     let source: Box<dyn FrameSource> = if synthetic {
         Box::new(capture::synthetic::for_display(display.unwrap_or(1), fps)?)
     } else {
-        app::build_screen_source(display, fps, capture)?
+        app::build_screen_source(display, fps, capture, &[])?
     };
 
     let (width, height) = source.size();

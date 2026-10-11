@@ -41,6 +41,7 @@ use crate::adapt::{AdaptConfig, Controller, Feedback};
 use crate::capture::{self, DisplayInfo, FrameSource};
 use crate::clipboard::{self, ClipboardBackend, ClipboardEvent, ClipboardSync};
 use crate::cursor::{self, CursorSource, CursorState};
+use crate::curtain::Curtain;
 use crate::encode::{build_encoder, EncodedFrame, EncoderConfig, EncoderKind, RateTarget};
 use crate::files::FilesCommand;
 use crate::input::{Injector, InputRouter, NoopInjector};
@@ -82,6 +83,11 @@ const ELEVATED_INPUT_BLOCKED_REASON: &str =
 /// level deeper than `build_injector`/`build_cursor_source`'s bare closures.
 pub type BuildClipboard = Box<dyn Fn() -> anyhow::Result<Box<dyn ClipboardBackend>> + Send + Sync>;
 
+/// См. `HostContext::build_source`. Вынесен в псевдоним (clippy
+/// `type_complexity`).
+pub type BuildSource =
+    Box<dyn Fn(u32, &[u32]) -> anyhow::Result<Box<dyn FrameSource>> + Send + Sync>;
+
 /// What the signaling client needs to build a fresh `PeerSession` and video
 /// pipeline for each joining peer.
 pub struct HostContext {
@@ -108,8 +114,15 @@ pub struct HostContext {
     /// `scap` source is only constructible behind `cfg(...)`, and this
     /// module stays platform-agnostic; `main.rs` supplies the closure.
     /// Called once per pipeline, i.e. again on every `SelectDisplay`
-    /// (slice 2.4), not just once per session.
-    pub build_source: Box<dyn Fn(u32) -> anyhow::Result<Box<dyn FrameSource>> + Send + Sync>,
+    /// (slice 2.4), not just once per session. Второй аргумент -- CGWindowID
+    /// окон, которые не захватывать (окна шторки, слайс 4.2c); пустой срез
+    /// -- исключений нет. Действует только на macOS, остальные бэкенды его
+    /// игнорируют.
+    pub build_source: BuildSource,
+    /// Шторка хоста (слайс 4.2c), если платформа её умеет; `None` --
+    /// `SetCurtain` отвечает отказом, а `HostInfo.curtain_available` ложно.
+    /// Реализация приедет в 4.2c2, пока везде `None`.
+    pub curtain: Option<Arc<dyn Curtain>>,
     /// Lists the displays capturable right now, for the initial
     /// `ControlMessage::Displays` announcement and to resolve
     /// `ControlMessage::SelectDisplay` ids (slice 2.4). `main.rs` supplies
@@ -600,8 +613,9 @@ impl VideoPipeline {
         peer: Arc<PeerSession>,
         video_tx: mpsc::Sender<EncodedFrame>,
         keyframe_flag: Arc<AtomicBool>,
+        exclude_windows: &[u32],
     ) -> anyhow::Result<VideoPipeline> {
-        let source = (ctx.build_source)(display.id)?;
+        let source = (ctx.build_source)(display.id, exclude_windows)?;
         let (width, height) = source.size();
         let fps = ctx.session.fps.max(1);
 
@@ -859,6 +873,14 @@ struct ActiveSession {
     /// pipeline's controller instead of silently resetting the owner's
     /// choice on every display switch.
     quality_preset: QualityPreset,
+    /// Шторка хоста для этого сеанса (слайс 4.2c), копия `HostContext::curtain`:
+    /// `shutdown` не получает `ctx`, а блокировка экрана в конце сеанса
+    /// нужна именно ему.
+    curtain: Option<Arc<dyn Curtain>>,
+    /// CGWindowID окон включённой шторки (слайс 4.2c); пусто -- шторка
+    /// выключена. Передаётся в `build_source` при каждой пересборке
+    /// конвейера (смена дисплея не должна выдать шторку в видео).
+    curtain_windows: Vec<u32>,
     /// Slice 3.5b: tracks the current `RTCPeerConnectionState::Disconnected`
     /// grace window (if any) for this session -- see `DisconnectGrace`'s
     /// doc comment and `handle_session_event`'s `ConnectionState`/
@@ -987,6 +1009,26 @@ impl ActiveSession {
             task.abort();
         }
         self.files_task.abort();
+        // Шторка включена -- сначала блокируем экран, и только потом убираем
+        // шторку: рабочий стол не должен открыться без присмотра (слайс 4.2c).
+        if let (Some(curtain), false) = (self.curtain, self.curtain_windows.is_empty()) {
+            let result = tokio::task::spawn_blocking(move || {
+                let locked = curtain.lock_screen();
+                curtain.hide();
+                locked
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => tracing::info!("curtain: screen locked, curtain hidden"),
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        ?err,
+                        "curtain: failed to lock screen, curtain hidden anyway"
+                    );
+                }
+                Err(err) => tracing::warn!(?err, "curtain: teardown task failed"),
+            }
+        }
     }
 }
 
@@ -1550,6 +1592,8 @@ async fn begin_session(
                     files_enabled: parts.files_enabled,
                     session_tag,
                     quality_preset: QualityPreset::Auto,
+                    curtain: ctx.curtain.clone(),
+                    curtain_windows: Vec::new(),
                     disconnect_grace: DisconnectGrace::default(),
                     session_key,
                 });
@@ -1872,6 +1916,14 @@ async fn handle_session_event(
                                 }
                             }
                         }
+                        Ok(ControlMessage::SetCurtain { on }) => {
+                            if let Some(active) = active.as_mut() {
+                                let status = set_curtain(ctx, active, on).await;
+                                if let Err(err) = active.peer.send_control(&status).await {
+                                    tracing::warn!(?err, "failed to send curtain status");
+                                }
+                            }
+                        }
                         Ok(ControlMessage::ClipboardText { text }) => {
                             // Wrong direction: `ClipboardText` is host ->
                             // client only on `control` (see
@@ -1938,7 +1990,7 @@ async fn handle_session_event(
                         tracing::warn!(?err, "failed to send initial displays list");
                     }
                 }
-                let host_info = host_info_message(active.files_enabled);
+                let host_info = host_info_message(active.files_enabled, active.curtain.is_some());
                 match active.peer.send_control(&host_info).await {
                     Ok(true) => {}
                     Ok(false) => {
@@ -1994,10 +2046,11 @@ fn apply_remote_clipboard_text(clipboard: Option<&Arc<Mutex<ClipboardSync>>>, te
 
 /// Builds the `ControlMessage::HostInfo` announcement (slice 3.5f), sent
 /// alongside `displays_message` when the `control` channel opens.
-fn host_info_message(files_enabled: bool) -> ControlMessage {
+fn host_info_message(files_enabled: bool, curtain_available: bool) -> ControlMessage {
     ControlMessage::HostInfo {
         os: crate::platform::host_os(),
         files_enabled,
+        curtain_available,
     }
 }
 
@@ -2048,32 +2101,9 @@ async fn switch_display(ctx: &HostContext, active: &mut ActiveSession, id: u32) 
         let _ = active.peer.send_control(&msg).await;
         return;
     }
-    match VideoPipeline::start(
-        ctx,
-        display,
-        Arc::clone(&active.peer),
-        active.video_tx.clone(),
-        Arc::clone(&active.keyframe_flag),
-    )
-    .await
-    {
-        Ok(new) => {
-            let from = active.video.display.id;
-            let old = std::mem::replace(&mut active.video, new);
-            old.stop();
-            // The new pipeline's `Controller` (if any) always starts fresh
-            // at `QualityPreset::Auto` -- re-apply the session's own choice
-            // (slice 3.5e) so a display switch doesn't silently revert it.
-            if active.quality_preset != QualityPreset::Auto {
-                if let Some(adapt_tx) = &active.video.adapt_tx {
-                    let _ = adapt_tx.send(Feedback::Preset {
-                        preset: active.quality_preset,
-                    });
-                }
-            }
-            active
-                .router
-                .set_capture_rect(crate::input::CaptureRect::from(&active.video.display));
+    let from = active.video.display.id;
+    match replace_pipeline(ctx, active, display).await {
+        Ok(()) => {
             active.displays = list;
             tracing::info!(from, to = active.video.display.id, "switched display");
             let msg = displays_message(&active.displays, active.video.display.id);
@@ -2087,6 +2117,101 @@ async fn switch_display(ctx: &HostContext, active: &mut ActiveSession, id: u32) 
             );
             let msg = displays_message(&active.displays, active.video.display.id);
             let _ = active.peer.send_control(&msg).await;
+        }
+    }
+}
+
+/// Строит новый `VideoPipeline` для `display` (с исключением окон шторки
+/// `active.curtain_windows`), и только потом останавливает прежний: при
+/// ошибке сеанс продолжает стримить как стримил. Общая часть `switch_display`
+/// и перезапуска конвейера под шторку (слайс 4.2c): ре-аплай пресета
+/// качества и обновление rect роутера ввода. `PeerSession` не трогает.
+async fn replace_pipeline(
+    ctx: &HostContext,
+    active: &mut ActiveSession,
+    display: DisplayInfo,
+) -> anyhow::Result<()> {
+    let new = VideoPipeline::start(
+        ctx,
+        display,
+        Arc::clone(&active.peer),
+        active.video_tx.clone(),
+        Arc::clone(&active.keyframe_flag),
+        &active.curtain_windows,
+    )
+    .await?;
+    let old = std::mem::replace(&mut active.video, new);
+    old.stop();
+    // The new pipeline's `Controller` (if any) always starts fresh
+    // at `QualityPreset::Auto` -- re-apply the session's own choice
+    // (slice 3.5e) so a display switch doesn't silently revert it.
+    if active.quality_preset != QualityPreset::Auto {
+        if let Some(adapt_tx) = &active.video.adapt_tx {
+            let _ = adapt_tx.send(Feedback::Preset {
+                preset: active.quality_preset,
+            });
+        }
+    }
+    active
+        .router
+        .set_capture_rect(crate::input::CaptureRect::from(&active.video.display));
+    Ok(())
+}
+
+/// Обрабатывает `ControlMessage::SetCurtain { on }` (слайс 4.2c) и возвращает
+/// `CurtainStatus` для ответа клиенту. Включение: `show()` -> перезапуск
+/// конвейера с исключением окон шторки; любая ошибка откатывает шторку
+/// (`hide()`) и оставляет прежний рабочий конвейер. Выключение: `hide()`,
+/// конвейер не перезапускается -- несуществующие окна в исключении безвредны.
+async fn set_curtain(ctx: &HostContext, active: &mut ActiveSession, on: bool) -> ControlMessage {
+    let status = |on: bool, reason: Option<String>| ControlMessage::CurtainStatus { on, reason };
+    let Some(curtain) = ctx.curtain.clone() else {
+        return status(false, Some("шторка недоступна на этом хосте".to_string()));
+    };
+    if !on {
+        let c = Arc::clone(&curtain);
+        if let Err(err) = tokio::task::spawn_blocking(move || c.hide()).await {
+            tracing::warn!(?err, "curtain: hide task failed");
+        }
+        active.curtain_windows.clear();
+        tracing::info!("curtain: off");
+        return status(false, None);
+    }
+    if !active.curtain_windows.is_empty() {
+        return status(true, None);
+    }
+    let c = Arc::clone(&curtain);
+    let ids = match tokio::task::spawn_blocking(move || c.show()).await {
+        Ok(Ok(ids)) => ids,
+        Ok(Err(err)) => {
+            tracing::warn!(?err, "curtain: show failed");
+            return status(false, Some(err.to_string()));
+        }
+        Err(err) => {
+            tracing::warn!(?err, "curtain: show task failed");
+            return status(false, Some(err.to_string()));
+        }
+    };
+    // `show()` без окон (пустой список) нечем отличить от «выключена»:
+    // считаем это ошибкой и откатываем.
+    if ids.is_empty() {
+        let c = Arc::clone(&curtain);
+        let _ = tokio::task::spawn_blocking(move || c.hide()).await;
+        return status(false, Some("шторка не создала ни одного окна".to_string()));
+    }
+    active.curtain_windows = ids;
+    let display = active.video.display.clone();
+    match replace_pipeline(ctx, active, display).await {
+        Ok(()) => {
+            tracing::info!(windows = active.curtain_windows.len(), "curtain: on");
+            status(true, None)
+        }
+        Err(err) => {
+            tracing::warn!(?err, "curtain: failed to restart pipeline, hiding curtain");
+            active.curtain_windows.clear();
+            let c = Arc::clone(&curtain);
+            let _ = tokio::task::spawn_blocking(move || c.hide()).await;
+            status(false, Some(err.to_string()))
         }
     }
 }
@@ -2219,6 +2344,7 @@ async fn start_session(
         Arc::clone(&peer),
         video_tx.clone(),
         Arc::clone(&keyframe_flag),
+        &[],
     )
     .await?;
 
@@ -2506,9 +2632,10 @@ pub(crate) fn test_ctx() -> HostContext {
         adapt: false,
         max_qp: None,
         encoder: Some(EncoderKind::OpenH264),
-        build_source: Box::new(|id| {
+        build_source: Box::new(|id, _exclude| {
             Ok(Box::new(capture::synthetic::for_display(id, 30)?) as Box<dyn FrameSource>)
         }),
+        curtain: None,
         list_displays: Box::new(|| Ok(capture::synthetic::list_displays())),
         display: None,
         build_injector: Box::new(|| {
@@ -2706,17 +2833,19 @@ mod tests {
     #[test]
     fn host_info_message_reports_this_hosts_os() {
         assert_eq!(
-            host_info_message(true),
+            host_info_message(true, false),
             ControlMessage::HostInfo {
                 os: crate::platform::host_os(),
-                files_enabled: true
+                files_enabled: true,
+                curtain_available: false
             }
         );
         assert_eq!(
-            host_info_message(false),
+            host_info_message(false, true),
             ControlMessage::HostInfo {
                 os: crate::platform::host_os(),
-                files_enabled: false
+                files_enabled: false,
+                curtain_available: true
             }
         );
     }
@@ -2782,6 +2911,7 @@ mod tests {
             Arc::clone(&peer),
             video_tx.clone(),
             Arc::clone(&keyframe_flag),
+            &[],
         )
         .await
         .unwrap();
@@ -2798,6 +2928,7 @@ mod tests {
             Arc::clone(&peer),
             video_tx.clone(),
             Arc::clone(&keyframe_flag),
+            &[],
         )
         .await
         .unwrap();
@@ -2848,6 +2979,7 @@ mod tests {
             Arc::clone(&parts.peer),
             video_tx,
             keyframe_flag,
+            &[],
         )
         .await
         .unwrap();
@@ -2882,7 +3014,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn peer_joined_sends_bye_when_session_start_fails() {
         let mut ctx = test_ctx();
-        ctx.build_source = Box::new(|_id| anyhow::bail!("synthetic source failure"));
+        ctx.build_source = Box::new(|_id, _exclude| anyhow::bail!("synthetic source failure"));
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
         let (event_tx, _event_rx) = mpsc::channel(64);
         let mut active: Option<ActiveSession> = None;
@@ -4183,6 +4315,242 @@ mod tests {
         if let Some(active) = active.take() {
             active.shutdown().await;
         }
+    }
+
+    /// Фейковая шторка (слайс 4.2c): пишет вызовы в общий журнал.
+    struct FakeCurtain {
+        log: Arc<Mutex<Vec<String>>>,
+        ids: Vec<u32>,
+        show_error: Option<String>,
+    }
+
+    impl Curtain for FakeCurtain {
+        fn show(&self) -> anyhow::Result<Vec<u32>> {
+            self.log.lock().unwrap().push("show".to_string());
+            match &self.show_error {
+                Some(msg) => Err(anyhow::anyhow!(msg.clone())),
+                None => Ok(self.ids.clone()),
+            }
+        }
+        fn hide(&self) {
+            self.log.lock().unwrap().push("hide".to_string());
+        }
+        fn lock_screen(&self) -> anyhow::Result<()> {
+            self.log.lock().unwrap().push("lock_screen".to_string());
+            Ok(())
+        }
+    }
+
+    type SourceCalls = Arc<Mutex<Vec<(u32, Vec<u32>)>>>;
+
+    /// `test_ctx()` с фейковой шторкой и шпионом на `build_source`.
+    fn curtain_ctx(
+        ids: Vec<u32>,
+        show_error: Option<&str>,
+    ) -> (HostContext, Arc<Mutex<Vec<String>>>, SourceCalls) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let calls: SourceCalls = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = test_ctx();
+        ctx.curtain = Some(Arc::new(FakeCurtain {
+            log: Arc::clone(&log),
+            ids,
+            show_error: show_error.map(str::to_string),
+        }));
+        let spy = Arc::clone(&calls);
+        ctx.build_source = Box::new(move |id, exclude| {
+            spy.lock().unwrap().push((id, exclude.to_vec()));
+            Ok(Box::new(capture::synthetic::for_display(id, 30)?) as Box<dyn FrameSource>)
+        });
+        (ctx, log, calls)
+    }
+
+    /// Запускает сеанс через `PeerJoined`, как остальные тесты. Возвращает
+    /// каналы, чтобы они жили до конца теста.
+    async fn start_active_session(
+        ctx: &HostContext,
+    ) -> (
+        ActiveSession,
+        mpsc::UnboundedReceiver<SignalMessage>,
+        mpsc::Sender<SessionEvent>,
+        mpsc::Receiver<SessionEvent>,
+    ) {
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+        let (status_tx, _status_rx) = watch::channel(AgentStatus::Connecting);
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+                ice_servers: vec![],
+            },
+            ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut None,
+            &mut 0,
+            &mut None,
+        )
+        .await;
+        (
+            active.expect("session must have started"),
+            out_rx,
+            event_tx,
+            event_rx,
+        )
+    }
+
+    fn journal(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        log.lock().unwrap().clone()
+    }
+
+    fn curtain_status(on: bool, reason: Option<&str>) -> ControlMessage {
+        ControlMessage::CurtainStatus {
+            on,
+            reason: reason.map(str::to_string),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_curtain_without_curtain_is_refused() {
+        let ctx = test_ctx();
+        let (mut active, _out, _etx, _erx) = start_active_session(&ctx).await;
+
+        let reply = set_curtain(&ctx, &mut active, true).await;
+
+        assert_eq!(
+            reply,
+            curtain_status(false, Some("шторка недоступна на этом хосте"))
+        );
+        assert!(active.curtain_windows.is_empty());
+        active.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_curtain_on_restarts_pipeline_excluding_curtain_windows() {
+        let (ctx, log, calls) = curtain_ctx(vec![101, 102], None);
+        let (mut active, _out, _etx, _erx) = start_active_session(&ctx).await;
+        let display_id = active.video.display.id;
+        assert_eq!(*calls.lock().unwrap(), vec![(display_id, vec![])]);
+
+        let reply = set_curtain(&ctx, &mut active, true).await;
+
+        assert_eq!(reply, curtain_status(true, None));
+        assert_eq!(journal(&log), vec!["show"]);
+        assert_eq!(active.curtain_windows, vec![101, 102]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(display_id, vec![]), (display_id, vec![101, 102])],
+            "pipeline must be rebuilt on the same display with the curtain windows excluded"
+        );
+
+        // Повторное включение -- просто повтор статуса, без нового show.
+        let again = set_curtain(&ctx, &mut active, true).await;
+        assert_eq!(again, curtain_status(true, None));
+        assert_eq!(journal(&log), vec!["show"]);
+        assert_eq!(calls.lock().unwrap().len(), 2);
+
+        active.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_curtain_show_error_reports_reason_and_keeps_pipeline() {
+        let (ctx, log, calls) = curtain_ctx(vec![101], Some("нет прав"));
+        let (mut active, _out, _etx, _erx) = start_active_session(&ctx).await;
+
+        let reply = set_curtain(&ctx, &mut active, true).await;
+
+        assert_eq!(reply, curtain_status(false, Some("нет прав")));
+        assert!(active.curtain_windows.is_empty());
+        assert_eq!(calls.lock().unwrap().len(), 1, "no pipeline rebuild");
+        assert_eq!(journal(&log), vec!["show"]);
+
+        active.shutdown().await;
+        assert_eq!(
+            journal(&log),
+            vec!["show"],
+            "curtain is off: nothing at shutdown"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_curtain_rolls_back_when_pipeline_restart_fails() {
+        let (mut ctx, log, _calls) = curtain_ctx(vec![101], None);
+        let (mut active, _out, _etx, _erx) = start_active_session(&ctx).await;
+        ctx.build_source = Box::new(|_id, _exclude| anyhow::bail!("restart failure"));
+
+        let reply = set_curtain(&ctx, &mut active, true).await;
+
+        assert_eq!(reply, curtain_status(false, Some("restart failure")));
+        assert!(active.curtain_windows.is_empty());
+        assert_eq!(journal(&log), vec!["show", "hide"]);
+
+        active.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_curtain_off_hides_without_restarting_pipeline() {
+        let (ctx, log, calls) = curtain_ctx(vec![101], None);
+        let (mut active, _out, _etx, _erx) = start_active_session(&ctx).await;
+        set_curtain(&ctx, &mut active, true).await;
+        assert_eq!(calls.lock().unwrap().len(), 2);
+
+        let reply = set_curtain(&ctx, &mut active, false).await;
+
+        assert_eq!(reply, curtain_status(false, None));
+        assert_eq!(journal(&log), vec!["show", "hide"]);
+        assert!(active.curtain_windows.is_empty());
+        assert_eq!(calls.lock().unwrap().len(), 2, "no pipeline rebuild on off");
+
+        active.shutdown().await;
+        assert_eq!(journal(&log), vec!["show", "hide"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_with_curtain_on_locks_screen_before_hiding() {
+        let (ctx, log, _calls) = curtain_ctx(vec![101], None);
+        let (mut active, _out, _etx, _erx) = start_active_session(&ctx).await;
+        set_curtain(&ctx, &mut active, true).await;
+
+        active.shutdown().await;
+
+        assert_eq!(journal(&log), vec!["show", "lock_screen", "hide"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_without_curtain_never_touches_it() {
+        let (ctx, log, _calls) = curtain_ctx(vec![101], None);
+        let (active, _out, _etx, _erx) = start_active_session(&ctx).await;
+
+        active.shutdown().await;
+
+        assert!(journal(&log).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn switching_display_with_curtain_on_excludes_curtain_windows() {
+        let (ctx, _log, calls) = curtain_ctx(vec![101, 102], None);
+        let (mut active, _out, _etx, _erx) = start_active_session(&ctx).await;
+        set_curtain(&ctx, &mut active, true).await;
+        let other = capture::synthetic::list_displays()
+            .into_iter()
+            .find(|d| d.id != active.video.display.id)
+            .unwrap()
+            .id;
+
+        switch_display(&ctx, &mut active, other).await;
+
+        assert_eq!(active.video.display.id, other);
+        assert_eq!(
+            calls.lock().unwrap().last().cloned(),
+            Some((other, vec![101, 102]))
+        );
+        active.shutdown().await;
     }
 
     /// `AgentCommand::EndSession` with an active session must tell the

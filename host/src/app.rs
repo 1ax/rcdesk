@@ -21,8 +21,8 @@ use crate::input::Injector;
 use crate::input::NoopInjector;
 use crate::platform;
 use crate::signaling::{
-    AgentCommand, AgentStatus, BuildClipboard, ConnectError, HostContext, Keepalive, SessionSlot,
-    SignalingClient,
+    AgentCommand, AgentStatus, BuildClipboard, BuildSource, ConnectError, HostContext, Keepalive,
+    SessionSlot, SignalingClient,
 };
 use crate::transport::SessionConfig;
 
@@ -96,12 +96,15 @@ pub fn resolve_display(display: Option<u32>) -> anyhow::Result<u32> {
 /// the GDI fallback (`capture::gdi`) by probing Direct3D 11 support first
 /// (`platform::windows::d3d::wgc_supported`) -- see that module and
 /// `capture::gdi` for why: `scap` 0.0.8 panics outright on drivers below
-/// feature level 11_0 instead of returning an error.
+/// feature level 11_0 instead of returning an error. `exclude_windows` --
+/// CGWindowID окон шторки, которые не захватывать (слайс 4.2c); действует
+/// только на macOS, на Windows игнорируется.
 #[cfg(target_os = "windows")]
 pub fn build_screen_source(
     display: Option<u32>,
     fps: u32,
     backend: CaptureBackend,
+    exclude_windows: &[u32],
 ) -> anyhow::Result<Box<dyn FrameSource>> {
     let display = Some(resolve_display(display)?);
     let use_wgc = match backend {
@@ -111,7 +114,11 @@ pub fn build_screen_source(
     };
     if use_wgc {
         tracing::info!(backend = "wgc", "screen capture backend");
-        Ok(Box::new(capture::scap::ScapSource::new(display, fps)?))
+        Ok(Box::new(capture::scap::ScapSource::new(
+            display,
+            fps,
+            exclude_windows,
+        )?))
     } else {
         tracing::info!(backend = "gdi", "screen capture backend");
         Ok(Box::new(capture::gdi::GdiSource::new(display, fps)?))
@@ -123,6 +130,7 @@ pub fn build_screen_source(
     display: Option<u32>,
     fps: u32,
     backend: CaptureBackend,
+    exclude_windows: &[u32],
 ) -> anyhow::Result<Box<dyn FrameSource>> {
     match backend {
         CaptureBackend::Gdi => Err(anyhow::anyhow!(
@@ -130,7 +138,11 @@ pub fn build_screen_source(
         )),
         CaptureBackend::Auto | CaptureBackend::Wgc => {
             let display = Some(resolve_display(display)?);
-            Ok(Box::new(capture::scap::ScapSource::new(display, fps)?))
+            Ok(Box::new(capture::scap::ScapSource::new(
+                display,
+                fps,
+                exclude_windows,
+            )?))
         }
     }
 }
@@ -140,6 +152,7 @@ pub fn build_screen_source(
     _display: Option<u32>,
     _fps: u32,
     _backend: CaptureBackend,
+    _exclude_windows: &[u32],
 ) -> anyhow::Result<Box<dyn FrameSource>> {
     Err(capture::CaptureError::Unsupported.into())
 }
@@ -253,14 +266,13 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
     let runtime = webrtc::runtime::default_runtime()
         .ok_or_else(|| anyhow::anyhow!("no webrtc runtime available"))?;
 
-    let build_source: Box<dyn Fn(u32) -> anyhow::Result<Box<dyn FrameSource>> + Send + Sync> =
-        if synthetic {
-            Box::new(move |id| {
-                Ok(Box::new(capture::synthetic::for_display(id, fps)?) as Box<dyn FrameSource>)
-            })
-        } else {
-            Box::new(move |id| build_screen_source(Some(id), fps, capture))
-        };
+    let build_source: BuildSource = if synthetic {
+        Box::new(move |id, _exclude| {
+            Ok(Box::new(capture::synthetic::for_display(id, fps)?) as Box<dyn FrameSource>)
+        })
+    } else {
+        Box::new(move |id, exclude| build_screen_source(Some(id), fps, capture, exclude))
+    };
 
     let list_displays: Box<dyn Fn() -> anyhow::Result<Vec<capture::DisplayInfo>> + Send + Sync> =
         if synthetic {
@@ -319,6 +331,7 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
         max_qp: opts.max_qp,
         encoder: opts.encoder.kind(),
         build_source,
+        curtain: None,
         list_displays,
         display,
         build_injector,

@@ -23,6 +23,7 @@ pub mod build_info;
 pub mod capture;
 pub mod clipboard;
 pub mod cursor;
+pub mod curtain;
 pub mod device;
 pub mod dtls_bind;
 pub mod encode;
