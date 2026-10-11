@@ -19,6 +19,7 @@ pub mod access;
 pub mod adapt;
 pub mod agent;
 pub mod app;
+pub mod build_info;
 pub mod capture;
 pub mod clipboard;
 pub mod cursor;

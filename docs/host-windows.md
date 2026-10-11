@@ -7,7 +7,12 @@ Graphics Capture, ввод — SendInput). Права администратор
 
 ## Где взять бинарник
 
-GitHub → репозиторий `1ax/rcdesk` → Actions → workflow «Deploy» → последний
+Релизные сборки лежат в GitHub Releases:
+<https://github.com/1ax/rcdesk/releases/latest> (`rcdesk-windows-x64.zip`, внутри
+`rcdesk-host.exe` и `rcdesk-agent.exe`).
+
+Промежуточные сборки (не релиз) -- артефакты Actions: GitHub → репозиторий
+`1ax/rcdesk` → Actions → workflow «Deploy» → последний
 зелёный запуск на `main` → раздел Artifacts → `rcdesk-host-windows-x64` (zip,
 внутри `rcdesk-host.exe` и `rcdesk-agent.exe`, слайс 2.6d). Нужен вход в
 GitHub. Распаковать, например, в `C:\rcdesk\`.

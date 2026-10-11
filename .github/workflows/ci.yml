@@ -69,3 +69,5 @@ jobs:
         run: shellcheck infra/*.sh
       - name: bash infra/traffic-monitor.test.sh
         run: bash infra/traffic-monitor.test.sh
+      - name: bash infra/release-version-check.test.sh
+        run: bash infra/release-version-check.test.sh

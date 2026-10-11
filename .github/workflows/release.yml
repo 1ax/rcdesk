@@ -1,0 +1,58 @@
+name: Release
+
+# Релиз по тегу vX.Y.Z (infra/README.md, раздел «Релиз»). push в main релиз не
+# создаёт -- он только деплоит (deploy.yml).
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  # Первым делом: тег совпадает с версией -- иначе не тратим сборку.
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Тег совпадает с версией в Cargo.toml
+        run: bash infra/release-version-check.sh "$GITHUB_REF_NAME" Cargo.toml
+
+  # Гейт релиза: те же проверки, что и в deploy.yml.
+  test:
+    needs: version-check
+    uses: ./.github/workflows/ci.yml
+
+  build-host:
+    needs: test
+    uses: ./.github/workflows/build-host.yml
+
+  release:
+    needs: build-host
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: rcdesk-host-windows-x64
+          path: dist/windows
+      - uses: actions/download-artifact@v5
+        with:
+          name: rcdesk-host-macos-arm64
+          path: dist/macos
+      # upload/download-artifact теряют бит исполнения -- возвращаем до упаковки.
+      - name: Упаковать zip
+        run: |
+          set -e
+          chmod +x dist/macos/rcdesk-host dist/macos/rcdesk-agent
+          (cd dist/windows && zip -r ../../rcdesk-windows-x64.zip .)
+          (cd dist/macos && zip -r ../../rcdesk-macos-arm64.zip .)
+          unzip -l rcdesk-windows-x64.zip
+          unzip -l rcdesk-macos-arm64.zip
+      - name: Создать релиз
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # checkout в этом job нет -- репозиторий для gh задаём явно.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            rcdesk-windows-x64.zip rcdesk-macos-arm64.zip \
+            --title "rcdesk $GITHUB_REF_NAME" --generate-notes

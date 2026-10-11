@@ -62,7 +62,7 @@ mod imp {
     const PERMISSIONS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
     #[derive(Parser)]
-    #[command(name = "rcdesk-agent", version, about = "rcdesk tray agent")]
+    #[command(name = "rcdesk-agent", version = rcdesk_host::build_info::FULL_VERSION, about = "rcdesk tray agent")]
     struct Cli {
         /// Signaling server WebSocket URL.
         #[arg(long, default_value = "wss://rcdesk.app/ws")]
@@ -114,7 +114,7 @@ mod imp {
         let device_store = DeviceStore::new(&data_dir);
 
         tracing::info!(
-            version = env!("CARGO_PKG_VERSION"),
+            version = rcdesk_host::build_info::FULL_VERSION,
             platform = platform::name(),
             log_path = %log_path.display(),
             "rcdesk-agent starting"
@@ -234,7 +234,18 @@ mod imp {
         );
         let quit_item = MenuItem::with_id("quit", "Выйти из rcdesk", true, None);
 
+        let version_item = MenuItem::with_id(
+            "version",
+            format!("rcdesk {}", rcdesk_host::build_info::FULL_VERSION),
+            false,
+            None,
+        );
+
         let menu = Menu::new();
+        menu.append(&version_item)
+            .expect("append version menu item");
+        menu.append(&PredefinedMenuItem::separator())
+            .expect("append separator");
         menu.append(&status_item).expect("append status menu item");
         #[cfg(target_os = "macos")]
         {

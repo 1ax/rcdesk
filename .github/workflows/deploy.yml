@@ -66,47 +66,13 @@ jobs:
           name: web-dist
           path: web/dist
 
-  # Кросс-компиляции нет: openh264 собирается из исходников под MSVC, поэтому
-  # exe для Windows-стенда владельца собирает CI, а не локальная macOS-машина.
+  # Сборка хоста -- reusable build-host.yml (его же вызывает release.yml).
   # Артефакт скачивается со страницы запуска workflow (Actions -> Deploy ->
   # запуск -> Artifacts). deploy от этого job не зависит -- деплой прода не
   # должен ждать сборку хоста.
   build-host:
     needs: test
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            artifact: rcdesk-host-windows-x64
-            binary: target/release/rcdesk-host.exe
-            agent_binary: target/release/rcdesk-agent.exe
-          - os: macos-latest
-            artifact: rcdesk-host-macos-arm64
-            binary: target/release/rcdesk-host
-            agent_binary: target/release/rcdesk-agent
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release
-      # Собирает оба [[bin]] пакета rcdesk-host (rcdesk-host и rcdesk-agent) --
-      # `cargo build -p <pkg>` без `--bin` строит все бинарники пакета, так
-      # что `autostart status` ниже находит rcdesk-agent уже рядом (слайс 2.6d).
-      - run: cargo build --release -p rcdesk-host
-      - name: Дымовая проверка -- бинарник запускается
-        run: |
-          cargo run --release -p rcdesk-host -- --version
-          cargo run --release -p rcdesk-host -- autostart status
-      - uses: actions/upload-artifact@v5
-        with:
-          name: ${{ matrix.artifact }}
-          path: |
-            ${{ matrix.binary }}
-            ${{ matrix.agent_binary }}
-          if-no-files-found: error
+    uses: ./.github/workflows/build-host.yml
 
   deploy:
     needs: [build-push, build-web]

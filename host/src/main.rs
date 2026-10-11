@@ -18,7 +18,7 @@ use rcdesk_host::platform;
 use rcdesk_host::signaling::{AgentStatus, Keepalive};
 
 #[derive(Parser)]
-#[command(name = "rcdesk-host", version, about = "rcdesk host agent")]
+#[command(name = "rcdesk-host", version = rcdesk_host::build_info::FULL_VERSION, about = "rcdesk host agent")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -211,7 +211,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_logging(&cli.command);
 
-    let version = env!("CARGO_PKG_VERSION");
+    let version = rcdesk_host::build_info::FULL_VERSION;
     let platform = platform::name();
     tracing::info!("rcdesk-host {version} on {platform}");
 

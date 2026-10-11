@@ -505,7 +505,7 @@ pub fn run(server: &str) -> anyhow::Result<()> {
     logging::init_named(&log_dir, SERVICE_LOG)
         .with_context(|| format!("лог службы в {}", log_dir.display()))?;
     tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
+        version = crate::build_info::FULL_VERSION,
         server,
         "rcdesk service starting"
     );

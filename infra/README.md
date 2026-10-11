@@ -112,3 +112,16 @@ cat ~/app/traffic/$(date -u +%Y-%m).state
 mkdir -p /tmp/t && cp ~/app/traffic/$(date -u +%Y-%m).state /tmp/t/
 TRAFFIC_DIR=/tmp/t TRAFFIC_RELAY_BUDGET=1 bash ~/app/traffic-monitor.sh
 ```
+
+## Релиз
+
+Релизы собирает `.github/workflows/release.yml` по тегу `v*`; push в `main`
+по-прежнему только деплоит.
+
+1. Поднять `version` в `[workspace.package]` корневого `Cargo.toml`, коммит.
+2. `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+Workflow сначала прогоняет гейты (CI), собирает хост под Windows и macOS и
+проверяет (`infra/release-version-check.sh`), что тег совпадает с `version`;
+при несовпадении релиз не создаётся. В GitHub Releases попадают
+`rcdesk-windows-x64.zip` и `rcdesk-macos-arm64.zip`.
