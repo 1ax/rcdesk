@@ -34,6 +34,9 @@ pub use macos::activity;
 /// subcommand itself doesn't need cfg-gating either.
 #[cfg(target_os = "macos")]
 pub use macos::autostart;
+/// Шторка (4.2c2): только macOS, только `rcdesk-agent`.
+#[cfg(target_os = "macos")]
+pub use macos::curtain;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub use other::autostart;
 #[cfg(target_os = "windows")]

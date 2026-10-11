@@ -201,6 +201,17 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSResponder",
     "NSEvent",
     "NSRunningApplication",
+    # Шторка (platform::macos::curtain, 4.2c2): чёрные окна на каждом экране
+    # с текстовой надписью по центру.
+    "NSWindow",
+    "NSScreen",
+    "NSColor",
+    "NSView",
+    "NSTextField",
+    "NSControl",
+    "NSFont",
+    "NSText",
+    "NSGraphics",
 ] }
 # Буфер обмена (2.5b), тот же default-features=false что для Windows выше --
 # нужен только текст.
@@ -214,6 +225,21 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
     "CFNumber",
     "CFDictionary",
     "CFArray",
+    # Шторка (4.2c2): run-loop source для CGEventTap, ключ/значение словаря сеанса.
+    "CFRunLoop",
+    "CFMachPort",
+] }
+# Шторка (4.2c2): CGEventTap блокировки локального ввода, Ctrl+Cmd+Q, уровень
+# окна и состояние сеанса. Версия 0.3.2 уже в графе (её тянут enigo и scap).
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGEvent",
+    "CGEventTypes",
+    "CGEventSource",
+    "CGRemoteOperation",
+    "CGWindowLevel",
+    "CGDirectDisplay",
+    "CGSession",
 ] }
 # CVPixelBuffer: the image container VideoToolbox's compression session
 # encodes from -- built and filled from each `RawFrame` in encode::videotoolbox.

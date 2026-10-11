@@ -161,12 +161,22 @@ mod imp {
         };
         let host_name = app::resolve_host_name(cli.name.as_deref());
         let ctx = match app::build_host_context(&opts) {
-            Ok(ctx) => Arc::new(ctx),
+            Ok(ctx) => ctx,
             Err(err) => {
                 tracing::error!(error = %err, "failed to build the host context");
                 std::process::exit(1);
             }
         };
+        // Шторка (4.2c2): прокси для потоков tokio, а сторона главного потока
+        // обслуживается в главном цикле ниже.
+        #[cfg(target_os = "macos")]
+        let (ctx, mut curtain_main) = {
+            let (curtain, curtain_main) = platform::curtain::create();
+            let mut ctx = ctx;
+            ctx.curtain = Some(Arc::new(curtain));
+            (ctx, curtain_main)
+        };
+        let ctx = Arc::new(ctx);
 
         let (status_tx, mut status_rx) = watch::channel(AgentStatus::Connecting);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<AgentCommand>();
@@ -327,6 +337,8 @@ mod imp {
 
         loop {
             platform::event_loop::pump(PUMP_INTERVAL);
+            #[cfg(target_os = "macos")]
+            curtain_main.poll();
 
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 let id = event.id().0.as_str();
@@ -359,7 +371,13 @@ mod imp {
                     "open_accessibility_prefs" => open_system_settings_pane(
                         "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
                     ),
-                    "quit" => quit(cmd_tx, status_rx, runtime),
+                    "quit" => quit(
+                        cmd_tx,
+                        status_rx,
+                        runtime,
+                        #[cfg(target_os = "macos")]
+                        &mut curtain_main,
+                    ),
                     _ => {}
                 }
             }
@@ -576,6 +594,7 @@ mod imp {
         cmd_tx: mpsc::UnboundedSender<AgentCommand>,
         status_rx: watch::Receiver<AgentStatus>,
         runtime: tokio::runtime::Runtime,
+        #[cfg(target_os = "macos")] curtain_main: &mut platform::curtain::CurtainMain,
     ) -> ! {
         if matches!(*status_rx.borrow(), AgentStatus::InSession { .. }) {
             let _ = cmd_tx.send(AgentCommand::EndSession);
@@ -584,9 +603,20 @@ mod imp {
                 if !matches!(*status_rx.borrow(), AgentStatus::InSession { .. }) {
                     break;
                 }
+                // macOS: `shutdown` сеанса зовёт `hide` через мост в главный поток --
+                // пока ждём, обслуживаем run loop и команды шторки (без дедлока).
+                #[cfg(target_os = "macos")]
+                {
+                    platform::event_loop::pump(Duration::from_millis(20));
+                    curtain_main.poll();
+                }
+                #[cfg(not(target_os = "macos"))]
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
+        // Шторка всё ещё показана -- оставляем машину заблокированной.
+        #[cfg(target_os = "macos")]
+        curtain_main.finish(platform::event_loop::pump);
         tracing::info!("rcdesk-agent quitting");
         runtime.shutdown_timeout(Duration::from_secs(1));
         std::process::exit(0);
