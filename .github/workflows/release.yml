@@ -36,6 +36,10 @@ jobs:
           path: dist/windows
       - uses: actions/download-artifact@v5
         with:
+          name: rcdesk-setup-windows-x64
+          path: dist/setup
+      - uses: actions/download-artifact@v5
+        with:
           name: rcdesk-host-macos-arm64
           path: dist/macos
       # upload/download-artifact теряют бит исполнения -- возвращаем до упаковки.
@@ -54,5 +58,5 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            rcdesk-windows-x64.zip rcdesk-macos-arm64.zip \
+            rcdesk-windows-x64.zip rcdesk-macos-arm64.zip dist/setup/rcdesk-setup.exe \
             --title "rcdesk $GITHUB_REF_NAME" --generate-notes

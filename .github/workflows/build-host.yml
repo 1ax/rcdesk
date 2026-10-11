@@ -45,3 +45,41 @@ jobs:
             ${{ matrix.binary }}
             ${{ matrix.agent_binary }}
           if-no-files-found: error
+      # Установщик Windows (4.3b): Inno Setup из choco, версия закреплена.
+      # Собираем из тех же exe, что лежат в артефакте выше (target/release).
+      - name: Версия хоста из Cargo
+        if: runner.os == 'Windows'
+        id: version
+        shell: pwsh
+        run: |
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $v = ($meta.packages | Where-Object { $_.name -eq 'rcdesk-host' }).version
+          if (-not $v) { throw 'версия rcdesk-host не найдена в cargo metadata' }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "version=$v"
+      - name: Установить Inno Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install innosetup --version 6.7.1 -y --no-progress
+      - name: Собрать установщик
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # choco кладёт Inno Setup в Program Files (x86); PATH не полагаемся.
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          )
+          $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe не найден: $($candidates -join '; ')" }
+          $src = (Resolve-Path 'target/release').Path
+          $out = Join-Path $env:GITHUB_WORKSPACE 'installer-out'
+          & $iscc "/DAppVersion=${{ steps.version.outputs.version }}" "/DSourceDir=$src" "/O$out" 'installer/windows/rcdesk.iss'
+          if ($LASTEXITCODE -ne 0) { throw "iscc завершился с кодом $LASTEXITCODE" }
+          Get-ChildItem $out
+      - uses: actions/upload-artifact@v5
+        if: runner.os == 'Windows'
+        with:
+          name: rcdesk-setup-windows-x64
+          path: installer-out/rcdesk-setup.exe
+          if-no-files-found: error
