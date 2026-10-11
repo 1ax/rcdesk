@@ -149,6 +149,10 @@ pub struct HostContext {
     /// `Start` with `Abort { Disabled }`, and `HostInfo.files_enabled` tells
     /// the client up front.
     pub files_enabled: bool,
+    /// Full-mode helper (`serve --machine`, `ServeOptions::data_dir` set):
+    /// the process may run as SYSTEM, so per-user folders (Downloads) are
+    /// looked up for the console session's user.
+    pub machine_mode: bool,
     pub runtime: Arc<dyn Runtime>,
     /// Slice 3.2c: the host's access password, if one is set (`access::AccessStore::load`
     /// returns `Some` -- see `access.rs`'s module doc comment). When present,
@@ -2260,8 +2264,12 @@ async fn start_session(
     // transport's dedicated mpsc rather than `handle_session_event`. A
     // disabled or folder-less session still runs the task so the client
     // gets a clean `Abort { Disabled }` instead of silence.
+    // The download folder is resolved once, at session start. In machine
+    // mode (Windows helper under SYSTEM) it is the Downloads of the user
+    // logged on to the console session; if the session began on the logon
+    // screen, files stay disabled in it until the client reconnects.
     let files_dir = if ctx.files_enabled {
-        match crate::files::receive_dir() {
+        match crate::files::receive_dir(ctx.machine_mode) {
             Ok(dir) => Some(dir),
             Err(err) => {
                 tracing::warn!(error = %err, "download folder unavailable, file transfer disabled");
@@ -2511,6 +2519,7 @@ pub(crate) fn test_ctx() -> HostContext {
         }),
         build_clipboard: None,
         files_enabled: false,
+        machine_mode: false,
         runtime: webrtc::runtime::default_runtime().expect("runtime-tokio feature must be enabled"),
         // Slice 3.2c: a fresh, per-test scratch directory under the system
         // temp dir that's never written to here, mirroring

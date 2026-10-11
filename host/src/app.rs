@@ -325,6 +325,7 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
         build_cursor_source: Box::new(build_real_cursor_source),
         build_clipboard,
         files_enabled: !opts.no_files,
+        machine_mode: opts.data_dir.is_some(),
         runtime,
         // Slice 3.2c: same data directory as `DeviceStore`
         // (`main.rs`/`agent_main.rs` both build one over

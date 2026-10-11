@@ -52,14 +52,17 @@ const MAX_NAME_BYTES: usize = 200;
 /// a long name is truncated.
 const MAX_KEPT_EXT_BYTES: usize = 20;
 
-/// Where incoming files land: the user's Downloads folder.
-pub fn receive_dir() -> anyhow::Result<PathBuf> {
+/// Where incoming files land: the user's Downloads folder. `console_user`
+/// (Windows full mode, helper runs as SYSTEM) takes the folder of the user
+/// logged on to the helper's session; ignored on other platforms.
+pub fn receive_dir(console_user: bool) -> anyhow::Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        windows::downloads_dir()
+        windows::downloads_dir(console_user)
     }
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = console_user;
         let home = std::env::var_os("HOME")
             .filter(|h| !h.is_empty())
             .ok_or_else(|| anyhow::anyhow!("HOME is not set, cannot locate Downloads"))?;
