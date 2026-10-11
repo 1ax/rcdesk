@@ -472,7 +472,7 @@ Telegram-бот (`TRAFFIC_TG_BOT_TOKEN`/`TRAFFIC_TG_CHAT_ID` в `~/app/.env`); �
 ### Фаза 4 — полный режим и расширения
 - 4.1 Windows: служба SYSTEM + помощник в сессии ✅ (4.1a, окна администратора), «Загрузки» пользователя под SYSTEM ✅ (4.1d); UAC/экран блокировки (4.1b) и Ctrl+Alt+Del (4.1c) — долги.
 - 4.2 macOS: LaunchDaemon + агент LoginWindow; шторка (curtain).
-- 4.3 Инсталляторы (pkg, msi), самообновление; подписи, когда появятся сертификаты.
+- 4.3 Установщики и релизы ✅ (`v0.1.0`): Inno Setup `rcdesk-setup.exe` (не MSI), `rcdesk-macos.pkg` с самоподписанным `rcdesk.app`, GitHub Releases по тегу `v*`, уведомление о новой версии в меню агента; самообновление и Developer ID/Authenticode — долги (D50).
 - 4.4 Звук (SCK system audio / WASAPI loopback → Opus-трек).
 - 4.5 Буфер обмена с изображениями; AV1/High-профиль по переговорам.
 
