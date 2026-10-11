@@ -348,9 +348,11 @@ at login» или `rcdesk-host autostart on`. `launchctl` не вызывает�
 
 ## 9. Платформы
 
-- **macOS 13+** (ScreenCaptureKit), сборки arm64 и x86_64. Подпись: пока
-  self-signed сертификат с постоянным идентификатором, чтобы TCC-разрешения
-  переживали пересборку; Developer ID + нотаризация — когда появится аккаунт.
+- **macOS 13+** (ScreenCaptureKit), сборки arm64 и x86_64. Поставка — бандл
+  `rcdesk.app` (`app.rcdesk.agent`) в `rcdesk-macos.pkg`, подписан самоподписанным
+  сертификатом (ключ — секреты GitHub `MACOS_SIGN_P12*`, копия у владельца): DR =
+  идентификатор + лист сертификата, поэтому TCC-разрешения переживают обновление;
+  без hardened runtime. Developer ID + нотаризация — когда появится аккаунт.
 - **Windows 10 1903+ и 11**, x64. WGC, Media Foundation, SendInput. Тестовый
   стенд владельца — Windows 10 x64.
 

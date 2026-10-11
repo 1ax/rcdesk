@@ -1,0 +1,44 @@
+#!/bin/bash
+# После установки: автозапуск и запуск агента у вошедшего пользователя.
+# Скрипт идёт от root; всё пользовательское делаем от имени владельца консоли.
+# Ошибки пользовательской части установку не валят. Вывод -- в /var/log/install.log.
+
+APP="/Applications/rcdesk.app"
+
+user="$(stat -f %Su /dev/console 2>/dev/null || true)"
+case "$user" in
+  "" | root | loginwindow)
+    echo "rcdesk postinstall: пользователь консоли не определён ('$user'), автозапуск и запуск пропущены"
+    exit 0
+    ;;
+esac
+
+uid="$(id -u "$user" 2>/dev/null || true)"
+if [ -z "$uid" ]; then
+  echo "rcdesk postinstall: не найден uid пользователя '$user', пропуск"
+  exit 0
+fi
+
+echo "rcdesk postinstall: пользователь $user (uid $uid)"
+
+# LaunchAgent в ~/Library/LaunchAgents пишет сам rcdesk-host (launchctl он не
+# вызывает), поэтому запускаем его от имени пользователя, а не root. `-H`
+# обязателен: хост берёт домашний каталог из $HOME, а sudo на macOS по
+# умолчанию оставляет HOME вызывающего (root) -- plist лёг бы в /var/root.
+if sudo -H -u "$user" "$APP/Contents/MacOS/rcdesk-host" autostart on; then
+  echo "rcdesk postinstall: автозапуск включён"
+else
+  echo "rcdesk postinstall: не удалось включить автозапуск (код $?)"
+fi
+
+# Запуск в GUI-сессии пользователя: `launchctl asuser <uid>` переносит команду
+# в bootstrap-контекст сессии (иначе open из root-скрипта установщика не
+# достучится до WindowServer), `sudo -u` снимает права root, чтобы агент
+# работал от пользователя.
+if launchctl asuser "$uid" sudo -H -u "$user" /usr/bin/open -a "$APP"; then
+  echo "rcdesk postinstall: агент запущен"
+else
+  echo "rcdesk postinstall: не удалось запустить агент (код $?)"
+fi
+
+exit 0

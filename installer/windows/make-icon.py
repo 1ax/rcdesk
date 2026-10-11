@@ -5,12 +5,19 @@
 
     python3 installer/windows/make-icon.py
 
+Для macOS (installer/macos/rcdesk.icns) тот же рисунок выводится набором
+PNG в формате .iconset, затем iconutil собирает icns:
+
+    python3 installer/windows/make-icon.py --iconset /tmp/rcdesk.iconset
+    iconutil -c icns /tmp/rcdesk.iconset -o installer/macos/rcdesk.icns
+
 Только стандартная библиотека (zlib, struct), без PIL. Кадры 16/32/48/256
 пишутся как PNG внутри ICO (Windows Vista+ читает такие кадры). Геометрия --
 те же доли размера, что у трея: рамка 1/6 от краёв, экран 4:3, подставка;
 цвета -- цвета Windows-ветки трея (рамка серая, экран зелёный, «сеанс»).
 Супервыборка 4x даёт сглаженные края на мелких размерах.
 """
+import argparse
 import struct
 import zlib
 from pathlib import Path
@@ -80,7 +87,24 @@ def png(size):
     )
 
 
+def write_iconset(directory):
+    """PNG-набор .iconset: имена и размеры по требованиям iconutil."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    for base in (16, 32, 128, 256, 512):
+        for scale in (1, 2):
+            name = f"icon_{base}x{base}{'@2x' if scale == 2 else ''}.png"
+            (directory / name).write_bytes(png(base * scale))
+    print(f"{directory}: iconset записан")
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--iconset", metavar="DIR", help="вывести .iconset вместо ICO")
+    args = parser.parse_args()
+    if args.iconset:
+        write_iconset(args.iconset)
+        return
     frames = [png(s) for s in SIZES]
     head = struct.pack("<HHH", 0, 1, len(SIZES))
     offset = 6 + 16 * len(SIZES)

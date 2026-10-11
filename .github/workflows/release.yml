@@ -23,6 +23,7 @@ jobs:
   build-host:
     needs: test
     uses: ./.github/workflows/build-host.yml
+    secrets: inherit
 
   release:
     needs: build-host
@@ -42,6 +43,10 @@ jobs:
         with:
           name: rcdesk-host-macos-arm64
           path: dist/macos
+      - uses: actions/download-artifact@v5
+        with:
+          name: rcdesk-macos-pkg
+          path: dist/macos-pkg
       # upload/download-artifact теряют бит исполнения -- возвращаем до упаковки.
       - name: Упаковать zip
         run: |
@@ -58,5 +63,5 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            rcdesk-windows-x64.zip rcdesk-macos-arm64.zip dist/setup/rcdesk-setup.exe \
+            rcdesk-windows-x64.zip rcdesk-macos-arm64.zip dist/setup/rcdesk-setup.exe dist/macos-pkg/rcdesk-macos.pkg \
             --title "rcdesk $GITHUB_REF_NAME" --generate-notes

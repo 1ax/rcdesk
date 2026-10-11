@@ -73,6 +73,7 @@ jobs:
   build-host:
     needs: test
     uses: ./.github/workflows/build-host.yml
+    secrets: inherit
 
   deploy:
     needs: [build-push, build-web]

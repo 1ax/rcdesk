@@ -6,7 +6,8 @@ mouse, keyboard, clipboard and file transfer over data channels.
 
 **Status:** phase 1 (MVP) deployed at https://rcdesk.app; phase 2 in progress (Windows host works,
 including a GDI capture fallback for machines without Direct3D 11). See `ARCHITECTURE.md` for design
-and roadmap, `SLICES_LOG.md` for current state, `docs/host-windows.md` to run the host on Windows.
+and roadmap, `SLICES_LOG.md` for current state, `docs/host-windows.md` to run the host on Windows,
+`docs/host-macos.md` to install it on macOS.
 
 ## Layout
 

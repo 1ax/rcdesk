@@ -67,6 +67,8 @@ jobs:
       - uses: actions/checkout@v5
       - name: shellcheck infra/*.sh
         run: shellcheck infra/*.sh
+      - name: shellcheck installer/macos
+        run: shellcheck installer/macos/build-pkg.sh installer/macos/scripts/*
       - name: bash infra/traffic-monitor.test.sh
         run: bash infra/traffic-monitor.test.sh
       - name: bash infra/release-version-check.test.sh
