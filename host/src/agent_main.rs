@@ -43,6 +43,7 @@ mod imp {
     use rcdesk_host::device::DeviceStore;
     use rcdesk_host::platform;
     use rcdesk_host::signaling::{AgentCommand, AgentStatus, Keepalive};
+    use rcdesk_host::update_check::{self, Version};
 
     /// Menu-bar/tray icon size in pixels. macOS: tray-icon draws the image
     /// 18pt tall, so 44px stays sharp on Retina (2x). Windows: the shell
@@ -60,6 +61,11 @@ mod imp {
     /// startup (`Instant::now()` below, i.e. immediately on the first loop
     /// iteration) and then on this interval.
     const PERMISSIONS_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+    /// Первая проверка обновлений -- через столько после старта агента (4.3d).
+    const UPDATE_FIRST_CHECK_DELAY: Duration = Duration::from_secs(60);
+    /// Дальше -- раз в сутки.
+    const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
     #[derive(Parser)]
     #[command(name = "rcdesk-agent", version = rcdesk_host::build_info::FULL_VERSION, about = "rcdesk tray agent")]
@@ -181,6 +187,28 @@ mod imp {
             .await;
         });
 
+        // Фоновая проверка обновлений (4.3d): результат -- в `watch`, как статус
+        // агента; главный цикл читает его и показывает пункт меню.
+        let (update_tx, mut update_rx) = watch::channel::<Option<Version>>(None);
+        runtime.spawn(async move {
+            tokio::time::sleep(UPDATE_FIRST_CHECK_DELAY).await;
+            loop {
+                match update_check::fetch_latest().await {
+                    Ok(Some(latest)) => {
+                        tracing::info!(latest = %latest, "проверка обновлений");
+                        if latest > current_version() {
+                            let _ = update_tx.send(Some(latest));
+                        }
+                    }
+                    Ok(None) => tracing::info!("проверка обновлений: релизов нет"),
+                    Err(err) => {
+                        tracing::info!(error = %err, "проверка обновлений не удалась");
+                    }
+                }
+                tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
+            }
+        });
+
         // macOS only: bring up `NSApplication` on this (main) thread before
         // the first pump -- `tray-icon` requires the event loop already
         // running before a `TrayIcon` is built. Windows' `tray-icon` backend
@@ -241,6 +269,11 @@ mod imp {
             None,
         );
 
+        // Пункт «Доступно обновление» вставляется в меню динамически, когда фоновая
+        // проверка находит новую версию (`menu.insert` сразу после пункта версии).
+        let update_item = MenuItem::with_id("update", "", true, None);
+        let mut update_shown = false;
+
         let menu = Menu::new();
         menu.append(&version_item)
             .expect("append version menu item");
@@ -272,7 +305,7 @@ mod imp {
         let icon = Icon::from_rgba(render_icon(model.icon, ICON_SIZE), ICON_SIZE, ICON_SIZE)
             .expect("render_icon always produces a valid-sized RGBA buffer");
         let tray_icon = TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
+            .with_menu(Box::new(menu.clone()))
             .with_tooltip(&model.tooltip)
             .with_icon(icon)
             .with_icon_as_template(is_macos)
@@ -316,6 +349,7 @@ mod imp {
                         let _ = cmd_tx.send(AgentCommand::EndSession);
                     }
                     "open_log" => open_log(&log_path),
+                    "update" => open_url(update_check::DOWNLOAD_URL),
                     "autostart" => toggle_autostart(&autostart_item),
                     #[cfg(target_os = "macos")]
                     "open_screen_prefs" => open_system_settings_pane(
@@ -327,6 +361,20 @@ mod imp {
                     ),
                     "quit" => quit(cmd_tx, status_rx, runtime),
                     _ => {}
+                }
+            }
+
+            if update_rx.has_changed().unwrap_or(false) {
+                if let Some(latest) = *update_rx.borrow_and_update() {
+                    update_item.set_text(format!("Доступно обновление {latest} — скачать"));
+                    if !update_shown {
+                        match menu.insert(&update_item, 1) {
+                            Ok(()) => update_shown = true,
+                            Err(err) => {
+                                tracing::warn!(error = %err, "не удалось добавить пункт обновления");
+                            }
+                        }
+                    }
                 }
             }
 
@@ -439,6 +487,23 @@ mod imp {
             if let Err(err) = std::process::Command::new("notepad.exe").arg(path).spawn() {
                 tracing::warn!(error = %err, "failed to open the log file");
             }
+        }
+    }
+
+    /// Текущая версия агента; при непарсящейся -- `0.0.0` (уведомление не пропадёт).
+    fn current_version() -> Version {
+        update_check::parse_version(rcdesk_host::build_info::VERSION).unwrap_or(Version(0, 0, 0))
+    }
+
+    /// Открывает URL в браузере по умолчанию: `open` на macOS; на Windows --
+    /// `explorer.exe <url>` (не `cmd /c start`, который ломается на `&`/`#`).
+    fn open_url(url: &str) {
+        #[cfg(target_os = "macos")]
+        let program = "open";
+        #[cfg(target_os = "windows")]
+        let program = "explorer.exe";
+        if let Err(err) = std::process::Command::new(program).arg(url).spawn() {
+            tracing::warn!(error = %err, url, "failed to open the URL");
         }
     }
 

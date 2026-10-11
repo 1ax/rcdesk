@@ -34,3 +34,4 @@ pub mod platform;
 pub mod service;
 pub mod signaling;
 pub mod transport;
+pub mod update_check;

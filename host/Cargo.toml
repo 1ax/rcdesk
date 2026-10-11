@@ -48,6 +48,11 @@ tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 # тот же, что уже в графе.
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std", "logging"] }
 futures-util = "0.3"
+# Проверка обновлений (4.3d): ручной HEAD к github.com. Все три крейта уже в графе через
+# tokio-tungstenite; прямыми -- в тех же версиях, провайдер ring (как у rustls выше).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "0.26"
+httparse = "1"
 base64 = { workspace = true }
 opaque-ke = { workspace = true }
 argon2 = { workspace = true }
