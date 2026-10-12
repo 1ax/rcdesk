@@ -295,8 +295,13 @@ fn make_window(mtm: MainThreadMarker, screen: &NSScreen) -> Retained<NSWindow> {
     // Safety: окно живёт в `Retained` у нас; закрытие не должно делать лишний release.
     unsafe { window.setReleasedWhenClosed(false) };
     window.setTitle(&objc2_foundation::NSString::from_str(WINDOW_TITLE));
-    window.setBackgroundColor(Some(&NSColor::blackColor()));
-    window.setOpaque(true);
+    // Не `setOpaque(true)`: непрозрачное окно на весь экран macOS считает
+    // перекрывающим всё под собой (`occlusionState` без `.visible`), и
+    // приложения перестают рисоваться -- в захвате застывший рабочий стол.
+    // 99 % чёрного на глаз не отличить, а окна под шторкой остаются
+    // «видимыми» (проверено пробой 2026-10-12).
+    window.setBackgroundColor(Some(&NSColor::blackColor().colorWithAlphaComponent(0.99)));
+    window.setOpaque(false);
     window.setHasShadow(false);
     window.setIgnoresMouseEvents(true);
     window.setLevel(CGShieldingWindowLevel() as isize);
