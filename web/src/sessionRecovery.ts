@@ -111,6 +111,21 @@ export function byeOutcome(inDisconnectGrace: boolean): ByeOutcome {
   return inDisconnectGrace ? "session-lost" : "teardown";
 }
 
+/** Slice 4.6b: how a `bye` that carries a `reason` ends the session.
+ * - `"final"` + `text`: a final `teardown(text)` with the host's reason --
+ *   no auto-recovery and no further attempts, even if one is in flight
+ *   (retrying can't help: the host's display is asleep/unplugged).
+ * - `"by-grace"`: no reason (or an unknown one from a newer host) -- the
+ *   `byeOutcome` rules above apply, unchanged. */
+export type ByeReasonOutcome = { kind: "final"; text: string } | { kind: "by-grace" };
+
+export function byeReasonOutcome(reason: string | null | undefined): ByeReasonOutcome {
+  if (reason === "display_unavailable") {
+    return { kind: "final", text: "Экран хоста недоступен: дисплей спит или отключён" };
+  }
+  return { kind: "by-grace" };
+}
+
 /** The banner text for `phase`, or `null` for `"streaming"` (hide it). */
 export function connectionBannerLabel(phase: ConnectionBannerPhase): string | null {
   switch (phase.kind) {

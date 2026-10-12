@@ -73,6 +73,7 @@ import {
 import { reconnectBackoffMs } from "./reconnectBackoff";
 import {
   byeOutcome,
+  byeReasonOutcome,
   connectionBannerLabel,
   connectionStateOutcome,
   DISCONNECT_GRACE_MS,
@@ -1910,6 +1911,17 @@ export function mount(root: Element | null): void {
     // `server/src/ws.rs`, but an explicit `bye` can still race a reconnect).
     // Tearing down whatever session *is* now running would be wrong.
     if (msg.session_id !== sessionId) return;
+    // Slice 4.6b: the host says why it ended the session (its display is
+    // unavailable) -- a final end with that text, never an auto-recovery.
+    // In a recovery run `joined` for the new session has already reset
+    // `recovering`/`recoveryAttempt` and set `sessionId`, so this `bye`
+    // matches the check above and `teardown` also clears any leftover timer.
+    const byReason = byeReasonOutcome(msg.reason);
+    if (byReason.kind === "final") {
+      setSessionStatus("disconnected");
+      teardown(byReason.text);
+      return;
+    }
     // Slice 3.2a/D35: a `bye` arriving while this end is itself sitting in
     // its own `DISCONNECT_GRACE_MS` window is the host's side of the same
     // race giving up first (its `DisconnectTimeout`/`Failed`/`Closed` now

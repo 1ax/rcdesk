@@ -28,6 +28,15 @@ pub struct IceServer {
     pub credential: Option<String>,
 }
 
+/// Причина, по которой хост завершил сеанс `Bye` (слайс 4.6b).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ByeReason {
+    /// Экран хоста недоступен: дисплей спит или отключён, захватывать нечего.
+    DisplayUnavailable,
+}
+
 /// Постоянные креды устройства (слайс 3.1): сервер выдаёт их при первой
 /// регистрации, хост сохраняет у себя и предъявляет при каждой следующей,
 /// получая тот же `host_id` вместо нового случайного.
@@ -150,8 +159,15 @@ pub enum SignalMessage {
         session_id: String,
         candidate: IceCandidate,
     },
-    /// either side; server forwards to the other and closes the session
-    Bye { session_id: String },
+    /// either side; server forwards to the other and closes the session.
+    /// `reason` (slice 4.6b) tells the peer why the host ended the session;
+    /// `None` is the plain end and is omitted from the JSON, so older sides
+    /// without the field keep working in both directions.
+    Bye {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<ByeReason>,
+    },
     /// client -> server, необязательное сообщение сразу после `Hello`:
     /// `token` — сохранённый браузером токен владельца, если он есть.
     ClientAuth {
@@ -232,6 +248,35 @@ mod tests {
 
         let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, hello);
+    }
+
+    /// Slice 4.6b: `Bye` without `reason` keeps the old wire form.
+    #[test]
+    fn bye_without_reason_omits_field_and_parses_old_form() {
+        let bye = SignalMessage::Bye {
+            session_id: "x".to_string(),
+            reason: None,
+        };
+        let json = serde_json::to_string(&bye).expect("serialize");
+        assert_eq!(json, r#"{"type":"bye","session_id":"x"}"#);
+        let parsed: SignalMessage =
+            serde_json::from_str(r#"{"type":"bye","session_id":"x"}"#).expect("deserialize");
+        assert_eq!(parsed, bye);
+    }
+
+    #[test]
+    fn bye_with_reason_round_trips_through_json() {
+        let bye = SignalMessage::Bye {
+            session_id: "x".to_string(),
+            reason: Some(ByeReason::DisplayUnavailable),
+        };
+        let json = serde_json::to_string(&bye).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"bye","session_id":"x","reason":"display_unavailable"}"#
+        );
+        let parsed: SignalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, bye);
     }
 
     #[test]

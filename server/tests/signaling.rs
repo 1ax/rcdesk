@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use proto::signal::{DeviceCredentials, IceCandidate, Role, SignalMessage};
+use proto::signal::{ByeReason, DeviceCredentials, IceCandidate, Role, SignalMessage};
 use rcdesk_server::app::app;
 use rcdesk_server::db::Db;
 use rcdesk_server::ice::IceConfig;
@@ -237,6 +237,46 @@ async fn client_join_succeeds_and_host_is_notified() {
 }
 
 // (c) Offer/Answer/Ice are forwarded between the two sides of a session.
+/// Slice 4.6b: `Bye.reason` from the host reaches the client as is, and a
+/// reasonless `Bye` from the client reaches the host without one.
+#[tokio::test]
+async fn bye_reason_is_forwarded_as_is() {
+    let url = spawn_server().await;
+    let (mut host, mut client, session_id, _pin) = host_and_joined_client(&url).await;
+    send(
+        &mut host,
+        &SignalMessage::Bye {
+            session_id: session_id.clone(),
+            reason: Some(ByeReason::DisplayUnavailable),
+        },
+    )
+    .await;
+    match recv(&mut client).await {
+        SignalMessage::Bye {
+            session_id: sid,
+            reason,
+        } => {
+            assert_eq!(sid, session_id);
+            assert_eq!(reason, Some(ByeReason::DisplayUnavailable));
+        }
+        other => panic!("expected bye, got {other:?}"),
+    }
+
+    let (mut host, mut client, session_id, _pin) = host_and_joined_client(&url).await;
+    send(
+        &mut client,
+        &SignalMessage::Bye {
+            session_id: session_id.clone(),
+            reason: None,
+        },
+    )
+    .await;
+    match recv(&mut host).await {
+        SignalMessage::Bye { reason, .. } => assert_eq!(reason, None),
+        other => panic!("expected bye, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn offer_answer_and_ice_are_forwarded_between_session_peers() {
     let url = spawn_server().await;
@@ -849,11 +889,14 @@ async fn connect_device_starts_a_session_for_a_linked_device() {
         &mut linking_client,
         &SignalMessage::Bye {
             session_id: session_id.clone(),
+            reason: None,
         },
     )
     .await;
     match recv(&mut host).await {
-        SignalMessage::Bye { session_id: sid } => assert_eq!(sid, session_id),
+        SignalMessage::Bye {
+            session_id: sid, ..
+        } => assert_eq!(sid, session_id),
         other => panic!("expected bye, got {other:?}"),
     }
     drop(linking_client);
@@ -1087,6 +1130,7 @@ async fn bye_for_unknown_session_from_host_or_client_is_a_silent_no_op() {
         &mut host,
         &SignalMessage::Bye {
             session_id: "no-such-session".to_string(),
+            reason: None,
         },
     )
     .await;
@@ -1098,6 +1142,7 @@ async fn bye_for_unknown_session_from_host_or_client_is_a_silent_no_op() {
         &mut client,
         &SignalMessage::Bye {
             session_id: "no-such-session".to_string(),
+            reason: None,
         },
     )
     .await;
@@ -1154,7 +1199,14 @@ async fn host_reconnect_with_live_session_id_marks_device_busy_until_bye() {
         SignalMessage::PeerJoined { .. } => {}
         other => panic!("expected peer_joined, got {other:?}"),
     }
-    send(&mut owner, &SignalMessage::Bye { session_id }).await;
+    send(
+        &mut owner,
+        &SignalMessage::Bye {
+            session_id,
+            reason: None,
+        },
+    )
+    .await;
     match recv(&mut host).await {
         SignalMessage::Bye { .. } => {}
         other => panic!("expected bye, got {other:?}"),
@@ -1211,6 +1263,7 @@ async fn host_reconnect_with_live_session_id_marks_device_busy_until_bye() {
         &mut host2,
         &SignalMessage::Bye {
             session_id: "s-live".to_string(),
+            reason: None,
         },
     )
     .await;

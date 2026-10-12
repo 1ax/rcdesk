@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   byeOutcome,
+  byeReasonOutcome,
   connectionBannerLabel,
   connectionStateOutcome,
   MAX_RECOVERY_ATTEMPTS,
@@ -109,5 +110,20 @@ describe("connectionBannerLabel", () => {
 
   it("is hidden (null) once streaming", () => {
     expect(connectionBannerLabel({ kind: "streaming" })).toBeNull();
+  });
+});
+
+describe("byeReasonOutcome", () => {
+  it("ends the session finally with the display text for display_unavailable", () => {
+    expect(byeReasonOutcome("display_unavailable")).toEqual({
+      kind: "final",
+      text: "Экран хоста недоступен: дисплей спит или отключён",
+    });
+  });
+
+  it("falls back to the grace rules without a reason or with an unknown one", () => {
+    expect(byeReasonOutcome(undefined)).toEqual({ kind: "by-grace" });
+    expect(byeReasonOutcome(null)).toEqual({ kind: "by-grace" });
+    expect(byeReasonOutcome("something_new")).toEqual({ kind: "by-grace" });
   });
 });

@@ -1306,7 +1306,10 @@ async fn handle_signal_message(
                         });
                     }
                     *current_session_id = None;
-                    let _ = out_tx.send(SignalMessage::Bye { session_id });
+                    let _ = out_tx.send(SignalMessage::Bye {
+                        session_id,
+                        reason: None,
+                    });
                     return;
                 }
             }
@@ -1493,7 +1496,7 @@ async fn handle_signal_message(
                 }
             }
         }
-        SignalMessage::Bye { session_id } => {
+        SignalMessage::Bye { session_id, .. } => {
             if current_session_id.as_deref() == Some(session_id.as_str()) {
                 tracing::info!(%session_id, "session ended by peer");
                 if let Some(old) = active.take() {
@@ -1569,7 +1572,10 @@ async fn begin_session(
                                 task.abort();
                             }
                             parts.files_task.abort();
-                            let _ = out_tx.send(SignalMessage::Bye { session_id });
+                            let _ = out_tx.send(SignalMessage::Bye {
+                                session_id,
+                                reason: None,
+                            });
                             return;
                         }
                     },
@@ -1615,12 +1621,15 @@ async fn begin_session(
                 if let Some(task) = parts.elevation_task {
                     task.abort();
                 }
-                let _ = out_tx.send(SignalMessage::Bye { session_id });
+                let _ = out_tx.send(SignalMessage::Bye {
+                    session_id,
+                    reason: None,
+                });
             }
         },
         Err(err) => {
             tracing::warn!(?err, "failed to start session pipeline");
-            let _ = out_tx.send(SignalMessage::Bye { session_id });
+            let _ = out_tx.send(bye_for_start_error(session_id, &err));
         }
     }
 }
@@ -1658,6 +1667,7 @@ async fn handle_agent_command(
                 tracing::info!(session_id = %pending.session_id, "ending pending auth (End session command)");
                 let _ = out_tx.send(SignalMessage::Bye {
                     session_id: pending.session_id,
+                    reason: None,
                 });
                 return;
             };
@@ -1665,7 +1675,10 @@ async fn handle_agent_command(
             tracing::info!(?session_id, "ending session (End session command)");
             old.shutdown().await;
             if let Some(session_id) = session_id {
-                let _ = out_tx.send(SignalMessage::Bye { session_id });
+                let _ = out_tx.send(SignalMessage::Bye {
+                    session_id,
+                    reason: None,
+                });
             }
             let _ = status.send(AgentStatus::Registered {
                 pin: pin.to_string(),
@@ -1765,7 +1778,10 @@ async fn handle_session_event(
                 // `EndSession` command -- tell the server so it doesn't keep
                 // the device marked busy for a session that's actually over.
                 if let Some(session_id) = current_session_id.take() {
-                    let _ = out_tx.send(SignalMessage::Bye { session_id });
+                    let _ = out_tx.send(SignalMessage::Bye {
+                        session_id,
+                        reason: None,
+                    });
                 }
             }
         }
@@ -1788,7 +1804,10 @@ async fn handle_session_event(
                 // Slice 3.2a/D35: same reasoning as `Failed`/`Closed` above
                 // -- the session ended locally, tell the server.
                 if let Some(session_id) = current_session_id.take() {
-                    let _ = out_tx.send(SignalMessage::Bye { session_id });
+                    let _ = out_tx.send(SignalMessage::Bye {
+                        session_id,
+                        reason: None,
+                    });
                 }
             } else {
                 tracing::debug!(%session_id, generation, "stale disconnect timeout, ignoring");
@@ -1806,7 +1825,10 @@ async fn handle_session_event(
             if matches_pending {
                 tracing::info!(%session_id, "auth wait timed out, ending pending session");
                 *pending_auth = None;
-                let _ = out_tx.send(SignalMessage::Bye { session_id });
+                let _ = out_tx.send(SignalMessage::Bye {
+                    session_id,
+                    reason: None,
+                });
             } else {
                 tracing::debug!(%session_id, generation, "stale auth timeout, ignoring");
             }
@@ -1833,7 +1855,10 @@ async fn handle_session_event(
                 // Slice 3.2a/D35: same reasoning as `Failed`/`Closed` above
                 // -- the session ended locally, tell the server.
                 if let Some(session_id) = current_session_id.take() {
-                    let _ = out_tx.send(SignalMessage::Bye { session_id });
+                    let _ = out_tx.send(SignalMessage::Bye {
+                        session_id,
+                        reason: None,
+                    });
                 }
             } else {
                 // Fix to slice 3.5b: same reasoning as `ConnectionState`'s
@@ -2312,6 +2337,23 @@ fn spawn_elevation_watcher(peer: Arc<PeerSession>) -> tokio::task::JoinHandle<()
 const DISPLAY_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const DISPLAY_WAIT_STEP: Duration = Duration::from_millis(250);
 
+/// Дисплей хоста недоступен: список пуст или нужного id нет даже после
+/// пробуждения и ожидания (слайс 4.6b). Типизирована, чтобы
+/// `begin_session` отличил её от прочих сбоев и сообщил клиенту причину
+/// (`ByeReason::DisplayUnavailable`).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct DisplayUnavailable(String);
+
+/// `Bye` для сеанса, который не удалось поднять: с причиной, если дело в
+/// недоступном дисплее, иначе без неё.
+fn bye_for_start_error(session_id: String, err: &anyhow::Error) -> SignalMessage {
+    let reason = err
+        .downcast_ref::<DisplayUnavailable>()
+        .map(|_| proto::signal::ByeReason::DisplayUnavailable);
+    SignalMessage::Bye { session_id, reason }
+}
+
 /// Повторяет `attempt` с шагом `step`, пока он не вернёт `Ok` или не
 /// истечёт `timeout`; после таймаута возвращает последнюю ошибку. Первая
 /// удачная попытка -- без задержки. Если пришлось ждать, пишет `info`.
@@ -2355,6 +2397,17 @@ async fn start_session(
     registered_ice_servers: &[proto::signal::IceServer],
     events: mpsc::Sender<SessionEvent>,
 ) -> anyhow::Result<SessionParts> {
+    start_session_with_display_wait(ctx, registered_ice_servers, events, DISPLAY_WAIT_TIMEOUT).await
+}
+
+/// `start_session` с явным таймаутом ожидания дисплея (в тестах -- крошечным,
+/// в бою -- `DISPLAY_WAIT_TIMEOUT`).
+async fn start_session_with_display_wait(
+    ctx: &HostContext,
+    registered_ice_servers: &[proto::signal::IceServer],
+    events: mpsc::Sender<SessionEvent>,
+    display_wait_timeout: Duration,
+) -> anyhow::Result<SessionParts> {
     // Слайс 4.6a: будим дисплей и ждём, пока он появится в списке; guard
     // отпускаем сразу после выбора -- дальше его держит `SessionActivity`.
     let wake_guard = (ctx.wake_display)();
@@ -2366,14 +2419,20 @@ async fn start_session(
                     .iter()
                     .find(|d| d.id == id)
                     .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("display {id} not found"))?,
+                    .ok_or_else(|| {
+                        anyhow::Error::new(DisplayUnavailable(format!("display {id} not found")))
+                    })?,
                 None => capture::default_display(&displays)
                     .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("no capturable display found"))?,
+                    .ok_or_else(|| {
+                        anyhow::Error::new(DisplayUnavailable(
+                            "no capturable display found".to_string(),
+                        ))
+                    })?,
             };
             Ok((displays, chosen))
         },
-        DISPLAY_WAIT_TIMEOUT,
+        display_wait_timeout,
         DISPLAY_WAIT_STEP,
     )
     .await?;
@@ -3148,6 +3207,38 @@ mod tests {
         }
     }
 
+    /// Slice 4.6b: no capturable display -> `start_session` fails with the
+    /// typed error and the resulting `Bye` carries `DisplayUnavailable`;
+    /// any other failure stays a plain `Bye`. The wait timeout is shrunk via
+    /// `start_session_with_display_wait` so the test doesn't sit out 5 s.
+    #[tokio::test]
+    async fn empty_display_list_yields_bye_with_display_unavailable() {
+        let mut ctx = test_ctx();
+        ctx.list_displays = Box::new(|| Ok(Vec::new()));
+        let (events_tx, _events_rx) = mpsc::channel(64);
+
+        let err = start_session_with_display_wait(&ctx, &[], events_tx, Duration::from_millis(30))
+            .await
+            .err()
+            .expect("no display must fail the start");
+
+        assert_eq!(
+            bye_for_start_error("sess-1".to_string(), &err),
+            SignalMessage::Bye {
+                session_id: "sess-1".to_string(),
+                reason: Some(proto::signal::ByeReason::DisplayUnavailable),
+            }
+        );
+        let other = anyhow::anyhow!("synthetic source failure");
+        assert_eq!(
+            bye_for_start_error("sess-1".to_string(), &other),
+            SignalMessage::Bye {
+                session_id: "sess-1".to_string(),
+                reason: None,
+            }
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn peer_joined_sends_bye_when_session_start_fails() {
         let mut ctx = test_ctx();
@@ -3182,7 +3273,8 @@ mod tests {
         assert_eq!(
             out_rx.try_recv().expect("expected a Bye message"),
             SignalMessage::Bye {
-                session_id: "sess-1".to_string()
+                session_id: "sess-1".to_string(),
+                reason: None,
             }
         );
     }
@@ -3569,7 +3661,8 @@ mod tests {
         assert_eq!(
             out_rx.try_recv().expect("expected bye"),
             SignalMessage::Bye {
-                session_id: "sess-1".to_string()
+                session_id: "sess-1".to_string(),
+                reason: None,
             }
         );
         assert!(active.is_none(), "session must have been ended");
@@ -4194,6 +4287,7 @@ mod tests {
         handle_signal_message(
             SignalMessage::Bye {
                 session_id: "sess-1".to_string(),
+                reason: None,
             },
             &ctx,
             &[],
@@ -4288,7 +4382,8 @@ mod tests {
         assert_eq!(
             out_rx.try_recv().unwrap(),
             SignalMessage::Bye {
-                session_id: "sess-1".to_string()
+                session_id: "sess-1".to_string(),
+                reason: None,
             }
         );
     }
@@ -4739,7 +4834,8 @@ mod tests {
         assert_eq!(
             out_rx.try_recv().expect("expected a Bye message"),
             SignalMessage::Bye {
-                session_id: "sess-1".to_string()
+                session_id: "sess-1".to_string(),
+                reason: None,
             }
         );
         assert_eq!(
@@ -4837,7 +4933,8 @@ mod tests {
         assert_eq!(
             out_rx.try_recv().expect("expected a Bye message"),
             SignalMessage::Bye {
-                session_id: "sess-1".to_string()
+                session_id: "sess-1".to_string(),
+                reason: None,
             }
         );
         assert!(
@@ -5287,7 +5384,8 @@ mod tests {
         assert_eq!(
             out_rx.try_recv().expect("expected a Bye message"),
             SignalMessage::Bye {
-                session_id: "sess-1".to_string()
+                session_id: "sess-1".to_string(),
+                reason: None,
             }
         );
     }
@@ -5623,7 +5721,8 @@ mod tests {
         assert_eq!(
             out_rx.try_recv().expect("expected a Bye message"),
             SignalMessage::Bye {
-                session_id: "sess-1".to_string()
+                session_id: "sess-1".to_string(),
+                reason: None,
             }
         );
 

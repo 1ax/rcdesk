@@ -349,11 +349,11 @@ async fn run_host(
                     });
                 }
             },
-            SignalMessage::Bye { session_id } => {
+            SignalMessage::Bye { session_id, reason } => {
                 match registry.close_session_by_host(&host_id, &session_id) {
                     Some(Some(client_tx)) => {
                         tracing::info!(%session_id, "host ended session");
-                        let _ = client_tx.send(SignalMessage::Bye { session_id });
+                        let _ = client_tx.send(SignalMessage::Bye { session_id, reason });
                     }
                     Some(None) => {
                         // Slice 3.2a (D35): a "detached" session -- reported
@@ -727,11 +727,11 @@ async fn run_client(
                     });
                 }
             },
-            SignalMessage::Bye { session_id } => {
+            SignalMessage::Bye { session_id, reason } => {
                 match registry.close_session_by_client(&session_id, &tx) {
                     Some(host_tx) => {
                         tracing::info!(%session_id, "client ended session");
-                        let _ = host_tx.send(SignalMessage::Bye { session_id });
+                        let _ = host_tx.send(SignalMessage::Bye { session_id, reason });
                     }
                     None => {
                         // Unknown to the server -- most likely a stale
