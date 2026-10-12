@@ -13,6 +13,7 @@ import type { InputMessage } from "./generated/InputMessage";
 import type { PointerButton } from "./generated/PointerButton";
 import { isCopyShortcut, isPasteShortcut } from "./clipboard";
 import { remapCode } from "./keyRemap";
+import { createLayoutChord } from "./layoutChord";
 
 /** The two data channels `attachInput` needs, opened by the host and handed
  * to the client via `PeerSession`'s `onDataChannel` callback (see
@@ -213,7 +214,11 @@ export function attachInput(
   // reads the current value at the moment it fires, rather than capturing
   // whatever was true when `attachInput` was called.
   getCmdAsCtrl?: () => boolean,
+  // Slice 4.6d: called when the Alt+Shift chord completes (see
+  // `layoutChord.ts`). Key forwarding to the host is unchanged.
+  onLayoutChord?: () => void,
 ): () => void {
+  const layoutChord = createLayoutChord();
   let rafHandle: number | null = null;
   let pendingMove: { x: number; y: number } | null = null;
   const keyGate = new KeyMessageGate();
@@ -302,6 +307,7 @@ export function attachInput(
 
     if (isCopyShortcut(e)) hooks?.onCopyShortcut?.();
 
+    layoutChord.keyDown(e.code); // idempotent for auto-repeat
     if (msg) sendGatedInput(msg);
   }
 
@@ -309,9 +315,11 @@ export function attachInput(
     e.preventDefault();
     const msg = keyToMessage(e.code, false, e.repeat, getCmdAsCtrl?.());
     if (msg) sendGatedInput(msg);
+    if (layoutChord.keyUp(e.code)) onLayoutChord?.();
   }
 
   function releaseAll(): void {
+    layoutChord.reset();
     sendGatedInput({ type: "release_all" });
   }
 

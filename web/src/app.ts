@@ -340,6 +340,14 @@ export function mount(root: Element | null): void {
           >
             Шторка
           </button>
+          <button
+            id="layout-btn"
+            class="btn btn-secondary layout-btn"
+            title="Раскладка на удалённом компьютере — нажмите или Alt+Shift"
+            hidden
+          >
+            Яз
+          </button>
           <button id="fullscreen-btn" class="btn btn-secondary" hidden>На весь экран</button>
           <button id="disconnect-btn" class="btn btn-secondary">Отключиться</button>
           <button
@@ -483,6 +491,26 @@ export function mount(root: Element | null): void {
     dc.send(JSON.stringify(msg));
     curtain = state;
     renderCurtain();
+  });
+  // Slice 4.6d: remote keyboard layout indicator/switch (macOS host only).
+  const layoutBtn = root.querySelector<HTMLButtonElement>("#layout-btn")!;
+  const LAYOUT_DEFAULT_LABEL = "Яз";
+  let inputSourceAvailable = false;
+  function renderLayoutBtn(label: string | null): void {
+    layoutBtn.hidden = !inputSourceAvailable;
+    layoutBtn.textContent = label ?? LAYOUT_DEFAULT_LABEL;
+  }
+  function sendSwitchInputSource(): void {
+    const dc = controlChannel;
+    if (!dc || dc.readyState !== "open") return;
+    const msg: ControlMessage = { type: "switch_input_source" };
+    dc.send(JSON.stringify(msg));
+  }
+  layoutBtn.addEventListener("click", () => {
+    sendSwitchInputSource();
+    // The button is clicked mid-typing: give the keyboard back to the video
+    // so the next keys reach the host (and Space/Enter don't re-press it).
+    video.focus();
   });
   // `document.fullscreenEnabled` doesn't change over a tab's lifetime, so
   // this is decided once, here, rather than on every render (slice 3.5c).
@@ -1018,6 +1046,11 @@ export function mount(root: Element | null): void {
       // (see the checkbox's `change` listener below) is picked up by every
       // keydown/keyup without re-attaching.
       () => cmdAsCtrl,
+      // Slice 4.6d: Alt+Shift on the client switches the Mac host's layout
+      // (a Windows host handles the forwarded Alt+Shift itself).
+      () => {
+        if (hostOs === "macos" && inputSourceAvailable) sendSwitchInputSource();
+      },
     );
   }
 
@@ -1122,6 +1155,12 @@ export function mount(root: Element | null): void {
         updateFileUi();
         curtain = curtainOnHostInfo(curtain, msg.curtain_available);
         renderCurtain();
+        inputSourceAvailable = msg.input_source_available;
+        renderLayoutBtn(null);
+        return;
+      }
+      if (msg.type === "input_source") {
+        renderLayoutBtn(msg.label);
         return;
       }
       if (msg.type === "curtain_status") {
@@ -1418,6 +1457,8 @@ export function mount(root: Element | null): void {
     updateCmdAsCtrlVisibility();
     curtain = initialCurtainState();
     renderCurtain();
+    inputSourceAvailable = false;
+    renderLayoutBtn(null);
     if (fileSender) {
       fileSender.cancelAll();
       fileSender.dispose();
