@@ -101,3 +101,13 @@ export function saveOwnerToken(storage: Pick<Storage, "setItem">, token: string)
     // survive a reload; the user falls back to entering a PIN.
   }
 }
+
+/** Removes the saved owner token (sign-out, revoked browser), silently doing
+ * nothing if `storage` throws. */
+export function clearOwnerToken(storage: Pick<Storage, "removeItem">): void {
+  try {
+    storage.removeItem(OWNER_TOKEN_KEY);
+  } catch {
+    // Ignored: same reasoning as `saveOwnerToken`.
+  }
+}

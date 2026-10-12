@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   canConnect,
+  clearOwnerToken,
   deviceLabel,
   deviceStatusLabel,
   formatLastSeen,
@@ -183,5 +184,26 @@ describe("loadOwnerToken / saveOwnerToken", () => {
       },
     };
     expect(() => saveOwnerToken(storage, "tok-123")).not.toThrow();
+  });
+});
+
+describe("clearOwnerToken", () => {
+  it("removes the saved token and survives a throwing storage", () => {
+    const store = new Map<string, string>();
+    const storage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => void store.set(k, v),
+      removeItem: (k: string) => void store.delete(k),
+    };
+    saveOwnerToken(storage, "tok");
+    clearOwnerToken(storage);
+    expect(loadOwnerToken(storage)).toBeNull();
+    expect(() =>
+      clearOwnerToken({
+        removeItem: () => {
+          throw new Error("denied");
+        },
+      }),
+    ).not.toThrow();
   });
 });

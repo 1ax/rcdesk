@@ -209,12 +209,14 @@ body {
   opacity: 0.4;
 }
 
-.device-forget {
+.device-forget,
+.account-danger {
   color: var(--danger);
   background: transparent;
 }
 
-.device-forget:hover:not(:disabled) {
+.device-forget:hover:not(:disabled),
+.account-danger:hover:not(:disabled) {
   background: rgb(224 85 79 / 15%);
 }
 
@@ -660,4 +662,54 @@ body {
    via the `hidden` attribute, so make it win. */
 [hidden] {
   display: none !important;
+}
+
+/* Slice 3.7c: account row on the first screen and the account cabinet. */
+.account {
+  margin: 0 0 20px;
+  text-align: center;
+}
+
+.account .btn {
+  margin-top: 0;
+}
+
+.link-btn {
+  margin-top: 10px;
+  padding: 4px 8px;
+  font-size: 13px;
+  background: none;
+  border: none;
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.link-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.account-card {
+  max-width: 400px;
+}
+
+.account-card .devices {
+  margin-bottom: 20px;
+}
+
+.account-card .device-list + .btn {
+  margin-top: 12px;
+}
+
+.account-card .device-actions {
+  justify-content: flex-end;
+}
+
+.account-danger-btn {
+  color: var(--danger);
+}
+
+.account-status {
+  overflow-wrap: anywhere;
 }

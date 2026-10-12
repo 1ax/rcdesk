@@ -45,7 +45,21 @@ import {
   initialCurtainState,
 } from "./curtain";
 import {
+  accountRowMode,
+  assertionToServer,
+  browserRowText,
+  creationOptionsFromServer,
+  isCancelError,
+  isRevokedTokenError,
+  type PasskeyFlow,
+  passkeyFailText,
+  passkeyRowText,
+  registrationToServer,
+  requestOptionsFromServer,
+} from "./passkey";
+import {
   canConnect,
+  clearOwnerToken,
   deviceLabel,
   deviceStatusLabel,
   loadOwnerToken,
@@ -93,6 +107,8 @@ import type { AuthPhase } from "./hostAuth";
 import { authTag, decodeBase64Url, fingerprintFromSdp, verifyAuthTag } from "./dtlsBind";
 import type { ControlMessage } from "./generated/ControlMessage";
 import type { DisplayEntry } from "./generated/DisplayEntry";
+import type { BrowserEntry } from "./generated/BrowserEntry";
+import type { PasskeyEntry } from "./generated/PasskeyEntry";
 import type { DeviceEntry } from "./generated/DeviceEntry";
 import type { HostOs } from "./generated/HostOs";
 import type { InputMessage } from "./generated/InputMessage";
@@ -277,8 +293,17 @@ export function mount(root: Element | null): void {
   root.innerHTML = `
     <div class="build-badge" id="build-badge"></div>
     <div class="pin-screen" id="pin-screen">
-      <div class="card">
+      <div class="card" id="main-card">
         <h1>rcdesk</h1>
+        <div class="account" id="account" hidden>
+          <div id="account-guest" hidden>
+            <button id="passkey-login-btn" class="btn btn-secondary">Войти с passkey</button>
+            <button id="passkey-save-btn" class="link-btn">Сохранить список в аккаунт</button>
+            <p class="hint">Тогда список компьютеров откроется в любом браузере</p>
+          </div>
+          <button id="account-open-btn" class="btn btn-secondary" hidden>Аккаунт</button>
+          <p id="account-status" class="hint account-status"></p>
+        </div>
         <div class="devices" id="devices" hidden>
           <h2>Мои компьютеры</h2>
           <ul class="device-list" id="device-list"></ul>
@@ -296,6 +321,22 @@ export function mount(root: Element | null): void {
         />
         <button id="connect-btn" class="btn">Подключиться</button>
         <p id="pin-status" class="hint"></p>${downloadBlockHtml()}
+      </div>
+      <div class="card account-card" id="account-card" hidden>
+        <h1>Аккаунт</h1>
+        <div class="devices">
+          <h2>Passkey</h2>
+          <ul class="device-list" id="passkey-list"></ul>
+          <button id="passkey-add-btn" class="btn btn-secondary">Добавить passkey</button>
+        </div>
+        <div class="devices">
+          <h2>Браузеры</h2>
+          <ul class="device-list" id="browser-list"></ul>
+        </div>
+        <button id="sign-out-btn" class="btn btn-secondary account-danger-btn">Выйти</button>
+        <p id="sign-out-hint" class="hint"></p>
+        <p id="account-card-status" class="hint account-status"></p>
+        <button id="account-back-btn" class="btn btn-secondary">Назад</button>
       </div>
     </div>
     <div class="session-screen" id="session-screen" hidden>
@@ -517,6 +558,21 @@ export function mount(root: Element | null): void {
   // this is decided once, here, rather than on every render (slice 3.5c).
   fullscreenBtn.hidden = !isFullscreenSupported(document);
   const devicesEl = root.querySelector<HTMLDivElement>("#devices")!;
+  const mainCard = root.querySelector<HTMLDivElement>("#main-card")!;
+  const accountEl = root.querySelector<HTMLDivElement>("#account")!;
+  const accountGuestEl = root.querySelector<HTMLDivElement>("#account-guest")!;
+  const accountOpenBtn = root.querySelector<HTMLButtonElement>("#account-open-btn")!;
+  const accountStatusEl = root.querySelector<HTMLParagraphElement>("#account-status")!;
+  const passkeyLoginBtn = root.querySelector<HTMLButtonElement>("#passkey-login-btn")!;
+  const passkeySaveBtn = root.querySelector<HTMLButtonElement>("#passkey-save-btn")!;
+  const accountCard = root.querySelector<HTMLDivElement>("#account-card")!;
+  const passkeyListEl = root.querySelector<HTMLUListElement>("#passkey-list")!;
+  const passkeyAddBtn = root.querySelector<HTMLButtonElement>("#passkey-add-btn")!;
+  const browserListEl = root.querySelector<HTMLUListElement>("#browser-list")!;
+  const signOutBtn = root.querySelector<HTMLButtonElement>("#sign-out-btn")!;
+  const signOutHintEl = root.querySelector<HTMLParagraphElement>("#sign-out-hint")!;
+  const accountCardStatusEl = root.querySelector<HTMLParagraphElement>("#account-card-status")!;
+  const accountBackBtn = root.querySelector<HTMLButtonElement>("#account-back-btn")!;
   const deviceListEl = root.querySelector<HTMLUListElement>("#device-list")!;
   // Slice 3.2d: the OPAQUE-login dialog, shown between `auth_required` and
   // either a successful `pake_finish` (the host then sends `offer`, see that
@@ -634,6 +690,21 @@ export function mount(root: Element | null): void {
   // second click to confirm (see the document-level `click` listener below,
   // which resets this when the user clicks anything else).
   let confirmingForgetId: string | null = null;
+  // Slice 3.7c: the owner's passkeys (`null` until `passkeys` answers the
+  // `list_passkeys` sent after every `authenticated`) and browsers (cabinet).
+  let passkeys: PasskeyEntry[] | null = null;
+  let browsers: BrowserEntry[] = [];
+  // The passkey flow in progress (between the button press and the final
+  // `passkeys`/`authenticated`/error), or `null`; buttons are disabled while set.
+  let passkeyFlow: PasskeyFlow | null = null;
+  // Cabinet two-click confirmation key (`passkey:<id>`, `browser:<id>`,
+  // `sign-out`), reset by the document click listener like `confirmingForgetId`.
+  let confirmingAccountKey: string | null = null;
+  const passkeySupported =
+    typeof window !== "undefined" &&
+    typeof window.PublicKeyCredential !== "undefined" &&
+    typeof navigator !== "undefined" &&
+    !!navigator.credentials;
   // Set once the signaling socket itself closes (not just a session ending)
   // -- disables every connect affordance until `scheduleReconnect`'s next
   // attempt succeeds (slice 3.5a; the live WebRTC session, if any, is
@@ -984,6 +1055,237 @@ export function mount(root: Element | null): void {
     renderDeviceList();
   });
 
+  // ---- Slice 3.7c: account row, cabinet, passkey flows ----
+
+  function setAccountMessage(text: string): void {
+    accountStatusEl.textContent = text;
+    accountCardStatusEl.textContent = text;
+  }
+
+  /** Shows the first-screen account row for the current `passkeys`. */
+  function renderAccountRow(): void {
+    const mode = accountRowMode(passkeySupported, passkeys);
+    accountEl.hidden = mode === "hidden";
+    accountGuestEl.hidden = mode !== "guest";
+    accountOpenBtn.hidden = mode !== "account";
+    const busy = passkeyFlow !== null || connectionLost;
+    passkeyLoginBtn.disabled = busy;
+    passkeySaveBtn.disabled = busy;
+    passkeyAddBtn.disabled = busy;
+  }
+
+  function accountRowEl(
+    title: string,
+    status: string,
+    button: HTMLButtonElement | null,
+  ): HTMLLIElement {
+    const li = document.createElement("li");
+    li.className = "device-item";
+    const info = document.createElement("div");
+    info.className = "device-info";
+    const nameEl = document.createElement("span");
+    nameEl.className = "device-name";
+    nameEl.textContent = title;
+    const statusEl = document.createElement("span");
+    statusEl.className = "device-status";
+    statusEl.textContent = status;
+    info.appendChild(nameEl);
+    info.appendChild(statusEl);
+    li.appendChild(info);
+    if (button) {
+      const actions = document.createElement("div");
+      actions.className = "device-actions";
+      actions.appendChild(button);
+      li.appendChild(actions);
+    }
+    return li;
+  }
+
+  /** A "Удалить"-style button that needs a second click ("Точно?"). */
+  function confirmButton(
+    key: string,
+    label: string,
+    onConfirm: () => void,
+  ): HTMLButtonElement {
+    const btn = document.createElement("button");
+    btn.className = "btn-secondary account-danger";
+    btn.dataset.confirmKey = key;
+    btn.textContent = confirmingAccountKey === key ? "Точно?" : label;
+    btn.addEventListener("click", () => {
+      if (confirmingAccountKey === key) {
+        confirmingAccountKey = null;
+        onConfirm();
+      } else {
+        confirmingAccountKey = key;
+      }
+      renderAccount();
+    });
+    return btn;
+  }
+
+  /** Rebuilds the cabinet lists and the sign-out button. */
+  function renderAccount(): void {
+    const nowSecs = Math.floor(Date.now() / 1000);
+    passkeyListEl.innerHTML = "";
+    for (const entry of passkeys ?? []) {
+      const text = passkeyRowText(entry, nowSecs);
+      passkeyListEl.appendChild(
+        accountRowEl(
+          text.title,
+          text.status,
+          confirmButton(`passkey:${entry.id}`, "Удалить", () =>
+            signaling.send({ type: "delete_passkey", id: entry.id }),
+          ),
+        ),
+      );
+    }
+    browserListEl.innerHTML = "";
+    for (const entry of browsers) {
+      const text = browserRowText(entry, nowSecs);
+      browserListEl.appendChild(
+        accountRowEl(
+          text.title,
+          text.status,
+          entry.current
+            ? null
+            : confirmButton(`browser:${entry.id}`, "Отозвать", () =>
+                signaling.send({ type: "revoke_browser", id: entry.id }),
+              ),
+        ),
+      );
+    }
+    const needConfirm = (passkeys ?? []).length === 0;
+    const confirmingSignOut = confirmingAccountKey === "sign-out";
+    signOutBtn.dataset.confirmKey = "sign-out";
+    signOutBtn.textContent = needConfirm && confirmingSignOut ? "Точно выйти?" : "Выйти";
+    signOutHintEl.textContent =
+      needConfirm && confirmingSignOut ? "Список компьютеров этого браузера пропадёт" : "";
+    renderAccountRow();
+  }
+
+  function openAccount(): void {
+    confirmingAccountKey = null;
+    setAccountMessage("");
+    mainCard.hidden = true;
+    accountCard.hidden = false;
+    renderAccount();
+    signaling.send({ type: "list_passkeys" });
+    signaling.send({ type: "list_browsers" });
+  }
+
+  function closeAccount(): void {
+    confirmingAccountKey = null;
+    accountCard.hidden = true;
+    mainCard.hidden = false;
+  }
+
+  /** Back to the first screen as a fresh anonymous owner: used after
+   * `signed_out` and when this browser's token was revoked elsewhere. */
+  function resetOwner(): void {
+    const storage = ownerStorage();
+    if (storage) clearOwnerToken(storage);
+    passkeyFlow = null;
+    passkeys = null;
+    browsers = [];
+    devices = [];
+    closeAccount();
+    setAccountMessage("");
+    renderDeviceList();
+    renderAccountRow();
+    signaling.send({ type: "client_auth", token: null });
+  }
+
+  function startPasskeyFlow(flow: PasskeyFlow): void {
+    if (passkeyFlow !== null || !passkeySupported) return;
+    passkeyFlow = flow;
+    setAccountMessage("");
+    renderAccount();
+    signaling.send({ type: flow === "login" ? "passkey_login_start" : "passkey_register_start" });
+  }
+
+  /** A flow step failed: silent for a dismissed system dialog, otherwise a
+   * "Не удалось …" next to the buttons. */
+  function failPasskeyFlow(err: unknown): void {
+    const flow = passkeyFlow;
+    passkeyFlow = null;
+    if (flow !== null && !isCancelError(err)) {
+      console.warn("passkey flow failed", err);
+      setAccountMessage(passkeyFailText(flow));
+    }
+    renderAccount();
+  }
+
+  passkeyLoginBtn.addEventListener("click", () => startPasskeyFlow("login"));
+  passkeySaveBtn.addEventListener("click", () => startPasskeyFlow("register"));
+  passkeyAddBtn.addEventListener("click", () => startPasskeyFlow("register"));
+  accountOpenBtn.addEventListener("click", openAccount);
+  accountBackBtn.addEventListener("click", closeAccount);
+  signOutBtn.addEventListener("click", () => {
+    if ((passkeys ?? []).length === 0 && confirmingAccountKey !== "sign-out") {
+      confirmingAccountKey = "sign-out";
+      renderAccount();
+      return;
+    }
+    confirmingAccountKey = null;
+    signaling.send({ type: "sign_out" });
+  });
+
+  // Resets a pending cabinet "Точно?" when something else is clicked.
+  document.addEventListener("click", (event) => {
+    if (confirmingAccountKey === null) return;
+    const target = event.target as Element | null;
+    if (target?.closest(`[data-confirm-key="${CSS.escape(confirmingAccountKey)}"]`)) return;
+    confirmingAccountKey = null;
+    renderAccount();
+  });
+
+  signaling.on("passkey_register_options", (msg) => {
+    if (passkeyFlow !== "register") return;
+    void (async () => {
+      try {
+        const publicKey = creationOptionsFromServer(msg.options);
+        const cred = await navigator.credentials.create({ publicKey });
+        if (!cred) throw new Error("no credential");
+        signaling.send({
+          type: "passkey_register_finish",
+          credential: registrationToServer(cred as unknown as Parameters<typeof registrationToServer>[0]),
+        });
+      } catch (err) {
+        failPasskeyFlow(err);
+      }
+    })();
+  });
+
+  signaling.on("passkey_login_options", (msg) => {
+    if (passkeyFlow !== "login") return;
+    void (async () => {
+      try {
+        const publicKey = requestOptionsFromServer(msg.options);
+        const cred = await navigator.credentials.get({ publicKey });
+        if (!cred) throw new Error("no credential");
+        signaling.send({
+          type: "passkey_login_finish",
+          credential: assertionToServer(cred as unknown as Parameters<typeof assertionToServer>[0]),
+        });
+      } catch (err) {
+        failPasskeyFlow(err);
+      }
+    })();
+  });
+
+  signaling.on("passkeys", (msg) => {
+    passkeys = msg.passkeys;
+    if (passkeyFlow === "register") passkeyFlow = null;
+    renderAccount();
+  });
+
+  signaling.on("browsers", (msg) => {
+    browsers = msg.browsers;
+    renderAccount();
+  });
+
+  signaling.on("signed_out", () => resetOwner());
+
   function stopDeviceListLoop(): void {
     if (deviceListTimer !== undefined) {
       clearInterval(deviceListTimer);
@@ -1284,6 +1586,7 @@ export function mount(root: Element | null): void {
   function showPinScreen(): void {
     sessionScreen.hidden = true;
     pinScreen.hidden = false;
+    closeAccount();
     startDeviceListLoop();
   }
 
@@ -1658,6 +1961,11 @@ export function mount(root: Element | null): void {
     if (storage) saveOwnerToken(storage, msg.token);
     devices = msg.devices;
     renderDeviceList();
+    // Slice 3.7c: a passkey login finished (or an ordinary (re)auth): learn
+    // whether this owner has passkeys, which drives the account row.
+    if (passkeyFlow === "login") passkeyFlow = null;
+    signaling.send({ type: "list_passkeys" });
+    if (!accountCard.hidden) signaling.send({ type: "list_browsers" });
     // Confirms a reconnect (slice 3.5a) succeeded, if that's what this is --
     // a no-op the rest of the time, since `connectionLost` starts `false`.
     if (connectionLost) {
@@ -2008,6 +2316,18 @@ export function mount(root: Element | null): void {
       return;
     }
     if (sessionId === null) {
+      // Slice 3.7c: this browser's token was revoked from another browser --
+      // same as a sign-out: forget it and start over as a new owner.
+      const savedStorage = ownerStorage();
+      if (isRevokedTokenError(msg.message, savedStorage ? loadOwnerToken(savedStorage) : null)) {
+        resetOwner();
+        return;
+      }
+      // A passkey flow step failed on the server (`passkey failed` or other).
+      if (passkeyFlow !== null) {
+        failPasskeyFlow(new Error(msg.message));
+        return;
+      }
       // No session yet (a bad PIN, a stale device row, an auth hiccup --
       // all the new 3.1e error codes land here): stay on the PIN/list
       // screen, just surface it and make sure nothing's left disabled from
