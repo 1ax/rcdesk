@@ -7,6 +7,9 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY proto/ proto/
 COPY server/ server/
+# `[patch.crates-io]` in the root Cargo.toml points here; cargo resolves it
+# even though rcdesk-server does not use rtc-sctp.
+COPY vendor/ vendor/
 
 # `host` is a workspace member with heavy, partly platform-specific
 # dependencies (webrtc, openh264, and -- behind `cfg(target_os = ...)` --
