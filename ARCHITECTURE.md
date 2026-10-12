@@ -364,6 +364,16 @@ DACL (SYSTEM + Administrators); `service install` переносит туда `d
 at login» или `rcdesk-host autostart on`. `launchctl` не вызывается: файл
 только пишется/удаляется, эффект — со следующего входа.
 
+**Шторка (слайс 4.2c, только macOS-агент).** Клиент кнопкой «Шторка» шлёт `ControlMessage::SetCurtain { on }`, хост
+отвечает `CurtainStatus { on, reason }`; `HostInfo.curtain_available` — только `rcdesk-agent` на macOS (трейт
+`curtain::Curtain` в `HostContext`, реализация `platform::macos::curtain`, вызовы маршалятся в главный поток агента).
+Показ: чёрные `NSWindow` на уровне `CGShieldingWindowLevel` на всех экранах, CGWindowID окон исключаются из захвата
+(перезапуск конвейера SCK с `exclude_windows`), локальный ввод глушит активный `CGEventTap` — проходят только события с
+`EventSourceUserData = enigo::EVENT_MARKER` (наша инъекция). Окно НЕ `opaque` (чёрный 99 %): непрозрачное окно на весь
+экран macOS считает перекрывающим, приложения под ним перестают рисоваться и видео застывает (фикс `db6039e`). Конец
+сеанса со шторкой — сначала блокировка экрана (Ctrl+Cmd+Q с меткой, ожидание `CGSSessionScreenIsLocked`), потом снятие
+шторки. Windows — долг D52.
+
 ## 9. Платформы
 
 - **macOS 13+** (ScreenCaptureKit), сборки arm64 и x86_64. Поставка — бандл
