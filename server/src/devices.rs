@@ -95,10 +95,11 @@ fn random_secret() -> String {
 
 /// SHA-256 of `secret`, base64-encoded. See this module's doc comment and
 /// `random_secret`'s for why a plain hash (no salt, no KDF) is appropriate
-/// for this particular secret. `pub(crate)` because `owners::authenticate`
-/// (slice 3.1) hashes owner tokens the same way -- same reasoning, so the
-/// hashing itself isn't duplicated.
-pub(crate) fn hash_secret(secret: &str) -> String {
+/// for this particular secret. `owners::authenticate` (slice 3.1) hashes
+/// owner tokens the same way -- same reasoning, so the hashing itself isn't
+/// duplicated. `pub` so integration tests can mint extra owner tokens
+/// straight into the `Db` (slice 3.7a).
+pub fn hash_secret(secret: &str) -> String {
     let digest = Sha256::digest(secret.as_bytes());
     BASE64_STANDARD.encode(digest)
 }

@@ -21,6 +21,13 @@ const SILENCE_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// Boots the signaling app on an OS-assigned port and returns its ws:// URL.
 async fn spawn_server() -> String {
+    spawn_server_with_db().await.0
+}
+
+/// Like `spawn_server`, but also hands back a handle to the server's
+/// database, for tests that need state the wire protocol can't create
+/// (a second token for the same owner).
+async fn spawn_server_with_db() -> (String, Db) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
@@ -28,6 +35,7 @@ async fn spawn_server() -> String {
     let registry = Registry::new();
     let ice = IceConfig::from_env();
     let db = Db::in_memory().expect("open in-memory db");
+    let db_handle = db.clone();
     tokio::spawn(async move {
         axum::serve(
             listener,
@@ -36,7 +44,7 @@ async fn spawn_server() -> String {
         .await
         .expect("serve");
     });
-    format!("ws://{addr}/ws")
+    (format!("ws://{addr}/ws"), db_handle)
 }
 
 async fn connect(url: &str) -> WsStream {
@@ -1357,4 +1365,176 @@ async fn wrong_pin_attempts_are_rate_limited_per_ip() {
         SignalMessage::Joined { .. } => {}
         other => panic!("expected joined, got {other:?}"),
     }
+}
+
+/// Reads one `Browsers` response.
+async fn recv_browsers(ws: &mut WsStream) -> Vec<proto::signal::BrowserEntry> {
+    match recv(ws).await {
+        SignalMessage::Browsers { browsers } => browsers,
+        other => panic!("expected browsers, got {other:?}"),
+    }
+}
+
+/// Asserts the next message is `Error { "not authenticated" }`.
+async fn expect_not_authenticated(ws: &mut WsStream) {
+    match recv(ws).await {
+        SignalMessage::Error { message } => assert_eq!(message, "not authenticated"),
+        other => panic!("expected not authenticated, got {other:?}"),
+    }
+}
+
+// (3.7a-a) a second connection authenticating with the first one's token
+// sees the same devices; ListBrowsers shows exactly one browser, current.
+#[tokio::test]
+async fn second_connection_with_same_token_shares_devices_and_lists_one_browser() {
+    let url = spawn_server().await;
+
+    let mut host = connect(&url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: None,
+            session_id: None,
+        },
+    )
+    .await;
+    let (host_id, pin) = match recv(&mut host).await {
+        SignalMessage::Registered { host_id, pin, .. } => (host_id, pin),
+        other => panic!("expected registered, got {other:?}"),
+    };
+
+    let mut first = connect(&url).await;
+    hello(&mut first, Role::Client).await;
+    let (token, _) = client_auth(&mut first, None).await;
+    send(&mut first, &SignalMessage::Join { pin }).await;
+    match recv(&mut first).await {
+        SignalMessage::Joined { .. } => {}
+        other => panic!("expected joined, got {other:?}"),
+    }
+
+    let mut second = connect(&url).await;
+    hello(&mut second, Role::Client).await;
+    let (token2, devices) = client_auth(&mut second, Some(token.clone())).await;
+    assert_eq!(token2, token);
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].device_id, host_id);
+
+    send(&mut second, &SignalMessage::ListBrowsers).await;
+    let browsers = recv_browsers(&mut second).await;
+    assert_eq!(browsers.len(), 1);
+    assert!(browsers[0].current);
+}
+
+// (3.7a-b) an owner with two tokens: revoking B from A leaves one browser;
+// B's connection is then "not authenticated", and B's old token yields a
+// brand-new, empty owner. The second token is inserted through the Db
+// handle (the wire protocol can't mint one).
+#[tokio::test]
+async fn revoking_another_browser_signs_that_connection_out() {
+    let (url, db) = spawn_server_with_db().await;
+
+    let mut a = connect(&url).await;
+    hello(&mut a, Role::Client).await;
+    let (token_a, _) = client_auth(&mut a, None).await;
+    let (owner_id, token_id_a) = db
+        .token_by_hash(&rcdesk_server::devices::hash_secret(&token_a))
+        .expect("query token")
+        .expect("token a stored");
+    db.insert_token(
+        &owner_id,
+        "token-b-id",
+        &rcdesk_server::devices::hash_secret("token-b-secret"),
+        "Browser B",
+        1,
+    )
+    .expect("insert second token");
+
+    let mut b = connect(&url).await;
+    hello(&mut b, Role::Client).await;
+    let (token_b, _) = client_auth(&mut b, Some("token-b-secret".to_string())).await;
+    assert_eq!(token_b, "token-b-secret");
+
+    send(&mut a, &SignalMessage::ListBrowsers).await;
+    let browsers = recv_browsers(&mut a).await;
+    assert_eq!(browsers.len(), 2);
+    assert_eq!(browsers.iter().filter(|b| b.current).count(), 1);
+    assert!(browsers.iter().any(|b| b.current && b.id == token_id_a));
+
+    send(
+        &mut a,
+        &SignalMessage::RevokeBrowser {
+            id: "token-b-id".to_string(),
+        },
+    )
+    .await;
+    let browsers = recv_browsers(&mut a).await;
+    assert_eq!(browsers.len(), 1);
+    assert_eq!(browsers[0].id, token_id_a);
+
+    send(&mut b, &SignalMessage::ListDevices).await;
+    expect_not_authenticated(&mut b).await;
+
+    let mut b2 = connect(&url).await;
+    hello(&mut b2, Role::Client).await;
+    let (new_token, devices) = client_auth(&mut b2, Some("token-b-secret".to_string())).await;
+    assert_ne!(new_token, "token-b-secret");
+    assert!(devices.is_empty());
+    let (new_owner, _) = db
+        .token_by_hash(&rcdesk_server::devices::hash_secret(&new_token))
+        .expect("query token")
+        .expect("new token stored");
+    assert_ne!(new_owner, owner_id);
+}
+
+// (3.7a-c) SignOut -> SignedOut; afterwards the connection is "not
+// authenticated" and the token is no longer recognized.
+#[tokio::test]
+async fn sign_out_forgets_owner_and_invalidates_token() {
+    let url = spawn_server().await;
+
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    let (token, _) = client_auth(&mut client, None).await;
+
+    send(&mut client, &SignalMessage::SignOut).await;
+    match recv(&mut client).await {
+        SignalMessage::SignedOut => {}
+        other => panic!("expected signed_out, got {other:?}"),
+    }
+    send(&mut client, &SignalMessage::ListDevices).await;
+    expect_not_authenticated(&mut client).await;
+
+    let mut again = connect(&url).await;
+    hello(&mut again, Role::Client).await;
+    let (new_token, _) = client_auth(&mut again, Some(token.clone())).await;
+    assert_ne!(new_token, token);
+}
+
+// (3.7a-d) RevokeBrowser with the connection's own token id behaves as
+// SignOut.
+#[tokio::test]
+async fn revoking_own_browser_acts_as_sign_out() {
+    let url = spawn_server().await;
+
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    client_auth(&mut client, None).await;
+    send(&mut client, &SignalMessage::ListBrowsers).await;
+    let browsers = recv_browsers(&mut client).await;
+
+    send(
+        &mut client,
+        &SignalMessage::RevokeBrowser {
+            id: browsers[0].id.clone(),
+        },
+    )
+    .await;
+    match recv(&mut client).await {
+        SignalMessage::SignedOut => {}
+        other => panic!("expected signed_out, got {other:?}"),
+    }
+    send(&mut client, &SignalMessage::ListBrowsers).await;
+    expect_not_authenticated(&mut client).await;
 }

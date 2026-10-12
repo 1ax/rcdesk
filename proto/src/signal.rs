@@ -61,6 +61,18 @@ pub struct DeviceEntry {
     pub last_seen_at: i64,
 }
 
+/// Один браузер владельца в списке (слайс 3.7a). `id` — идентификатор
+/// токена (не сам токен и не его хеш), `current` — токен этого соединения.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct BrowserEntry {
+    pub id: String,
+    pub user_agent: String,
+    pub created_at: i64,
+    pub last_used_at: i64,
+    pub current: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(export)]
@@ -185,6 +197,20 @@ pub enum SignalMessage {
     ListDevices,
     /// server -> client: текущий список устройств владельца.
     Devices { devices: Vec<DeviceEntry> },
+    /// client -> server (слайс 3.7a): перечитать список браузеров владельца.
+    ListBrowsers,
+    /// server -> client: браузеры (токены) владельца, недавно
+    /// использованные первыми.
+    Browsers { browsers: Vec<BrowserEntry> },
+    /// client -> server: отозвать токен браузера `id` этого владельца. В
+    /// ответ сервер шлёт обновлённый `Browsers`; если `id` — токен самого
+    /// соединения, это то же, что `SignOut`.
+    RevokeBrowser { id: String },
+    /// client -> server: выйти — удалить токен этого соединения; сервер
+    /// забывает владельца и отвечает `SignedOut`.
+    SignOut,
+    /// server -> client: ответ на `SignOut`.
+    SignedOut,
     /// client -> server: подключиться к своему устройству без PIN.
     ConnectDevice { device_id: String },
     /// client -> server: переименовать своё устройство (`alias = None` —
@@ -416,6 +442,47 @@ mod tests {
         let json = serde_json::to_string(&authenticated).expect("serialize");
         let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, authenticated);
+    }
+
+    #[test]
+    fn browsers_messages_round_trip_through_json() {
+        let messages = vec![
+            SignalMessage::ListBrowsers,
+            SignalMessage::Browsers {
+                browsers: vec![BrowserEntry {
+                    id: "tok1".to_string(),
+                    user_agent: "Mozilla/5.0".to_string(),
+                    created_at: 100,
+                    last_used_at: 200,
+                    current: true,
+                }],
+            },
+            SignalMessage::RevokeBrowser {
+                id: "tok2".to_string(),
+            },
+            SignalMessage::SignOut,
+            SignalMessage::SignedOut,
+        ];
+        for msg in messages {
+            let json = serde_json::to_string(&msg).expect("serialize");
+            let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(round_tripped, msg);
+        }
+    }
+
+    #[test]
+    fn sign_out_has_the_expected_wire_shape() {
+        let msg: SignalMessage =
+            serde_json::from_str(r#"{"type":"sign_out"}"#).expect("deserialize");
+        assert_eq!(msg, SignalMessage::SignOut);
+        let msg: SignalMessage =
+            serde_json::from_str(r#"{"type":"revoke_browser","id":"x"}"#).expect("deserialize");
+        assert_eq!(
+            msg,
+            SignalMessage::RevokeBrowser {
+                id: "x".to_string()
+            }
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ use rusqlite::{Connection, OptionalExtension};
 /// Schema version this binary expects (`PRAGMA user_version`). Bump this
 /// and extend `migrate` when the schema changes; `migrate` itself must stay
 /// idempotent (safe to run against an already-migrated database).
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone)]
 pub struct Db {
@@ -43,6 +43,15 @@ pub struct OwnedDevice {
     pub alias: Option<String>,
     pub added_at: i64,
     pub last_seen_at: i64,
+}
+
+/// Один токен браузера владельца (слайс 3.7a). Хеш наружу не отдаётся.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenRow {
+    pub token_id: String,
+    pub user_agent: String,
+    pub created_at: i64,
+    pub last_used_at: i64,
 }
 
 impl Db {
@@ -122,25 +131,104 @@ impl Db {
         Ok(changed > 0)
     }
 
-    pub fn insert_owner(&self, owner_id: &str, token_hash: &str, now: i64) -> anyhow::Result<()> {
+    pub fn insert_owner(&self, owner_id: &str, now: i64) -> anyhow::Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
-            "INSERT INTO owners (owner_id, token_hash, created_at) VALUES (?1, ?2, ?3)",
-            (owner_id, token_hash, now),
+            "INSERT INTO owners (owner_id, created_at) VALUES (?1, ?2)",
+            (owner_id, now),
         )?;
         Ok(())
     }
 
-    pub fn owner_by_token_hash(&self, token_hash: &str) -> anyhow::Result<Option<String>> {
+    /// Добавляет владельцу токен браузера; `created_at = last_used_at = now`.
+    pub fn insert_token(
+        &self,
+        owner_id: &str,
+        token_id: &str,
+        token_hash: &str,
+        user_agent: &str,
+        now: i64,
+    ) -> anyhow::Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let owner_id = conn
+        conn.execute(
+            "INSERT INTO owner_tokens
+                 (token_id, owner_id, token_hash, user_agent, created_at, last_used_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            (token_id, owner_id, token_hash, user_agent, now),
+        )?;
+        Ok(())
+    }
+
+    /// Ищет токен по хешу: `(owner_id, token_id)`.
+    pub fn token_by_hash(&self, token_hash: &str) -> anyhow::Result<Option<(String, String)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let found = conn
             .query_row(
-                "SELECT owner_id FROM owners WHERE token_hash = ?1",
+                "SELECT owner_id, token_id FROM owner_tokens WHERE token_hash = ?1",
                 [token_hash],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        Ok(owner_id)
+        Ok(found)
+    }
+
+    /// Обновляет `last_used_at` токена и, если `user_agent` непустой,
+    /// его `user_agent`. Возвращает `false`, если токена нет.
+    pub fn touch_token(&self, token_id: &str, user_agent: &str, now: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE owner_tokens
+             SET last_used_at = ?1,
+                 user_agent = CASE WHEN ?2 = '' THEN user_agent ELSE ?2 END
+             WHERE token_id = ?3",
+            (now, user_agent, token_id),
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Токены владельца, самые недавно использованные первыми.
+    pub fn tokens_for_owner(&self, owner_id: &str) -> anyhow::Result<Vec<TokenRow>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT token_id, user_agent, created_at, last_used_at
+             FROM owner_tokens
+             WHERE owner_id = ?1
+             ORDER BY last_used_at DESC, token_id",
+        )?;
+        let rows = stmt
+            .query_map([owner_id], |row| {
+                Ok(TokenRow {
+                    token_id: row.get(0)?,
+                    user_agent: row.get(1)?,
+                    created_at: row.get(2)?,
+                    last_used_at: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Удаляет токен владельца. `false`, если такого токена у него нет.
+    pub fn delete_token(&self, owner_id: &str, token_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let changed = conn.execute(
+            "DELETE FROM owner_tokens WHERE owner_id = ?1 AND token_id = ?2",
+            (owner_id, token_id),
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Жив ли ещё токен (не отозван).
+    pub fn token_exists(&self, token_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let found = conn
+            .query_row(
+                "SELECT 1 FROM owner_tokens WHERE token_id = ?1",
+                [token_id],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 
     /// Links an owner to a device. Calling this again for the same pair is
@@ -217,18 +305,8 @@ fn configure(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Applies the schema migration if `user_version` is `0`, then sets it to
-/// `SCHEMA_VERSION`. A no-op if the database is already at
-/// `SCHEMA_VERSION`. Idempotent: safe to call again against an
-/// already-migrated (and populated) database.
-fn migrate(conn: &Connection) -> anyhow::Result<()> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version >= SCHEMA_VERSION {
-        return Ok(());
-    }
-
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS devices (
+/// Полная схема v2.
+const SCHEMA_V2: &str = "CREATE TABLE IF NOT EXISTS devices (
             device_id    TEXT PRIMARY KEY,
             secret_hash  TEXT NOT NULL,
             name         TEXT NOT NULL,
@@ -237,8 +315,15 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
          );
          CREATE TABLE IF NOT EXISTS owners (
             owner_id   TEXT PRIMARY KEY,
-            token_hash TEXT NOT NULL UNIQUE,
             created_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS owner_tokens (
+            token_id     TEXT PRIMARY KEY,
+            owner_id     TEXT NOT NULL REFERENCES owners(owner_id) ON DELETE CASCADE,
+            token_hash   TEXT NOT NULL UNIQUE,
+            user_agent   TEXT NOT NULL DEFAULT '',
+            created_at   INTEGER NOT NULL,
+            last_used_at INTEGER NOT NULL
          );
          CREATE TABLE IF NOT EXISTS ownership (
             owner_id  TEXT NOT NULL REFERENCES owners(owner_id) ON DELETE CASCADE,
@@ -246,11 +331,76 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
             alias     TEXT,
             added_at  INTEGER NOT NULL,
             PRIMARY KEY (owner_id, device_id)
-         );",
-    )?;
+         );";
 
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    Ok(())
+/// Приводит базу к `SCHEMA_VERSION`: версия 0 — сразу полная схема v2,
+/// версия 1 — миграция v1 -> v2 (токен из `owners` переезжает в
+/// `owner_tokens`). Идемпотентна: на актуальной базе — no-op.
+fn migrate(conn: &Connection) -> anyhow::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    if version == 0 {
+        conn.execute_batch(SCHEMA_V2)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        return Ok(());
+    }
+
+    migrate_v1_to_v2(conn)
+}
+
+/// Процедура SQLite «12 шагов»: `DROP TABLE owners` при включённых
+/// внешних ключах каскадно снёс бы `ownership`, поэтому `foreign_keys`
+/// выключается ДО транзакции (внутри неё pragma — no-op) и включается
+/// обратно после коммита.
+fn migrate_v1_to_v2(conn: &Connection) -> anyhow::Result<()> {
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let fk_on: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    if fk_on != 0 {
+        anyhow::bail!("could not disable foreign_keys for migration");
+    }
+
+    let result = (|| -> anyhow::Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE owners_new (
+                owner_id   TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL
+             );
+             INSERT INTO owners_new (owner_id, created_at)
+                 SELECT owner_id, created_at FROM owners;
+             CREATE TABLE owner_tokens (
+                token_id     TEXT PRIMARY KEY,
+                owner_id     TEXT NOT NULL REFERENCES owners(owner_id) ON DELETE CASCADE,
+                token_hash   TEXT NOT NULL UNIQUE,
+                user_agent   TEXT NOT NULL DEFAULT '',
+                created_at   INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL
+             );
+             INSERT INTO owner_tokens
+                    (token_id, owner_id, token_hash, user_agent, created_at, last_used_at)
+                 SELECT lower(hex(randomblob(8))), owner_id, token_hash, '', created_at, created_at
+                 FROM owners;
+             DROP TABLE owners;
+             ALTER TABLE owners_new RENAME TO owners;",
+        )?;
+        let violations: i64 =
+            tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        if violations != 0 {
+            anyhow::bail!("foreign_key_check found {violations} violations after migration");
+        }
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
+        Ok(())
+    })();
+
+    // Включаем обратно при любом исходе.
+    conn.pragma_update(None, "foreign_keys", true)?;
+    result
 }
 
 #[cfg(test)]
@@ -258,13 +408,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fresh_db_has_user_version_one() {
+    fn fresh_db_has_user_version_two() {
         let db = Db::in_memory().expect("open in-memory db");
         let conn = db.conn.lock().expect("db mutex poisoned");
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read user_version");
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
     }
 
     #[test]
@@ -340,28 +490,135 @@ mod tests {
     }
 
     #[test]
-    fn insert_owner_and_owner_by_token_hash_round_trip() {
+    fn insert_token_and_token_by_hash_round_trip() {
         let db = Db::in_memory().expect("open in-memory db");
-        db.insert_owner("owner1", "tokenhash1", 100)
-            .expect("insert owner");
+        db.insert_owner("owner1", 100).expect("insert owner");
+        db.insert_token("owner1", "tok1", "tokenhash1", "UA", 100)
+            .expect("insert token");
 
         assert_eq!(
-            db.owner_by_token_hash("tokenhash1")
-                .expect("query owner by token hash"),
-            Some("owner1".to_string())
+            db.token_by_hash("tokenhash1").expect("query token"),
+            Some(("owner1".to_string(), "tok1".to_string()))
         );
-        assert_eq!(
-            db.owner_by_token_hash("unknown")
-                .expect("query owner by token hash"),
-            None
-        );
+        assert_eq!(db.token_by_hash("unknown").expect("query token"), None);
+        assert!(db.token_exists("tok1").expect("exists"));
+        assert!(!db.token_exists("nope").expect("exists"));
+    }
+
+    #[test]
+    fn touch_token_keeps_user_agent_when_new_one_is_empty() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("owner1", 100).expect("insert owner");
+        db.insert_token("owner1", "tok1", "h1", "UA1", 100)
+            .expect("insert token");
+
+        assert!(db.touch_token("tok1", "", 200).expect("touch"));
+        let rows = db.tokens_for_owner("owner1").expect("tokens");
+        assert_eq!(rows[0].user_agent, "UA1");
+        assert_eq!(rows[0].last_used_at, 200);
+
+        assert!(db.touch_token("tok1", "UA2", 300).expect("touch"));
+        let rows = db.tokens_for_owner("owner1").expect("tokens");
+        assert_eq!(rows[0].user_agent, "UA2");
+        assert_eq!(rows[0].created_at, 100);
+        assert!(!db.touch_token("nope", "x", 1).expect("touch unknown"));
+    }
+
+    #[test]
+    fn tokens_for_owner_orders_by_last_used_desc_and_delete_is_scoped_to_owner() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("owner1", 100).expect("insert owner");
+        db.insert_owner("owner2", 100).expect("insert owner");
+        db.insert_token("owner1", "old", "h1", "", 100)
+            .expect("insert token");
+        db.insert_token("owner1", "new", "h2", "", 200)
+            .expect("insert token");
+
+        let ids: Vec<_> = db
+            .tokens_for_owner("owner1")
+            .expect("tokens")
+            .into_iter()
+            .map(|t| t.token_id)
+            .collect();
+        assert_eq!(ids, vec!["new", "old"]);
+
+        assert!(!db.delete_token("owner2", "old").expect("foreign delete"));
+        assert!(db.token_exists("old").expect("exists"));
+        assert!(db.delete_token("owner1", "old").expect("delete"));
+        assert!(!db.token_exists("old").expect("exists"));
+    }
+
+    #[test]
+    fn migration_v1_to_v2_keeps_owners_ownership_devices_and_tokens() {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.pragma_update(None, "foreign_keys", true).expect("fk");
+        conn.execute_batch(
+            "CREATE TABLE devices (
+                device_id TEXT PRIMARY KEY, secret_hash TEXT NOT NULL, name TEXT NOT NULL,
+                created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL);
+             CREATE TABLE owners (
+                owner_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL);
+             CREATE TABLE ownership (
+                owner_id TEXT NOT NULL REFERENCES owners(owner_id) ON DELETE CASCADE,
+                device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+                alias TEXT, added_at INTEGER NOT NULL, PRIMARY KEY (owner_id, device_id));
+             INSERT INTO devices VALUES ('dev1', 'sh', 'My Mac', 10, 20);
+             INSERT INTO owners VALUES ('owner1', 'oldhash', 50);
+             INSERT INTO ownership VALUES ('owner1', 'dev1', 'Work', 60);
+             PRAGMA user_version = 1;",
+        )
+        .expect("build v1 database");
+
+        migrate(&conn).expect("migrate v1 -> v2");
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 2);
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("fk");
+        assert_eq!(fk, 1, "foreign_keys must be re-enabled");
+        let violations: i64 = conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("fk check");
+        assert_eq!(violations, 0);
+
+        let db = Db {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        let owned = db.devices_for_owner("owner1").expect("devices");
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].alias.as_deref(), Some("Work"));
+        assert_eq!(owned[0].added_at, 60);
+        assert!(db.device("dev1").expect("device").is_some());
+
+        let (owner_id, token_id) = db
+            .token_by_hash("oldhash")
+            .expect("token")
+            .expect("old token found");
+        assert_eq!(owner_id, "owner1");
+        assert_eq!(token_id.len(), 16);
+        let tokens = db.tokens_for_owner("owner1").expect("tokens");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].created_at, 50);
+        assert_eq!(tokens[0].last_used_at, 50);
+        assert_eq!(tokens[0].user_agent, "");
+
+        {
+            let conn = db.conn.lock().expect("db mutex poisoned");
+            migrate(&conn).expect("re-run migration is a no-op");
+        }
+        assert_eq!(db.tokens_for_owner("owner1").expect("tokens").len(), 1);
     }
 
     #[test]
     fn link_device_twice_is_not_an_error_and_device_appears_once() {
         let db = Db::in_memory().expect("open in-memory db");
-        db.insert_owner("owner1", "tokenhash1", 100)
-            .expect("insert owner");
+        db.insert_owner("owner1", 100).expect("insert owner");
         db.insert_device("dev1", "hash1", "My Mac", 100)
             .expect("insert device");
 
@@ -376,8 +633,7 @@ mod tests {
     #[test]
     fn devices_for_owner_orders_by_added_at_with_default_alias_and_live_last_seen() {
         let db = Db::in_memory().expect("open in-memory db");
-        db.insert_owner("owner1", "tokenhash1", 100)
-            .expect("insert owner");
+        db.insert_owner("owner1", 100).expect("insert owner");
         db.insert_device("dev1", "hash1", "First", 100)
             .expect("insert device 1");
         db.insert_device("dev2", "hash2", "Second", 100)
@@ -420,8 +676,7 @@ mod tests {
     #[test]
     fn set_alias_changes_and_clears_alias() {
         let db = Db::in_memory().expect("open in-memory db");
-        db.insert_owner("owner1", "tokenhash1", 100)
-            .expect("insert owner");
+        db.insert_owner("owner1", 100).expect("insert owner");
         db.insert_device("dev1", "hash1", "My Mac", 100)
             .expect("insert device");
         db.link_device("owner1", "dev1", 200).expect("link device");
@@ -444,8 +699,7 @@ mod tests {
     #[test]
     fn unlink_device_removes_from_owner_list_but_keeps_device() {
         let db = Db::in_memory().expect("open in-memory db");
-        db.insert_owner("owner1", "tokenhash1", 100)
-            .expect("insert owner");
+        db.insert_owner("owner1", 100).expect("insert owner");
         db.insert_device("dev1", "hash1", "My Mac", 100)
             .expect("insert device");
         db.link_device("owner1", "dev1", 200).expect("link device");
@@ -465,8 +719,7 @@ mod tests {
     #[test]
     fn foreign_keys_are_enforced_for_link_device() {
         let db = Db::in_memory().expect("open in-memory db");
-        db.insert_owner("owner1", "tokenhash1", 100)
-            .expect("insert owner");
+        db.insert_owner("owner1", 100).expect("insert owner");
 
         let result = db.link_device("owner1", "no-such-device", 200);
         assert!(result.is_err());

@@ -12,7 +12,7 @@ use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
-use proto::signal::{DeviceEntry, Role, SignalMessage};
+use proto::signal::{BrowserEntry, DeviceEntry, Role, SignalMessage};
 use std::net::{IpAddr, SocketAddr};
 use tokio::sync::mpsc;
 
@@ -35,17 +35,31 @@ pub fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
         .unwrap_or_else(|| peer.ip())
 }
 
+/// Что сервер знает о клиенте из апгрейда: IP и `User-Agent` (пустой, если
+/// заголовка нет или он не UTF-8).
+struct ClientInfo {
+    ip: IpAddr,
+    user_agent: String,
+}
+
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let ip = client_ip(&headers, peer);
-    ws.on_upgrade(move |socket| handle_socket(socket, state, ip))
+    let info = ClientInfo {
+        ip: client_ip(&headers, peer),
+        user_agent: headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string(),
+    };
+    ws.on_upgrade(move |socket| handle_socket(socket, state, info))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, ip: IpAddr) {
+async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<SignalMessage>();
 
@@ -73,7 +87,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, ip: IpAddr) {
         &state.ice,
         &state.db,
         &state.pin_limiter,
-        ip,
+        info,
     )
     .await;
     tracing::info!("websocket connection closed");
@@ -125,7 +139,7 @@ async fn run_connection(
     ice: &IceConfig,
     db: &Db,
     pin_limiter: &PinLimiter,
-    ip: IpAddr,
+    info: ClientInfo,
 ) {
     let role = match next_message(stream, &tx).await {
         Some(SignalMessage::Hello { role, .. }) => role,
@@ -140,7 +154,7 @@ async fn run_connection(
 
     match role {
         Role::Host => run_host(stream, tx, registry, ice, db).await,
-        Role::Client => run_client(stream, tx, registry, ice, db, pin_limiter, ip).await,
+        Role::Client => run_client(stream, tx, registry, ice, db, pin_limiter, info).await,
     }
 }
 
@@ -415,6 +429,81 @@ fn device_entries_for_owner(
         .collect())
 }
 
+/// Браузер, под которым авторизовано соединение (слайс 3.7a).
+struct ClientSession {
+    owner_id: String,
+    token_id: String,
+}
+
+/// Владелец соединения, если его токен ещё жив. Токен мог быть отозван
+/// другим браузером — тогда соединение забывает владельца (`session = None`)
+/// и ведёт себя как неавторизованное.
+fn current_owner(db: &Db, session: &mut Option<ClientSession>) -> anyhow::Result<Option<String>> {
+    let Some(current) = session else {
+        return Ok(None);
+    };
+    if db.token_exists(&current.token_id)? {
+        return Ok(Some(current.owner_id.clone()));
+    }
+    *session = None;
+    Ok(None)
+}
+
+/// `current_owner` для веток, которым владелец обязателен: сама отвечает
+/// `not authenticated` / `internal error` и возвращает `None`.
+fn require_owner(db: &Db, session: &mut Option<ClientSession>, tx: &Tx) -> Option<String> {
+    match current_owner(db, session) {
+        Ok(Some(owner_id)) => Some(owner_id),
+        Ok(None) => {
+            let _ = tx.send(SignalMessage::Error {
+                message: "not authenticated".to_string(),
+            });
+            None
+        }
+        Err(err) => {
+            tracing::error!(?err, "failed to check owner token");
+            let _ = tx.send(SignalMessage::Error {
+                message: "internal error".to_string(),
+            });
+            None
+        }
+    }
+}
+
+/// Список браузеров владельца для `Browsers`; `current_token_id` помечает
+/// токен этого соединения.
+fn browser_entries(
+    db: &Db,
+    owner_id: &str,
+    current_token_id: &str,
+) -> anyhow::Result<Vec<BrowserEntry>> {
+    Ok(db
+        .tokens_for_owner(owner_id)?
+        .into_iter()
+        .map(|token| BrowserEntry {
+            current: token.token_id == current_token_id,
+            id: token.token_id,
+            user_agent: token.user_agent,
+            created_at: token.created_at,
+            last_used_at: token.last_used_at,
+        })
+        .collect())
+}
+
+/// Выход: удаляет токен соединения, забывает владельца, шлёт `SignedOut`.
+fn sign_out(db: &Db, session: &mut Option<ClientSession>, tx: &Tx) {
+    if let Some(current) = session.take() {
+        if let Err(err) = db.delete_token(&current.owner_id, &current.token_id) {
+            tracing::error!(?err, "failed to delete token on sign out");
+            let _ = tx.send(SignalMessage::Error {
+                message: "internal error".to_string(),
+            });
+            return;
+        }
+    }
+    let _ = tx.send(SignalMessage::SignedOut);
+}
+
 async fn run_client(
     stream: &mut SplitStream<WebSocket>,
     tx: Tx,
@@ -422,12 +511,13 @@ async fn run_client(
     ice: &IceConfig,
     db: &Db,
     pin_limiter: &PinLimiter,
-    ip: IpAddr,
+    info: ClientInfo,
 ) {
+    let ClientInfo { ip, user_agent } = info;
     // The owner this connection has authenticated as (slice 3.1), if any --
     // `ClientAuth` is optional, so an older client that never sends it stays
     // fully compatible, just without device linking/listing.
-    let mut owner: Option<String> = None;
+    let mut session: Option<ClientSession> = None;
 
     loop {
         let msg = match next_message(stream, &tx).await {
@@ -437,8 +527,13 @@ async fn run_client(
 
         match msg {
             SignalMessage::ClientAuth { token } => {
-                match owners::authenticate(db, token.as_deref(), ice::now_unix() as i64) {
-                    Ok((owner_id, token)) => {
+                match owners::authenticate(
+                    db,
+                    token.as_deref(),
+                    &user_agent,
+                    ice::now_unix() as i64,
+                ) {
+                    Ok((owner_id, token_id, token)) => {
                         let devices = match device_entries_for_owner(db, registry, &owner_id) {
                             Ok(devices) => devices,
                             Err(err) => {
@@ -446,7 +541,7 @@ async fn run_client(
                                 Vec::new()
                             }
                         };
-                        owner = Some(owner_id);
+                        session = Some(ClientSession { owner_id, token_id });
                         let _ = tx.send(SignalMessage::Authenticated { token, devices });
                     }
                     Err(err) => {
@@ -457,8 +552,11 @@ async fn run_client(
                     }
                 }
             }
-            SignalMessage::ListDevices => match &owner {
-                Some(owner_id) => match device_entries_for_owner(db, registry, owner_id) {
+            SignalMessage::ListDevices => {
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                    continue;
+                };
+                match device_entries_for_owner(db, registry, &owner_id) {
                     Ok(devices) => {
                         let _ = tx.send(SignalMessage::Devices { devices });
                     }
@@ -468,18 +566,60 @@ async fn run_client(
                             message: "internal error".to_string(),
                         });
                     }
-                },
-                None => {
-                    let _ = tx.send(SignalMessage::Error {
-                        message: "not authenticated".to_string(),
-                    });
                 }
-            },
+            }
+            SignalMessage::ListBrowsers => {
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                    continue;
+                };
+                let current = session.as_ref().map(|s| s.token_id.as_str()).unwrap_or("");
+                match browser_entries(db, &owner_id, current) {
+                    Ok(browsers) => {
+                        let _ = tx.send(SignalMessage::Browsers { browsers });
+                    }
+                    Err(err) => {
+                        tracing::error!(?err, "failed to load browsers for owner");
+                        let _ = tx.send(SignalMessage::Error {
+                            message: "internal error".to_string(),
+                        });
+                    }
+                }
+            }
+            SignalMessage::RevokeBrowser { id } => {
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                    continue;
+                };
+                let current = session
+                    .as_ref()
+                    .map(|s| s.token_id.clone())
+                    .unwrap_or_default();
+                if id == current {
+                    sign_out(db, &mut session, &tx);
+                    continue;
+                }
+                match db
+                    .delete_token(&owner_id, &id)
+                    .and_then(|_| browser_entries(db, &owner_id, &current))
+                {
+                    Ok(browsers) => {
+                        let _ = tx.send(SignalMessage::Browsers { browsers });
+                    }
+                    Err(err) => {
+                        tracing::error!(?err, "failed to revoke browser");
+                        let _ = tx.send(SignalMessage::Error {
+                            message: "internal error".to_string(),
+                        });
+                    }
+                }
+            }
+            SignalMessage::SignOut => {
+                if require_owner(db, &mut session, &tx).is_none() {
+                    continue;
+                }
+                sign_out(db, &mut session, &tx);
+            }
             SignalMessage::ConnectDevice { device_id } => {
-                let Some(owner_id) = owner.clone() else {
-                    let _ = tx.send(SignalMessage::Error {
-                        message: "not authenticated".to_string(),
-                    });
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
                     continue;
                 };
 
@@ -526,10 +666,7 @@ async fn run_client(
                 }
             }
             SignalMessage::RenameDevice { device_id, alias } => {
-                let Some(owner_id) = owner.clone() else {
-                    let _ = tx.send(SignalMessage::Error {
-                        message: "not authenticated".to_string(),
-                    });
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
                     continue;
                 };
 
@@ -559,10 +696,7 @@ async fn run_client(
                 }
             }
             SignalMessage::ForgetDevice { device_id } => {
-                let Some(owner_id) = owner.clone() else {
-                    let _ = tx.send(SignalMessage::Error {
-                        message: "not authenticated".to_string(),
-                    });
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
                     continue;
                 };
 
@@ -616,12 +750,16 @@ async fn run_client(
                             session_id,
                             ice_servers: ice.ice_servers(ice::now_unix()),
                         });
-                        if let Some(owner_id) = &owner {
-                            if let Err(err) =
-                                db.link_device(owner_id, &host_id, ice::now_unix() as i64)
-                            {
-                                tracing::error!(?err, "failed to link device to owner");
+                        match current_owner(db, &mut session) {
+                            Ok(Some(owner_id)) => {
+                                if let Err(err) =
+                                    db.link_device(&owner_id, &host_id, ice::now_unix() as i64)
+                                {
+                                    tracing::error!(?err, "failed to link device to owner");
+                                }
                             }
+                            Ok(None) => {}
+                            Err(err) => tracing::error!(?err, "failed to check owner token"),
                         }
                     }
                     Err(err) => {
