@@ -15,12 +15,14 @@ use futures_util::{SinkExt, StreamExt};
 use proto::signal::{BrowserEntry, DeviceEntry, Role, SignalMessage};
 use std::net::{IpAddr, SocketAddr};
 use tokio::sync::mpsc;
+use webauthn_rs::prelude::{DiscoverableAuthentication, PasskeyRegistration};
 
 use crate::app::AppState;
 use crate::db::Db;
 use crate::devices::{self, DeviceAuth};
 use crate::ice::{self, IceConfig};
 use crate::owners;
+use crate::passkeys::{self, PasskeyError, SharedWebauthn};
 use crate::pin_limit::PinLimiter;
 use crate::registry::{JoinError, Registry, Tx};
 
@@ -87,6 +89,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
         &state.ice,
         &state.db,
         &state.pin_limiter,
+        &state.webauthn,
         info,
     )
     .await;
@@ -132,6 +135,7 @@ async fn next_message(stream: &mut SplitStream<WebSocket>, tx: &Tx) -> Option<Si
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_connection(
     stream: &mut SplitStream<WebSocket>,
     tx: Tx,
@@ -139,6 +143,7 @@ async fn run_connection(
     ice: &IceConfig,
     db: &Db,
     pin_limiter: &PinLimiter,
+    webauthn: &SharedWebauthn,
     info: ClientInfo,
 ) {
     let role = match next_message(stream, &tx).await {
@@ -154,7 +159,9 @@ async fn run_connection(
 
     match role {
         Role::Host => run_host(stream, tx, registry, ice, db).await,
-        Role::Client => run_client(stream, tx, registry, ice, db, pin_limiter, info).await,
+        Role::Client => {
+            run_client(stream, tx, registry, ice, db, pin_limiter, webauthn, info).await
+        }
     }
 }
 
@@ -504,6 +511,75 @@ fn sign_out(db: &Db, session: &mut Option<ClientSession>, tx: &Tx) {
     let _ = tx.send(SignalMessage::SignedOut);
 }
 
+/// Ответ `Passkeys` со списком passkey владельца.
+fn send_passkeys(db: &Db, owner_id: &str, tx: &Tx) {
+    match passkeys::passkey_entries(db, owner_id) {
+        Ok(passkeys) => {
+            let _ = tx.send(SignalMessage::Passkeys { passkeys });
+        }
+        Err(err) => {
+            tracing::error!(?err, "failed to load passkeys for owner");
+            let _ = tx.send(SignalMessage::Error {
+                message: "internal error".to_string(),
+            });
+        }
+    }
+}
+
+fn passkey_failed(tx: &Tx) {
+    let _ = tx.send(SignalMessage::Error {
+        message: "passkey failed".to_string(),
+    });
+}
+
+/// Любая ошибка WebAuthn — `passkey failed` (причина только в логе),
+/// ошибка БД — `internal error`.
+fn passkey_error(tx: &Tx, err: PasskeyError) {
+    match err {
+        PasskeyError::Rejected(reason) => {
+            tracing::warn!(%reason, "passkey ceremony rejected");
+            passkey_failed(tx);
+        }
+        PasskeyError::Internal(err) => {
+            tracing::error!(?err, "passkey ceremony failed");
+            let _ = tx.send(SignalMessage::Error {
+                message: "internal error".to_string(),
+            });
+        }
+    }
+}
+
+/// Успешный вход по passkey: соединение становится владельцем аккаунта
+/// `account_id`. Если до этого соединение было другим живым владельцем A:
+/// анонимный A (без passkey) сливается в аккаунт — его привязки устройств
+/// переезжают, сама запись A удаляется вместе с токенами; A-аккаунт (с
+/// passkey) и A == B остаются как есть, у A удаляется только токен этого
+/// соединения. Вход всегда выдаёт НОВЫЙ токен аккаунта; возвращает его.
+fn switch_to_account(
+    db: &Db,
+    session: &mut Option<ClientSession>,
+    account_id: &str,
+    user_agent: &str,
+    now: i64,
+) -> anyhow::Result<String> {
+    let previous = match current_owner(db, session)? {
+        Some(previous_owner) => session.take().map(|s| (previous_owner, s.token_id)),
+        None => None,
+    };
+    if let Some((previous_owner, previous_token)) = &previous {
+        if !db.merge_anonymous_owner(previous_owner, account_id)? {
+            db.delete_token(previous_owner, previous_token)?;
+        }
+    }
+    let (token_id, token) = owners::issue_token(db, account_id, user_agent, now)?;
+    *session = Some(ClientSession {
+        owner_id: account_id.to_string(),
+        token_id,
+    });
+    Ok(token)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_client(
     stream: &mut SplitStream<WebSocket>,
     tx: Tx,
@@ -511,6 +587,7 @@ async fn run_client(
     ice: &IceConfig,
     db: &Db,
     pin_limiter: &PinLimiter,
+    webauthn: &SharedWebauthn,
     info: ClientInfo,
 ) {
     let ClientInfo { ip, user_agent } = info;
@@ -518,6 +595,10 @@ async fn run_client(
     // `ClientAuth` is optional, so an older client that never sends it stays
     // fully compatible, just without device linking/listing.
     let mut session: Option<ClientSession> = None;
+    // Passkey ceremonies in flight on this connection (slice 3.7b): kept in
+    // memory only, consumed by the matching `Finish`.
+    let mut passkey_registration: Option<PasskeyRegistration> = None;
+    let mut passkey_login: Option<DiscoverableAuthentication> = None;
 
     loop {
         let msg = match next_message(stream, &tx).await {
@@ -617,6 +698,100 @@ async fn run_client(
                     continue;
                 }
                 sign_out(db, &mut session, &tx);
+            }
+            SignalMessage::ListPasskeys => {
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                    continue;
+                };
+                send_passkeys(db, &owner_id, &tx);
+            }
+            SignalMessage::PasskeyRegisterStart => {
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                    continue;
+                };
+                match passkeys::register_start(webauthn, db, &owner_id) {
+                    Ok((options, state)) => {
+                        passkey_registration = Some(state);
+                        let _ = tx.send(SignalMessage::PasskeyRegisterOptions { options });
+                    }
+                    Err(err) => passkey_error(&tx, err),
+                }
+            }
+            SignalMessage::PasskeyRegisterFinish { credential } => {
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                    continue;
+                };
+                let Some(state) = passkey_registration.take() else {
+                    tracing::warn!("passkey register finish without start");
+                    passkey_failed(&tx);
+                    continue;
+                };
+                match passkeys::register_finish(
+                    webauthn,
+                    db,
+                    &owner_id,
+                    &state,
+                    &credential,
+                    &user_agent,
+                    ice::now_unix() as i64,
+                ) {
+                    Ok(()) => send_passkeys(db, &owner_id, &tx),
+                    Err(err) => passkey_error(&tx, err),
+                }
+            }
+            SignalMessage::DeletePasskey { id } => {
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                    continue;
+                };
+                match db.delete_passkey(&owner_id, &id) {
+                    Ok(_) => send_passkeys(db, &owner_id, &tx),
+                    Err(err) => {
+                        tracing::error!(?err, "failed to delete passkey");
+                        let _ = tx.send(SignalMessage::Error {
+                            message: "internal error".to_string(),
+                        });
+                    }
+                }
+            }
+            SignalMessage::PasskeyLoginStart => match passkeys::login_start(webauthn) {
+                Ok((options, state)) => {
+                    passkey_login = Some(state);
+                    let _ = tx.send(SignalMessage::PasskeyLoginOptions { options });
+                }
+                Err(err) => passkey_error(&tx, err),
+            },
+            SignalMessage::PasskeyLoginFinish { credential } => {
+                let Some(state) = passkey_login.take() else {
+                    tracing::warn!("passkey login finish without start");
+                    passkey_failed(&tx);
+                    continue;
+                };
+                let now = ice::now_unix() as i64;
+                let owner_id = match passkeys::login_finish(webauthn, db, state, &credential, now) {
+                    Ok(owner_id) => owner_id,
+                    Err(err) => {
+                        passkey_error(&tx, err);
+                        continue;
+                    }
+                };
+                match switch_to_account(db, &mut session, &owner_id, &user_agent, now) {
+                    Ok(token) => {
+                        let devices = match device_entries_for_owner(db, registry, &owner_id) {
+                            Ok(devices) => devices,
+                            Err(err) => {
+                                tracing::error!(?err, "failed to load devices for owner");
+                                Vec::new()
+                            }
+                        };
+                        let _ = tx.send(SignalMessage::Authenticated { token, devices });
+                    }
+                    Err(err) => {
+                        tracing::error!(?err, "failed to sign in with passkey");
+                        let _ = tx.send(SignalMessage::Error {
+                            message: "internal error".to_string(),
+                        });
+                    }
+                }
             }
             SignalMessage::ConnectDevice { device_id } => {
                 let Some(owner_id) = require_owner(db, &mut session, &tx) else {
@@ -924,5 +1099,92 @@ mod tests {
     #[test]
     fn client_ip_uses_socket_without_header() {
         assert_eq!(client_ip(&HeaderMap::new(), peer()), peer().ip());
+    }
+
+    fn anonymous_session(db: &Db, now: i64) -> (Option<ClientSession>, String, String) {
+        let (owner_id, token_id, token) =
+            owners::authenticate(db, None, "UA", now).expect("authenticate");
+        (
+            Some(ClientSession {
+                owner_id: owner_id.clone(),
+                token_id,
+            }),
+            owner_id,
+            token,
+        )
+    }
+
+    #[test]
+    fn switch_to_account_moves_devices_and_replaces_the_anonymous_token() {
+        let db = Db::in_memory().expect("open in-memory db");
+        let (mut session, anon, anon_token) = anonymous_session(&db, 10);
+        db.insert_owner("account", 1).expect("account");
+        db.insert_device("dev1", "h", "Mac", 1).expect("device");
+        db.link_device(&anon, "dev1", 5).expect("link");
+        db.set_alias(&anon, "dev1", Some("Work")).expect("alias");
+
+        let token = switch_to_account(&db, &mut session, "account", "UA2", 20).expect("switch");
+
+        assert_eq!(
+            session.as_ref().map(|s| s.owner_id.as_str()),
+            Some("account")
+        );
+        assert_eq!(
+            db.token_by_hash(&crate::devices::hash_secret(&token))
+                .expect("lookup")
+                .map(|(owner, _)| owner),
+            Some("account".to_string())
+        );
+        assert_eq!(
+            db.token_by_hash(&crate::devices::hash_secret(&anon_token))
+                .expect("lookup"),
+            None
+        );
+        assert!(db.devices_for_owner(&anon).expect("anon").is_empty());
+        assert_eq!(db.webauthn_user_id(&anon).expect("anon gone"), None);
+        let moved = db.devices_for_owner("account").expect("account devices");
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].alias.as_deref(), Some("Work"));
+    }
+
+    #[test]
+    fn switch_to_account_keeps_an_account_owner_and_drops_only_the_current_token() {
+        let db = Db::in_memory().expect("open in-memory db");
+        let (mut session, other_account, old_token) = anonymous_session(&db, 10);
+        db.insert_passkey("pk", &other_account, "cred", "{}", "", 1)
+            .expect("passkey");
+        let (_, other_token) =
+            owners::issue_token(&db, &other_account, "UA", 11).expect("second token");
+        db.insert_owner("account", 1).expect("account");
+        db.insert_device("dev1", "h", "Mac", 1).expect("device");
+        db.link_device(&other_account, "dev1", 5).expect("link");
+
+        switch_to_account(&db, &mut session, "account", "UA2", 20).expect("switch");
+
+        assert_eq!(db.devices_for_owner(&other_account).expect("devs").len(), 1);
+        assert!(db.devices_for_owner("account").expect("devs").is_empty());
+        let hash = crate::devices::hash_secret;
+        assert_eq!(db.token_by_hash(&hash(&old_token)).expect("old"), None);
+        assert!(db
+            .token_by_hash(&hash(&other_token))
+            .expect("kept")
+            .is_some());
+        assert_eq!(db.passkeys_for_owner(&other_account).expect("pk").len(), 1);
+    }
+
+    #[test]
+    fn switch_to_account_without_a_session_or_to_the_same_owner_issues_a_new_token() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("account", 1).expect("account");
+        let mut none = None;
+        let token = switch_to_account(&db, &mut none, "account", "UA", 20).expect("switch");
+        assert!(none.is_some());
+        assert!(!token.is_empty());
+
+        let (mut session, same, old_token) = anonymous_session(&db, 10);
+        let new_token = switch_to_account(&db, &mut session, &same, "UA", 30).expect("switch");
+        assert_ne!(new_token, old_token);
+        let tokens = db.tokens_for_owner(&same).expect("tokens");
+        assert_eq!(tokens.len(), 1, "old token deleted, new one issued");
     }
 }

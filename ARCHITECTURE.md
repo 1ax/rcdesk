@@ -545,6 +545,7 @@ Telegram-бот (`TRAFFIC_TG_BOT_TOKEN`/`TRAFFIC_TG_CHAT_ID` в `~/app/.env`); �
 | vite 8, typescript 7, vitest 5 | web | сборка, типы, тесты; `vite.config.ts` использует `defineConfig` из `vitest/config` |
 | rusqlite 0.40 (bundled) | server | постоянное состояние сигналинга: устройства, владельцы, привязки (слайс 3.1); SQLite статически в бинарнике, файл в томе `/data` |
 | sha2 0.10 | server | SHA-256-хеши секретов устройств (3.1); секрет полноэнтропийный, KDF не нужен |
+| webauthn-rs 0.5.5 (conditional-ui) | server | passkey (WebAuthn): регистрация к владельцу и вход без логина через discoverable-аутентификацию (3.7b); Cargo-фича `conditional-ui` открывает `start/identify/finish_discoverable_authentication`. Цена: тянет OpenSSL (`openssl-sys`) — в runtime-образ добавлен `libssl3`, а `rcdesk-server` исключён из clippy/test на `windows-latest` (сервер работает только на Linux) |
 | opaque-ke 4.0 (argon2), argon2 0.5, sha2 0.10 | host | OPAQUE-пароль доступа к хосту (3.2b): шифронабор как у `@serenity-kit/opaque`, argon2id — KSF, SHA-512 — TripleDH |
 | rpassword 7 | host | скрытый ввод пароля в терминале для `rcdesk-host password set` (macOS + Windows) |
 | rand_core 0.6 (getrandom) | host | `OsRng` для трейтов `rand_core` 0.6, над которыми обобщён opaque-ke 4.0 (реэкспорт `opaque_ke::rand` без фичи `getrandom` `OsRng` не даёт; воркспейсный `rand` 0.10 — другой мажор трейтов) |

@@ -73,6 +73,17 @@ pub struct BrowserEntry {
     pub current: bool,
 }
 
+/// Один passkey владельца в списке (слайс 3.7b). `id` — идентификатор
+/// записи на сервере (не credential id и не данные ключа).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PasskeyEntry {
+    pub id: String,
+    pub user_agent: String,
+    pub created_at: i64,
+    pub last_used_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(export)]
@@ -211,6 +222,34 @@ pub enum SignalMessage {
     SignOut,
     /// server -> client: ответ на `SignOut`.
     SignedOut,
+    /// client -> server (слайс 3.7b): перечитать список passkey владельца.
+    ListPasskeys,
+    /// server -> client: passkey владельца, недавно использованные первыми.
+    Passkeys { passkeys: Vec<PasskeyEntry> },
+    /// client -> server: начать регистрацию passkey для текущего владельца.
+    /// Сервер отвечает `PasskeyRegisterOptions`.
+    PasskeyRegisterStart,
+    /// server -> client: параметры `navigator.credentials.create()`.
+    /// `options` — JSON-строка (`CreationChallengeResponse` webauthn-rs) как
+    /// есть; proto её содержимого не знает.
+    PasskeyRegisterOptions { options: String },
+    /// client -> server: ответ аутентификатора. `credential` — JSON-строка
+    /// (`RegisterPublicKeyCredential` webauthn-rs) как есть. В ответ сервер
+    /// шлёт обновлённый `Passkeys`.
+    PasskeyRegisterFinish { credential: String },
+    /// client -> server: начать вход по passkey без логина (владелец не
+    /// нужен). Сервер отвечает `PasskeyLoginOptions`.
+    PasskeyLoginStart,
+    /// server -> client: параметры `navigator.credentials.get()`. `options`
+    /// — JSON-строка (`RequestChallengeResponse` webauthn-rs) как есть.
+    PasskeyLoginOptions { options: String },
+    /// client -> server: ответ аутентификатора. `credential` — JSON-строка
+    /// (`PublicKeyCredential` webauthn-rs) как есть. В ответ сервер шлёт
+    /// `Authenticated` с новым токеном владельца аккаунта.
+    PasskeyLoginFinish { credential: String },
+    /// client -> server: удалить passkey `id` этого владельца. В ответ
+    /// сервер шлёт обновлённый `Passkeys`.
+    DeletePasskey { id: String },
     /// client -> server: подключиться к своему устройству без PIN.
     ConnectDevice { device_id: String },
     /// client -> server: переименовать своё устройство (`alias = None` —
@@ -468,6 +507,58 @@ mod tests {
             let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(round_tripped, msg);
         }
+    }
+
+    #[test]
+    fn passkey_messages_round_trip_through_json() {
+        let messages = vec![
+            SignalMessage::ListPasskeys,
+            SignalMessage::Passkeys {
+                passkeys: vec![PasskeyEntry {
+                    id: "pk1".to_string(),
+                    user_agent: "Mozilla/5.0".to_string(),
+                    created_at: 100,
+                    last_used_at: 200,
+                }],
+            },
+            SignalMessage::PasskeyRegisterStart,
+            SignalMessage::PasskeyRegisterOptions {
+                options: r#"{"publicKey":{}}"#.to_string(),
+            },
+            SignalMessage::PasskeyRegisterFinish {
+                credential: r#"{"id":"x"}"#.to_string(),
+            },
+            SignalMessage::PasskeyLoginStart,
+            SignalMessage::PasskeyLoginOptions {
+                options: r#"{"publicKey":{}}"#.to_string(),
+            },
+            SignalMessage::PasskeyLoginFinish {
+                credential: r#"{"id":"x"}"#.to_string(),
+            },
+            SignalMessage::DeletePasskey {
+                id: "pk1".to_string(),
+            },
+        ];
+        for msg in messages {
+            let json = serde_json::to_string(&msg).expect("serialize");
+            let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(round_tripped, msg);
+        }
+    }
+
+    #[test]
+    fn passkey_messages_have_the_expected_wire_shape() {
+        let msg: SignalMessage =
+            serde_json::from_str(r#"{"type":"passkey_login_start"}"#).expect("deserialize");
+        assert_eq!(msg, SignalMessage::PasskeyLoginStart);
+        let msg: SignalMessage =
+            serde_json::from_str(r#"{"type":"delete_passkey","id":"x"}"#).expect("deserialize");
+        assert_eq!(
+            msg,
+            SignalMessage::DeletePasskey {
+                id: "x".to_string()
+            }
+        );
     }
 
     #[test]

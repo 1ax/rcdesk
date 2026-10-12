@@ -36,10 +36,13 @@ async fn spawn_server_with_db() -> (String, Db) {
     let ice = IceConfig::from_env();
     let db = Db::in_memory().expect("open in-memory db");
     let db_handle = db.clone();
+    let webauthn = rcdesk_server::passkeys::build_webauthn("localhost", "http://localhost:5173")
+        .expect("build webauthn");
     tokio::spawn(async move {
         axum::serve(
             listener,
-            app(registry, ice, db).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            app(registry, ice, db, webauthn)
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .await
         .expect("serve");
@@ -1537,4 +1540,162 @@ async fn revoking_own_browser_acts_as_sign_out() {
     }
     send(&mut client, &SignalMessage::ListBrowsers).await;
     expect_not_authenticated(&mut client).await;
+}
+
+/// Asserts the next message is `Error { message }` with exactly this text.
+async fn expect_error(ws: &mut WsStream, expected: &str) {
+    match recv(ws).await {
+        SignalMessage::Error { message } => assert_eq!(message, expected),
+        other => panic!("expected error {expected:?}, got {other:?}"),
+    }
+}
+
+// (3.7b-a) passkey management without ClientAuth is "not authenticated".
+#[tokio::test]
+async fn passkey_management_without_client_auth_returns_not_authenticated() {
+    let url = spawn_server().await;
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+
+    for msg in [
+        SignalMessage::ListPasskeys,
+        SignalMessage::PasskeyRegisterStart,
+        SignalMessage::PasskeyRegisterFinish {
+            credential: "{}".to_string(),
+        },
+        SignalMessage::DeletePasskey {
+            id: "x".to_string(),
+        },
+    ] {
+        send(&mut client, &msg).await;
+        expect_not_authenticated(&mut client).await;
+    }
+}
+
+// (3.7b-b) an authenticated owner with no passkeys gets an empty list, and
+// RegisterStart returns options that parse as JSON and demand a resident key.
+#[tokio::test]
+async fn list_passkeys_is_empty_and_register_start_returns_options() {
+    let url = spawn_server().await;
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    client_auth(&mut client, None).await;
+
+    send(&mut client, &SignalMessage::ListPasskeys).await;
+    match recv(&mut client).await {
+        SignalMessage::Passkeys { passkeys } => assert!(passkeys.is_empty()),
+        other => panic!("expected passkeys, got {other:?}"),
+    }
+
+    send(&mut client, &SignalMessage::PasskeyRegisterStart).await;
+    match recv(&mut client).await {
+        SignalMessage::PasskeyRegisterOptions { options } => {
+            let json: serde_json::Value = serde_json::from_str(&options).expect("options json");
+            assert_eq!(
+                json["publicKey"]["authenticatorSelection"]["residentKey"],
+                "required"
+            );
+        }
+        other => panic!("expected passkey_register_options, got {other:?}"),
+    }
+}
+
+// (3.7b-c) Finish without Start, a second Finish and garbage are all
+// "passkey failed"; login needs no owner.
+#[tokio::test]
+async fn passkey_finish_without_start_or_with_garbage_fails() {
+    let url = spawn_server().await;
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    client_auth(&mut client, None).await;
+
+    let finish = SignalMessage::PasskeyRegisterFinish {
+        credential: "{}".to_string(),
+    };
+    send(&mut client, &finish).await;
+    expect_error(&mut client, "passkey failed").await;
+
+    send(&mut client, &SignalMessage::PasskeyRegisterStart).await;
+    let _ = recv(&mut client).await;
+    send(&mut client, &finish).await;
+    expect_error(&mut client, "passkey failed").await;
+    send(&mut client, &finish).await;
+    expect_error(&mut client, "passkey failed").await;
+
+    // Login: a stranger connection (no ClientAuth at all).
+    let mut stranger = connect(&url).await;
+    hello(&mut stranger, Role::Client).await;
+    let login_finish = SignalMessage::PasskeyLoginFinish {
+        credential: "garbage".to_string(),
+    };
+    send(&mut stranger, &login_finish).await;
+    expect_error(&mut stranger, "passkey failed").await;
+
+    send(&mut stranger, &SignalMessage::PasskeyLoginStart).await;
+    match recv(&mut stranger).await {
+        SignalMessage::PasskeyLoginOptions { options } => {
+            let json: serde_json::Value = serde_json::from_str(&options).expect("options json");
+            assert_eq!(json["publicKey"]["userVerification"], "required");
+        }
+        other => panic!("expected passkey_login_options, got {other:?}"),
+    }
+    send(&mut stranger, &login_finish).await;
+    expect_error(&mut stranger, "passkey failed").await;
+    // The state was consumed by the failed finish.
+    send(&mut stranger, &login_finish).await;
+    expect_error(&mut stranger, "passkey failed").await;
+}
+
+// (3.7b-d) DeletePasskey removes the owner's own passkey but never someone
+// else's. Passkeys are inserted through the Db handle (no authenticator).
+#[tokio::test]
+async fn delete_passkey_is_scoped_to_the_owner() {
+    let (url, db) = spawn_server_with_db().await;
+    db.insert_owner("other", 1).expect("other owner");
+    db.insert_passkey("foreign", "other", "cred-foreign", "{}", "", 1)
+        .expect("foreign passkey");
+
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    let (token, _) = client_auth(&mut client, None).await;
+    let (owner_id, _) = db
+        .token_by_hash(&rcdesk_server::devices::hash_secret(&token))
+        .expect("token lookup")
+        .expect("token present");
+    db.insert_passkey("mine", &owner_id, "cred-mine", "{}", "UA", 2)
+        .expect("own passkey");
+
+    send(&mut client, &SignalMessage::ListPasskeys).await;
+    match recv(&mut client).await {
+        SignalMessage::Passkeys { passkeys } => {
+            assert_eq!(passkeys.len(), 1);
+            assert_eq!(passkeys[0].id, "mine");
+        }
+        other => panic!("expected passkeys, got {other:?}"),
+    }
+
+    send(
+        &mut client,
+        &SignalMessage::DeletePasskey {
+            id: "foreign".to_string(),
+        },
+    )
+    .await;
+    match recv(&mut client).await {
+        SignalMessage::Passkeys { passkeys } => assert_eq!(passkeys.len(), 1),
+        other => panic!("expected passkeys, got {other:?}"),
+    }
+    assert_eq!(db.passkeys_for_owner("other").expect("list").len(), 1);
+
+    send(
+        &mut client,
+        &SignalMessage::DeletePasskey {
+            id: "mine".to_string(),
+        },
+    )
+    .await;
+    match recv(&mut client).await {
+        SignalMessage::Passkeys { passkeys } => assert!(passkeys.is_empty()),
+        other => panic!("expected passkeys, got {other:?}"),
+    }
 }

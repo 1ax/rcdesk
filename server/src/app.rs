@@ -3,6 +3,7 @@ use axum::Router;
 
 use crate::db::Db;
 use crate::ice::IceConfig;
+use crate::passkeys::SharedWebauthn;
 use crate::pin_limit::PinLimiter;
 use crate::registry::Registry;
 use crate::ws::ws_handler;
@@ -17,9 +18,11 @@ pub struct AppState {
     pub db: Db,
     /// Per-IP limit on wrong-PIN guesses (slice 3.6a).
     pub pin_limiter: PinLimiter,
+    /// WebAuthn relying party for passkeys (slice 3.7b).
+    pub webauthn: SharedWebauthn,
 }
 
-pub fn app(registry: Registry, ice: IceConfig, db: Db) -> Router {
+pub fn app(registry: Registry, ice: IceConfig, db: Db, webauthn: SharedWebauthn) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/ws", get(ws_handler))
@@ -28,6 +31,7 @@ pub fn app(registry: Registry, ice: IceConfig, db: Db) -> Router {
             ice,
             db,
             pin_limiter: PinLimiter::new(),
+            webauthn,
         })
 }
 
@@ -49,6 +53,8 @@ mod tests {
             Registry::new(),
             IceConfig::from_env(),
             crate::db::Db::in_memory().expect("open in-memory db"),
+            crate::passkeys::build_webauthn("localhost", "http://localhost:5173")
+                .expect("build webauthn"),
         )
         .oneshot(
             Request::builder()

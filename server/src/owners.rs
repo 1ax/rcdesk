@@ -58,6 +58,26 @@ pub fn authenticate(
     Ok((owner_id, token_id, token))
 }
 
+/// Выдаёт существующему владельцу новый токен (вход по passkey, слайс
+/// 3.7b). Возвращает `(token_id, token)`; токен надо отдать клиенту.
+pub fn issue_token(
+    db: &Db,
+    owner_id: &str,
+    user_agent: &str,
+    now: i64,
+) -> anyhow::Result<(String, String)> {
+    let token_id = random_token(TOKEN_ID_LEN);
+    let token = random_token(TOKEN_LEN);
+    db.insert_token(
+        owner_id,
+        &token_id,
+        &hash_secret(&token),
+        truncate_user_agent(user_agent),
+        now,
+    )?;
+    Ok((token_id, token))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +151,20 @@ mod tests {
 
         let tokens = db.tokens_for_owner(&owner_id).expect("tokens");
         assert_eq!(tokens[0].user_agent.chars().count(), 256);
+    }
+
+    #[test]
+    fn issue_token_adds_a_second_working_token_to_the_same_owner() {
+        let db = Db::in_memory().expect("open in-memory db");
+        let (owner_id, _, first) = authenticate(&db, None, "UA1", 100).expect("authenticate");
+
+        let (token_id, second) = issue_token(&db, &owner_id, "UA2", 200).expect("issue");
+
+        assert_ne!(first, second);
+        assert_eq!(
+            db.token_by_hash(&hash_secret(&second)).expect("lookup"),
+            Some((owner_id.clone(), token_id))
+        );
+        assert_eq!(db.tokens_for_owner(&owner_id).expect("tokens").len(), 2);
     }
 }

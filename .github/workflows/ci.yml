@@ -29,9 +29,19 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all --check
       - name: cargo clippy --workspace --all-targets -- -D warnings
+        if: matrix.os != 'windows-latest'
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test --workspace
+        if: matrix.os != 'windows-latest'
         run: cargo test --workspace
+      # rcdesk-server тянет OpenSSL (webauthn-rs) и работает только на Linux:
+      # на Windows-раннере OpenSSL нет, поэтому сервер там не собираем.
+      - name: cargo clippy --workspace --exclude rcdesk-server (windows)
+        if: matrix.os == 'windows-latest'
+        run: cargo clippy --workspace --exclude rcdesk-server --all-targets -- -D warnings
+      - name: cargo test --workspace --exclude rcdesk-server (windows)
+        if: matrix.os == 'windows-latest'
+        run: cargo test --workspace --exclude rcdesk-server
 
   proto-ts-sync:
     runs-on: ubuntu-latest
