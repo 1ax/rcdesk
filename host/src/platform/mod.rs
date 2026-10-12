@@ -37,6 +37,20 @@ pub use macos::autostart;
 /// Шторка (4.2c2): только macOS, только `rcdesk-agent`.
 #[cfg(target_os = "macos")]
 pub use macos::curtain;
+
+/// Будит спящий дисплей при старте сеанса (4.6a). macOS -- реальная
+/// IOKit-ассерция, остальные платформы -- no-op guard (поведение не меняется).
+#[cfg(target_os = "macos")]
+pub use macos::display_wake;
+#[cfg(not(target_os = "macos"))]
+pub mod display_wake {
+    /// Заглушка: на этой платформе будить нечего.
+    pub struct DisplayWakeGuard;
+
+    pub fn wake() -> DisplayWakeGuard {
+        DisplayWakeGuard
+    }
+}
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub use other::autostart;
 #[cfg(target_os = "windows")]

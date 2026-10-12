@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod autostart;
 pub mod curtain;
+pub mod display_wake;
 pub mod event_loop;
 
 pub(super) fn name() -> &'static str {

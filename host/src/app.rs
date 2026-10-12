@@ -22,7 +22,7 @@ use crate::input::NoopInjector;
 use crate::platform;
 use crate::signaling::{
     AgentCommand, AgentStatus, BuildClipboard, BuildSource, ConnectError, HostContext, Keepalive,
-    SessionSlot, SignalingClient,
+    SessionSlot, SignalingClient, WakeDisplay,
 };
 use crate::transport::SessionConfig;
 
@@ -281,6 +281,13 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
             Box::new(|| Ok(capture::list_displays()?))
         };
 
+    // Синтетика не будит экран машины (4.6a): no-op guard.
+    let wake_display: WakeDisplay = if synthetic {
+        Box::new(|| Box::new(()) as Box<dyn Send>)
+    } else {
+        Box::new(|| Box::new(crate::platform::display_wake::wake()) as Box<dyn Send>)
+    };
+
     let build_injector: Box<dyn Fn() -> anyhow::Result<Box<dyn Injector>> + Send + Sync> =
         if no_input {
             // `Err`, not a `NoopInjector` directly: `start_session` already
@@ -332,6 +339,7 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
         encoder: opts.encoder.kind(),
         build_source,
         curtain: None,
+        wake_display,
         list_displays,
         display,
         build_injector,

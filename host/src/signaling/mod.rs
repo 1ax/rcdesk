@@ -88,6 +88,11 @@ pub type BuildClipboard = Box<dyn Fn() -> anyhow::Result<Box<dyn ClipboardBacken
 pub type BuildSource =
     Box<dyn Fn(u32, &[u32]) -> anyhow::Result<Box<dyn FrameSource>> + Send + Sync>;
 
+/// Будит дисплей (слайс 4.6a) и возвращает guard, который держит ассерцию
+/// до своего `Drop`. Замыкание, а не прямой вызов `platform`, чтобы тесты и
+/// синтетика не дёргали IOKit (это включало бы экран машины разработчика).
+pub type WakeDisplay = Box<dyn Fn() -> Box<dyn Send> + Send + Sync>;
+
 /// What the signaling client needs to build a fresh `PeerSession` and video
 /// pipeline for each joining peer.
 pub struct HostContext {
@@ -123,6 +128,8 @@ pub struct HostContext {
     /// `SetCurtain` отвечает отказом, а `HostInfo.curtain_available` ложно.
     /// Реализация приедет в 4.2c2, пока везде `None`.
     pub curtain: Option<Arc<dyn Curtain>>,
+    /// Будит спящий дисплей перед выбором дисплея в `start_session` (4.6a).
+    pub wake_display: WakeDisplay,
     /// Lists the displays capturable right now, for the initial
     /// `ControlMessage::Displays` announcement and to resolve
     /// `ControlMessage::SelectDisplay` ids (slice 2.4). `main.rs` supplies
@@ -2301,6 +2308,41 @@ fn spawn_elevation_watcher(peer: Arc<PeerSession>) -> tokio::task::JoinHandle<()
     })
 }
 
+/// Сколько ждать появления дисплея после пробуждения (4.6a) и с каким шагом.
+const DISPLAY_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const DISPLAY_WAIT_STEP: Duration = Duration::from_millis(250);
+
+/// Повторяет `attempt` с шагом `step`, пока он не вернёт `Ok` или не
+/// истечёт `timeout`; после таймаута возвращает последнюю ошибку. Первая
+/// удачная попытка -- без задержки. Если пришлось ждать, пишет `info`.
+async fn wait_for_value<T>(
+    mut attempt: impl FnMut() -> anyhow::Result<T>,
+    timeout: Duration,
+    step: Duration,
+) -> anyhow::Result<T> {
+    let mut waited = Duration::ZERO;
+    loop {
+        match attempt() {
+            Ok(value) => {
+                if !waited.is_zero() {
+                    tracing::info!(
+                        waited_ms = waited.as_millis() as u64,
+                        "display appeared after wake"
+                    );
+                }
+                return Ok(value);
+            }
+            Err(err) => {
+                if waited >= timeout {
+                    return Err(err);
+                }
+                tokio::time::sleep(step).await;
+                waited += step;
+            }
+        }
+    }
+}
+
 /// Builds the video pipeline and the `PeerSession` for one joining peer, and
 /// starts the task that feeds encoded frames from the pipeline into the
 /// session's video track. `registered_ice_servers` are this session's own
@@ -2313,17 +2355,29 @@ async fn start_session(
     registered_ice_servers: &[proto::signal::IceServer],
     events: mpsc::Sender<SessionEvent>,
 ) -> anyhow::Result<SessionParts> {
-    let displays = (ctx.list_displays)()?;
-    let start_display = match ctx.display {
-        Some(id) => displays
-            .iter()
-            .find(|d| d.id == id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("display {id} not found"))?,
-        None => capture::default_display(&displays)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no capturable display found"))?,
-    };
+    // Слайс 4.6a: будим дисплей и ждём, пока он появится в списке; guard
+    // отпускаем сразу после выбора -- дальше его держит `SessionActivity`.
+    let wake_guard = (ctx.wake_display)();
+    let (displays, start_display) = wait_for_value(
+        || {
+            let displays = (ctx.list_displays)()?;
+            let chosen = match ctx.display {
+                Some(id) => displays
+                    .iter()
+                    .find(|d| d.id == id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("display {id} not found"))?,
+                None => capture::default_display(&displays)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("no capturable display found"))?,
+            };
+            Ok((displays, chosen))
+        },
+        DISPLAY_WAIT_TIMEOUT,
+        DISPLAY_WAIT_STEP,
+    )
+    .await?;
+    drop(wake_guard);
 
     let keyframe_flag = Arc::new(AtomicBool::new(false));
     let (video_tx, video_rx) = mpsc::channel(4);
@@ -2636,6 +2690,7 @@ pub(crate) fn test_ctx() -> HostContext {
             Ok(Box::new(capture::synthetic::for_display(id, 30)?) as Box<dyn FrameSource>)
         }),
         curtain: None,
+        wake_display: Box::new(|| Box::new(()) as Box<dyn Send>),
         list_displays: Box::new(|| Ok(capture::synthetic::list_displays())),
         display: None,
         build_injector: Box::new(|| {
@@ -2665,6 +2720,88 @@ pub(crate) fn test_ctx() -> HostContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `tokio/test-util` в воркспейсе не включён, поэтому вместо paused-времени
+    // берём реальные, но крошечные шаги/таймаут.
+    const T_STEP: Duration = Duration::from_millis(5);
+    const T_TIMEOUT: Duration = Duration::from_millis(60);
+
+    #[tokio::test]
+    async fn wait_for_value_first_attempt_no_sleep() {
+        let mut calls = 0;
+        let started = Instant::now();
+        let v = wait_for_value(
+            || {
+                calls += 1;
+                Ok(7)
+            },
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v, 7);
+        assert_eq!(calls, 1);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn wait_for_value_succeeds_on_nth_attempt() {
+        let mut calls = 0;
+        let v = wait_for_value(
+            || {
+                calls += 1;
+                if calls < 4 {
+                    Err(anyhow::anyhow!("not yet"))
+                } else {
+                    Ok(calls)
+                }
+            },
+            T_TIMEOUT,
+            T_STEP,
+        )
+        .await
+        .unwrap();
+        assert_eq!(v, 4);
+    }
+
+    #[tokio::test]
+    async fn wait_for_value_times_out_with_last_error() {
+        let mut calls = 0;
+        let err = wait_for_value(
+            || -> anyhow::Result<()> {
+                calls += 1;
+                Err(anyhow::anyhow!("attempt {calls}"))
+            },
+            T_TIMEOUT,
+            T_STEP,
+        )
+        .await
+        .unwrap_err();
+        assert!(calls > 1);
+        assert_eq!(err.to_string(), format!("attempt {calls}"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_value_retries_after_list_error_then_succeeds() {
+        let mut calls = 0;
+        let v = wait_for_value(
+            || {
+                calls += 1;
+                match calls {
+                    1 => Err(anyhow::anyhow!("list failed")),
+                    2 => Err(anyhow::anyhow!("no capturable display found")),
+                    _ => Ok("display"),
+                }
+            },
+            T_TIMEOUT,
+            T_STEP,
+        )
+        .await
+        .unwrap();
+        assert_eq!(v, "display");
+        assert_eq!(calls, 3);
+    }
 
     fn display(id: u32, title: &str, primary: bool) -> DisplayInfo {
         DisplayInfo {

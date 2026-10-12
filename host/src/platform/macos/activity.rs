@@ -3,6 +3,10 @@
 //! interaction -- exactly what App Nap targets -- so without this macOS may
 //! coalesce/delay the capture and encode threads' timers, degrading fps
 //! during an otherwise idle-looking background process.
+//!
+//! Слайс 4.6a: к тому же `IdleDisplaySleepDisabled` -- пока идёт сеанс, дисплей
+//! не гаснет по таймеру простоя (иначе захват остаётся без дисплея). Сам
+//! подъём уже уснувшего дисплея при старте сеанса -- в `display_wake`.
 
 use objc2::rc::Retained;
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
@@ -21,7 +25,9 @@ impl SessionActivity {
         let info = NSProcessInfo::processInfo();
         let reason = NSString::from_str("rcdesk remote session");
         let token = info.beginActivityWithOptions_reason(
-            NSActivityOptions::UserInitiated | NSActivityOptions::IdleSystemSleepDisabled,
+            NSActivityOptions::UserInitiated
+                | NSActivityOptions::IdleSystemSleepDisabled
+                | NSActivityOptions::IdleDisplaySleepDisabled,
             &reason,
         );
         Self(token)
