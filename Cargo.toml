@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["proto", "host", "server"]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -34,3 +35,6 @@ argon2 = "0.5"
 sha2 = "0.10"
 rpassword = "7"
 hmac = "0.12"
+
+[patch.crates-io]
+rtc-sctp = { path = "vendor/rtc-sctp" }

@@ -527,6 +527,7 @@ Telegram-бот (`TRAFFIC_TG_BOT_TOKEN`/`TRAFFIC_TG_CHAT_ID` в `~/app/.env`); �
 | futures-util 0.3 | server | `split()` WebSocket на sink/stream |
 | rand 0.10 | server | генерация PIN и идентификаторов |
 | webrtc 0.20 + rtc 0.20 | host | WebRTC-стек (async-обёртка + sans-IO ядро; `rtc` нужен напрямую для типов) |
+| rtc-sctp 0.20.5 (своя копия в `vendor/rtc-sctp`, `[patch.crates-io]`) | host (транзитивно через `rtc`) | одна правка: T3-rtx повторяется без лимита. В upstream после 5 повторов таймер гаснет навсегда, и хост→клиент по каналам данных встаёт (файлы висят на «1/N», буфер не доходит). Убрать, когда исправят upstream или откроют `TimerConfig`; см. `vendor/rtc-sctp/RCDESK-PATCH.md` |
 | scap 0.0.8 | host (macOS/Windows) | захват экрана; NV12 на macOS, BGRA на Windows |
 | openh264 0.9 (source) | host | H.264 программный + SIMD-конверсия BGRA→I420 |
 | openh264-sys2 0.9 | host | сырые FFI-типы (`ENCODER_OPTION_BITRATE`, `SBitrateInfo`), которые `openh264` не реэкспортирует — смена битрейта/fps на живом кодере через `Encoder::raw_api` (слайс 2.3). Та же 0.9.8, что уже в графе |
