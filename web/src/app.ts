@@ -58,7 +58,7 @@ import {
   saveQualityPreset,
 } from "./qualityPreset";
 import {
-  cmdAsCtrlApplies,
+  keyRemapMode,
   isMacClient,
   loadCmdAsCtrlSetting,
   saveCmdAsCtrlSetting,
@@ -323,7 +323,7 @@ export function mount(root: Element | null): void {
           <select id="quality-select" class="quality-select" title="Качество"></select>
           <label id="cmd-as-ctrl-label" class="cmd-as-ctrl-toggle" hidden>
             <input type="checkbox" id="cmd-as-ctrl-checkbox" />
-            Cmd как Ctrl
+            <span id="cmd-as-ctrl-text">Cmd как Ctrl</span>
           </label>
           <span id="view-only" class="status view-only" hidden></span>
           <span id="input-blocked" class="status input-blocked" hidden></span>
@@ -443,6 +443,7 @@ export function mount(root: Element | null): void {
   }
   const cmdAsCtrlLabel = root.querySelector<HTMLLabelElement>("#cmd-as-ctrl-label")!;
   const cmdAsCtrlCheckbox = root.querySelector<HTMLInputElement>("#cmd-as-ctrl-checkbox")!;
+  const cmdAsCtrlText = root.querySelector<HTMLSpanElement>("#cmd-as-ctrl-text")!;
   // Decided once per tab (the physical keyboard doesn't change mid-session),
   // unlike `hostOs` below, which is per-session and arrives from the host.
   const clientIsMac = isMacClient(navigator);
@@ -1045,7 +1046,7 @@ export function mount(root: Element | null): void {
       // Slice 3.5f: a getter, not `cmdAsCtrl` itself, so a later toggle
       // (see the checkbox's `change` listener below) is picked up by every
       // keydown/keyup without re-attaching.
-      () => cmdAsCtrl,
+      () => keyRemapMode(clientIsMac, hostOs, cmdAsCtrl),
       // Slice 4.6d: Alt+Shift on the client switches the Mac host's layout
       // (a Windows host handles the forwarded Alt+Shift itself).
       () => {
@@ -1059,7 +1060,18 @@ export function mount(root: Element | null): void {
    * `host_info` arriving, and `stopSessionResources` resetting `hostOs` back
    * to `null` between sessions. */
   function updateCmdAsCtrlVisibility(): void {
-    cmdAsCtrlLabel.hidden = !cmdAsCtrlApplies(clientIsMac, hostOs);
+    // Slice 4.6e: one shared checkbox; its caption follows the mode that
+    // would apply (the mode with the setting forced on).
+    const mode = keyRemapMode(clientIsMac, hostOs, true);
+    cmdAsCtrlLabel.hidden = mode === "none";
+    if (mode === "ctrl-as-cmd") {
+      cmdAsCtrlText.textContent = "Ctrl как Cmd";
+      cmdAsCtrlLabel.title =
+        "Ctrl работает как Cmd на Mac: Ctrl+C/V копируют и вставляют. Клавиша Win работает как Ctrl";
+    } else {
+      cmdAsCtrlText.textContent = "Cmd как Ctrl";
+      cmdAsCtrlLabel.title = "";
+    }
   }
 
   /** Sends `InputMessage::ReleaseAll` on the `input` channel directly (a

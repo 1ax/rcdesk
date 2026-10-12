@@ -12,7 +12,7 @@
 import type { InputMessage } from "./generated/InputMessage";
 import type { PointerButton } from "./generated/PointerButton";
 import { isCopyShortcut, isPasteShortcut } from "./clipboard";
-import { remapCode } from "./keyRemap";
+import { remapCode, type KeyRemapMode } from "./keyRemap";
 import { createLayoutChord } from "./layoutChord";
 
 /** The two data channels `attachInput` needs, opened by the host and handed
@@ -108,8 +108,8 @@ export function normalizeWheel(
 
 /** Builds the `Key` message for a keydown/keyup, or `null` for an
  * auto-repeat keydown -- the OS/host repeats a held key on its own once, so
- * forwarding every repeat event would double it up. `cmdAsCtrl` (slice
- * 3.5f, default `false`) is applied to `code` via `keyRemap.remapCode`
+ * forwarding every repeat event would double it up. `remapMode` (slices
+ * 3.5f/4.6e, default `"none"`) is applied to `code` via `keyRemap.remapCode`
  * before the message is built -- the same call, with the same flag, for
  * both a keydown and the matching keyup (see `attachInput`'s `onKeyDown`/
  * `onKeyUp`) so a held key can't desync into "Meta down, Ctrl up" on the
@@ -119,10 +119,10 @@ export function keyToMessage(
   code: string,
   pressed: boolean,
   repeat: boolean,
-  cmdAsCtrl = false,
+  remapMode: KeyRemapMode = "none",
 ): InputMessage | null {
   if (repeat) return null;
-  return { type: "key", code: remapCode(code, cmdAsCtrl), pressed };
+  return { type: "key", code: remapCode(code, remapMode), pressed };
 }
 
 const POINTER_BUTTON_NAMES: readonly PointerButton[] = ["left", "middle", "right", "back", "forward"];
@@ -209,11 +209,11 @@ export function attachInput(
   video: HTMLVideoElement,
   channels: InputChannels,
   hooks?: InputHooks,
-  // Slice 3.5f: a getter, not a plain `boolean`, since the owner can flip
+  // Slice 3.5f: a getter, not a plain value, since the owner can flip
   // the "Cmd как Ctrl" toggle (`app.ts`) mid-session -- every keydown/keyup
   // reads the current value at the moment it fires, rather than capturing
   // whatever was true when `attachInput` was called.
-  getCmdAsCtrl?: () => boolean,
+  getRemapMode?: () => KeyRemapMode,
   // Slice 4.6d: called when the Alt+Shift chord completes (see
   // `layoutChord.ts`). Key forwarding to the host is unchanged.
   onLayoutChord?: () => void,
@@ -285,7 +285,7 @@ export function attachInput(
 
   function onKeyDown(e: KeyboardEvent): void {
     e.preventDefault();
-    const msg = keyToMessage(e.code, true, e.repeat, getCmdAsCtrl?.());
+    const msg = keyToMessage(e.code, true, e.repeat, getRemapMode?.());
 
     if (msg && isPasteShortcut(e) && hooks?.beforePaste) {
       // Open the gate *before* queueing this keydown, so it -- and every
@@ -313,7 +313,7 @@ export function attachInput(
 
   function onKeyUp(e: KeyboardEvent): void {
     e.preventDefault();
-    const msg = keyToMessage(e.code, false, e.repeat, getCmdAsCtrl?.());
+    const msg = keyToMessage(e.code, false, e.repeat, getRemapMode?.());
     if (msg) sendGatedInput(msg);
     if (layoutChord.keyUp(e.code)) onLayoutChord?.();
   }

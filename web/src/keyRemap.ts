@@ -1,4 +1,4 @@
-// Pure functions backing the client's "Cmd как Ctrl" setting (slice 3.5f):
+// Pure functions backing the client's "Cmd как Ctrl" setting (slice 3.5f); 4.6e adds the mirrored "Ctrl как Cmd" mode:
 // deciding whether it applies to this session, remapping a key `code`, and
 // the localStorage load/save for the owner's choice. No DOM access here so
 // this stays unit testable without a browser (see `displays.ts`/`fullscreen.ts`
@@ -51,15 +51,41 @@ export function cmdAsCtrlApplies(clientIsMac: boolean, hostOs: HostOs | null): b
   return clientIsMac && hostOs === "windows";
 }
 
-/** Remaps a `KeyboardEvent.code` for the wire when `cmdAsCtrl` is enabled and
- * applicable (see `cmdAsCtrlApplies`): the two Cmd codes become the matching
- * Ctrl code, side preserved; every other code passes through unchanged.
- * Applied identically to keydown and keyup (see `input.ts`'s `keyToMessage`)
- * so a held key can't desync into "Meta down, Ctrl up" on the host. */
-export function remapCode(code: string, cmdAsCtrl: boolean): string {
-  if (!cmdAsCtrl) return code;
-  if (code === "MetaLeft") return "ControlLeft";
-  if (code === "MetaRight") return "ControlRight";
+/** How modifier codes are rewritten on the wire (slice 4.6e generalises 3.5f):
+ * - `none`: pass-through;
+ * - `cmd-as-ctrl`: Mac client -> Windows host, Meta becomes Control;
+ * - `ctrl-as-cmd`: non-Mac client -> Mac host, Control and Meta are SWAPPED
+ *   (Ctrl acts as Cmd, the Win key acts as Ctrl, so a real Mac Ctrl stays
+ *   reachable for Ctrl+Space, terminal Ctrl+C and the like). */
+export type KeyRemapMode = "none" | "cmd-as-ctrl" | "ctrl-as-cmd";
+
+/** Picks the remap mode for this session. `enabled` is the single shared
+ * "substitute the modifier for the host OS" checkbox. */
+export function keyRemapMode(
+  clientIsMac: boolean,
+  hostOs: HostOs | null,
+  enabled: boolean,
+): KeyRemapMode {
+  if (!enabled) return "none";
+  if (clientIsMac && hostOs === "windows") return "cmd-as-ctrl";
+  if (!clientIsMac && hostOs === "macos") return "ctrl-as-cmd";
+  return "none";
+}
+
+/** Remaps a `KeyboardEvent.code` for the wire according to `mode`, side
+ * preserved; every other code passes through unchanged. Applied identically
+ * to keydown and keyup (see `input.ts`'s `keyToMessage`) so a held key can't
+ * desync into "Meta down, Ctrl up" on the host. */
+export function remapCode(code: string, mode: KeyRemapMode): string {
+  if (mode === "cmd-as-ctrl") {
+    if (code === "MetaLeft") return "ControlLeft";
+    if (code === "MetaRight") return "ControlRight";
+  } else if (mode === "ctrl-as-cmd") {
+    if (code === "ControlLeft") return "MetaLeft";
+    if (code === "ControlRight") return "MetaRight";
+    if (code === "MetaLeft") return "ControlLeft";
+    if (code === "MetaRight") return "ControlRight";
+  }
   return code;
 }
 

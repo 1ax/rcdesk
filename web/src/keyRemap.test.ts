@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   cmdAsCtrlApplies,
+  keyRemapMode,
   CMD_AS_CTRL_STORAGE_KEY,
   isMacClient,
   loadCmdAsCtrlSetting,
@@ -63,23 +64,57 @@ describe("cmdAsCtrlApplies", () => {
   });
 });
 
-describe("remapCode", () => {
-  it("remaps MetaLeft/MetaRight to the matching Ctrl code when enabled", () => {
-    expect(remapCode("MetaLeft", true)).toBe("ControlLeft");
-    expect(remapCode("MetaRight", true)).toBe("ControlRight");
+describe("keyRemapMode", () => {
+  it("Mac client + windows host", () => {
+    expect(keyRemapMode(true, "windows", true)).toBe("cmd-as-ctrl");
+    expect(keyRemapMode(true, "windows", false)).toBe("none");
   });
 
-  it("leaves MetaLeft/MetaRight alone when disabled", () => {
-    expect(remapCode("MetaLeft", false)).toBe("MetaLeft");
-    expect(remapCode("MetaRight", false)).toBe("MetaRight");
+  it("non-Mac client + macos host", () => {
+    expect(keyRemapMode(false, "macos", true)).toBe("ctrl-as-cmd");
+    expect(keyRemapMode(false, "macos", false)).toBe("none");
   });
 
-  it("leaves every other code unchanged regardless of the flag", () => {
-    expect(remapCode("KeyC", true)).toBe("KeyC");
-    expect(remapCode("ControlLeft", true)).toBe("ControlLeft");
-    expect(remapCode("ShiftLeft", false)).toBe("ShiftLeft");
+  it("is none for same-OS family, other and unknown hosts", () => {
+    expect(keyRemapMode(true, "macos", true)).toBe("none");
+    expect(keyRemapMode(false, "windows", true)).toBe("none");
+    expect(keyRemapMode(false, "other", true)).toBe("none");
+    expect(keyRemapMode(true, null, true)).toBe("none");
+    expect(keyRemapMode(false, null, true)).toBe("none");
   });
 });
+
+describe("remapCode", () => {
+  it("cmd-as-ctrl maps Meta to Control, side preserved", () => {
+    expect(remapCode("MetaLeft", "cmd-as-ctrl")).toBe("ControlLeft");
+    expect(remapCode("MetaRight", "cmd-as-ctrl")).toBe("ControlRight");
+  });
+
+  it("cmd-as-ctrl does not touch Control or other codes", () => {
+    expect(remapCode("ControlLeft", "cmd-as-ctrl")).toBe("ControlLeft");
+    expect(remapCode("ControlRight", "cmd-as-ctrl")).toBe("ControlRight");
+    expect(remapCode("KeyC", "cmd-as-ctrl")).toBe("KeyC");
+  });
+
+  it("ctrl-as-cmd swaps Control and Meta, side preserved", () => {
+    expect(remapCode("ControlLeft", "ctrl-as-cmd")).toBe("MetaLeft");
+    expect(remapCode("ControlRight", "ctrl-as-cmd")).toBe("MetaRight");
+    expect(remapCode("MetaLeft", "ctrl-as-cmd")).toBe("ControlLeft");
+    expect(remapCode("MetaRight", "ctrl-as-cmd")).toBe("ControlRight");
+  });
+
+  it("ctrl-as-cmd leaves other codes alone", () => {
+    expect(remapCode("KeyC", "ctrl-as-cmd")).toBe("KeyC");
+    expect(remapCode("ShiftLeft", "ctrl-as-cmd")).toBe("ShiftLeft");
+  });
+
+  it("none changes nothing", () => {
+    for (const c of ["MetaLeft", "MetaRight", "ControlLeft", "ControlRight", "KeyC"]) {
+      expect(remapCode(c, "none")).toBe(c);
+    }
+  });
+});
+
 
 /** A minimal in-memory `Storage` stand-in, same pattern as
  * `qualityPreset.test.ts`/`myDevices.test.ts`. */
@@ -119,6 +154,7 @@ function throwingStorage(): Storage {
     length: 0,
   };
 }
+
 
 describe("loadCmdAsCtrlSetting", () => {
   it("defaults to true (on) when nothing is stored", () => {

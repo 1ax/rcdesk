@@ -65,24 +65,47 @@ describe("keyToMessage", () => {
   // Slice 3.5f: `cmdAsCtrl` remaps Meta codes for both keydown and keyup,
   // the same way (`code: remapCode(code, cmdAsCtrl)`) -- see `keyRemap.ts`'s
   // own tests for the remap rule itself.
-  it("remaps MetaLeft to ControlLeft on keydown when cmdAsCtrl is true", () => {
-    expect(keyToMessage("MetaLeft", true, false, true)).toEqual({
+  it("remaps MetaLeft to ControlLeft on keydown in cmd-as-ctrl mode", () => {
+    expect(keyToMessage("MetaLeft", true, false, "cmd-as-ctrl")).toEqual({
       type: "key",
       code: "ControlLeft",
       pressed: true,
     });
   });
 
-  it("remaps MetaRight to ControlRight on keyup when cmdAsCtrl is true", () => {
-    expect(keyToMessage("MetaRight", false, false, true)).toEqual({
+  it("remaps MetaRight to ControlRight on keyup in cmd-as-ctrl mode", () => {
+    expect(keyToMessage("MetaRight", false, false, "cmd-as-ctrl")).toEqual({
       type: "key",
       code: "ControlRight",
       pressed: false,
     });
   });
 
-  it("leaves Meta codes alone when cmdAsCtrl is false or omitted", () => {
-    expect(keyToMessage("MetaLeft", true, false, false)).toEqual({
+  it("ctrl-as-cmd swaps Control/Meta symmetrically on keydown and keyup", () => {
+    expect(keyToMessage("ControlLeft", true, false, "ctrl-as-cmd")).toEqual({
+      type: "key",
+      code: "MetaLeft",
+      pressed: true,
+    });
+    expect(keyToMessage("ControlLeft", false, false, "ctrl-as-cmd")).toEqual({
+      type: "key",
+      code: "MetaLeft",
+      pressed: false,
+    });
+    expect(keyToMessage("MetaRight", true, false, "ctrl-as-cmd")).toEqual({
+      type: "key",
+      code: "ControlRight",
+      pressed: true,
+    });
+    expect(keyToMessage("MetaRight", false, false, "ctrl-as-cmd")).toEqual({
+      type: "key",
+      code: "ControlRight",
+      pressed: false,
+    });
+  });
+
+  it("leaves Meta codes alone in none mode or when omitted", () => {
+    expect(keyToMessage("MetaLeft", true, false, "none")).toEqual({
       type: "key",
       code: "MetaLeft",
       pressed: true,
