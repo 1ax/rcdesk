@@ -7,7 +7,9 @@ use std::sync::Arc;
 /// MTU for inbound packet (from DTLS)
 pub(crate) const RECEIVE_MTU: usize = 8192;
 /// initial MTU for outgoing packets (to DTLS)
-pub(crate) const INITIAL_MTU: u32 = 1228;
+// rcdesk patch: was 1228; 1228 + DTLS overhead was dropped on a real path to a
+// Windows client. Chrome's own packets top out at 1188. See vendor/rtc-sctp/RCDESK-PATCH.md
+pub(crate) const INITIAL_MTU: u32 = 1188;
 pub(crate) const INITIAL_RECV_BUF_SIZE: u32 = 1024 * 1024;
 pub(crate) const COMMON_HEADER_SIZE: u32 = 12;
 pub(crate) const DATA_CHUNK_HEADER_SIZE: u32 = 16;
@@ -243,5 +245,19 @@ impl ClientConfig {
         ClientConfig {
             transport: Arc::new(transport),
         }
+    }
+}
+
+#[cfg(test)]
+mod rcdesk_patch_tests {
+    use super::*;
+
+    #[test]
+    fn outgoing_packets_fit_chrome_sized_mtu() {
+        assert_eq!(INITIAL_MTU, 1188);
+        assert_eq!(
+            EndpointConfig::new().max_payload_size,
+            INITIAL_MTU - (COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE)
+        );
     }
 }
