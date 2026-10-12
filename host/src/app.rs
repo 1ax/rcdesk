@@ -313,6 +313,17 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
         }
     };
 
+    // Раскладка (4.6c): только реальный macOS-хост с вводом; без ввода
+    // переключать раскладку бессмысленно.
+    #[cfg(target_os = "macos")]
+    let input_source: Option<std::sync::Arc<dyn crate::input_source::InputSourceSwitcher>> =
+        (!synthetic && !no_input).then(|| {
+            std::sync::Arc::new(crate::platform::input_source::MacInputSourceSwitcher::new())
+                as std::sync::Arc<dyn crate::input_source::InputSourceSwitcher>
+        });
+    #[cfg(not(target_os = "macos"))]
+    let input_source: Option<std::sync::Arc<dyn crate::input_source::InputSourceSwitcher>> = None;
+
     // Extra STUN/TURN servers from `--stun`; the signaling server's own
     // per-registration credentials are merged in later, per session (see
     // this function's doc comment).
@@ -339,6 +350,7 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
         encoder: opts.encoder.kind(),
         build_source,
         curtain: None,
+        input_source,
         wake_display,
         list_displays,
         display,

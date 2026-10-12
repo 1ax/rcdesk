@@ -45,6 +45,7 @@ use crate::curtain::Curtain;
 use crate::encode::{build_encoder, EncodedFrame, EncoderConfig, EncoderKind, RateTarget};
 use crate::files::FilesCommand;
 use crate::input::{Injector, InputRouter, NoopInjector};
+use crate::input_source::InputSourceSwitcher;
 use crate::pipeline::Pipeline;
 #[cfg(target_os = "windows")]
 use crate::platform;
@@ -128,6 +129,10 @@ pub struct HostContext {
     /// `SetCurtain` отвечает отказом, а `HostInfo.curtain_available` ложно.
     /// Реализация приедет в 4.2c2, пока везде `None`.
     pub curtain: Option<Arc<dyn Curtain>>,
+    /// Переключатель раскладки хоста (слайс 4.6c); `None` --
+    /// `SwitchInputSource` игнорируется, `HostInfo.input_source_available`
+    /// ложно.
+    pub input_source: Option<Arc<dyn InputSourceSwitcher>>,
     /// Будит спящий дисплей перед выбором дисплея в `start_session` (4.6a).
     pub wake_display: WakeDisplay,
     /// Lists the displays capturable right now, for the initial
@@ -888,6 +893,11 @@ struct ActiveSession {
     /// выключена. Передаётся в `build_source` при каждой пересборке
     /// конвейера (смена дисплея не должна выдать шторку в видео).
     curtain_windows: Vec<u32>,
+    /// Раскладка хоста (слайс 4.6c), копия `HostContext::input_source`.
+    input_source: Option<Arc<dyn InputSourceSwitcher>>,
+    /// Фоновый опрос раскладки: шлёт `InputSource` при изменении. `None`
+    /// без реализации.
+    input_source_task: Option<tokio::task::JoinHandle<()>>,
     /// Slice 3.5b: tracks the current `RTCPeerConnectionState::Disconnected`
     /// grace window (if any) for this session -- see `DisconnectGrace`'s
     /// doc comment and `handle_session_event`'s `ConnectionState`/
@@ -1013,6 +1023,9 @@ impl ActiveSession {
             task.abort();
         }
         if let Some(task) = self.elevation_task {
+            task.abort();
+        }
+        if let Some(task) = self.input_source_task {
             task.abort();
         }
         self.files_task.abort();
@@ -1588,6 +1601,7 @@ async fn begin_session(
                 });
                 *current_session_id = Some(session_id);
                 let session_tag = parts.peer.tag();
+                let session_peer = Arc::clone(&parts.peer);
                 *active = Some(ActiveSession {
                     peer: parts.peer,
                     video: parts.video,
@@ -1607,6 +1621,14 @@ async fn begin_session(
                     quality_preset: QualityPreset::Auto,
                     curtain: ctx.curtain.clone(),
                     curtain_windows: Vec::new(),
+                    input_source: ctx.input_source.clone(),
+                    input_source_task: ctx.input_source.clone().map(|switcher| {
+                        spawn_input_source_poll(
+                            Arc::clone(&session_peer),
+                            switcher,
+                            INPUT_SOURCE_POLL_INTERVAL,
+                        )
+                    }),
                     disconnect_grace: DisconnectGrace::default(),
                     session_key,
                 });
@@ -1956,6 +1978,17 @@ async fn handle_session_event(
                                 }
                             }
                         }
+                        Ok(ControlMessage::SwitchInputSource) => {
+                            if let Some(active) = active.as_ref() {
+                                if let Some(msg) =
+                                    switch_input_source(active.input_source.as_deref())
+                                {
+                                    if let Err(err) = active.peer.send_control(&msg).await {
+                                        tracing::warn!(?err, "failed to send input source");
+                                    }
+                                }
+                            }
+                        }
                         Ok(ControlMessage::ClipboardText { text }) => {
                             // Wrong direction: `ClipboardText` is host ->
                             // client only on `control` (see
@@ -2022,7 +2055,11 @@ async fn handle_session_event(
                         tracing::warn!(?err, "failed to send initial displays list");
                     }
                 }
-                let host_info = host_info_message(active.files_enabled, active.curtain.is_some());
+                let host_info = host_info_message(
+                    active.files_enabled,
+                    active.curtain.is_some(),
+                    active.input_source.is_some(),
+                );
                 match active.peer.send_control(&host_info).await {
                     Ok(true) => {}
                     Ok(false) => {
@@ -2030,6 +2067,15 @@ async fn handle_session_event(
                     }
                     Err(err) => {
                         tracing::warn!(?err, "failed to send host info");
+                    }
+                }
+                if let Some(msg) = active
+                    .input_source
+                    .as_deref()
+                    .and_then(input_source_message)
+                {
+                    if let Err(err) = active.peer.send_control(&msg).await {
+                        tracing::warn!(?err, "failed to send initial input source");
                     }
                 }
                 let status = ControlMessage::InputStatus {
@@ -2078,12 +2124,87 @@ fn apply_remote_clipboard_text(clipboard: Option<&Arc<Mutex<ClipboardSync>>>, te
 
 /// Builds the `ControlMessage::HostInfo` announcement (slice 3.5f), sent
 /// alongside `displays_message` when the `control` channel opens.
-fn host_info_message(files_enabled: bool, curtain_available: bool) -> ControlMessage {
+fn host_info_message(
+    files_enabled: bool,
+    curtain_available: bool,
+    input_source_available: bool,
+) -> ControlMessage {
     ControlMessage::HostInfo {
         os: crate::platform::host_os(),
         files_enabled,
         curtain_available,
+        input_source_available,
     }
+}
+
+/// Интервал опроса раскладки хоста (слайс 4.6c): её могли переключить на
+/// самом хосте или хоткеем.
+const INPUT_SOURCE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// `InputSource` с текущей меткой раскладки, если она известна.
+fn input_source_message(switcher: &dyn InputSourceSwitcher) -> Option<ControlMessage> {
+    switcher
+        .current_label()
+        .map(|label| ControlMessage::InputSource { label })
+}
+
+/// Обрабатывает `SwitchInputSource` (слайс 4.6c): без реализации --
+/// игнорирует; иначе переключает раскладку и возвращает актуальный
+/// `InputSource` для отправки клиенту.
+fn switch_input_source(switcher: Option<&dyn InputSourceSwitcher>) -> Option<ControlMessage> {
+    let Some(switcher) = switcher else {
+        tracing::debug!("switch_input_source received without a switcher, ignoring");
+        return None;
+    };
+    if let Err(err) = switcher.select_next() {
+        tracing::warn!(?err, "failed to switch input source");
+    }
+    input_source_message(switcher)
+}
+
+/// Опрашивает раскладку каждые `interval` и отдаёт `send` новый
+/// `InputSource` только при изменении метки. `send` возвращает `true`, если
+/// сообщение доставлено; иначе метка не считается отправленной и уйдёт на
+/// следующем тике (канал `control` мог ещё не открыться). Стартовая метка
+/// `initial` снимается синхронно до запуска задачи (её клиенту шлёт открытие
+/// канала `control`), чтобы смена сразу после спавна не потерялась.
+async fn poll_input_source<F, Fut>(
+    switcher: Arc<dyn InputSourceSwitcher>,
+    initial: Option<String>,
+    interval: Duration,
+    mut send: F,
+) where
+    F: FnMut(ControlMessage) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut last = initial;
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        ticker.tick().await;
+        let label = switcher.current_label();
+        if label == last {
+            continue;
+        }
+        let Some(new) = label.clone() else {
+            last = None;
+            continue;
+        };
+        if send(ControlMessage::InputSource { label: new }).await {
+            last = label;
+        }
+    }
+}
+
+fn spawn_input_source_poll(
+    peer: Arc<PeerSession>,
+    switcher: Arc<dyn InputSourceSwitcher>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    let initial = switcher.current_label();
+    tokio::spawn(poll_input_source(switcher, initial, interval, move |msg| {
+        let peer = Arc::clone(&peer);
+        async move { matches!(peer.send_control(&msg).await, Ok(true)) }
+    }))
 }
 
 /// Builds the `ControlMessage::Displays` announcement for `displays`/`current`.
@@ -2749,6 +2870,7 @@ pub(crate) fn test_ctx() -> HostContext {
             Ok(Box::new(capture::synthetic::for_display(id, 30)?) as Box<dyn FrameSource>)
         }),
         curtain: None,
+        input_source: None,
         wake_display: Box::new(|| Box::new(()) as Box<dyn Send>),
         list_displays: Box::new(|| Ok(capture::synthetic::list_displays())),
         display: None,
@@ -3029,19 +3151,21 @@ mod tests {
     #[test]
     fn host_info_message_reports_this_hosts_os() {
         assert_eq!(
-            host_info_message(true, false),
+            host_info_message(true, false, false),
             ControlMessage::HostInfo {
                 os: crate::platform::host_os(),
                 files_enabled: true,
-                curtain_available: false
+                curtain_available: false,
+                input_source_available: false
             }
         );
         assert_eq!(
-            host_info_message(false, true),
+            host_info_message(false, true, true),
             ControlMessage::HostInfo {
                 os: crate::platform::host_os(),
                 files_enabled: false,
-                curtain_available: true
+                curtain_available: true,
+                input_source_available: true
             }
         );
     }
@@ -5779,5 +5903,164 @@ mod tests {
         if let Some(active) = active.take() {
             active.shutdown().await;
         }
+    }
+
+    /// Фейковый переключатель раскладки (слайс 4.6c): счётчик вызовов
+    /// `select_next` и управляемая метка. `select_next` переключает метку на
+    /// следующую из `cycle`.
+    struct FakeSwitcher {
+        calls: std::sync::atomic::AtomicUsize,
+        label: Mutex<Option<String>>,
+        next_label: Option<String>,
+        fail: bool,
+    }
+
+    impl FakeSwitcher {
+        fn new(label: Option<&str>, next_label: Option<&str>, fail: bool) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                label: Mutex::new(label.map(str::to_string)),
+                next_label: next_label.map(str::to_string),
+                fail,
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn set_label(&self, label: Option<&str>) {
+            *self.label.lock().unwrap() = label.map(str::to_string);
+        }
+    }
+
+    impl InputSourceSwitcher for FakeSwitcher {
+        fn select_next(&self) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                return Err(anyhow::anyhow!("boom"));
+            }
+            *self.label.lock().unwrap() = self.next_label.clone();
+            Ok(())
+        }
+        fn current_label(&self) -> Option<String> {
+            self.label.lock().unwrap().clone()
+        }
+    }
+
+    fn input_source_msg(label: &str) -> ControlMessage {
+        ControlMessage::InputSource {
+            label: label.to_string(),
+        }
+    }
+
+    #[test]
+    fn host_info_reports_input_source_availability() {
+        for available in [true, false] {
+            assert!(matches!(
+                host_info_message(true, false, available),
+                ControlMessage::HostInfo { input_source_available, .. }
+                    if input_source_available == available
+            ));
+        }
+    }
+
+    #[test]
+    fn switch_input_source_selects_next_and_reports_new_label() {
+        let fake = FakeSwitcher::new(Some("EN"), Some("RU"), false);
+        let msg = switch_input_source(Some(fake.as_ref() as &dyn InputSourceSwitcher));
+        assert_eq!(fake.calls(), 1);
+        assert_eq!(msg, Some(input_source_msg("RU")));
+    }
+
+    #[test]
+    fn switch_input_source_error_is_not_fatal_and_reports_current_label() {
+        let fake = FakeSwitcher::new(Some("EN"), Some("RU"), true);
+        let msg = switch_input_source(Some(fake.as_ref() as &dyn InputSourceSwitcher));
+        assert_eq!(fake.calls(), 1);
+        assert_eq!(msg, Some(input_source_msg("EN")));
+    }
+
+    #[test]
+    fn switch_input_source_without_switcher_sends_nothing() {
+        assert_eq!(switch_input_source(None), None);
+    }
+
+    #[test]
+    fn initial_input_source_message_needs_a_label() {
+        let with = FakeSwitcher::new(Some("EN"), None, false);
+        assert_eq!(
+            input_source_message(with.as_ref()),
+            Some(input_source_msg("EN"))
+        );
+        let without = FakeSwitcher::new(None, None, false);
+        assert_eq!(input_source_message(without.as_ref()), None);
+    }
+
+    #[tokio::test]
+    async fn poll_sends_on_label_change_and_not_on_repeat() {
+        let fake = FakeSwitcher::new(Some("EN"), None, false);
+        let (tx, mut rx) = mpsc::unbounded_channel::<ControlMessage>();
+        let task = tokio::spawn(poll_input_source(
+            fake.clone() as Arc<dyn InputSourceSwitcher>,
+            fake.current_label(),
+            Duration::from_millis(5),
+            move |msg| {
+                let tx = tx.clone();
+                async move { tx.send(msg).is_ok() }
+            },
+        ));
+
+        // Метка не менялась -- ничего не шлётся.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(rx.try_recv().is_err(), "unchanged label must not be sent");
+
+        fake.set_label(Some("RU"));
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(first, input_source_msg("RU"));
+
+        // Повтор той же метки не шлётся.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "repeat of same label must not be sent"
+        );
+
+        fake.set_label(Some("EN"));
+        let second = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(second, input_source_msg("EN"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn poll_retries_label_until_delivered() {
+        let fake = FakeSwitcher::new(Some("EN"), None, false);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let task = tokio::spawn(poll_input_source(
+            fake.clone() as Arc<dyn InputSourceSwitcher>,
+            fake.current_label(),
+            Duration::from_millis(5),
+            move |_msg| {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { n >= 2 }
+            },
+        ));
+        fake.set_label(Some("RU"));
+        // Две недоставки + одна доставка, дальше тишина.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while attempts.load(std::sync::atomic::Ordering::SeqCst) < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timeout");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        task.abort();
     }
 }

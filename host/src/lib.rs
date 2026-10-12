@@ -30,6 +30,7 @@ pub mod encode;
 pub mod files;
 mod fsutil;
 pub mod input;
+pub mod input_source;
 pub mod pipeline;
 pub mod platform;
 pub mod service;

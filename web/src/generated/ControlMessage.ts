@@ -12,4 +12,9 @@ export type ControlMessage = { "type": "cursor_shape", width: number, height: nu
  * Шторка доступна на этом хосте (слайс 4.2c) -- сейчас только
  * агент macOS. Клиент показывает кнопку шторки только при `true`.
  */
-curtain_available: boolean, } | { "type": "set_curtain", on: boolean, } | { "type": "curtain_status", on: boolean, reason: string | null, };
+curtain_available: boolean, 
+/**
+ * Хост умеет переключать раскладку клавиатуры (слайс 4.6c) --
+ * сейчас только агент macOS. Старый JSON без поля -- `false`.
+ */
+input_source_available: boolean, } | { "type": "set_curtain", on: boolean, } | { "type": "curtain_status", on: boolean, reason: string | null, } | { "type": "switch_input_source" } | { "type": "input_source", label: string, };

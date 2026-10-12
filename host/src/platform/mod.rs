@@ -37,6 +37,9 @@ pub use macos::autostart;
 /// Шторка (4.2c2): только macOS, только `rcdesk-agent`.
 #[cfg(target_os = "macos")]
 pub use macos::curtain;
+/// Переключение раскладки (4.6c): только macOS.
+#[cfg(target_os = "macos")]
+pub use macos::input_source;
 
 /// Будит спящий дисплей при старте сеанса (4.6a). macOS -- реальная
 /// IOKit-ассерция, остальные платформы -- no-op guard (поведение не меняется).

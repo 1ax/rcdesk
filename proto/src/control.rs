@@ -161,6 +161,10 @@ pub enum ControlMessage {
         /// Шторка доступна на этом хосте (слайс 4.2c) -- сейчас только
         /// агент macOS. Клиент показывает кнопку шторки только при `true`.
         curtain_available: bool,
+        /// Хост умеет переключать раскладку клавиатуры (слайс 4.6c) --
+        /// сейчас только агент macOS. Старый JSON без поля -- `false`.
+        #[serde(default)]
+        input_source_available: bool,
     },
     /// client -> host: включить (`on: true`) или выключить шторку (слайс
     /// 4.2c). Шторка закрывает физический монитор хоста чёрным окном
@@ -172,6 +176,13 @@ pub enum ControlMessage {
     /// ошибки. `reason` -- человекочитаемая причина, когда запрошенное
     /// состояние не достигнуто (или шторка снята по ошибке), иначе `None`.
     CurtainStatus { on: bool, reason: Option<String> },
+    /// client -> host: переключить раскладку клавиатуры хоста на следующую
+    /// (слайс 4.6c). Хост отвечает `InputSource` с новой меткой.
+    SwitchInputSource,
+    /// host -> client: метка текущей раскладки хоста (слайс 4.6c), например
+    /// `"RU"`. Шлётся после `HostInfo`, в ответ на `SwitchInputSource` и при
+    /// любом изменении раскладки на самом хосте.
+    InputSource { label: String },
 }
 
 #[cfg(test)]
@@ -402,13 +413,14 @@ mod tests {
                 os,
                 files_enabled: true,
                 curtain_available: false,
+                input_source_available: true,
             };
 
             let json = serde_json::to_string(&msg).expect("serialize");
             assert_eq!(
                 json,
                 format!(
-                    r#"{{"type":"host_info","os":"{wire}","files_enabled":true,"curtain_available":false}}"#
+                    r#"{{"type":"host_info","os":"{wire}","files_enabled":true,"curtain_available":false,"input_source_available":true}}"#
                 )
             );
 
@@ -450,5 +462,41 @@ mod tests {
         assert_eq!(json, r#"{"type":"curtain_status","on":true,"reason":null}"#);
         let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, on);
+    }
+
+    #[test]
+    fn host_info_without_input_source_available_parses_as_false() {
+        let json =
+            r#"{"type":"host_info","os":"macos","files_enabled":true,"curtain_available":true}"#;
+        let msg: ControlMessage = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            msg,
+            ControlMessage::HostInfo {
+                os: HostOs::Macos,
+                files_enabled: true,
+                curtain_available: true,
+                input_source_available: false,
+            }
+        );
+    }
+
+    #[test]
+    fn switch_input_source_round_trips_through_json_with_exact_shape() {
+        let msg = ControlMessage::SwitchInputSource;
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(json, r#"{"type":"switch_input_source"}"#);
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, msg);
+    }
+
+    #[test]
+    fn input_source_round_trips_through_json_with_exact_shape() {
+        let msg = ControlMessage::InputSource {
+            label: "RU".to_string(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(json, r#"{"type":"input_source","label":"RU"}"#);
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, msg);
     }
 }
