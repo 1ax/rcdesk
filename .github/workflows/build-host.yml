@@ -38,7 +38,7 @@ jobs:
             agent_binary: target/release/rcdesk-agent
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -51,7 +51,7 @@ jobs:
         run: |
           cargo run --release -p rcdesk-host -- --version
           cargo run --release -p rcdesk-host -- autostart status
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -90,7 +90,7 @@ jobs:
           & $iscc "/DAppVersion=${{ steps.version.outputs.version }}" "/DSourceDir=$src" "/O$out" 'installer/windows/rcdesk.iss'
           if ($LASTEXITCODE -ne 0) { throw "iscc завершился с кодом $LASTEXITCODE" }
           Get-ChildItem $out
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: runner.os == 'Windows'
         with:
           name: rcdesk-setup-windows-x64
@@ -112,7 +112,7 @@ jobs:
           MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
           MACOS_SIGN_P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
         run: bash installer/macos/build-pkg.sh target/release "${{ steps.mac_version.outputs.version }}" pkg-out
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: runner.os == 'macOS'
         with:
           name: rcdesk-macos-pkg
