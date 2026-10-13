@@ -17,6 +17,9 @@
 //! upload, ...). Download ids start at `proto::file::HOST_ID_BASE`, upload
 //! ids (client) at 1, so `Abort` ids never clash.
 //!
+//! A copied folder is offered as `<folder>.zip`: a STORED (uncompressed) zip
+//! assembled on the fly while streaming (`zip`), its exact size known up front.
+//!
 //! Disk safety: data is written to `<name>.rcdesk-part`; the final name is
 //! reserved up front with `create_new` (an empty placeholder, so two
 //! transfers can never pick the same name) and the part file replaces it on
@@ -38,6 +41,8 @@ use tokio::sync::mpsc;
 use webrtc::data_channel::DataChannel;
 
 use crate::transport::FileChannelMessage;
+
+mod zip;
 
 #[cfg(target_os = "windows")]
 pub mod windows;
@@ -422,7 +427,16 @@ impl Receiver {
 struct OfferEntry {
     path: PathBuf,
     name: String,
+    /// File size, or the exact zip size for a folder.
     size: u64,
+    kind: EntryKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EntryKind {
+    File,
+    /// Streamed as a STORED zip, re-walked at send time.
+    Folder,
 }
 
 /// A running download of one offer. Dropping it stops the task.
@@ -505,15 +519,33 @@ impl Downloader {
 
     async fn offer(&mut self, paths: Vec<PathBuf>) {
         let mut entries = Vec::new();
-        let mut skipped_folders = 0u32;
+        // Folders are offered now (as zip); the protocol field stays 0.
+        let skipped_folders = 0u32;
         for path in paths {
             match tokio::fs::metadata(&path).await {
                 Ok(meta) if meta.is_file() => entries.push(OfferEntry {
                     name: file_name_of(&path),
                     size: meta.len(),
                     path,
+                    kind: EntryKind::File,
                 }),
-                Ok(meta) if meta.is_dir() => skipped_folders += 1,
+                Ok(meta) if meta.is_dir() => {
+                    let root = path.clone();
+                    match tokio::task::spawn_blocking(move || zip::walk(&root)).await {
+                        Ok(Ok(manifest)) => entries.push(OfferEntry {
+                            name: format!("{}.zip", file_name_of(&path)),
+                            size: manifest.zip_size(),
+                            path,
+                            kind: EntryKind::Folder,
+                        }),
+                        Ok(Err(err)) => {
+                            tracing::debug!(path = %path.display(), ?err, "cannot walk folder, skipping")
+                        }
+                        Err(err) => {
+                            tracing::debug!(path = %path.display(), ?err, "folder walk failed, skipping")
+                        }
+                    }
+                }
                 Ok(_) => tracing::debug!(path = %path.display(), "not a regular file, skipping"),
                 Err(err) => {
                     tracing::debug!(path = %path.display(), ?err, "cannot stat copied path, skipping")
@@ -569,6 +601,7 @@ impl Downloader {
                 path: e.path.clone(),
                 name: e.name.clone(),
                 size: e.size,
+                kind: e.kind,
             })
             .collect();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -627,6 +660,9 @@ async fn send_one(
     entry: &OfferEntry,
     cancel: &AtomicBool,
 ) -> anyhow::Result<()> {
+    if entry.kind == EntryKind::Folder {
+        return send_folder(channel, id, entry, cancel).await;
+    }
     let opened = async {
         let file = tokio::fs::File::open(&entry.path).await?;
         let meta = file.metadata().await?;
@@ -701,6 +737,96 @@ async fn send_one(
     }
     send_msg(channel, &FileMessage::End { id }).await?;
     tracing::info!(size, "file sent");
+    Ok(())
+}
+
+/// Sends a folder as a STORED zip. The folder is walked afresh, so the
+/// `Start` size is the exact size of the archive that follows (it may differ
+/// from the offered one). Same error/cancel contract as `send_one`.
+async fn send_folder(
+    channel: &dyn FileChannel,
+    id: u32,
+    entry: &OfferEntry,
+    cancel: &AtomicBool,
+) -> anyhow::Result<()> {
+    let root = entry.path.clone();
+    let manifest = match tokio::task::spawn_blocking(move || zip::walk(&root)).await {
+        Ok(Ok(m)) => Some(m),
+        Ok(Err(err)) => {
+            tracing::debug!(path = %entry.path.display(), ?err, "cannot walk folder for download");
+            None
+        }
+        Err(err) => {
+            tracing::debug!(?err, "folder walk task failed");
+            None
+        }
+    };
+    let abort_io = FileMessage::Abort {
+        id,
+        reason: AbortReason::Io,
+    };
+    let Some(manifest) = manifest else {
+        send_msg(
+            channel,
+            &FileMessage::Start {
+                id,
+                name: entry.name.clone(),
+                size: entry.size,
+            },
+        )
+        .await?;
+        send_msg(channel, &abort_io).await?;
+        return Ok(());
+    };
+    let size = manifest.zip_size();
+    send_msg(
+        channel,
+        &FileMessage::Start {
+            id,
+            name: entry.name.clone(),
+            size,
+        },
+    )
+    .await?;
+    let mut stream = match zip::ZipStream::new(manifest) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::debug!(?err, id, "folder too large for download");
+            send_msg(channel, &abort_io).await?;
+            return Ok(());
+        }
+    };
+    let mut sent = 0u64;
+    loop {
+        while channel.outstanding_bytes().await > SEND_HIGH_WATER {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            tokio::time::sleep(BACKPRESSURE_POLL).await;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        match stream.next_chunk().await {
+            Ok(Some(chunk)) => {
+                channel.send_binary(&chunk).await?;
+                sent += chunk.len() as u64;
+            }
+            Ok(None) => break,
+            Err(err) => {
+                tracing::debug!(?err, id, "folder download read failed");
+                send_msg(channel, &abort_io).await?;
+                return Ok(());
+            }
+        }
+    }
+    if sent != size {
+        tracing::debug!(sent, size, id, "zip size mismatch");
+        send_msg(channel, &abort_io).await?;
+        return Ok(());
+    }
+    send_msg(channel, &FileMessage::End { id }).await?;
+    tracing::info!(size, "folder sent");
     Ok(())
 }
 
@@ -1245,24 +1371,119 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offer_lists_files_and_counts_folders() {
+    async fn offer_lists_files_and_folders_as_zip() {
         let mut h = Harness::new(true);
         let file = put(&h, "a.txt", b"hello");
         let sub = h.dir.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         let missing = h.dir.join("gone.txt");
-        h.command(FilesCommand::Offer(vec![file, sub, missing]))
+        h.command(FilesCommand::Offer(vec![file, sub.clone(), missing]))
             .await;
         assert_eq!(
             h.sent(),
             vec![FileMessage::Offer {
                 list_id: 1,
-                files: vec![OfferedFile {
-                    name: "a.txt".into(),
-                    size: 5
-                }],
-                skipped_folders: 1,
+                files: vec![
+                    OfferedFile {
+                        name: "a.txt".into(),
+                        size: 5
+                    },
+                    OfferedFile {
+                        name: "sub.zip".into(),
+                        size: zip::walk(&sub).unwrap().zip_size()
+                    }
+                ],
+                skipped_folders: 0,
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_streams_a_folder_as_zip_after_a_file() {
+        let mut h = Harness::new(true);
+        let file = put(&h, "a.txt", b"hello");
+        let folder = h.dir.join("pack");
+        std::fs::create_dir_all(folder.join("nested")).unwrap();
+        std::fs::write(folder.join("x.bin"), vec![9u8; CHUNK_BYTES + 5]).unwrap();
+        let zip_size = zip::walk(&folder).unwrap().zip_size();
+        h.command(FilesCommand::Offer(vec![file, folder])).await;
+        assert_eq!(
+            h.sent()[0],
+            FileMessage::Offer {
+                list_id: 1,
+                files: vec![
+                    OfferedFile {
+                        name: "a.txt".into(),
+                        size: 5
+                    },
+                    OfferedFile {
+                        name: "pack.zip".into(),
+                        size: zip_size
+                    }
+                ],
+                skipped_folders: 0,
+            }
+        );
+        h.feed(vec![fetch(1)]).await;
+        h.wait_download_done().await;
+        let log = h.log();
+        assert_eq!(
+            log[1],
+            msg(FileMessage::Start {
+                id: HOST_ID_BASE,
+                name: "a.txt".into(),
+                size: 5
+            })
+        );
+        assert_eq!(log[3], msg(FileMessage::End { id: HOST_ID_BASE }));
+        assert_eq!(
+            log[4],
+            msg(FileMessage::Start {
+                id: HOST_ID_BASE + 1,
+                name: "pack.zip".into(),
+                size: zip_size
+            })
+        );
+        let mut total = 0u64;
+        let mut first = Vec::new();
+        for item in &log[5..log.len() - 1] {
+            match item {
+                Sent::Chunk(c) => {
+                    if first.is_empty() {
+                        first = c.clone();
+                    }
+                    total += c.len() as u64;
+                }
+                other => panic!("expected chunk, got {other:?}"),
+            }
+        }
+        assert_eq!(total, zip_size);
+        assert_eq!(&first[..4], b"PK\x03\x04");
+        assert_eq!(
+            log.last().unwrap(),
+            &msg(FileMessage::End {
+                id: HOST_ID_BASE + 1
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn folder_vanished_after_offer_is_aborted() {
+        let mut h = Harness::new(true);
+        let folder = h.dir.join("pack");
+        std::fs::create_dir_all(&folder).unwrap();
+        h.command(FilesCommand::Offer(vec![folder.clone()])).await;
+        std::fs::remove_dir_all(&folder).unwrap();
+        h.feed(vec![fetch(1)]).await;
+        h.wait_download_done().await;
+        let sent = h.sent();
+        assert!(matches!(&sent[1], FileMessage::Start { name, .. } if name == "pack.zip"));
+        assert_eq!(
+            sent[2],
+            FileMessage::Abort {
+                id: HOST_ID_BASE,
+                reason: AbortReason::Io
+            }
         );
     }
 
