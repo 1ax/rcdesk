@@ -12,6 +12,10 @@
 
 - `docker-compose.prod.yml` -- `server` (сигнальный сервер, `127.0.0.1:8100`)
   и `coturn` (host-сеть, `3478` + relay-диапазон `49152-65535`).
+  coturn ограничен: `denied-peer-ip` на внутренние адреса и сам VPS, квоты,
+  без TCP-relay; контейнеры идут с `cap_drop`, логи ротируются. Откат при
+  проблеме с привязкой 3478 -- убрать `cap_drop`/`cap_add` у coturn и
+  `docker compose up -d`.
 - `.env.prod.example` -- шаблон секретов; на сервере копируется в `.env`
   рядом с compose-файлом (`chmod 600`, владелец `rcdesk`).
 
@@ -111,6 +115,64 @@ cat ~/app/traffic/$(date -u +%Y-%m).state
 ```bash
 mkdir -p /tmp/t && cp ~/app/traffic/$(date -u +%Y-%m).state /tmp/t/
 TRAFFIC_DIR=/tmp/t TRAFFIC_RELAY_BUDGET=1 bash ~/app/traffic-monitor.sh
+```
+
+## Бэкап БД
+
+`backup-db.sh` раз в сутки делает консистентную копию SQLite (`sqlite3 .backup`
+внутри образа сервера, через `docker run --entrypoint sqlite3`), проверяет
+`PRAGMA integrity_check` и шифрует GPG на ключ владельца
+`CE0B 723C BB61 6652 6661 7F6A B9B1 E3BB 79CE 3DA7` («CrewTally Backup», общий
+для проектов владельца). Открытая копия БД на диск вне временного каталога не
+пишется и удаляется при выходе. Дальше: `~/backups` (14 дней) -> Box через
+rclone (90 дней) -> heartbeat Better Stack. Любая ошибка шлёт «УПАЛ» в
+Telegram (тот же бот, что у монитора трафика).
+
+Разовая настройка под пользователем `rcdesk` на VPS:
+
+1. rclone без root: скачать `rclone-current-linux-amd64.zip` с rclone.org,
+   распаковать бинарник `rclone` в `~/bin` (скрипт добавляет `~/bin` в `PATH`).
+2. Box. На Mac: `brew install rclone`, `rclone authorize "box"` -- получить
+   токен. На VPS: `rclone config` -> `n`, имя `box`, тип `box`, client id и
+   secret пустые, `box_sub_type=user`, на вопрос про браузер ответить `n` и
+   вставить токен. Проверка: `rclone lsd box:`, затем
+   `rclone mkdir box:rcdesk-backups`. Конфиг `~/.config/rclone/rclone.conf`
+   должен быть писаемым: refresh-токен обновляется при запусках (без запусков
+   он живёт 60 дней).
+3. Импортировать открытый ключ: `gpg --import pub.asc`.
+4. В `~/app/.env` заполнить `BACKUP_GPG_RECIPIENT` (отпечаток ключа) и
+   `BACKUP_HEARTBEAT_URL` (Better Stack heartbeat).
+5. Crontab (`crontab -e`):
+
+```bash
+mkdir -p ~/backups
+30 4 * * * $HOME/app/backup-db.sh >> $HOME/backups/backup.log 2>&1
+```
+
+Деплой копирует скрипт в `~/app/` и делает его исполняемым; crontab ставится
+один раз вручную.
+
+Ручной прогон:
+
+```bash
+bash ~/app/backup-db.sh
+ls -l ~/backups && rclone ls box:rcdesk-backups
+```
+
+Восстановление. На Mac расшифровать и проверить:
+
+```bash
+gpg --decrypt rcdesk-<дата>.db.gpg > rcdesk.db
+sqlite3 rcdesk.db 'PRAGMA integrity_check'
+```
+
+На VPS (файл `rcdesk.db` в текущем каталоге, `<образ>` -- образ сервера):
+
+```bash
+docker compose -f docker-compose.prod.yml stop server
+docker run --rm --user 0 -v rcdesk_db-data:/data -v "$PWD:/in" --entrypoint sh <образ> \
+  -c 'cp /in/rcdesk.db /data/rcdesk.db && rm -f /data/rcdesk.db-wal /data/rcdesk.db-shm && chown nobody:nogroup /data/rcdesk.db'
+docker compose -f docker-compose.prod.yml start server
 ```
 
 ## Релиз
