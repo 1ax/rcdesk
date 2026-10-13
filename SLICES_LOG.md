@@ -12,7 +12,7 @@
 > чата читает сначала голову, в тело ныряет по ссылке на слайс.
 
 **Состояние на 2026-10-13 (двадцать четвёртый чат: слайс B «Сервер: лимиты и DoS», ЗАКРЫТ, ждёт деплоя):**
-- ✅ **Коммиты (НЕ запушены, вместе с `a5bc379` автотег):** `1dc0a40` B1 кадр ≤ 64 КиБ, bounded-очередь 64 с
+- ✅ **Коммиты (НЕ запушены, вместе с `a5bc379` автотег):** `1dc0a40` B1 кадр ≤ 64 КиБ, bounded-очередь 256 (было 64, fix после CI) с
   рубильником, writer под таймаутом 10 с, `name`/`alias` ≤ 64 символов; `a930934` B2 `IpLimiter` (PIN 10/мин,
   владельцы 20/мин, устройства 10/10 мин), prune устройств без владельца 30 дней, `busy_timeout` 2 с +
   `synchronous=NORMAL`, `/healthz` с `SELECT 1` и мьютексом реестра; `6aa1db9` B3 Ping 30 с / таймаут чтения 90 с,
@@ -2058,7 +2058,7 @@ passkey (без почты и паролей; Bitwarden, iCloud, Google — лю
 TTL TURN 24 ч (не 2 ч), без graceful shutdown и `Origin` (см. ARCHITECTURE §6).
 
 - **B1 (`1dc0a40`) — транспортные лимиты (S-H1).** `max_message_size`/`max_frame_size` 64 КиБ (было 64 МиБ: один
-  `Offer` → ~200 МБ при лимите контейнера 256M). `registry::Tx` — структура над `mpsc::channel(64)` + `watch`-
+  `Offer` → ~200 МБ при лимите контейнера 256M). `registry::Tx` — структура над `mpsc::channel(256)` (64 до fix-коммита, см. ниже) + `watch`-
   рубильник: `send` = `try_send`, при `Full` соединение получателя убивается (`next_message` ждёт `tx.killed()` в
   `select!` и возвращает `None` — ветки делают свою уборку); writer пишет в сокет под `WRITE_TIMEOUT` 10 с, после
   цикла чтения ждётся ≤ 5 с, иначе `abort`. `name`/`alias` → `truncate_chars(.., 64)`. Тесты: кадр 65 КиБ закрывает
@@ -2079,6 +2079,12 @@ TTL TURN 24 ч (не 2 ч), без graceful shutdown и `Origin` (см. ARCHITEC
 - **B4 (`9a23eb5`) — реестр.** `JoinError::AlreadyInSession` (`join_by_host_id` проверяет `same_channel` по всем
   сеансам; PIN-токен не тратится); `disconnect_client` → `Vec`; `register_host` удаляет `old.session_id` только при
   `s.host_id == host_id`.
+- **Fix после первого Deploy (этот коммит).** CI `ubuntu-latest` уронил `peer_that_stops_reading_is_disconnected`:
+  второй клиент получил `unknown pin` — пропал сам хост. После отключения клиента каждое оставшееся ICE флудера
+  получает `Error{not in session}`; на однопоточном тестовом рантайме writer хоста голодал, 64 ответа переполнили
+  очередь, рубильник закрыл здоровое соединение. `OUTBOUND_QUEUE` 64 → 256 (легитимный всплеск — десятки ICE-
+  кандидатов; худший случай 16 МиБ на соединение и только до `WRITE_TIMEOUT`), тест — `flavor = "multi_thread"`.
+  Проверено на ветке `wip/` в CI до push в `main` (D29).
 - **Не сделано сознательно:** `X-Real-IP` только от loopback-пира — неприменимо (контейнер за bridge видит nginx и
   coturn-релей с одного шлюза); закрывается в C через `--denied-peer-ip`. TTL TURN 2 ч — отвергнут (см. выше).
 - **Гейты:** host `336 passed; 0 failed; 3 ignored`, proto `77`, server `88` + `43`, loopback `1`,

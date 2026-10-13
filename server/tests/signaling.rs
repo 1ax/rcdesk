@@ -1856,8 +1856,11 @@ async fn host_name_and_alias_are_truncated_to_64_chars() {
 }
 
 // B1: a peer that stops reading overflows its outbound queue and is
-// disconnected; the host is freed for the next client.
-#[tokio::test]
+// disconnected; the host is freed for the next client. Multi-threaded
+// runtime: the flooding host gets one `not in session` reply per message
+// once the client is gone, and its writer must drain them concurrently --
+// on the current-thread runtime it starved and the host itself got killed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_that_stops_reading_is_disconnected() {
     let url = spawn_server().await;
     let (mut host, mut client, session_id, pin) = host_and_joined_client(&url).await;
