@@ -24,9 +24,9 @@ use crate::app::AppState;
 use crate::db::Db;
 use crate::devices::{self, DeviceAuth};
 use crate::ice::{self, IceConfig};
+use crate::ip_limit::IpLimiter;
 use crate::owners;
 use crate::passkeys::{self, PasskeyError, SharedWebauthn};
-use crate::pin_limit::PinLimiter;
 use crate::registry::{JoinError, Registry, Tx};
 
 /// Максимальный размер входящего WebSocket-сообщения/кадра. Самый большой
@@ -109,6 +109,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
         &state.ice,
         &state.db,
         &state.pin_limiter,
+        &state.owner_limiter,
+        &state.device_limiter,
         &state.webauthn,
         info,
     )
@@ -174,7 +176,9 @@ async fn run_connection(
     registry: &Registry,
     ice: &IceConfig,
     db: &Db,
-    pin_limiter: &PinLimiter,
+    pin_limiter: &IpLimiter,
+    owner_limiter: &IpLimiter,
+    device_limiter: &IpLimiter,
     webauthn: &SharedWebauthn,
     info: ClientInfo,
 ) {
@@ -190,9 +194,20 @@ async fn run_connection(
     };
 
     match role {
-        Role::Host => run_host(stream, tx, registry, ice, db).await,
+        Role::Host => run_host(stream, tx, registry, ice, db, device_limiter, info.ip).await,
         Role::Client => {
-            run_client(stream, tx, registry, ice, db, pin_limiter, webauthn, info).await
+            run_client(
+                stream,
+                tx,
+                registry,
+                ice,
+                db,
+                pin_limiter,
+                owner_limiter,
+                webauthn,
+                info,
+            )
+            .await
         }
     }
 }
@@ -203,6 +218,8 @@ async fn run_host(
     registry: &Registry,
     ice: &IceConfig,
     db: &Db,
+    device_limiter: &IpLimiter,
+    ip: IpAddr,
 ) {
     let (name, device, session_id) = match next_message(stream, &tx).await {
         Some(SignalMessage::HostRegister {
@@ -218,6 +235,14 @@ async fn run_host(
         }
         None => return,
     };
+
+    if device.is_none() && !device_limiter.check(ip) {
+        tracing::warn!(%ip, "new device registration rate-limited");
+        let _ = tx.send(SignalMessage::Error {
+            message: "too many attempts".to_string(),
+        });
+        return;
+    }
 
     let name = owners::truncate_chars(&name, MAX_NAME_CHARS).to_string();
     let auth = match devices::authenticate(db, device.as_ref(), &name, ice::now_unix() as i64) {
@@ -247,7 +272,10 @@ async fn run_host(
         DeviceAuth::Issued {
             device_id,
             credentials,
-        } => (device_id, Some(credentials)),
+        } => {
+            device_limiter.spend(ip);
+            (device_id, Some(credentials))
+        }
         DeviceAuth::Known { device_id } => (device_id, None),
     };
 
@@ -619,7 +647,8 @@ async fn run_client(
     registry: &Registry,
     ice: &IceConfig,
     db: &Db,
-    pin_limiter: &PinLimiter,
+    pin_limiter: &IpLimiter,
+    owner_limiter: &IpLimiter,
     webauthn: &SharedWebauthn,
     info: ClientInfo,
 ) {
@@ -641,12 +670,28 @@ async fn run_client(
 
         match msg {
             SignalMessage::ClientAuth { token } => {
-                match owners::authenticate(
-                    db,
-                    token.as_deref(),
-                    &user_agent,
-                    ice::now_unix() as i64,
-                ) {
+                let now = ice::now_unix() as i64;
+                let auth = match owners::lookup_token(db, token.as_deref(), &user_agent, now) {
+                    Ok(Some((owner_id, token_id))) => {
+                        Ok((owner_id, token_id, token.unwrap_or_default()))
+                    }
+                    Ok(None) => {
+                        if !owner_limiter.check(ip) {
+                            tracing::warn!(%ip, "new owner creation rate-limited");
+                            let _ = tx.send(SignalMessage::Error {
+                                message: "too many attempts".to_string(),
+                            });
+                            continue;
+                        }
+                        let created = owners::create_owner(db, &user_agent, now);
+                        if created.is_ok() {
+                            owner_limiter.spend(ip);
+                        }
+                        created
+                    }
+                    Err(err) => Err(err),
+                };
+                match auth {
                     Ok((owner_id, token_id, token)) => {
                         let devices = match device_entries_for_owner(db, registry, &owner_id) {
                             Ok(devices) => devices,
@@ -975,7 +1020,7 @@ async fn run_client(
                     }
                     Err(err) => {
                         if err == JoinError::UnknownPin {
-                            pin_limiter.record_failure(ip);
+                            pin_limiter.spend(ip);
                             tracing::info!(%ip, "wrong pin");
                         }
                         let _ = tx.send(SignalMessage::Error {

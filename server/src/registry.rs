@@ -249,6 +249,17 @@ impl Registry {
         (pin, displaced)
     }
 
+    /// Ids of all currently registered (online) hosts.
+    pub fn online_host_ids(&self) -> Vec<String> {
+        let inner = self.inner.lock().expect("registry mutex poisoned");
+        inner.hosts.keys().cloned().collect()
+    }
+
+    /// Whether the registry mutex is usable (not poisoned); for `/healthz`.
+    pub fn is_healthy(&self) -> bool {
+        self.inner.lock().is_ok()
+    }
+
     /// Removes a host on disconnect, but only if `tx` is still the
     /// connection that owns `host_id` (`same_channel`) -- a displaced
     /// connection's own disconnect (it was already removed from the

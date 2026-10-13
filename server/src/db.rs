@@ -14,6 +14,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -25,6 +26,10 @@ const SCHEMA_VERSION: i64 = 3;
 /// Сколько секунд владелец без устройств и passkey может не появляться,
 /// прежде чем `prune_empty_owners` его удалит (долг D53).
 pub const OWNER_IDLE_TTL_SECS: u64 = 30 * 24 * 3600;
+
+/// Сколько секунд устройство без владельца может не регистрироваться,
+/// прежде чем `prune_unowned_devices` его удалит (B2, аудит S-H2).
+pub const DEVICE_IDLE_TTL_SECS: u64 = 30 * 24 * 3600;
 
 #[derive(Clone)]
 pub struct Db {
@@ -450,6 +455,58 @@ impl Db {
         Ok(removed)
     }
 
+    /// Удаляет устройства без владельца (ни одной строки `ownership`) с
+    /// `last_seen_at` старше `now - max_idle_secs` (B2, аудит S-H2). Id из
+    /// `keep` (сейчас подключённые хосты) не трогаются: их `last_seen_at`
+    /// обновляется только при регистрации. Кандидаты выбираются и удаляются
+    /// в одной транзакции; возвращает число удалённых устройств.
+    pub fn prune_unowned_devices(
+        &self,
+        now: u64,
+        max_idle_secs: u64,
+        keep: &[String],
+    ) -> anyhow::Result<usize> {
+        let cutoff = now.saturating_sub(max_idle_secs) as i64;
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        let candidates: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT device_id FROM devices
+                 WHERE NOT EXISTS (SELECT 1 FROM ownership WHERE ownership.device_id = devices.device_id)
+                   AND last_seen_at < ?1",
+            )?;
+            let rows = stmt.query_map([cutoff], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut removed = 0;
+        for device_id in candidates.iter().filter(|id| !keep.contains(id)) {
+            removed += tx.execute("DELETE FROM devices WHERE device_id = ?1", [device_id])?;
+        }
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Проверка живости БД для `/healthz`: мьютекс не отравлен, запрос идёт.
+    pub fn ping(&self) -> anyhow::Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
+        conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))?;
+        Ok(())
+    }
+
+    /// Отравляет мьютекс соединения (поток берёт lock и паникует).
+    #[cfg(test)]
+    pub fn poison_for_test(&self) {
+        let conn = Arc::clone(&self.conn);
+        let _ = std::thread::spawn(move || {
+            let _guard = conn.lock().expect("lock");
+            panic!("poison db mutex for test");
+        })
+        .join();
+    }
+
     /// Links an owner to a device. Calling this again for the same pair is
     /// not an error (`INSERT OR IGNORE`).
     pub fn link_device(&self, owner_id: &str, device_id: &str, now: i64) -> anyhow::Result<()> {
@@ -516,10 +573,16 @@ impl Db {
 /// Applies pragmas that don't persist in the database file and must be set
 /// on every connection (`foreign_keys`), plus ones that do persist but are
 /// cheap to (re)set on open (`journal_mode`), then runs the schema
-/// migration.
+/// migration. `busy_timeout` makes a concurrent external writer (e.g. an
+/// open `sqlite3` shell) wait up to 2 s instead of failing at once;
+/// `synchronous = NORMAL` is safe in WAL (only the last transactions can be
+/// lost on power failure, integrity is kept) and avoids an fsync per commit
+/// under the std mutex on tokio workers.
 fn configure(conn: &Connection) -> anyhow::Result<()> {
     conn.pragma_update_and_check(None, "journal_mode", "WAL", |_row| Ok(()))?;
     conn.pragma_update(None, "foreign_keys", true)?;
+    conn.busy_timeout(Duration::from_secs(2))?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     migrate(conn)?;
     Ok(())
 }
@@ -755,6 +818,54 @@ mod tests {
         db.insert_owner("fresh", 9_900).expect("owner");
         assert_eq!(db.prune_empty_owners(10_000, 1_000).expect("prune"), 2);
         assert_eq!(owner_count(&db), 1);
+    }
+
+    fn device_count(db: &Db) -> i64 {
+        let conn = db.conn.lock().expect("db mutex poisoned");
+        conn.query_row("SELECT COUNT(*) FROM devices", [], |r| r.get(0))
+            .expect("count devices")
+    }
+
+    #[test]
+    fn prune_unowned_devices_removes_old_unowned() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_device("old", "h", "Old", 100).expect("device");
+        db.insert_device("old2", "h", "Old2", 200).expect("device");
+        let n = db
+            .prune_unowned_devices(10_000, 1_000, &[])
+            .expect("prune devices");
+        assert_eq!(n, 2);
+        assert_eq!(device_count(&db), 0);
+    }
+
+    #[test]
+    fn prune_unowned_devices_keeps_owned_and_fresh() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("o", 100).expect("owner");
+        db.insert_device("owned", "h", "Owned", 100)
+            .expect("device");
+        db.link_device("o", "owned", 100).expect("link");
+        db.insert_device("fresh", "h", "Fresh", 9_900)
+            .expect("device");
+        let n = db
+            .prune_unowned_devices(10_000, 1_000, &[])
+            .expect("prune devices");
+        assert_eq!(n, 0);
+        assert_eq!(device_count(&db), 2);
+    }
+
+    #[test]
+    fn prune_unowned_devices_keeps_online_ids() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_device("online", "h", "Online", 100)
+            .expect("device");
+        db.insert_device("gone", "h", "Gone", 100).expect("device");
+        let n = db
+            .prune_unowned_devices(10_000, 1_000, &["online".to_string()])
+            .expect("prune devices");
+        assert_eq!(n, 1);
+        assert!(db.device("online").expect("query").is_some());
+        assert!(db.device("gone").expect("query").is_none());
     }
 
     #[test]

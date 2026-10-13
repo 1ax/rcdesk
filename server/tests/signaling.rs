@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use proto::signal::{ByeReason, DeviceCredentials, IceCandidate, Role, SignalMessage};
-use rcdesk_server::app::app;
+use rcdesk_server::app::{app, NEW_DEVICE_BURST, NEW_OWNER_BURST};
 use rcdesk_server::db::Db;
 use rcdesk_server::ice::IceConfig;
 use rcdesk_server::registry::Registry;
@@ -1851,4 +1851,99 @@ async fn peer_that_stops_reading_is_disconnected() {
         }
     }
     assert!(joined, "host must be free after the slow client is dropped");
+}
+
+// B2 (audit S-H2): creating new owners is rate-limited per client IP; known
+// tokens are free, another IP is unaffected.
+#[tokio::test]
+async fn new_owner_creation_is_rate_limited_per_ip() {
+    let url = spawn_server().await;
+
+    let mut ws = connect_as(&url, "203.0.113.50").await;
+    hello(&mut ws, Role::Client).await;
+    let mut tokens = Vec::new();
+    for _ in 0..NEW_OWNER_BURST {
+        let (token, _devices) = client_auth(&mut ws, None).await;
+        tokens.push(token);
+    }
+    send(&mut ws, &SignalMessage::ClientAuth { token: None }).await;
+    match recv(&mut ws).await {
+        SignalMessage::Error { message } => assert_eq!(message, "too many attempts"),
+        other => panic!("expected too many attempts, got {other:?}"),
+    }
+
+    let (token, _devices) = client_auth(&mut ws, Some(tokens[0].clone())).await;
+    assert_eq!(token, tokens[0]);
+
+    let mut other = connect_as(&url, "203.0.113.51").await;
+    hello(&mut other, Role::Client).await;
+    client_auth(&mut other, None).await;
+}
+
+/// Registers a host with `device` over a fresh connection from `ip`.
+/// Returns the connection and the first response.
+async fn register_host_as(
+    url: &str,
+    ip: &str,
+    device: Option<DeviceCredentials>,
+) -> (WsStream, SignalMessage) {
+    let mut host = connect_as(url, ip).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device,
+            session_id: None,
+        },
+    )
+    .await;
+    let response = recv(&mut host).await;
+    (host, response)
+}
+
+// B2 (audit S-H2): registering new devices is rate-limited per client IP;
+// known devices are free, another IP is unaffected.
+#[tokio::test]
+async fn new_device_registration_is_rate_limited_per_ip() {
+    let url = spawn_server().await;
+    let ip = "203.0.113.60";
+
+    let mut credentials = None;
+    for _ in 0..NEW_DEVICE_BURST {
+        let (mut host, response) = register_host_as(&url, ip, None).await;
+        match response {
+            SignalMessage::Registered { device, .. } => {
+                credentials = Some(device.expect("issued credentials"));
+            }
+            other => panic!("expected registered, got {other:?}"),
+        }
+        host.close(None).await.expect("close");
+    }
+
+    let (mut blocked, response) = register_host_as(&url, ip, None).await;
+    match response {
+        SignalMessage::Error { message } => assert_eq!(message, "too many attempts"),
+        other => panic!("expected too many attempts, got {other:?}"),
+    }
+    let end = timeout(TIMEOUT, async {
+        loop {
+            match blocked.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await;
+    assert!(end.is_ok(), "stream must end after the rate-limit error");
+
+    // A known device from the same IP is not limited.
+    let (_known, response) = register_host_as(&url, ip, credentials).await;
+    match response {
+        SignalMessage::Registered { device, .. } => assert!(device.is_none()),
+        other => panic!("expected registered, got {other:?}"),
+    }
+
+    let (_other, response) = register_host_as(&url, "203.0.113.61", None).await;
+    assert!(matches!(response, SignalMessage::Registered { .. }));
 }

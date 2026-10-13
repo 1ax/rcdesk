@@ -37,6 +37,46 @@ pub fn truncate_user_agent(user_agent: &str) -> &str {
     truncate_chars(user_agent, MAX_USER_AGENT_CHARS)
 }
 
+/// Опознаёт владельца по присланному токену. Если токен известен, обновляет
+/// `last_used_at` и `user_agent` и возвращает `(owner_id, token_id)`, иначе
+/// `None`.
+pub fn lookup_token(
+    db: &Db,
+    token: Option<&str>,
+    user_agent: &str,
+    now: i64,
+) -> anyhow::Result<Option<(String, String)>> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    let Some((owner_id, token_id)) = db.token_by_hash(&hash_secret(token))? else {
+        return Ok(None);
+    };
+    db.touch_token(&token_id, truncate_user_agent(user_agent), now)?;
+    Ok(Some((owner_id, token_id)))
+}
+
+/// Заводит нового владельца и его первый токен. Возвращает
+/// `(owner_id, token_id, token)`; токен надо отдать клиенту в `Authenticated`.
+pub fn create_owner(
+    db: &Db,
+    user_agent: &str,
+    now: i64,
+) -> anyhow::Result<(String, String, String)> {
+    let owner_id = random_token(OWNER_ID_LEN);
+    let token_id = random_token(TOKEN_ID_LEN);
+    let token = random_token(TOKEN_LEN);
+    db.insert_owner(&owner_id, now)?;
+    db.insert_token(
+        &owner_id,
+        &token_id,
+        &hash_secret(&token),
+        truncate_user_agent(user_agent),
+        now,
+    )?;
+    Ok((owner_id, token_id, token))
+}
+
 /// Опознаёт владельца по присланному токену или заводит нового.
 /// Возвращает `(owner_id, token_id, token)`: токен тот же, если присланный
 /// опознан (при этом обновляются `last_used_at` и `user_agent`), иначе
@@ -47,20 +87,10 @@ pub fn authenticate(
     user_agent: &str,
     now: i64,
 ) -> anyhow::Result<(String, String, String)> {
-    let user_agent = truncate_user_agent(user_agent);
-    if let Some(token) = token {
-        if let Some((owner_id, token_id)) = db.token_by_hash(&hash_secret(token))? {
-            db.touch_token(&token_id, user_agent, now)?;
-            return Ok((owner_id, token_id, token.to_string()));
-        }
+    if let Some((owner_id, token_id)) = lookup_token(db, token, user_agent, now)? {
+        return Ok((owner_id, token_id, token.unwrap_or_default().to_string()));
     }
-
-    let owner_id = random_token(OWNER_ID_LEN);
-    let token_id = random_token(TOKEN_ID_LEN);
-    let token = random_token(TOKEN_LEN);
-    db.insert_owner(&owner_id, now)?;
-    db.insert_token(&owner_id, &token_id, &hash_secret(&token), user_agent, now)?;
-    Ok((owner_id, token_id, token))
+    create_owner(db, user_agent, now)
 }
 
 /// Выдаёт существующему владельцу новый токен (вход по passkey, слайс

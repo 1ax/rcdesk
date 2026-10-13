@@ -1,5 +1,5 @@
 use rcdesk_server::app::app;
-use rcdesk_server::db::{Db, OWNER_IDLE_TTL_SECS};
+use rcdesk_server::db::{Db, DEVICE_IDLE_TTL_SECS, OWNER_IDLE_TTL_SECS};
 use rcdesk_server::ice::{now_unix, IceConfig};
 use rcdesk_server::passkeys;
 use rcdesk_server::registry::Registry;
@@ -25,6 +25,8 @@ async fn main() -> anyhow::Result<()> {
     // Долг D53: раз в сутки (и сразу при старте) чистим пустых анонимных
     // владельцев. Короткий запрос под std-мьютексом, как остальной код.
     let prune_db = db.clone();
+    let registry = Registry::new();
+    let prune_registry = registry.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
         loop {
@@ -33,6 +35,15 @@ async fn main() -> anyhow::Result<()> {
                 Ok(0) => {}
                 Ok(n) => tracing::info!("pruned {n} empty owners"),
                 Err(err) => tracing::warn!("failed to prune empty owners: {err:#}"),
+            }
+            match prune_db.prune_unowned_devices(
+                now_unix(),
+                DEVICE_IDLE_TTL_SECS,
+                &prune_registry.online_host_ids(),
+            ) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("pruned {n} unowned devices"),
+                Err(err) => tracing::warn!("failed to prune unowned devices: {err:#}"),
             }
         }
     });
@@ -46,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
 
     axum::serve(
         listener,
-        app(Registry::new(), IceConfig::from_env(), db, webauthn)
+        app(registry, IceConfig::from_env(), db, webauthn)
             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await?;
