@@ -71,6 +71,19 @@ curl -s http://127.0.0.1:8100/healthz   # ok
 в https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/ --
 относительно TURN-сервера должны появиться `relay`-кандидаты.
 
+### Откат
+
+Деплой выставляет `IMAGE_TAG=sha-<7 символов коммита>`, поэтому каждый
+выкаченный образ остаётся на сервере и в ghcr.io под своим тегом. Откат на
+предыдущий образ (тег -- со страницы Deploy в Actions или из
+`docker images ghcr.io/1ax/rcdesk-server`):
+
+```bash
+cd ~/app && IMAGE_TAG=sha-<предыдущий> docker compose -f docker-compose.prod.yml up -d server
+```
+
+Следующий деплой вернёт свежий sha.
+
 ## Монитор трафика
 
 `traffic-monitor.sh` считает исходящий трафик VPS за месяц и уведомляет в

@@ -11,6 +11,9 @@ on:
     branches: [main]
     tags: ['v*']
 
+permissions:
+  contents: read
+
 jobs:
   # Первым делом: какой тег релизим и нужно ли вообще -- иначе не тратим сборку.
   version:
@@ -21,7 +24,7 @@ jobs:
       tag: ${{ steps.decide.outputs.tag }}
       release: ${{ steps.decide.outputs.release }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Определить тег релиза
         id: decide
         env:
@@ -57,7 +60,9 @@ jobs:
   build-host:
     needs: test
     uses: ./.github/workflows/build-host.yml
-    secrets: inherit
+    secrets:
+      MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+      MACOS_SIGN_P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
 
   release:
     needs: [version, build-host]
@@ -68,20 +73,20 @@ jobs:
       RELEASE_TAG: ${{ needs.version.outputs.tag }}
     steps:
       # Скрипт подписи манифеста лежит в репозитории.
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: rcdesk-host-windows-x64
           path: dist/windows
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: rcdesk-setup-windows-x64
           path: dist/setup
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: rcdesk-host-macos-arm64
           path: dist/macos
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: rcdesk-macos-pkg
           path: dist/macos-pkg
