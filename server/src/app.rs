@@ -22,6 +22,25 @@ pub const NEW_OWNER_REFILL: Duration = Duration::from_secs(60);
 pub const NEW_DEVICE_BURST: u32 = 10;
 pub const NEW_DEVICE_REFILL: Duration = Duration::from_secs(600);
 
+/// Серверный keepalive (B3): Ping раз в `ping_interval`, закрытие соединения,
+/// если `read_timeout` не пришло ни одного кадра (текст, Ping, Pong — любой).
+/// Хост сам пингует каждые 20 с, браузер отвечает Pong автоматически, так что
+/// живое соединение всегда шлёт кадры чаще 90 с.
+#[derive(Debug, Clone, Copy)]
+pub struct Liveness {
+    pub ping_interval: Duration,
+    pub read_timeout: Duration,
+}
+
+impl Default for Liveness {
+    fn default() -> Self {
+        Self {
+            ping_interval: Duration::from_secs(30),
+            read_timeout: Duration::from_secs(90),
+        }
+    }
+}
+
 /// Shared state handed to every `/ws` connection: the in-memory signaling
 /// registry, the ICE server configuration used to fill `Registered`'s and
 /// `Joined`'s `ice_servers` field, and the persistent device/owner store.
@@ -38,9 +57,21 @@ pub struct AppState {
     pub device_limiter: IpLimiter,
     /// WebAuthn relying party for passkeys (slice 3.7b).
     pub webauthn: SharedWebauthn,
+    /// Server keepalive parameters (B3).
+    pub liveness: Liveness,
 }
 
 pub fn app(registry: Registry, ice: IceConfig, db: Db, webauthn: SharedWebauthn) -> Router {
+    app_with_liveness(registry, ice, db, webauthn, Liveness::default())
+}
+
+pub fn app_with_liveness(
+    registry: Registry,
+    ice: IceConfig,
+    db: Db,
+    webauthn: SharedWebauthn,
+    liveness: Liveness,
+) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/ws", get(ws_handler))
@@ -52,6 +83,7 @@ pub fn app(registry: Registry, ice: IceConfig, db: Db, webauthn: SharedWebauthn)
             owner_limiter: IpLimiter::new(NEW_OWNER_BURST, NEW_OWNER_REFILL),
             device_limiter: IpLimiter::new(NEW_DEVICE_BURST, NEW_DEVICE_REFILL),
             webauthn,
+            liveness,
         })
 }
 

@@ -65,21 +65,28 @@ impl IceConfig {
         )
     }
 
-    /// Builds the ICE server list for one `Registered`/`Joined` reply: one
-    /// `IceServer` per STUN URL (no credentials), followed by a single TURN
-    /// `IceServer` covering every `RCDESK_TURN_URLS` entry with short-lived
-    /// REST-API credentials -- only when both `RCDESK_TURN_URLS` and
-    /// `RCDESK_TURN_SECRET` are set; otherwise TURN is omitted entirely.
-    pub fn ice_servers(&self, now_unix: u64) -> Vec<IceServer> {
-        let mut servers: Vec<IceServer> = self
-            .stun_urls
+    /// Only the STUN entries (no TURN, no credentials). The host takes its
+    /// TURN credentials per session from `PeerJoined` (2.6b); `Registered`
+    /// carries STUN only, so credentials are not handed to an unauthenticated
+    /// host for nothing (B3, audit S-H3).
+    pub fn stun_servers(&self) -> Vec<IceServer> {
+        self.stun_urls
             .iter()
             .map(|url| IceServer {
                 urls: vec![url.clone()],
                 username: None,
                 credential: None,
             })
-            .collect();
+            .collect()
+    }
+
+    /// Builds the ICE server list for one `Joined`/`PeerJoined` reply: one
+    /// `IceServer` per STUN URL (no credentials), followed by a single TURN
+    /// `IceServer` covering every `RCDESK_TURN_URLS` entry with short-lived
+    /// REST-API credentials -- only when both `RCDESK_TURN_URLS` and
+    /// `RCDESK_TURN_SECRET` are set; otherwise TURN is omitted entirely.
+    pub fn ice_servers(&self, now_unix: u64) -> Vec<IceServer> {
+        let mut servers = self.stun_servers();
 
         if !self.turn_urls.is_empty() && !self.turn_secret.is_empty() {
             let expiry = now_unix + self.turn_ttl_secs;
@@ -183,5 +190,25 @@ mod tests {
             .as_ref()
             .expect("turn server has a credential")
             .is_empty());
+    }
+
+    #[test]
+    fn stun_servers_has_no_turn_even_when_turn_is_configured() {
+        let cfg = IceConfig::new(
+            vec!["stun:stun.l.google.com:19302".to_string()],
+            vec!["turn:turn.rcdesk.app:3478".to_string()],
+            "s3cret".to_string(),
+            86400,
+        );
+
+        let stun = cfg.stun_servers();
+        assert_eq!(stun.len(), 1);
+        assert!(stun
+            .iter()
+            .all(|s| s.username.is_none() && s.credential.is_none()));
+        assert!(cfg
+            .ice_servers(1_000_000)
+            .iter()
+            .any(|s| s.username.is_some()));
     }
 }

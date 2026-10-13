@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use proto::signal::{ByeReason, DeviceCredentials, IceCandidate, Role, SignalMessage};
-use rcdesk_server::app::{app, NEW_DEVICE_BURST, NEW_OWNER_BURST};
+use rcdesk_server::app::{app_with_liveness, Liveness, NEW_DEVICE_BURST, NEW_OWNER_BURST};
 use rcdesk_server::db::Db;
 use rcdesk_server::ice::IceConfig;
 use rcdesk_server::registry::Registry;
@@ -29,12 +29,20 @@ async fn spawn_server() -> String {
 /// database, for tests that need state the wire protocol can't create
 /// (a second token for the same owner).
 async fn spawn_server_with_db() -> (String, Db) {
+    spawn_full(IceConfig::from_env(), Liveness::default()).await
+}
+
+/// Like `spawn_server`, with explicit ICE config and keepalive parameters.
+async fn spawn_server_with(ice: IceConfig, liveness: Liveness) -> String {
+    spawn_full(ice, liveness).await.0
+}
+
+async fn spawn_full(ice: IceConfig, liveness: Liveness) -> (String, Db) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
     let registry = Registry::new();
-    let ice = IceConfig::from_env();
     let db = Db::in_memory().expect("open in-memory db");
     let db_handle = db.clone();
     let webauthn = rcdesk_server::passkeys::build_webauthn("localhost", "http://localhost:5173")
@@ -42,7 +50,7 @@ async fn spawn_server_with_db() -> (String, Db) {
     tokio::spawn(async move {
         axum::serve(
             listener,
-            app(registry, ice, db, webauthn)
+            app_with_liveness(registry, ice, db, webauthn, liveness)
                 .into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .await
@@ -1946,4 +1954,133 @@ async fn new_device_registration_is_rate_limited_per_ip() {
 
     let (_other, response) = register_host_as(&url, "203.0.113.61", None).await;
     assert!(matches!(response, SignalMessage::Registered { .. }));
+}
+
+// B3: TURN credentials are not handed out in `Registered`, only per session.
+#[tokio::test]
+async fn registered_has_only_stun_but_joined_and_peer_joined_have_turn() {
+    let ice = IceConfig::new(
+        vec!["stun:stun.example:3478".into()],
+        vec!["turn:turn.example:3478".into()],
+        "secret".into(),
+        3600,
+    );
+    let url = spawn_server_with(ice, Liveness::default()).await;
+    let mut host = connect(&url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: None,
+            session_id: None,
+        },
+    )
+    .await;
+    let pin = match recv(&mut host).await {
+        SignalMessage::Registered {
+            pin, ice_servers, ..
+        } => {
+            assert!(!ice_servers.is_empty());
+            assert!(ice_servers.iter().all(|s| s.username.is_none()));
+            pin
+        }
+        other => panic!("expected registered, got {other:?}"),
+    };
+
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    send(&mut client, &SignalMessage::Join { pin }).await;
+    match recv(&mut client).await {
+        SignalMessage::Joined { ice_servers, .. } => {
+            assert!(ice_servers.iter().any(|s| s.username.is_some()));
+        }
+        other => panic!("expected joined, got {other:?}"),
+    }
+    match recv(&mut host).await {
+        SignalMessage::PeerJoined { ice_servers, .. } => {
+            assert!(ice_servers.iter().any(|s| s.username.is_some()));
+        }
+        other => panic!("expected peer_joined, got {other:?}"),
+    }
+}
+
+// B3: the server pings an idle connection.
+#[tokio::test]
+async fn server_pings_idle_connection() {
+    let liveness = Liveness {
+        ping_interval: Duration::from_millis(100),
+        read_timeout: Duration::from_secs(5),
+    };
+    let url = spawn_server_with(IceConfig::from_env(), liveness).await;
+    let mut ws = connect(&url).await;
+    hello(&mut ws, Role::Client).await;
+    let got_ping = timeout(Duration::from_secs(1), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Ping(_))) => return true,
+                Some(Ok(_)) => continue,
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .expect("no ping within 1s");
+    assert!(got_ping);
+}
+
+// B3: a peer that sends nothing (and does not answer pings) is dropped after
+// the read timeout; a peer that answers pings stays alive.
+#[tokio::test]
+async fn silent_peer_is_disconnected_after_read_timeout() {
+    let liveness = Liveness {
+        ping_interval: Duration::from_millis(100),
+        read_timeout: Duration::from_millis(400),
+    };
+    let url = spawn_server_with(IceConfig::from_env(), liveness).await;
+
+    let mut host = connect(&url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "Silent".to_string(),
+            device: None,
+            session_id: None,
+        },
+    )
+    .await;
+    match recv(&mut host).await {
+        SignalMessage::Registered { .. } => {}
+        other => panic!("expected registered, got {other:?}"),
+    }
+    // Not reading: no automatic Pong goes out.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        stream_ended(&mut host, TIMEOUT).await,
+        "silent connection must be closed after the read timeout"
+    );
+
+    // Control: a client that keeps reading (and so answers Pings) survives.
+    let mut live = connect(&url).await;
+    hello(&mut live, Role::Client).await;
+    let _ = timeout(Duration::from_secs(1), async {
+        loop {
+            if live.next().await.is_none() {
+                return;
+            }
+        }
+    })
+    .await;
+    send(
+        &mut live,
+        &SignalMessage::Join {
+            pin: "000000".to_string(),
+        },
+    )
+    .await;
+    match recv(&mut live).await {
+        SignalMessage::Error { message } => assert_eq!(message, "unknown pin"),
+        other => panic!("expected error, got {other:?}"),
+    }
 }

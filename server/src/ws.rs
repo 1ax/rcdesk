@@ -8,6 +8,7 @@
 //! overflows or the peer stops reading (`WRITE_TIMEOUT`), a kill switch closes
 //! the connection: the read loop exits and runs its usual cleanup.
 
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
@@ -17,7 +18,7 @@ use futures_util::{SinkExt, StreamExt};
 use proto::signal::{BrowserEntry, DeviceEntry, Role, SignalMessage};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
-use tokio::time::timeout;
+use tokio::time::{interval, timeout, MissedTickBehavior};
 use webauthn_rs::prelude::{DiscoverableAuthentication, PasskeyRegistration};
 
 use crate::app::AppState;
@@ -79,8 +80,33 @@ async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx, kill) = Tx::channel();
 
+    let liveness = state.liveness;
+    let read_timeout = liveness.read_timeout;
     let mut writer = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
+        let mut ping = interval(liveness.ping_interval);
+        ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // The first tick fires immediately; the first Ping goes out one
+        // interval from now.
+        ping.tick().await;
+        loop {
+            let msg = tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(msg) => msg,
+                    None => break,
+                },
+                _ = ping.tick() => {
+                    match timeout(WRITE_TIMEOUT, sink.send(Message::Ping(Bytes::new()))).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => break,
+                        Err(_) => {
+                            tracing::warn!("peer not reading for 10s, closing connection");
+                            kill.kill();
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            };
             let json = match serde_json::to_string(&msg) {
                 Ok(json) => json,
                 Err(err) => {
@@ -113,6 +139,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
         &state.device_limiter,
         &state.webauthn,
         info,
+        read_timeout,
     )
     .await;
     tracing::info!("websocket connection closed");
@@ -129,12 +156,24 @@ async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
 /// Reads the next text frame and parses it as a `SignalMessage`. Returns
 /// `None` when the connection is over (closed, transport error) or the frame
 /// was invalid JSON / not text (an `Error` reply is sent for the latter).
-/// Ping/Pong control frames are transparently skipped; axum answers Pings
-/// automatically at the transport level.
-async fn next_message(stream: &mut SplitStream<WebSocket>, tx: &Tx) -> Option<SignalMessage> {
+/// Ping/Pong control frames are transparently skipped (axum answers Pings
+/// automatically at the transport level) but they reset the read timeout:
+/// if no frame of any kind arrives within `read_timeout`, the connection is
+/// considered dead and `None` is returned (B3).
+async fn next_message(
+    stream: &mut SplitStream<WebSocket>,
+    tx: &Tx,
+    read_timeout: Duration,
+) -> Option<SignalMessage> {
     loop {
         let item = tokio::select! {
-            item = stream.next() => item,
+            item = timeout(read_timeout, stream.next()) => match item {
+                Ok(item) => item,
+                Err(_) => {
+                    tracing::warn!("no frames for {read_timeout:?}, closing connection");
+                    return None;
+                }
+            },
             _ = tx.killed() => {
                 tracing::info!(
                     "connection closed by server: outbound queue overflow or peer not reading"
@@ -181,8 +220,9 @@ async fn run_connection(
     device_limiter: &IpLimiter,
     webauthn: &SharedWebauthn,
     info: ClientInfo,
+    read_timeout: Duration,
 ) {
-    let role = match next_message(stream, &tx).await {
+    let role = match next_message(stream, &tx, read_timeout).await {
         Some(SignalMessage::Hello { role, .. }) => role,
         Some(_) => {
             let _ = tx.send(SignalMessage::Error {
@@ -194,7 +234,19 @@ async fn run_connection(
     };
 
     match role {
-        Role::Host => run_host(stream, tx, registry, ice, db, device_limiter, info.ip).await,
+        Role::Host => {
+            run_host(
+                stream,
+                tx,
+                registry,
+                ice,
+                db,
+                device_limiter,
+                info.ip,
+                read_timeout,
+            )
+            .await
+        }
         Role::Client => {
             run_client(
                 stream,
@@ -206,12 +258,14 @@ async fn run_connection(
                 owner_limiter,
                 webauthn,
                 info,
+                read_timeout,
             )
             .await
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_host(
     stream: &mut SplitStream<WebSocket>,
     tx: Tx,
@@ -220,8 +274,9 @@ async fn run_host(
     db: &Db,
     device_limiter: &IpLimiter,
     ip: IpAddr,
+    read_timeout: Duration,
 ) {
-    let (name, device, session_id) = match next_message(stream, &tx).await {
+    let (name, device, session_id) = match next_message(stream, &tx, read_timeout).await {
         Some(SignalMessage::HostRegister {
             name,
             device,
@@ -314,12 +369,12 @@ async fn run_host(
     let _ = tx.send(SignalMessage::Registered {
         host_id: host_id.clone(),
         pin,
-        ice_servers: ice.ice_servers(ice::now_unix()),
+        ice_servers: ice.stun_servers(),
         device: issued_credentials,
     });
 
     loop {
-        let msg = match next_message(stream, &tx).await {
+        let msg = match next_message(stream, &tx, read_timeout).await {
             Some(msg) => msg,
             None => break,
         };
@@ -651,6 +706,7 @@ async fn run_client(
     owner_limiter: &IpLimiter,
     webauthn: &SharedWebauthn,
     info: ClientInfo,
+    read_timeout: Duration,
 ) {
     let ClientInfo { ip, user_agent } = info;
     // The owner this connection has authenticated as (slice 3.1), if any --
@@ -663,7 +719,7 @@ async fn run_client(
     let mut passkey_login: Option<DiscoverableAuthentication> = None;
 
     loop {
-        let msg = match next_message(stream, &tx).await {
+        let msg = match next_message(stream, &tx, read_timeout).await {
             Some(msg) => msg,
             None => break,
         };
