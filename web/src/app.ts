@@ -676,6 +676,9 @@ export function mount(root: Element | null): void {
   let offeredFiles: OfferedFile[] = [];
   let offeredFolders = 0;
   let downloading = false;
+  // Set when the current download is cancelled or a file fails: the offer
+  // then stays so the user can retry; a clean download forgets it.
+  let downloadFailed = false;
   let fileDragDepth = 0;
   let clipboardNoteTimer: ReturnType<typeof setTimeout> | undefined;
   let fullscreenNoteTimer: ReturnType<typeof setTimeout> | undefined;
@@ -851,13 +854,19 @@ export function mount(root: Element | null): void {
         saveDownloadedFile(name, blob);
         showClipboardNote(`Скачано: ${name}`);
       },
-      onError: (name, reason) =>
+      onError: (name, reason) => {
+        downloadFailed = true;
         showClipboardNote(
           name === ""
             ? `Не скачано: ${downloadFailLabel(reason)}`
             : `Не скачано: ${name} — ${downloadFailLabel(reason)}`,
-        ),
+        );
+      },
       onDone: () => {
+        if (downloading && !downloadFailed) {
+          offeredFiles = [];
+          offeredFolders = 0;
+        }
         downloading = false;
         downloadStatusEl.hidden = true;
         downloadStatusTextEl.textContent = "";
@@ -1534,12 +1543,14 @@ export function mount(root: Element | null): void {
     if (offeredFolders > 0) {
       showClipboardNote(`Папки пока не поддерживаются: пропущено ${offeredFolders}`);
     }
+    downloadFailed = false;
     if (fileReceiver.fetch()) {
       downloading = true;
       updateFileUi();
     }
   });
   downloadCancelBtn.addEventListener("click", () => {
+    downloadFailed = true;
     fileReceiver?.cancel();
   });
   // Drag-and-drop onto the video area. These are HTML5 drag events, which
