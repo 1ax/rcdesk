@@ -11,10 +11,82 @@ use std::sync::{Arc, Mutex};
 
 use proto::signal::SignalMessage;
 use rand::RngExt;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{mpsc, watch};
 
-/// Channel used to push outgoing `SignalMessage`s to one connection's writer task.
-pub type Tx = UnboundedSender<SignalMessage>;
+/// Размер исходящей очереди одного соединения (B1).
+pub const OUTBOUND_QUEUE: usize = 64;
+
+/// Ошибка отправки в `Tx`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendError {
+    /// Очередь переполнена: пир не читает сокет, соединение убито.
+    Full,
+    /// Получатель (writer-задача) уже закрыт.
+    Closed,
+}
+
+/// «Рубильник» соединения: им writer-задача закрывает соединение, не держа
+/// клон `Tx` (иначе канал никогда не закроется).
+pub struct KillSwitch(watch::Sender<bool>);
+
+impl KillSwitch {
+    pub fn kill(&self) {
+        self.0.send_replace(true);
+    }
+}
+
+/// Исходящая очередь одного соединения (B1): bounded-канал на OUTBOUND_QUEUE
+/// сообщений + «рубильник», которым любой держатель Tx может закрыть это
+/// соединение (пир не читает сокет -> очередь переполнилась).
+#[derive(Clone)]
+pub struct Tx {
+    sender: mpsc::Sender<SignalMessage>,
+    kill: watch::Sender<bool>,
+}
+
+impl std::fmt::Debug for Tx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tx").finish_non_exhaustive()
+    }
+}
+
+impl Tx {
+    pub fn channel() -> (Tx, mpsc::Receiver<SignalMessage>, KillSwitch) {
+        let (sender, receiver) = mpsc::channel(OUTBOUND_QUEUE);
+        let (kill, _) = watch::channel(false);
+        (
+            Tx {
+                sender,
+                kill: kill.clone(),
+            },
+            receiver,
+            KillSwitch(kill),
+        )
+    }
+
+    /// Неблокирующая отправка. При переполнении очереди убивает соединение.
+    pub fn send(&self, msg: SignalMessage) -> Result<(), SendError> {
+        match self.sender.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("outbound queue full, closing connection");
+                self.kill.send_replace(true);
+                Err(SendError::Full)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(SendError::Closed),
+        }
+    }
+
+    pub fn same_channel(&self, other: &Tx) -> bool {
+        self.sender.same_channel(&other.sender)
+    }
+
+    /// Завершается, когда соединение убито (сразу, если уже убито).
+    pub async fn killed(&self) {
+        let mut rx = self.kill.subscribe();
+        let _ = rx.wait_for(|k| *k).await;
+    }
+}
 
 const ID_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 const ID_LEN: usize = 16;
@@ -436,10 +508,42 @@ fn random_pin() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc;
+    use std::time::Duration;
+    use tokio::time::timeout;
 
-    fn channel() -> (Tx, tokio::sync::mpsc::UnboundedReceiver<SignalMessage>) {
-        mpsc::unbounded_channel()
+    fn channel() -> (Tx, mpsc::Receiver<SignalMessage>) {
+        let (tx, rx, _kill) = Tx::channel();
+        (tx, rx)
+    }
+
+    fn msg() -> SignalMessage {
+        SignalMessage::Error {
+            message: "x".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn tx_send_returns_full_and_kills_after_queue_overflow() {
+        let (tx, _rx, _kill) = Tx::channel();
+        for _ in 0..OUTBOUND_QUEUE {
+            assert_eq!(tx.send(msg()), Ok(()));
+        }
+        assert_eq!(tx.send(msg()), Err(SendError::Full));
+        assert!(timeout(Duration::from_millis(100), tx.killed())
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn tx_killed_waits_until_kill_switch() {
+        let (tx, _rx, kill) = Tx::channel();
+        assert!(timeout(Duration::from_millis(50), tx.killed())
+            .await
+            .is_err());
+        kill.kill();
+        assert!(timeout(Duration::from_millis(50), tx.killed())
+            .await
+            .is_ok());
     }
 
     #[test]

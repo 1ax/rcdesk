@@ -24,12 +24,17 @@ const TOKEN_ID_LEN: usize = 16;
 /// Максимальная длина сохраняемого `User-Agent`, в символах.
 const MAX_USER_AGENT_CHARS: usize = 256;
 
+/// Обрезает строку до `max_chars` символов по границе char.
+pub fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
 /// Обрезает `User-Agent` до `MAX_USER_AGENT_CHARS` символов по границе char.
 pub fn truncate_user_agent(user_agent: &str) -> &str {
-    match user_agent.char_indices().nth(MAX_USER_AGENT_CHARS) {
-        Some((idx, _)) => &user_agent[..idx],
-        None => user_agent,
-    }
+    truncate_chars(user_agent, MAX_USER_AGENT_CHARS)
 }
 
 /// Опознаёт владельца по присланному токену или заводит нового.
@@ -81,6 +86,15 @@ pub fn issue_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_chars_cuts_on_char_boundary() {
+        let s = "привет😀мир";
+        assert_eq!(truncate_chars(s, 6), "привет");
+        assert_eq!(truncate_chars(s, 7), "привет😀");
+        assert_eq!(truncate_chars(s, 100), s);
+        assert_eq!(truncate_chars(s, 0), "");
+    }
 
     #[test]
     fn no_token_creates_owner_with_hashed_token_in_db() {

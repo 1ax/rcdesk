@@ -1,10 +1,12 @@
 //! `/ws` handler: the signaling protocol over one WebSocket connection.
 //!
 //! Every connection gets a read task (this module's `run_connection` and
-//! friends, driven from the `on_upgrade` future) and an outgoing
-//! `mpsc::UnboundedSender<SignalMessage>` paired with a dedicated writer task
-//! that serializes messages to the socket. Other connections push messages to
-//! this one purely by holding a clone of its `Tx`.
+//! friends, driven from the `on_upgrade` future) and an outgoing bounded queue
+//! (`registry::Tx`, `OUTBOUND_QUEUE` messages) paired with a dedicated writer
+//! task that serializes messages to the socket. Other connections push
+//! messages to this one purely by holding a clone of its `Tx`. If the queue
+//! overflows or the peer stops reading (`WRITE_TIMEOUT`), a kill switch closes
+//! the connection: the read loop exits and runs its usual cleanup.
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
@@ -14,7 +16,8 @@ use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
 use proto::signal::{BrowserEntry, DeviceEntry, Role, SignalMessage};
 use std::net::{IpAddr, SocketAddr};
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::time::timeout;
 use webauthn_rs::prelude::{DiscoverableAuthentication, PasskeyRegistration};
 
 use crate::app::AppState;
@@ -25,6 +28,15 @@ use crate::owners;
 use crate::passkeys::{self, PasskeyError, SharedWebauthn};
 use crate::pin_limit::PinLimiter;
 use crate::registry::{JoinError, Registry, Tx};
+
+/// Максимальный размер входящего WebSocket-сообщения/кадра. Самый большой
+/// легитимный кадр: `Offer.sdp` — единицы КБ, JSON WebAuthn — 1–2 КБ. Дефолт
+/// tungstenite (64 МиБ) давал OOM одним сообщением.
+pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+/// Сколько ждём записи в сокет, прежде чем счесть пира не читающим.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Максимальная длина имени хоста и алиаса устройства, в символах.
+pub const MAX_NAME_CHARS: usize = 64;
 
 /// The client's IP: the first valid `X-Real-IP` value (the server sits behind
 /// nginx, so the socket peer is the proxy), otherwise the socket peer.
@@ -58,14 +70,16 @@ pub async fn ws_handler(
             .unwrap_or_default()
             .to_string(),
     };
-    ws.on_upgrade(move |socket| handle_socket(socket, state, info))
+    ws.max_message_size(MAX_MESSAGE_BYTES)
+        .max_frame_size(MAX_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state, info))
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
     let (mut sink, mut stream) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<SignalMessage>();
+    let (tx, mut rx, kill) = Tx::channel();
 
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             let json = match serde_json::to_string(&msg) {
                 Ok(json) => json,
@@ -74,11 +88,17 @@ async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
                     continue;
                 }
             };
-            if sink.send(Message::Text(json.into())).await.is_err() {
-                break;
+            match timeout(WRITE_TIMEOUT, sink.send(Message::Text(json.into()))).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    tracing::warn!("peer not reading for 10s, closing connection");
+                    kill.kill();
+                    break;
+                }
             }
         }
-        let _ = sink.close().await;
+        let _ = timeout(WRITE_TIMEOUT, sink.close()).await;
     });
 
     tracing::info!("websocket connection opened");
@@ -98,7 +118,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
     // Drop our own sender clone so the writer task's channel closes once no
     // other connection (via the registry) is still holding a clone either.
     drop(tx);
-    let _ = writer.await;
+    // Даём дослать последний `Error`, но не ждём застрявшего пира.
+    if timeout(Duration::from_secs(5), &mut writer).await.is_err() {
+        writer.abort();
+    }
 }
 
 /// Reads the next text frame and parses it as a `SignalMessage`. Returns
@@ -108,7 +131,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
 /// automatically at the transport level.
 async fn next_message(stream: &mut SplitStream<WebSocket>, tx: &Tx) -> Option<SignalMessage> {
     loop {
-        match stream.next().await {
+        let item = tokio::select! {
+            item = stream.next() => item,
+            _ = tx.killed() => {
+                tracing::info!(
+                    "connection closed by server: outbound queue overflow or peer not reading"
+                );
+                return None;
+            }
+        };
+        match item {
             Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
                 Ok(msg) => return Some(msg),
                 Err(err) => {
@@ -128,7 +160,7 @@ async fn next_message(stream: &mut SplitStream<WebSocket>, tx: &Tx) -> Option<Si
                 return None;
             }
             Some(Err(err)) => {
-                tracing::debug!(?err, "websocket read error");
+                tracing::warn!(?err, "websocket read error");
                 return None;
             }
         }
@@ -187,6 +219,7 @@ async fn run_host(
         None => return,
     };
 
+    let name = owners::truncate_chars(&name, MAX_NAME_CHARS).to_string();
     let auth = match devices::authenticate(db, device.as_ref(), &name, ice::now_unix() as i64) {
         Ok(auth) => auth,
         Err(err) => {
@@ -845,7 +878,10 @@ async fn run_client(
                     continue;
                 };
 
-                match db.set_alias(&owner_id, &device_id, alias.as_deref()) {
+                let alias = alias
+                    .as_deref()
+                    .map(|a| owners::truncate_chars(a, MAX_NAME_CHARS));
+                match db.set_alias(&owner_id, &device_id, alias) {
                     Ok(true) => match device_entries_for_owner(db, registry, &owner_id) {
                         Ok(devices) => {
                             let _ = tx.send(SignalMessage::Devices { devices });

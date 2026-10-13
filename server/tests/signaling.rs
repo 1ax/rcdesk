@@ -6,6 +6,7 @@ use rcdesk_server::app::app;
 use rcdesk_server::db::Db;
 use rcdesk_server::ice::IceConfig;
 use rcdesk_server::registry::Registry;
+use rcdesk_server::ws::MAX_MESSAGE_BYTES;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -1698,4 +1699,156 @@ async fn delete_passkey_is_scoped_to_the_owner() {
         SignalMessage::Passkeys { passkeys } => assert!(passkeys.is_empty()),
         other => panic!("expected passkeys, got {other:?}"),
     }
+}
+
+/// True once the stream is over (closed, errored, or a Close frame).
+async fn stream_ended(ws: &mut WsStream, dur: Duration) -> bool {
+    timeout(dur, async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+// B1: an oversized frame closes the connection; the server stays alive.
+#[tokio::test]
+async fn oversized_message_closes_the_connection() {
+    let url = spawn_server().await;
+    let mut bad = connect(&url).await;
+    hello(&mut bad, Role::Client).await;
+    let big = serde_json::to_string(&SignalMessage::Join {
+        pin: "0".repeat(MAX_MESSAGE_BYTES + 1024),
+    })
+    .expect("serialize");
+    // The server may close while we are still writing; ignore send errors.
+    let _ = timeout(TIMEOUT, bad.send(Message::Text(big.into()))).await;
+    assert!(
+        stream_ended(&mut bad, TIMEOUT).await,
+        "connection must be closed after an oversized message"
+    );
+
+    let mut good = connect(&url).await;
+    hello(&mut good, Role::Client).await;
+    send(
+        &mut good,
+        &SignalMessage::Join {
+            pin: "000000".to_string(),
+        },
+    )
+    .await;
+    match recv(&mut good).await {
+        SignalMessage::Error { message } => assert_eq!(message, "unknown pin"),
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+// B1: host name and device alias are cut to 64 chars.
+#[tokio::test]
+async fn host_name_and_alias_are_truncated_to_64_chars() {
+    let url = spawn_server().await;
+    let mut host = connect(&url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "й".repeat(100),
+            device: None,
+            session_id: None,
+        },
+    )
+    .await;
+    let (host_id, pin) = match recv(&mut host).await {
+        SignalMessage::Registered { host_id, pin, .. } => (host_id, pin),
+        other => panic!("expected registered, got {other:?}"),
+    };
+
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    client_auth(&mut client, None).await;
+    send(&mut client, &SignalMessage::Join { pin }).await;
+    match recv(&mut client).await {
+        SignalMessage::Joined { host_name, .. } => assert_eq!(host_name.chars().count(), 64),
+        other => panic!("expected joined, got {other:?}"),
+    }
+    match recv(&mut host).await {
+        SignalMessage::PeerJoined { .. } => {}
+        other => panic!("expected peer_joined, got {other:?}"),
+    }
+
+    send(
+        &mut client,
+        &SignalMessage::RenameDevice {
+            device_id: host_id,
+            alias: Some("я".repeat(100)),
+        },
+    )
+    .await;
+    match recv(&mut client).await {
+        SignalMessage::Devices { devices } => {
+            assert_eq!(devices.len(), 1);
+            assert_eq!(
+                devices[0].alias.as_deref().map(|a| a.chars().count()),
+                Some(64)
+            );
+        }
+        other => panic!("expected devices, got {other:?}"),
+    }
+}
+
+// B1: a peer that stops reading overflows its outbound queue and is
+// disconnected; the host is freed for the next client.
+#[tokio::test]
+async fn peer_that_stops_reading_is_disconnected() {
+    let url = spawn_server().await;
+    let (mut host, mut client, session_id, pin) = host_and_joined_client(&url).await;
+
+    // The client does not read. The host floods it with large ICE candidates.
+    for _ in 0..600 {
+        let msg = SignalMessage::Ice {
+            session_id: session_id.clone(),
+            candidate: IceCandidate {
+                candidate: "x".repeat(60 * 1024),
+                sdp_mid: None,
+                sdp_mline_index: None,
+            },
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        if timeout(TIMEOUT, host.send(Message::Text(json.into())))
+            .await
+            .map(|r| r.is_err())
+            .unwrap_or(true)
+        {
+            break;
+        }
+    }
+
+    // Now the client starts reading and discarding: the stream must end.
+    assert!(
+        stream_ended(&mut client, Duration::from_secs(15)).await,
+        "non-reading client must be disconnected"
+    );
+
+    // The host is free again: a second client gets Joined, not "host busy".
+    let mut second = connect(&url).await;
+    hello(&mut second, Role::Client).await;
+    let mut joined = false;
+    for _ in 0..20 {
+        send(&mut second, &SignalMessage::Join { pin: pin.clone() }).await;
+        match recv(&mut second).await {
+            SignalMessage::Joined { .. } => {
+                joined = true;
+                break;
+            }
+            SignalMessage::Error { message } if message == "host busy" => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(joined, "host must be free after the slow client is dropped");
 }
