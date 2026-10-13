@@ -20,18 +20,10 @@ if [[ "$tag" != v* ]]; then
   exit 1
 fi
 
-# version из секции [workspace.package]
-version="$(awk '
-  /^\[/ { in_pkg = ($0 == "[workspace.package]"); next }
-  in_pkg && /^version[[:space:]]*=/ {
-    gsub(/^version[[:space:]]*=[[:space:]]*"/, ""); gsub(/".*$/, ""); print; exit
-  }
-' "$cargo_toml")"
+# version из секции [workspace.package] -- общий парсер с release.yml.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+version="$(bash "$script_dir/cargo-version.sh" "$cargo_toml")"
 
-if [[ -z "$version" ]]; then
-  echo "ошибка: в $cargo_toml нет version в [workspace.package]" >&2
-  exit 2
-fi
 if [[ "${tag#v}" != "$version" ]]; then
   echo "ошибка: тег '$tag' не совпадает с версией $version в $cargo_toml; поднимите version и перевыпустите тег" >&2
   exit 1

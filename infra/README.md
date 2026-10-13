@@ -115,15 +115,18 @@ TRAFFIC_DIR=/tmp/t TRAFFIC_RELAY_BUDGET=1 bash ~/app/traffic-monitor.sh
 
 ## Релиз
 
-Релизы собирает `.github/workflows/release.yml` по тегу `v*`; push в `main`
-по-прежнему только деплоит.
+Релизы собирает `.github/workflows/release.yml`. Тег ставить руками не нужно:
 
 1. Поднять `version` в `[workspace.package]` корневого `Cargo.toml` и в `web/package.json`
    (тест `web/src/version.test.ts` сверяет их), обновить `Cargo.lock`/`package-lock.json`, коммит.
-2. `git tag vX.Y.Z && git push origin vX.Y.Z`.
+2. `git push origin main`. Job `version` читает версию (`infra/cargo-version.sh`); если тега
+   `v<version>` на GitHub ещё нет, он сам ставит его на этот коммит, пушит и в том же прогоне
+   собирает релиз. Push без смены версии релиз не создаёт — только деплой (`deploy.yml`).
 
-Workflow сначала проверяет (`infra/release-version-check.sh`), что тег совпадает
-с `version` (при несовпадении релиз не создаётся), затем прогоняет гейты (CI) и
+Резервный путь — тег руками: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+При ручном теге workflow сначала проверяет (`infra/release-version-check.sh`), что тег совпадает
+с `version` (при несовпадении релиз не создаётся); затем прогоняет гейты (CI) и
 собирает хост под Windows и macOS. В GitHub Releases попадают установщик
 `rcdesk-setup.exe` (Windows) и zip без установки: `rcdesk-windows-x64.zip`,
 `rcdesk-macos-arm64.zip`.

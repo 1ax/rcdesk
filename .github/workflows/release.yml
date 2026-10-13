@@ -1,23 +1,57 @@
 name: Release
 
-# Релиз по тегу vX.Y.Z (infra/README.md, раздел «Релиз»). push в main релиз не
-# создаёт -- он только деплоит (deploy.yml).
+# Релиз запускается двумя путями (infra/README.md, раздел «Релиз»):
+#  - push в main с поднятой `version` в Cargo.toml: job `version` сам ставит тег
+#    v<version> и пушит его. Тег, созданный GITHUB_TOKEN, другой прогон не
+#    запускает, поэтому сборка идёт в этом же прогоне. Push без смены версии
+#    релиз не создаёт (тег уже есть) -- только деплой (deploy.yml).
+#  - push тега vX.Y.Z вручную (резервный путь): тег сверяется с `version`.
 on:
   push:
+    branches: [main]
     tags: ['v*']
 
 jobs:
-  # Первым делом: тег совпадает с версией -- иначе не тратим сборку.
-  version-check:
+  # Первым делом: какой тег релизим и нужно ли вообще -- иначе не тратим сборку.
+  version:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.decide.outputs.tag }}
+      release: ${{ steps.decide.outputs.release }}
     steps:
       - uses: actions/checkout@v5
-      - name: Тег совпадает с версией в Cargo.toml
-        run: bash infra/release-version-check.sh "$GITHUB_REF_NAME" Cargo.toml
+      - name: Определить тег релиза
+        id: decide
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" = "tag" ]; then
+            bash infra/release-version-check.sh "$REF_NAME" Cargo.toml
+            echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tag="v$(bash infra/cargo-version.sh Cargo.toml)"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "тег $tag уже есть: версия выпущена, релиз не нужен"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "ставлю тег $tag на $GITHUB_SHA"
+          git tag "$tag" "$GITHUB_SHA"
+          git push origin "refs/tags/$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release=true" >> "$GITHUB_OUTPUT"
 
   # Гейт релиза: те же проверки, что и в deploy.yml.
   test:
-    needs: version-check
+    needs: version
+    if: needs.version.outputs.release == 'true'
     uses: ./.github/workflows/ci.yml
 
   build-host:
@@ -26,10 +60,12 @@ jobs:
     secrets: inherit
 
   release:
-    needs: build-host
+    needs: [version, build-host]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      RELEASE_TAG: ${{ needs.version.outputs.tag }}
     steps:
       # Скрипт подписи манифеста лежит в репозитории.
       - uses: actions/checkout@v5
@@ -72,7 +108,7 @@ jobs:
           key_file="$(mktemp)"
           trap 'rm -f "$key_file"' EXIT
           printf '%s\n' "$RELEASE_SIGN_KEY" > "$key_file"
-          bash infra/release-manifest.sh "${GITHUB_REF_NAME#v}" "$key_file" . \
+          bash infra/release-manifest.sh "${RELEASE_TAG#v}" "$key_file" . \
             dist/setup/rcdesk-setup.exe dist/macos-pkg/rcdesk-macos.pkg
       - name: Создать релиз
         env:
@@ -80,7 +116,7 @@ jobs:
           # репозиторий для gh задаём явно (не зависим от .git после checkout).
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$RELEASE_TAG" \
             rcdesk-windows-x64.zip rcdesk-macos-arm64.zip dist/setup/rcdesk-setup.exe dist/macos-pkg/rcdesk-macos.pkg \
             rcdesk-update.json rcdesk-update.json.sig \
-            --title "rcdesk $GITHUB_REF_NAME" --generate-notes
+            --title "rcdesk $RELEASE_TAG" --generate-notes
