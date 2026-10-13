@@ -81,6 +81,8 @@ jobs:
         run: shellcheck installer/macos/build-pkg.sh installer/macos/scripts/*
       - name: bash infra/traffic-monitor.test.sh
         run: bash infra/traffic-monitor.test.sh
+      - name: bash infra/backup-db.test.sh
+        run: bash infra/backup-db.test.sh
       - name: bash infra/cargo-version.test.sh
         run: bash infra/cargo-version.test.sh
       - name: bash infra/release-version-check.test.sh

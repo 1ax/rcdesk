@@ -25,11 +25,14 @@ RUN mkdir -p host/src && \
     printf 'fn main() {}\n' > host/src/main.rs && \
     touch host/src/lib.rs
 
-RUN cargo build --release -p rcdesk-server
+RUN cargo build --release --locked -p rcdesk-server
 
 FROM debian:bookworm-slim
+# sqlite3 is needed by infra/backup-db.sh, which runs `.backup` via
+# `docker run --entrypoint sqlite3` from this very image -- no separate image
+# or network is required.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates curl libssl3 && \
+    apt-get install -y --no-install-recommends ca-certificates curl libssl3 sqlite3 && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/rcdesk-server /usr/local/bin/rcdesk-server
