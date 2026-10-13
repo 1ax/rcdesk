@@ -2,6 +2,7 @@
 import type { DisplayEntry } from "./DisplayEntry";
 import type { HostOs } from "./HostOs";
 import type { QualityPreset } from "./QualityPreset";
+import type { UpdateState } from "./UpdateState";
 
 /**
  * A single `control`-channel message, JSON-encoded on the wire (see
@@ -21,4 +22,9 @@ input_source_available: boolean,
 /**
  * Версия хоста `X.Y.Z` (слайс D50a); старые хосты поле не шлют.
  */
-version: string | null, } | { "type": "set_curtain", on: boolean, } | { "type": "curtain_status", on: boolean, reason: string | null, } | { "type": "switch_input_source" } | { "type": "input_source", label: string, };
+version: string | null, 
+/**
+ * Хост умеет обновиться из сеанса (слайс D50d). Старый JSON без
+ * поля -- `false`.
+ */
+update_available: boolean, } | { "type": "set_curtain", on: boolean, } | { "type": "curtain_status", on: boolean, reason: string | null, } | { "type": "switch_input_source" } | { "type": "input_source", label: string, } | { "type": "update_host" } | { "type": "update_status", state: UpdateState, version: string | null, message: string | null, };

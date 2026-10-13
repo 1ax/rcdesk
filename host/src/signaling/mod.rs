@@ -94,6 +94,14 @@ pub type BuildSource =
 /// синтетика не дёргали IOKit (это включало бы экран машины разработчика).
 pub type WakeDisplay = Box<dyn Fn() -> Box<dyn Send> + Send + Sync>;
 
+/// Каталоги для обновления хоста из сеанса (слайс D50d): рабочий (куда
+/// качается установщик) и каталог логов установщика.
+#[derive(Debug, Clone)]
+pub struct UpdateDirs {
+    pub work_dir: std::path::PathBuf,
+    pub log_dir: std::path::PathBuf,
+}
+
 /// What the signaling client needs to build a fresh `PeerSession` and video
 /// pipeline for each joining peer.
 pub struct HostContext {
@@ -187,6 +195,10 @@ pub struct HostContext {
     /// away. `main.rs`/`app::build_host_context` point this at the same
     /// data directory as `device::DeviceStore` (`agent::paths::data_dir()`).
     pub access_store: crate::access::AccessStore,
+    /// Каталоги обновления (слайс D50d); `None` -- хост не умеет обновляться
+    /// из сеанса: `UpdateHost` отвечает отказом, а
+    /// `HostInfo.update_available` ложно.
+    pub update_dirs: Option<UpdateDirs>,
 }
 
 /// One host agent's current phase, as reported through the `watch` channel
@@ -1989,6 +2001,30 @@ async fn handle_session_event(
                                 }
                             }
                         }
+                        Ok(ControlMessage::UpdateHost) => {
+                            if let Some(active) = active.as_ref() {
+                                match begin_update(ctx) {
+                                    Err(refusal) => {
+                                        if let Err(err) = active.peer.send_control(&refusal).await {
+                                            tracing::warn!(?err, "failed to send update status");
+                                        }
+                                    }
+                                    Ok(mut rx) => {
+                                        // Статусы уходят в control-канал, пока
+                                        // жив сеанс; задача обновления от этого
+                                        // не зависит.
+                                        let peer = Arc::clone(&active.peer);
+                                        tokio::spawn(async move {
+                                            while let Some(msg) = rx.recv().await {
+                                                if peer.send_control(&msg).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                        }
                         Ok(ControlMessage::ClipboardText { text }) => {
                             // Wrong direction: `ClipboardText` is host ->
                             // client only on `control` (see
@@ -2059,6 +2095,7 @@ async fn handle_session_event(
                     active.files_enabled,
                     active.curtain.is_some(),
                     active.input_source.is_some(),
+                    update_available(ctx),
                 );
                 match active.peer.send_control(&host_info).await {
                     Ok(true) => {}
@@ -2128,6 +2165,7 @@ fn host_info_message(
     files_enabled: bool,
     curtain_available: bool,
     input_source_available: bool,
+    update_available: bool,
 ) -> ControlMessage {
     ControlMessage::HostInfo {
         os: crate::platform::host_os(),
@@ -2135,7 +2173,90 @@ fn host_info_message(
         curtain_available,
         input_source_available,
         version: Some(crate::build_info::VERSION.to_string()),
+        update_available,
     }
+}
+
+/// Хост умеет обновиться из сеанса (слайс D50d): известны каталоги и
+/// платформа поддерживает установщик.
+fn update_available(ctx: &HostContext) -> bool {
+    ctx.update_dirs.is_some() && !crate::platform::update::ASSET_NAME.is_empty()
+}
+
+/// Максимальная длина `message` в `UpdateStatus::Failed`.
+const UPDATE_MESSAGE_MAX_CHARS: usize = 300;
+
+/// Обрезает сообщение об ошибке до `UPDATE_MESSAGE_MAX_CHARS` по границе char.
+fn truncate_update_message(text: &str) -> String {
+    match text.char_indices().nth(UPDATE_MESSAGE_MAX_CHARS) {
+        Some((idx, _)) => text[..idx].to_string(),
+        None => text.to_string(),
+    }
+}
+
+fn update_failed(message: String) -> ControlMessage {
+    ControlMessage::UpdateStatus {
+        state: proto::control::UpdateState::Failed,
+        version: None,
+        message: Some(message),
+    }
+}
+
+/// Запускает обновление по `UpdateHost` (слайс D50d). `Err` -- готовое
+/// сообщение об отказе (обновление недоступно). `Ok` -- приёмник статусов:
+/// задача обновления живёт сама по себе (не abort), закрытие приёмника
+/// (сеанс кончился) статусы просто теряет. `InstallerLaunched` ничего сверх
+/// `Installing` не шлёт: сеанс сейчас оборвётся.
+fn begin_update(
+    ctx: &HostContext,
+) -> Result<mpsc::UnboundedReceiver<ControlMessage>, Box<ControlMessage>> {
+    use crate::updater::{UpdateOutcome, UpdateProgress};
+    use proto::control::UpdateState;
+
+    let dirs = match (&ctx.update_dirs, update_available(ctx)) {
+        (Some(dirs), true) => dirs.clone(),
+        _ => {
+            return Err(Box::new(update_failed(
+                "обновление недоступно на этом хосте".to_string(),
+            )))
+        }
+    };
+    let (tx, rx) = mpsc::unbounded_channel::<ControlMessage>();
+    let current = crate::update_check::parse_version(crate::build_info::VERSION)
+        .unwrap_or(crate::update_check::Version(0, 0, 0));
+    tokio::spawn(async move {
+        let progress_tx = tx.clone();
+        let result = crate::updater::run_update(&dirs.work_dir, &dirs.log_dir, current, move |p| {
+            let (state, version) = match p {
+                UpdateProgress::Checking => (UpdateState::Checking, None),
+                UpdateProgress::Downloading(v) => (UpdateState::Downloading, Some(v.to_string())),
+                UpdateProgress::Installing(v) => (UpdateState::Installing, Some(v.to_string())),
+            };
+            let _ = progress_tx.send(ControlMessage::UpdateStatus {
+                state,
+                version,
+                message: None,
+            });
+        })
+        .await;
+        match result {
+            Ok(UpdateOutcome::UpToDate(v)) => {
+                let _ = tx.send(ControlMessage::UpdateStatus {
+                    state: UpdateState::UpToDate,
+                    version: Some(v.to_string()),
+                    message: None,
+                });
+            }
+            Ok(UpdateOutcome::InstallerLaunched(v)) => {
+                tracing::info!(version = %v, "установщик обновления запущен из сеанса");
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "обновление из сеанса не удалось");
+                let _ = tx.send(update_failed(truncate_update_message(&format!("{err:#}"))));
+            }
+        }
+    });
+    Ok(rx)
 }
 
 /// Интервал опроса раскладки хоста (слайс 4.6c): её могли переключить на
@@ -2896,6 +3017,7 @@ pub(crate) fn test_ctx() -> HostContext {
             std::process::id(),
             std::thread::current().id()
         ))),
+        update_dirs: None,
     }
 }
 
@@ -3152,25 +3274,65 @@ mod tests {
     #[test]
     fn host_info_message_reports_this_hosts_os() {
         assert_eq!(
-            host_info_message(true, false, false),
+            host_info_message(true, false, false, false),
             ControlMessage::HostInfo {
                 os: crate::platform::host_os(),
                 files_enabled: true,
                 curtain_available: false,
                 input_source_available: false,
                 version: Some(crate::build_info::VERSION.to_string()),
+                update_available: false,
             }
         );
         assert_eq!(
-            host_info_message(false, true, true),
+            host_info_message(false, true, true, false),
             ControlMessage::HostInfo {
                 os: crate::platform::host_os(),
                 files_enabled: false,
                 curtain_available: true,
                 input_source_available: true,
                 version: Some(crate::build_info::VERSION.to_string()),
+                update_available: false,
             }
         );
+    }
+
+    /// Слайс D50d: без `update_dirs` обновление недоступно.
+    #[tokio::test]
+    async fn update_unavailable_without_dirs() {
+        let ctx = test_ctx();
+        assert!(!update_available(&ctx));
+        assert!(matches!(
+            host_info_message(true, false, false, update_available(&ctx)),
+            ControlMessage::HostInfo {
+                update_available: false,
+                ..
+            }
+        ));
+    }
+
+    /// Слайс D50d: `UpdateHost` при недоступности -- `Failed` с причиной.
+    #[tokio::test]
+    async fn update_host_without_dirs_is_refused() {
+        let ctx = test_ctx();
+        match begin_update(&ctx) {
+            Err(refusal) => assert_eq!(
+                *refusal,
+                ControlMessage::UpdateStatus {
+                    state: proto::control::UpdateState::Failed,
+                    version: None,
+                    message: Some("обновление недоступно на этом хосте".to_string()),
+                }
+            ),
+            Ok(_) => panic!("обновление не должно стартовать без update_dirs"),
+        }
+    }
+
+    #[test]
+    fn truncate_update_message_cuts_on_char_boundary() {
+        let long = "я".repeat(400);
+        assert_eq!(truncate_update_message(&long).chars().count(), 300);
+        assert_eq!(truncate_update_message("коротко"), "коротко");
     }
 
     /// Collects frames from `rx` until either `n` arrive or `timeout` elapses,
@@ -5959,7 +6121,7 @@ mod tests {
     fn host_info_reports_input_source_availability() {
         for available in [true, false] {
             assert!(matches!(
-                host_info_message(true, false, available),
+                host_info_message(true, false, available, false),
                 ControlMessage::HostInfo { input_source_available, .. }
                     if input_source_available == available
             ));

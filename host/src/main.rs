@@ -640,9 +640,26 @@ fn percentile(sizes: &[usize], pct: f64) -> usize {
 /// status back to `Registered` with the *same* PIN it already had (see
 /// `signaling::run`), which must not print again; a real reconnect gets a
 /// fresh PIN from the server and does.
+/// Каталог логов для `serve`: при `--machine` (Windows) -- машинный, иначе
+/// пользовательский (как у агента).
+fn serve_log_dir(opts: &ServeOptions) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    if opts.data_dir.is_some() {
+        return agent::paths::machine_log_dir();
+    }
+    let _ = opts;
+    agent::paths::log_dir()
+}
+
 async fn run_serve(opts: ServeOptions) -> anyhow::Result<()> {
     let name = app::resolve_host_name(opts.name.as_deref());
-    let ctx = app::build_host_context(&opts)?;
+    let mut ctx = app::build_host_context(&opts)?;
+    // D50d: обновление из сеанса. Каталог данных -- тот же, что у хранилищ;
+    // логи -- машинный каталог для `--machine` (Windows), иначе обычный.
+    ctx.update_dirs = Some(rcdesk_host::signaling::UpdateDirs {
+        work_dir: opts.resolved_data_dir(),
+        log_dir: serve_log_dir(&opts),
+    });
 
     // `serve` has no tray UI to send `AgentCommand`s from -- `_cmd_tx` is
     // just kept alive so `cmd_rx.recv()` inside `run_agent` parks instead of

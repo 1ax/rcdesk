@@ -577,6 +577,11 @@ body {
   text-transform: none;
 }
 
+/* Слайс D50d: кнопка «Обновить хост» в плашке. */
+.host-outdated .btn {
+  margin-left: 8px;
+}
+
 .curtain-status {
   color: var(--danger);
   text-transform: none;

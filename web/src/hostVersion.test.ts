@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { hostOutdatedLabel } from "./hostVersion";
+import { hostOutdatedLabel, updateStatusLabel } from "./hostVersion";
 
 describe("hostOutdatedLabel", () => {
   it("warns when the host is older", () => {
@@ -35,5 +35,38 @@ describe("hostOutdatedLabel", () => {
       "На хосте rcdesk v0.1.0 — доступна v0.2.0",
     );
     expect(hostOutdatedLabel("v0.2.0", "0.2.0")).toBeNull();
+  });
+});
+
+describe("updateStatusLabel", () => {
+  const base = { version: null, message: null };
+  it("checking", () => {
+    expect(updateStatusLabel({ ...base, state: "checking" }, null)).toBe("Проверяю обновление…");
+  });
+  it("downloading", () => {
+    expect(updateStatusLabel({ ...base, state: "downloading", version: "0.2.0" }, "windows")).toBe(
+      "Скачиваю rcdesk 0.2.0…",
+    );
+  });
+  it("installing on windows", () => {
+    expect(updateStatusLabel({ ...base, state: "installing", version: "0.2.0" }, "windows")).toBe(
+      "Устанавливаю rcdesk 0.2.0 — сеанс прервётся",
+    );
+  });
+  it("installing on macos mentions the admin password", () => {
+    expect(updateStatusLabel({ ...base, state: "installing", version: "0.2.0" }, "macos")).toBe(
+      "Устанавливаю rcdesk 0.2.0 — сеанс прервётся (на хосте нужен пароль администратора)",
+    );
+  });
+  it("up_to_date", () => {
+    expect(updateStatusLabel({ ...base, state: "up_to_date", version: "0.2.0" }, null)).toBe(
+      "На хосте уже последняя версия",
+    );
+  });
+  it("failed with and without message", () => {
+    expect(updateStatusLabel({ ...base, state: "failed", message: "нет сети" }, null)).toBe(
+      "Не удалось обновить: нет сети",
+    );
+    expect(updateStatusLabel({ ...base, state: "failed" }, null)).toBe("Не удалось обновить хост");
   });
 });

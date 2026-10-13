@@ -365,6 +365,8 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
         // `opts.resolved_data_dir()`); `AccessStore::new` doesn't touch the
         // filesystem, so this is safe even before the directory exists.
         access_store: crate::access::AccessStore::new(&opts.resolved_data_dir()),
+        // D50d: каталоги обновления проставляет вызывающий (агент, `serve`).
+        update_dirs: None,
     })
 }
 

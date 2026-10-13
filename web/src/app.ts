@@ -38,7 +38,7 @@ import {
 } from "./fullscreen";
 import type { NavigatorWithKeyboard } from "./fullscreen";
 import { inputBlockedLabel } from "./inputBlocked";
-import { hostOutdatedLabel } from "./hostVersion";
+import { hostOutdatedLabel, updateStatusLabel } from "./hostVersion";
 import { viewOnlyLabel } from "./inputStatus";
 import {
   type CurtainState,
@@ -374,7 +374,10 @@ export function mount(root: Element | null): void {
           </label>
           <span id="view-only" class="status view-only" hidden></span>
           <span id="input-blocked" class="status input-blocked" hidden></span>
-          <span id="host-outdated" class="status host-outdated" hidden></span>
+          <span id="host-outdated" class="status host-outdated" hidden>
+            <span id="host-outdated-text"></span>
+            <button id="host-update-btn" class="btn btn-secondary" hidden>Обновить хост</button>
+          </span>
           <span id="curtain-status" class="status curtain-status" hidden></span>
           <span id="clipboard-note" class="status clipboard-note" hidden></span>
           <span id="fullscreen-note" class="status fullscreen-note" hidden></span>
@@ -504,6 +507,17 @@ export function mount(root: Element | null): void {
   const viewOnlyEl = root.querySelector<HTMLSpanElement>("#view-only")!;
   const inputBlockedEl = root.querySelector<HTMLSpanElement>("#input-blocked")!;
   const hostOutdatedEl = root.querySelector<HTMLSpanElement>("#host-outdated")!;
+  const hostOutdatedTextEl = root.querySelector<HTMLSpanElement>("#host-outdated-text")!;
+  const hostUpdateBtn = root.querySelector<HTMLButtonElement>("#host-update-btn")!;
+  // Слайс D50d: хост умеет обновиться из сеанса (`host_info.update_available`).
+  let hostUpdateAvailable = false;
+  hostUpdateBtn.addEventListener("click", () => {
+    const dc = controlChannel;
+    if (!dc || dc.readyState !== "open") return;
+    const msg: ControlMessage = { type: "update_host" };
+    dc.send(JSON.stringify(msg));
+    hostUpdateBtn.disabled = true;
+  });
   const clipboardNoteEl = root.querySelector<HTMLSpanElement>("#clipboard-note")!;
   const fullscreenNoteEl = root.querySelector<HTMLSpanElement>("#fullscreen-note")!;
   const fileStatusEl = root.querySelector<HTMLSpanElement>("#file-status")!;
@@ -1509,8 +1523,22 @@ export function mount(root: Element | null): void {
         renderLayoutBtn(null);
         // Слайс D50a: плашка, если хост старее клиента.
         const outdated = hostOutdatedLabel(msg.version, __APP_VERSION__);
-        hostOutdatedEl.textContent = outdated ?? "";
+        hostOutdatedTextEl.textContent = outdated ?? "";
         hostOutdatedEl.hidden = outdated === null;
+        hostUpdateAvailable = msg.update_available;
+        hostUpdateBtn.hidden = !(outdated !== null && hostUpdateAvailable);
+        hostUpdateBtn.disabled = false;
+        return;
+      }
+      if (msg.type === "update_status") {
+        hostOutdatedTextEl.textContent = updateStatusLabel(msg, hostOs);
+        hostOutdatedEl.hidden = false;
+        if (msg.state === "failed" || msg.state === "up_to_date") {
+          hostUpdateBtn.disabled = false;
+        }
+        if (msg.state === "up_to_date") {
+          hostUpdateBtn.hidden = true;
+        }
         return;
       }
       if (msg.type === "input_source") {
@@ -1846,7 +1874,10 @@ export function mount(root: Element | null): void {
     inputBlockedEl.hidden = true;
     inputBlockedEl.textContent = "";
     hostOutdatedEl.hidden = true;
-    hostOutdatedEl.textContent = "";
+    hostOutdatedTextEl.textContent = "";
+    hostUpdateAvailable = false;
+    hostUpdateBtn.hidden = true;
+    hostUpdateBtn.disabled = false;
     if (clipboardBridge) {
       window.removeEventListener("focus", onClipboardFocusOrGesture);
       document.removeEventListener("pointerdown", onClipboardFocusOrGesture, true);

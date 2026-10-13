@@ -1,3 +1,6 @@
+import type { HostOs } from "./generated/HostOs";
+import type { UpdateState } from "./generated/UpdateState";
+
 // Чистая функция плашки «хост устарел» (слайс D50a): сравнивает версию хоста
 // из `ControlMessage::HostInfo.version` с версией клиента. Без доступа к DOM,
 // как `inputBlocked.ts`.
@@ -35,4 +38,27 @@ function isOlder(a: [number, number, number], b: [number, number, number]): bool
     if (a[i] !== b[i]) return a[i] < b[i];
   }
   return false;
+}
+
+/** Текст плашки по `update_status` (слайс D50d). */
+export function updateStatusLabel(
+  msg: { state: UpdateState; version: string | null; message: string | null },
+  hostOs: HostOs | null,
+): string {
+  const v = msg.version ?? "";
+  switch (msg.state) {
+    case "checking":
+      return "Проверяю обновление…";
+    case "downloading":
+      return `Скачиваю rcdesk ${v}…`;
+    case "installing":
+      return (
+        `Устанавливаю rcdesk ${v} — сеанс прервётся` +
+        (hostOs === "macos" ? " (на хосте нужен пароль администратора)" : "")
+      );
+    case "up_to_date":
+      return "На хосте уже последняя версия";
+    case "failed":
+      return msg.message ? `Не удалось обновить: ${msg.message}` : "Не удалось обновить хост";
+  }
 }

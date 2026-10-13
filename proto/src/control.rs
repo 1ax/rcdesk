@@ -54,6 +54,19 @@ pub enum HostOs {
     Other,
 }
 
+/// Этап обновления хоста из сеанса (слайс D50d), см.
+/// `ControlMessage::UpdateStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum UpdateState {
+    Checking,
+    Downloading,
+    Installing,
+    UpToDate,
+    Failed,
+}
+
 /// A single `control`-channel message, JSON-encoded on the wire (see
 /// ARCHITECTURE.md §5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -168,6 +181,10 @@ pub enum ControlMessage {
         /// Версия хоста `X.Y.Z` (слайс D50a); старые хосты поле не шлют.
         #[serde(default)]
         version: Option<String>,
+        /// Хост умеет обновиться из сеанса (слайс D50d). Старый JSON без
+        /// поля -- `false`.
+        #[serde(default)]
+        update_available: bool,
     },
     /// client -> host: включить (`on: true`) или выключить шторку (слайс
     /// 4.2c). Шторка закрывает физический монитор хоста чёрным окном
@@ -186,6 +203,17 @@ pub enum ControlMessage {
     /// `"RU"`. Шлётся после `HostInfo`, в ответ на `SwitchInputSource` и при
     /// любом изменении раскладки на самом хосте.
     InputSource { label: String },
+    /// client -> host: обновить хост до последней версии релиза (слайс
+    /// D50d). Хост отвечает потоком `UpdateStatus`.
+    UpdateHost,
+    /// host -> client: ход обновления (слайс D50d). `version` -- целевая
+    /// версия (`Downloading`/`Installing`/`UpToDate`), `message` -- причина
+    /// при `Failed`.
+    UpdateStatus {
+        state: UpdateState,
+        version: Option<String>,
+        message: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -418,13 +446,14 @@ mod tests {
                 curtain_available: false,
                 input_source_available: true,
                 version: Some("0.1.1".to_string()),
+                update_available: true,
             };
 
             let json = serde_json::to_string(&msg).expect("serialize");
             assert_eq!(
                 json,
                 format!(
-                    r#"{{"type":"host_info","os":"{wire}","files_enabled":true,"curtain_available":false,"input_source_available":true,"version":"0.1.1"}}"#
+                    r#"{{"type":"host_info","os":"{wire}","files_enabled":true,"curtain_available":false,"input_source_available":true,"version":"0.1.1","update_available":true}}"#
                 )
             );
 
@@ -481,6 +510,7 @@ mod tests {
                 curtain_available: true,
                 input_source_available: false,
                 version: None,
+                update_available: false,
             }
         );
     }
@@ -499,7 +529,7 @@ mod tests {
     /// Слайс D50a: `version` переживает круговой round-trip.
     #[test]
     fn host_info_with_version_round_trips() {
-        let json = r#"{"type":"host_info","os":"windows","files_enabled":true,"curtain_available":false,"input_source_available":false,"version":"0.2.3"}"#;
+        let json = r#"{"type":"host_info","os":"windows","files_enabled":true,"curtain_available":false,"input_source_available":false,"version":"0.2.3","update_available":false}"#;
         let msg: ControlMessage = serde_json::from_str(json).expect("deserialize");
         assert!(matches!(
             &msg,
@@ -527,5 +557,66 @@ mod tests {
         assert_eq!(json, r#"{"type":"input_source","label":"RU"}"#);
         let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, msg);
+    }
+
+    /// Слайс D50d: `update_host` без полей.
+    #[test]
+    fn update_host_round_trips_through_json_with_exact_shape() {
+        let msg = ControlMessage::UpdateHost;
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(json, r#"{"type":"update_host"}"#);
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, msg);
+    }
+
+    /// Слайс D50d: точная форма `update_status` для каждого состояния.
+    #[test]
+    fn update_status_round_trips_through_json_with_exact_shape() {
+        for (state, wire) in [
+            (UpdateState::Checking, "checking"),
+            (UpdateState::Downloading, "downloading"),
+            (UpdateState::Installing, "installing"),
+            (UpdateState::UpToDate, "up_to_date"),
+            (UpdateState::Failed, "failed"),
+        ] {
+            let msg = ControlMessage::UpdateStatus {
+                state,
+                version: Some("0.2.0".to_string()),
+                message: None,
+            };
+            let json = serde_json::to_string(&msg).expect("serialize");
+            assert_eq!(
+                json,
+                format!(
+                    r#"{{"type":"update_status","state":"{wire}","version":"0.2.0","message":null}}"#
+                )
+            );
+            let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(round_tripped, msg);
+        }
+        let failed = ControlMessage::UpdateStatus {
+            state: UpdateState::Failed,
+            version: None,
+            message: Some("нет сети".to_string()),
+        };
+        let json = serde_json::to_string(&failed).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"update_status","state":"failed","version":null,"message":"нет сети"}"#
+        );
+    }
+
+    /// Слайс D50d: старый `host_info` без `update_available` -- `false`.
+    #[test]
+    fn host_info_without_update_available_parses_as_false() {
+        let json = r#"{"type":"host_info","os":"macos","files_enabled":true,"curtain_available":true,"input_source_available":false,"version":"0.2.0"}"#;
+        let msg: ControlMessage = serde_json::from_str(json).expect("deserialize");
+        assert!(matches!(
+            msg,
+            ControlMessage::HostInfo {
+                update_available: false,
+                ..
+            }
+        ));
     }
 }

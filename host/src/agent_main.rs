@@ -168,6 +168,15 @@ mod imp {
                 std::process::exit(1);
             }
         };
+        // D50d: обновление из сеанса -- каталоги агента.
+        let ctx = {
+            let mut ctx = ctx;
+            ctx.update_dirs = Some(rcdesk_host::signaling::UpdateDirs {
+                work_dir: agent::paths::data_dir(),
+                log_dir: agent::paths::log_dir(),
+            });
+            ctx
+        };
         // Шторка (4.2c2): прокси для потоков tokio, а сторона главного потока
         // обслуживается в главном цикле ниже.
         #[cfg(target_os = "macos")]
