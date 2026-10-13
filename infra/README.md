@@ -118,7 +118,8 @@ TRAFFIC_DIR=/tmp/t TRAFFIC_RELAY_BUDGET=1 bash ~/app/traffic-monitor.sh
 Релизы собирает `.github/workflows/release.yml` по тегу `v*`; push в `main`
 по-прежнему только деплоит.
 
-1. Поднять `version` в `[workspace.package]` корневого `Cargo.toml`, коммит.
+1. Поднять `version` в `[workspace.package]` корневого `Cargo.toml` и в `web/package.json`
+   (тест `web/src/version.test.ts` сверяет их), обновить `Cargo.lock`/`package-lock.json`, коммит.
 2. `git tag vX.Y.Z && git push origin vX.Y.Z`.
 
 Workflow сначала проверяет (`infra/release-version-check.sh`), что тег совпадает
@@ -126,3 +127,14 @@ Workflow сначала проверяет (`infra/release-version-check.sh`), �
 собирает хост под Windows и macOS. В GitHub Releases попадают установщик
 `rcdesk-setup.exe` (Windows) и zip без установки: `rcdesk-windows-x64.zip`,
 `rcdesk-macos-arm64.zip`.
+
+### Подпись манифеста обновления (D50b)
+
+Job `release` публикует `rcdesk-update.json` (версия и sha256 установщиков) и
+`rcdesk-update.json.sig` — подпись ed25519 (`infra/release-manifest.sh`). Хост
+обновляется только по манифесту с подписью ключа, открытая часть которого зашита в
+`host/src/update_verify.rs` (`RELEASE_PUBLIC_KEY`). Закрытый ключ (PEM) — в секрете
+репозитория `RELEASE_SIGN_KEY` и в Bitwarden владельца; без секрета релиз падает на
+шаге подписи. Смена ключа = новая версия хоста с новым открытым ключом; хосты со
+старым ключом обновятся только вручную.
+
