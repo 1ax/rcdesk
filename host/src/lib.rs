@@ -37,3 +37,4 @@ pub mod service;
 pub mod signaling;
 pub mod transport;
 pub mod update_check;
+pub mod update_verify;

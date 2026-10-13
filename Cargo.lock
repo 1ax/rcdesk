@@ -2888,6 +2888,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_core 0.6.4",
  "rcdesk-proto",
+ "ring",
  "rpassword",
  "rtc",
  "rustls",

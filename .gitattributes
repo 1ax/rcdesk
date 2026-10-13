@@ -1,0 +1,2 @@
+# Фикстуры с подписью и хэшами (D50b): байты не должны меняться при checkout.
+host/tests/fixtures/update/** -text

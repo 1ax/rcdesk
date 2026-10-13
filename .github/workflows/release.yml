@@ -31,6 +31,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Скрипт подписи манифеста лежит в репозитории.
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
         with:
           name: rcdesk-host-windows-x64
@@ -56,12 +58,29 @@ jobs:
           (cd dist/macos && zip -r ../../rcdesk-macos-arm64.zip .)
           unzip -l rcdesk-windows-x64.zip
           unzip -l rcdesk-macos-arm64.zip
+      # Манифест обновления (D50b): версия и sha256 установщиков, подпись ed25519.
+      - name: Подписать манифест обновления
+        env:
+          RELEASE_SIGN_KEY: ${{ secrets.RELEASE_SIGN_KEY }}
+        run: |
+          set -e
+          if [ -z "$RELEASE_SIGN_KEY" ]; then
+            echo "ошибка: нет секрета RELEASE_SIGN_KEY" >&2
+            exit 1
+          fi
+          umask 077
+          key_file="$(mktemp)"
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s\n' "$RELEASE_SIGN_KEY" > "$key_file"
+          bash infra/release-manifest.sh "${GITHUB_REF_NAME#v}" "$key_file" . \
+            dist/setup/rcdesk-setup.exe dist/macos-pkg/rcdesk-macos.pkg
       - name: Создать релиз
         env:
           GH_TOKEN: ${{ github.token }}
-          # checkout в этом job нет -- репозиторий для gh задаём явно.
+          # репозиторий для gh задаём явно (не зависим от .git после checkout).
           GH_REPO: ${{ github.repository }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
             rcdesk-windows-x64.zip rcdesk-macos-arm64.zip dist/setup/rcdesk-setup.exe dist/macos-pkg/rcdesk-macos.pkg \
+            rcdesk-update.json rcdesk-update.json.sig \
             --title "rcdesk $GITHUB_REF_NAME" --generate-notes

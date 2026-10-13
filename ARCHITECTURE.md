@@ -561,5 +561,6 @@ Telegram-бот (`TRAFFIC_TG_BOT_TOKEN`/`TRAFFIC_TG_CHAT_ID` в `~/app/.env`); �
 | rand_core 0.6 (getrandom) | host | `OsRng` для трейтов `rand_core` 0.6, над которыми обобщён opaque-ke 4.0 (реэкспорт `opaque_ke::rand` без фичи `getrandom` `OsRng` не даёт; воркспейсный `rand` 0.10 — другой мажор трейтов) |
 | @serenity-kit/opaque 1.1 | web | клиентская сторона OPAQUE (3.2d) — `opaque-ke` 4.0 в WASM, первая runtime-зависимость web |
 | tokio-rustls 0.26 (ring, tls12), webpki-roots 0.26, httparse 1 | host | уже в графе через tokio-tungstenite, прямыми — для проверки обновлений (4.3d): ручной `HEAD` к github.com без нового крейта |
+| ring 0.17 | host | уже в графе через rustls, прямой — проверка подписи ed25519 манифеста обновления `rcdesk-update.json` (D50b); ключ подписи — секрет `RELEASE_SIGN_KEY`, открытый зашит в `update_verify.rs` |
 | winresource 0.1.31 | host (Windows, build) | иконка и VERSIONINFO exe (4.3b); актуальная на crates.io, поддерживаемый форк-наследник `winres`, умеет `.ico` + строки версии через `rc.exe` MSVC |
 | Inno Setup 6.7.1 | CI (Windows), инструмент сборки | компилятор установщика `installer/windows/rcdesk.iss` (4.3b); не зависимость кода, ставится в CI через `choco install innosetup --version 6.7.1`, `iscc` собирает `rcdesk-setup.exe` |
