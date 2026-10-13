@@ -307,7 +307,8 @@ status` на машине хоста (меню трея текст вводит�
 (`HostRegister` без кредов, 10 за 10 мин); известные токены и устройства лимит не тратят.
 `X-Real-IP` сервер доверяет как раньше: в Docker за bridge-сетью nginx и трафик через
 coturn-релей приходят с одного адреса шлюза, различить их по пиру нельзя — подделку через релей
-закрывает `--denied-peer-ip` у coturn (слайс C). Проверка `Origin` на `/ws` не делается
+закрывает `--denied-peer-ip` у coturn на localhost и внутренние диапазоны (слайс C; внешний IP VPS не
+запрещён — при релее с обеих сторон пир это relay-адрес самого coturn, иначе `ChannelBind` → 403). Проверка `Origin` на `/ws` не делается
 сознательно: cookie нет, токен владельца живёт в `localStorage` и шлётся сообщением, поэтому
 чужой сайт из браузера жертвы ничего не получает. Graceful shutdown не делается: WAL не теряет
 закоммиченное при SIGKILL, клиенты переподключаются с backoff.
@@ -474,6 +475,25 @@ coturn получает `--prometheus --prometheus-address=127.0.0.1` (host-се
 Telegram-бот (`TRAFFIC_TG_BOT_TOKEN`/`TRAFFIC_TG_CHAT_ID` в `~/app/.env`); на 100 % —
 только уведомить, отсечка (флаг «не выдавать TURN-креды» в сигнальном сервере) — фаза 3.
 Деплой копирует скрипт в `~/app/`, crontab ставится один раз вручную (`infra/README.md`).
+
+**Ужесточение инфраструктуры (слайс C, 2026-10-13).** coturn `4.18.0` (пин), `--denied-peer-ip` на
+0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.168/16, `::1`, `fc00::/7`, `fe80::/10` (внешний IP VPS не
+запрещён, см. §6), `--no-tcp-relay`, `--user-quota=8`, `--total-quota=200`; контейнеры с `cap_drop: ALL` (coturn
+`+NET_BIND_SERVICE`, без `no-new-privileges` — порт 3478 под `nobody` держится file-capability), сервер `read_only`
++ tmpfs `/tmp`, логи json-file 10m × 3. **Бэкап БД** (аудит I-H1): `infra/backup-db.sh` по cron `rcdesk` в 04:30
+UTC — `sqlite3 .backup` через `docker run --entrypoint sqlite3` из образа сервера (поэтому в образ добавлен
+`sqlite3`, сборка `--locked`), `integrity_check`, GPG на общий ключ владельца «CrewTally Backup» (`CE0B…3DA7`,
+приватная часть только у владельца), `~/backups` 14 дней, Box через rclone (`~/bin`, remote `box:rcdesk-backups`,
+OAuth-токен в `~/.config/rclone/rclone.conf`) 90 дней, heartbeat Better Stack, сбой — в Telegram. **Внешний
+мониторинг** — Better Stack Free (как у crewtally): keyword-монитор `rcdesk.app/healthz` («не содержит `ok`»,
+3 мин) и heartbeat «rcdesk backup» (1 день, grace 2 ч), канал email; TCP-монитор coturn и SSL-монитор требуют
+платного плана — не заводятся (решение владельца: ничего платного). **Workflows:** `permissions: contents: read`,
+actions по SHA, явные секреты `MACOS_*` вместо `inherit`, ключ VPS в `infra/known_hosts`
+(`StrictHostKeyChecking=yes`), job `cargo-audit` (`rustsec/audit-check`), Dependabot (cargo, npm, actions,
+docker, compose, еженедельно, группами), деплой выставляет `IMAGE_TAG=sha-<7>` — откат одной командой
+(`infra/README.md` «Откат»). **nginx:** дополнительные директивы сайта в `infra/nginx/rcdesk.app.conf` (источник
+правды; конфиг панели вне репо): `Cache-Control: no-cache` на `index.html` (D39), `immutable` на `/assets/`,
+CSP сначала `Report-Only`, затем enforcing; HSTS/nosniff/X-Frame-Options/Referrer-Policy панель ставит сама.
 
 ## 12. Целевые показатели
 

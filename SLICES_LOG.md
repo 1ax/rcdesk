@@ -11,6 +11,30 @@
 > Всё, что НИЖЕ разделителя `---`, — append-only история. Архитектор при старте
 > чата читает сначала голову, в тело ныряет по ссылке на слайс.
 
+**Состояние на 2026-10-13 (двадцать пятый чат: слайс C «Инфра: coturn, бэкап, compose, CI», код ГОТОВ, ждёт push и nginx):**
+- ✅ **Коммиты:** запушены `92e6b2d` C1 compose (coturn 4.18.0, `denied-peer-ip`, квоты, `no-tcp-relay`, `cap_drop`,
+  `read_only`, ротация логов; Deploy `38448836778` зелёный) и `a15de5b` fix (внешний IP VPS из `denied-peer-ip` убран:
+  релей↔релей давал `ChannelBind 403`, проверено `turnutils_uclient -y` на проде, после фикса — 0 потерь, пир `127.0.0.1`
+  → 403 как задумано). **НЕ запушены:** `22be23e` C2 бэкап, `188b594` rustls 0.23.45 (RUSTSEC-2026-0285, иначе новый
+  `cargo-audit` красный), `600892e` C3 workflows, `c1b8bc9` C4 nginx-сниппет + README мониторинга. Запись слайса — в
+  теле журнала. Гейты на `188b594`: host `336 passed; 0 failed; 3 ignored`, proto `77`, server `88` + `43`,
+  loopback `1`; `cargo audit` чистый; `infra-shell` тесты `ok 9`/`ok 8`.
+- ✅ **Прод (сделано по ops-SSH и в Chrome владельца):** бэкап работает вживую — два файла по 10 КБ в `~/backups` и в
+  `box:rcdesk-backups`, cron `30 4 * * *`; rclone v1.75.2 в `~/bin`, remote `box` (OAuth владельца), ключ `CE0B…3DA7`
+  импортирован, `.env` дополнен `BACKUP_GPG_RECIPIENT`/`BACKUP_HEARTBEAT_URL`. Better Stack: монитор «rcdesk healthz»
+  (keyword `ok`, 3 мин) и heartbeat «rcdesk backup» (1 день, grace 2 ч) — первый heartbeat пришёл. TCP-монитор 3478 и
+  SSL-монитор на Free недоступны — не заводим (решение владельца: ничего платного).
+- ⚠️ **Огрех процесса:** раздел README «Бэкап БД» уехал в `92e6b2d` под сообщением про coturn (исполнитель C2 дописал
+  README между сверкой и `git add`). Правило: файлы, которые трогает работающий исполнитель, в чужой коммит не брать.
+- ▶️ **Дальше (владелец):** (1) `git push origin main` — четыре коммита, Deploy проверит новый `deploy.yml`
+  (known_hosts, `IMAGE_TAG=sha-…`); (2) вставить `infra/nginx/rcdesk.app.conf` в директивы сайта в FastPanel root'ом,
+  `nginx -t && systemctl reload nginx`; затем архитектор проверяет заголовки и консоль живого сеанса (CSP Report-Only →
+  enforcing); (3) на Mac расшифровать один бэкап (`gpg --decrypt`, нужен пароль ключа) — проверка цепочки восстановления.
+  Следующий слайс — **D «PIN: ротация и TTL»** (D44).
+- ⏳ Долги из C: диск/сертификат без мониторинга (Free); D48 (флаки `aborting_the_task_removes_the_part_file`) снова
+  уронил Deploy `38446495044`, прошёл при перезапуске; `.env` на VPS теперь содержит heartbeat-URL (не секрет, но и не
+  публиковать).
+
 **Состояние на 2026-10-13 (двадцать четвёртый чат: слайс B «Сервер: лимиты и DoS», ЗАКРЫТ, ЗАДЕПЛОЕН):**
 - ✅ **Коммиты (запушены, Deploy `38441122686` зелёный; первый Deploy `38439865203` упал на CI-тесте — fix `74fc4df`, очередь 256, проверен веткой `wip/`):** `1dc0a40` B1 кадр ≤ 64 КиБ, bounded-очередь 256 (было 64, fix после CI) с
   рубильником, writer под таймаутом 10 с, `name`/`alias` ≤ 64 символов; `a930934` B2 `IpLimiter` (PIN 10/мин,
@@ -2092,6 +2116,41 @@ TTL TURN 24 ч (не 2 ч), без graceful shutdown и `Origin` (см. ARCHITEC
   web `Tests 348 passed (348)`; fmt/clippy чистые.
 - **Не измерялось:** видеопуть не трогался.
 - **Остаток:** живая проверка после деплоя — лог `pruned N unowned devices`, `/healthz`; S-H4 (PIN) — слайс D.
+
+## Слайс C — Инфра: coturn, бэкап, compose, CI (2026-10-13)
+
+Третий слайс по плану аудита 2026-10-13: остаток S-H3, I-H1, I-H2, раздел «Инфраструктура и CI», D39. Развилки
+(решения владельца): offsite — Box через rclone (не Mac), мониторинг — Better Stack как у crewtally, ничего платного;
+`cap_drop` на coturn, деплой по `sha`, CSP в два шага — по рекомендации.
+
+- **C1 (`92e6b2d` + fix `a15de5b`) — compose.** coturn `4.18.0`, `--denied-peer-ip` диапазонами (coturn не понимает
+  CIDR), `--no-tcp-relay`, `--user-quota=8`, `--total-quota=200`, `cap_drop: ALL` + `NET_BIND_SERVICE` (без
+  `no-new-privileges`: он отключает file-caps, на которых держится 3478 под `nobody`); server `cap_drop: ALL`,
+  `no-new-privileges`, `read_only` + tmpfs `/tmp`; логи json-file 10m × 3. **Просчёт:** запрет внешнего IP VPS ломал
+  релей↔релей (`turnutils_uclient -y` → `channel bind: error 403`), убран fix-коммитом; после него `-y` даёт 0 потерь,
+  пир `127.0.0.1` → 403. Первый Deploy упал на D48 (флаки Windows), прошёл при перезапуске.
+- **C2 (`22be23e`) — бэкап (I-H1).** `infra/backup-db.sh`: `docker run --rm --user 0 --entrypoint sqlite3 <образ
+  сервера> .backup` (в образ добавлен `sqlite3`, `cargo build --locked`), `PRAGMA integrity_check`, `gpg --encrypt` на
+  ключ владельца, `.part` → `mv`, `find -mtime +14`, `rclone copy`/`delete --min-age 90d` в `box:rcdesk-backups`,
+  heartbeat, `flock`, при ошибке «УПАЛ» в Telegram тем же ботом. 8 тестов с заглушками `docker`/`gpg`/`rclone`/`curl`
+  в PATH. Деплой копирует скрипт в `~/app/`, crontab и remote — руками (сделано). Живой прогон: 10 375 байт, в Box.
+- **chore (`188b594`)** — `rustls` 0.23.44 → 0.23.45 (RUSTSEC-2026-0285, medium), иначе `cargo-audit` красный.
+- **C3 (`600892e`) — workflows (I-H2).** `permissions: contents: read` везде, все `uses:` по SHA с комментарием-тегом,
+  `secrets:` явные `MACOS_*`, `infra/known_hosts` + `StrictHostKeyChecking=yes` вместо `ssh-keyscan`, job `cargo-audit`
+  (`rustsec/audit-check` v2.0.0), `.github/dependabot.yml` (cargo, npm, github-actions, docker, docker-compose; раз в
+  неделю, группами, ≤ 5 PR), деплой `IMAGE_TAG=sha-<7>` через heredoc в `sh -s` (README «Откат»). Проверено только
+  синтаксически — первый прогон будет на push.
+- **C4 (`c1b8bc9`) — nginx и мониторинг.** `infra/nginx/rcdesk.app.conf`: `location = /index.html` и `= /` с
+  `Cache-Control: no-cache` (D39) и `Content-Security-Policy-Report-Only` (`default-src 'self'; script-src 'self'
+  'wasm-unsafe-eval'; connect-src 'self' wss://rcdesk.app; img-src 'self' data: blob:; media-src 'self' blob:;
+  object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`), `/assets/` immutable; заголовки
+  панели (HSTS, nosniff, X-Frame-Options, Referrer-Policy — она их уже ставит) повторены в каждом `location`, т.к.
+  `add_header` в `location` отменяет наследование. README: применение root'ом, порядок Report-Only → enforcing,
+  Better Stack.
+- **Не сделано сознательно:** TCP-монитор coturn и SSL-монитор (платный план); диск — долг; meta-CSP из слайса E снят
+  (заголовок nginx покрывает).
+- **Гейты:** см. голову. **Не измерялось:** видеопуть не трогался.
+- **Остаток:** push, nginx-сниппет root'ом + проверка CSP в живом сеансе, расшифровка бэкапа на Mac.
 
 ## Слайс D50 — самообновление хоста (+ D53) (2026-10-13)
 
