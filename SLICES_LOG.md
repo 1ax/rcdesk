@@ -11,6 +11,24 @@
 > Всё, что НИЖЕ разделителя `---`, — append-only история. Архитектор при старте
 > чата читает сначала голову, в тело ныряет по ссылке на слайс.
 
+**Состояние на 2026-10-13 (двадцать четвёртый чат: слайс B «Сервер: лимиты и DoS», ЗАКРЫТ, ждёт деплоя):**
+- ✅ **Коммиты (НЕ запушены, вместе с `a5bc379` автотег):** `1dc0a40` B1 кадр ≤ 64 КиБ, bounded-очередь 64 с
+  рубильником, writer под таймаутом 10 с, `name`/`alias` ≤ 64 символов; `a930934` B2 `IpLimiter` (PIN 10/мин,
+  владельцы 20/мин, устройства 10/10 мин), prune устройств без владельца 30 дней, `busy_timeout` 2 с +
+  `synchronous=NORMAL`, `/healthz` с `SELECT 1` и мьютексом реестра; `6aa1db9` B3 Ping 30 с / таймаут чтения 90 с,
+  `Registered` только STUN; `9a23eb5` B4 `already in session`, `disconnect_client` снимает все сеансы, фильтр
+  `host_id` в `register_host`. Запись слайса — в теле журнала. Гейты: host `336 passed; 0 failed; 3 ignored`,
+  proto `77`, server `88` + `43`, loopback `1`, web `Tests 348 passed (348)`.
+- ✅ Решения владельца 2026-10-13 (по рекомендации): TTL TURN остаётся 24 ч (coturn перепроверяет REST-креды при
+  ротации nonce — релейный сеанс длиннее TTL умер бы); graceful shutdown и проверка `Origin` не делаются
+  (обоснование в ARCHITECTURE §6).
+- ▶️ **Дальше (владелец):** `git push origin main` → Deploy (сервер без изменений proto, хосты/веб совместимы: хост
+  берёт TURN из `PeerJoined` с 2.6b). После деплоя глянуть `docker compose logs server`: `pruned N unowned devices`
+  при старте (сколько мусорных устройств снялось), `/healthz` → `ok`. Следующий чат — слайс **C «Инфра: coturn,
+  бэкап, compose, CI»** по плану ниже (`--denied-peer-ip` закрывает оставшийся вектор S-H3).
+- ⏳ Из прошлого чата остаётся: живые проверки A1 (второй пользователь, `agent.log` с `video: 5s summary`) и A5
+  (Mac с 0.1.4 / стенд GDI). `v0.1.4` уже на GitHub (релиз вышел).
+
 **Состояние на 2026-10-13 (двадцать третий чат: слайс A «D17/D58: кодер и сторож», ЗАКРЫТ, ждёт релиза 0.1.4):**
 - ✅ **Коммиты (НЕ запушены):** `2c8a77b` A1 цикл кредитов async-MFT с дедлайном 2 с (D17/D58); `cdae740` A2 `connect`
   сигналинга под таймаутом 30 с; `a0f592d` A4 `warn` при смерти потоков курсора/буфера (InputRouter уже предупреждал);
@@ -2032,6 +2050,41 @@ passkey (без почты и паролей; Bitwarden, iCloud, Google — лю
 - **Остаток:** живые проверки A1 (второй пользователь) и A5 (Mac с 0.1.4, стенд GDI) — см. голову; watchdog
   «captured растёт, encoded нет» и подписка на реконфигурацию дисплеев (из аудита) — не делались, остаются
   кандидатами в долг; WGC-crop `expect` → паника потока (D58-гипотеза №2) — тоже.
+
+## Слайс B — Сервер: лимиты и DoS (2026-10-13)
+
+Второй слайс по плану аудита 2026-10-13 (`docs/audit-2026-10-13.md`, локально): S-H1, S-H2, часть S-H3 и средние
+находки по серверу. Всё — `server/`, proto не менялся, один деплой. Развилки решены владельцем по рекомендации:
+TTL TURN 24 ч (не 2 ч), без graceful shutdown и `Origin` (см. ARCHITECTURE §6).
+
+- **B1 (`1dc0a40`) — транспортные лимиты (S-H1).** `max_message_size`/`max_frame_size` 64 КиБ (было 64 МиБ: один
+  `Offer` → ~200 МБ при лимите контейнера 256M). `registry::Tx` — структура над `mpsc::channel(64)` + `watch`-
+  рубильник: `send` = `try_send`, при `Full` соединение получателя убивается (`next_message` ждёт `tx.killed()` в
+  `select!` и возвращает `None` — ветки делают свою уборку); writer пишет в сокет под `WRITE_TIMEOUT` 10 с, после
+  цикла чтения ждётся ≤ 5 с, иначе `abort`. `name`/`alias` → `truncate_chars(.., 64)`. Тесты: кадр 65 КиБ закрывает
+  соединение, сервер жив; не читающий клиент (600 × 60 КиБ ICE) отключён, хост свободен.
+- **B2 (`a930934`) — регистрации и БД (S-H2).** `pin_limit.rs` → `ip_limit.rs`, `IpLimiter::new(burst, refill)`;
+  константы в `app.rs`: PIN 10/60 с, новые владельцы 20/60 с, новые устройства 10/600 с; токен тратится только при
+  фактическом создании строки (`owners::lookup_token`/`create_owner`, `DeviceAuth::Issued`). Повторный `ClientAuth
+  {None}` на том же соединении остаётся легальным (веб шлёт его после выхода, `app.ts:1245`). `prune_unowned_devices`
+  (без `ownership`, `last_seen_at` старше 30 дней, онлайн исключены через `Registry::online_host_ids`) в суточной
+  задаче рядом с D53. `configure`: `busy_timeout(2 s)`, `synchronous=NORMAL`. `/healthz` → `Db::ping` (`SELECT 1`)
+  + `Registry::is_healthy`, 503 `db error`/`registry error`, тело `ok` сохранено (его сверяет `deploy.yml`).
+- **B3 (`6aa1db9`) — живость и TURN.** `app::Liveness { ping_interval 30 с, read_timeout 90 с }`: writer шлёт Ping
+  по `interval` (первый тик съеден), `next_message` оборачивает `stream.next()` в `timeout` — любой кадр сбрасывает.
+  Хост сам пингует каждые 20 с, браузер отвечает Pong — живых не отрежет. `IceConfig::stun_servers()` для
+  `Registered`; `Joined`/`PeerJoined` — как были. Хост использует `Registered.ice_servers` только как запасной
+  путь при пустом `PeerJoined.ice_servers` (`signaling/mod.rs: peer_ice_servers`) — совместимо со всеми хостами
+  с 2.6b.
+- **B4 (`9a23eb5`) — реестр.** `JoinError::AlreadyInSession` (`join_by_host_id` проверяет `same_channel` по всем
+  сеансам; PIN-токен не тратится); `disconnect_client` → `Vec`; `register_host` удаляет `old.session_id` только при
+  `s.host_id == host_id`.
+- **Не сделано сознательно:** `X-Real-IP` только от loopback-пира — неприменимо (контейнер за bridge видит nginx и
+  coturn-релей с одного шлюза); закрывается в C через `--denied-peer-ip`. TTL TURN 2 ч — отвергнут (см. выше).
+- **Гейты:** host `336 passed; 0 failed; 3 ignored`, proto `77`, server `88` + `43`, loopback `1`,
+  web `Tests 348 passed (348)`; fmt/clippy чистые.
+- **Не измерялось:** видеопуть не трогался.
+- **Остаток:** живая проверка после деплоя — лог `pruned N unowned devices`, `/healthz`; S-H4 (PIN) — слайс D.
 
 ## Слайс D50 — самообновление хоста (+ D53) (2026-10-13)
 
