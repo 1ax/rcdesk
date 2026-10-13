@@ -12,7 +12,7 @@
 
 - `docker-compose.prod.yml` -- `server` (сигнальный сервер, `127.0.0.1:8100`)
   и `coturn` (host-сеть, `3478` + relay-диапазон `49152-65535`).
-  coturn ограничен: `denied-peer-ip` на внутренние адреса и сам VPS, квоты,
+  coturn ограничен: `denied-peer-ip` на внутренние адреса, квоты,
   без TCP-relay; контейнеры идут с `cap_drop`, логи ротируются. Откат при
   проблеме с привязкой 3478 -- убрать `cap_drop`/`cap_add` у coturn и
   `docker compose up -d`.

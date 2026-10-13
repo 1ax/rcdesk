@@ -72,9 +72,11 @@ services:
       - "--fingerprint"
       - "--log-file=stdout"
       - "--no-multicast-peers"
-      # Аудит S-H3: релей на localhost, внутренние адреса и сам VPS даёт обход
-      # nginx и подделку `X-Real-IP`. Без правила адрес разрешён, поэтому
-      # запрещаем явно; квоты и отказ от TCP-relay ограничивают злоупотребление.
+      # Аудит S-H3: релей на localhost и внутренние адреса даёт обход nginx и
+      # подделку `X-Real-IP`. Без правила адрес разрешён, поэтому запрещаем явно;
+      # квоты и отказ от TCP-relay ограничивают злоупотребление. Внешний IP VPS
+      # НЕ запрещать: когда обе стороны идут через релей, пир -- это relay-адрес
+      # самого coturn, и ChannelBind получает 403 (проверено 2026-10-13).
       - "--no-tcp-relay"
       - "--user-quota=8"
       - "--total-quota=200"
@@ -88,7 +90,6 @@ services:
       - "--denied-peer-ip=::1"
       - "--denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
       - "--denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
-      - "--denied-peer-ip=${TURN_EXTERNAL_IP}"
       # Метрики только на localhost (host-сеть), порт 9641 по умолчанию --
       # читает infra/traffic-monitor.sh (ARCHITECTURE.md §11).
       - "--prometheus"
