@@ -121,6 +121,13 @@ describe("byeReasonOutcome", () => {
     });
   });
 
+  it("ends the session finally with the video text for video_failed", () => {
+    expect(byeReasonOutcome("video_failed")).toEqual({
+      kind: "final",
+      text: "Видео на хосте остановилось (сбой захвата экрана или кодера), подробности в логе хоста",
+    });
+  });
+
   it("falls back to the grace rules without a reason or with an unknown one", () => {
     expect(byeReasonOutcome(undefined)).toEqual({ kind: "by-grace" });
     expect(byeReasonOutcome(null)).toEqual({ kind: "by-grace" });

@@ -3,4 +3,4 @@
 /**
  * Причина, по которой хост завершил сеанс `Bye` (слайс 4.6b).
  */
-export type ByeReason = "display_unavailable";
+export type ByeReason = "display_unavailable" | "video_failed";

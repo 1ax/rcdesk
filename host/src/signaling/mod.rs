@@ -689,13 +689,28 @@ impl VideoPipeline {
         let frame_feedback_tx = adapt_tx.clone();
 
         let pipeline_stats = Arc::clone(&handle.stats);
+        let failure_peer = Arc::clone(&peer);
         let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
             let mut handle = handle;
             loop {
                 tokio::select! {
                     frame = handle.frames.recv() => {
-                        let Some(frame) = frame else { break };
+                        let Some(frame) = frame else {
+                            // D58: the encode thread exited (it dropped
+                            // `tx`) while we were not asked to stop: the
+                            // capture or the encoder failed.
+                            tracing::error!(
+                                "video pipeline stopped unexpectedly, ending session"
+                            );
+                            let _ = failure_peer
+                                .events()
+                                .send(SessionEvent::VideoFailed {
+                                    tag: failure_peer.tag(),
+                                })
+                                .await;
+                            break;
+                        };
                         if let Some(tx) = &frame_feedback_tx {
                             let _ = tx.send(Feedback::Frame {
                                 bytes: frame.data.len(),
@@ -1904,6 +1919,28 @@ async fn handle_session_event(
                     label,
                     tag,
                     "control data channel closed event from a superseded session, ignoring"
+                );
+            }
+        }
+        SessionEvent::VideoFailed { tag } => {
+            if active.as_ref().is_some_and(|a| a.session_tag == tag) {
+                if let Some(old) = active.take() {
+                    tracing::warn!("video pipeline failed, ending session");
+                    old.shutdown().await;
+                    let _ = status.send(AgentStatus::Registered {
+                        pin: pin.to_string(),
+                    });
+                }
+                if let Some(session_id) = current_session_id.take() {
+                    let _ = out_tx.send(SignalMessage::Bye {
+                        session_id,
+                        reason: Some(proto::signal::ByeReason::VideoFailed),
+                    });
+                }
+            } else {
+                tracing::debug!(
+                    tag,
+                    "video failed event from a superseded session, ignoring"
                 );
             }
         }
@@ -3526,6 +3563,109 @@ mod tests {
                 reason: None,
             }
         );
+    }
+
+    /// D58: a capture source that dies mid-session ends the session with
+    /// `Bye { VideoFailed }` and returns the agent to `Registered`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn capture_failure_ends_the_session_with_video_failed() {
+        struct DyingSource {
+            inner: Box<dyn FrameSource>,
+            left: u32,
+        }
+        impl FrameSource for DyingSource {
+            fn next_frame(&mut self) -> Result<capture::RawFrame, capture::CaptureError> {
+                if self.left == 0 {
+                    return Err(capture::CaptureError::Backend("boom".into()));
+                }
+                self.left -= 1;
+                self.inner.next_frame()
+            }
+            fn size(&self) -> (u32, u32) {
+                self.inner.size()
+            }
+        }
+
+        let mut ctx = test_ctx();
+        ctx.build_source = Box::new(|id, _exclude| {
+            Ok(Box::new(DyingSource {
+                inner: Box::new(capture::synthetic::for_display(id, 30)?),
+                left: 3,
+            }) as Box<dyn FrameSource>)
+        });
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+        let (status_tx, status_rx) = watch::channel(AgentStatus::Connecting);
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx.clone(),
+            &mut active,
+            &mut current_session_id,
+            &mut None,
+            &mut 0,
+            &mut None,
+        )
+        .await;
+        assert!(active.is_some(), "session must have started successfully");
+        let tag = active.as_ref().unwrap().session_tag;
+
+        let failed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(SessionEvent::VideoFailed { tag }) => break Some(tag),
+                    Some(_) => continue,
+                    None => break None,
+                }
+            }
+        })
+        .await
+        .expect("VideoFailed must arrive");
+        assert_eq!(failed, Some(tag));
+
+        handle_session_event(
+            SessionEvent::VideoFailed { tag },
+            &ctx,
+            "111111",
+            &status_tx,
+            &out_tx,
+            &event_tx,
+            &mut active,
+            &mut current_session_id,
+            &mut None,
+        )
+        .await;
+
+        assert!(active.is_none());
+        assert_eq!(current_session_id, None);
+        assert_eq!(
+            *status_rx.borrow(),
+            AgentStatus::Registered {
+                pin: "111111".to_string()
+            }
+        );
+        let mut found = false;
+        while let Ok(msg) = out_rx.try_recv() {
+            if msg
+                == (SignalMessage::Bye {
+                    session_id: "sess-1".to_string(),
+                    reason: Some(proto::signal::ByeReason::VideoFailed),
+                })
+            {
+                found = true;
+            }
+        }
+        assert!(found, "expected Bye with VideoFailed");
     }
 
     #[tokio::test(flavor = "multi_thread")]

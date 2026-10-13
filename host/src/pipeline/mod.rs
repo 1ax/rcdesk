@@ -208,7 +208,20 @@ impl Pipeline {
                             }
                             slot.condvar.notify_one();
                         }
-                        Err(_) => break,
+                        Err(err) => {
+                            // A live source returns `Err` after `stop_capture`
+                            // from `Drop` -- that is the orderly stop (see
+                            // `PipelineHandle::stop`), not a failure.
+                            if !stop.load(Ordering::Relaxed) {
+                                tracing::error!(
+                                    error = %err,
+                                    "capture source failed, stopping video pipeline"
+                                );
+                                stop.store(true, Ordering::Release);
+                                slot.condvar.notify_all();
+                            }
+                            break;
+                        }
                     }
                 }
             })
@@ -309,7 +322,14 @@ impl Pipeline {
                                             }
                                         }
                                         Ok(None) => {}
-                                        Err(_) => break,
+                                        Err(err) => {
+                                            tracing::error!(
+                                                error = %err,
+                                                "encoder failed, stopping video pipeline"
+                                            );
+                                            stop.store(true, Ordering::Release);
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -380,7 +400,14 @@ impl Pipeline {
                             }
                         }
                         Ok(None) => {}
-                        Err(_) => break,
+                        Err(err) => {
+                            tracing::error!(
+                                error = %err,
+                                "encoder failed, stopping video pipeline"
+                            );
+                            stop.store(true, Ordering::Release);
+                            break;
+                        }
                     }
                     // The encoder only borrowed `raw`; it's still ours to
                     // keep as the keyframe-repeat candidate for the next
@@ -780,6 +807,75 @@ mod tests {
         fn size(&self) -> (u32, u32) {
             (self.width, self.height)
         }
+    }
+
+    /// D58: a source that serves two frames and then fails.
+    struct FailingSource {
+        served: u32,
+    }
+
+    impl FrameSource for FailingSource {
+        fn next_frame(&mut self) -> Result<RawFrame, crate::capture::CaptureError> {
+            if self.served < 2 {
+                self.served += 1;
+                std::thread::sleep(Duration::from_millis(30));
+                return Ok(RawFrame::Bgra {
+                    width: 64,
+                    height: 64,
+                    data: vec![0u8; 64 * 64 * 4],
+                    stride: 64 * 4,
+                    ts: Instant::now(),
+                });
+            }
+            Err(crate::capture::CaptureError::Backend("boom".into()))
+        }
+
+        fn size(&self) -> (u32, u32) {
+            (64, 64)
+        }
+    }
+
+    #[test]
+    fn capture_failure_closes_the_frame_channel() {
+        let _guard = serialized();
+        // A current-thread runtime built by hand: the serialization guard
+        // is a std `MutexGuard`, which must not be held across an `.await`
+        // in an async test body (clippy `await_holding_lock`).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let cfg = EncoderConfig {
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_kbps: 2000,
+            keyframe_interval_frames: 60,
+            max_qp: None,
+        };
+        let (encoder, _kind) =
+            build_encoder(Some(EncoderKind::OpenH264), cfg).expect("encoder init");
+        let mut handle = Pipeline::start(
+            Box::new(FailingSource { served: 0 }),
+            encoder,
+            RateTarget {
+                bitrate_kbps: 2000,
+                fps: 30,
+            },
+        );
+
+        let closed = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while handle.frames.recv().await.is_some() {}
+            })
+            .await
+        });
+        assert!(
+            closed.is_ok(),
+            "the frame channel must close after the capture source fails"
+        );
+        // Joins both threads; a hang here would hang the test.
+        handle.stop();
     }
 
     #[test]

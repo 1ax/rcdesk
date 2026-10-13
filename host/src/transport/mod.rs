@@ -367,6 +367,12 @@ pub enum SessionEvent {
     /// new `PeerJoined` already superseded) is recognized as stale and
     /// ignored.
     AuthTimeout { session_id: String, generation: u64 },
+    /// D58: the video pipeline (screen capture or encoder) stopped with an
+    /// error. Sent by the signaling layer's frame-forwarding task, not by
+    /// anything in this module. `tag` is `PeerSession::tag()`, so
+    /// `handle_session_event` can drop the event of a superseded session,
+    /// like for `ConnectionState`.
+    VideoFailed { tag: u64 },
 }
 
 fn ice_candidate_from_rtc(c: RTCIceCandidateInit) -> proto::signal::IceCandidate {
@@ -665,6 +671,12 @@ impl PeerSession {
     /// construction, to recognize a stale event from a superseded session.
     pub fn tag(&self) -> u64 {
         self.tag
+    }
+
+    /// A clone of the session's event sender (D58: lets the video forward
+    /// task report `SessionEvent::VideoFailed`).
+    pub fn events(&self) -> mpsc::Sender<SessionEvent> {
+        self.events.clone()
     }
 
     /// Hands out the `file` data channel together with the receiver of its

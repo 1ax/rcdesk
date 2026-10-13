@@ -250,6 +250,9 @@ Media Foundation и VideoToolbox потолка нет. Замер на стен
   window» → см. «Окна с правами администратора» выше.
 - В логах `rtc_dtls` WARN «Unsupported Extension» и mDNS-таймауты — шум, не
   ошибка (долг D12).
+- Картинка застыла, сеанс завершился с текстом «Видео на хосте остановилось…» →
+  в логе хоста ищи `capture source failed` или `encoder failed`; обойти можно
+  запуском `serve` с `--encoder openh264` (кодер) или `--capture gdi` (захват).
 
 ## Остановить
 

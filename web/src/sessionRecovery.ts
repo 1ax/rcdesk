@@ -123,6 +123,12 @@ export function byeReasonOutcome(reason: string | null | undefined): ByeReasonOu
   if (reason === "display_unavailable") {
     return { kind: "final", text: "Экран хоста недоступен: дисплей спит или отключён" };
   }
+  if (reason === "video_failed") {
+    return {
+      kind: "final",
+      text: "Видео на хосте остановилось (сбой захвата экрана или кодера), подробности в логе хоста",
+    };
+  }
   return { kind: "by-grace" };
 }
 
