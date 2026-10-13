@@ -118,7 +118,7 @@ mod imp {
             }
         };
 
-        let device_store = DeviceStore::new(&data_dir);
+        let device_store = DeviceStore::for_server(&data_dir, &cli.server);
 
         tracing::info!(
             version = rcdesk_host::build_info::FULL_VERSION,

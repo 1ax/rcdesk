@@ -476,7 +476,8 @@ impl Backoff {
 /// (`SignalingClient::issued_device`, `Some` only on this device's very
 /// first registration). `ConnectError::UnknownDevice` (the server doesn't
 /// recognize the saved credentials, e.g. its database was recreated) makes
-/// this loop forget them and retry immediately, skipping the backoff
+/// this loop forget them (the file is renamed to `*.bak`, not deleted -- see
+/// `DeviceStore::forget`) and retry immediately, skipping the backoff
 /// sleep/advance below entirely -- this isn't a lost connection, just a
 /// device the server no longer knows, so there's no reason to wait or to
 /// disturb the backoff state a real connection failure is tracking.
@@ -565,7 +566,11 @@ pub async fn run_agent(
                 }
             }
             Err(ConnectError::UnknownDevice) => {
-                tracing::info!("the server does not know this device, registering as a new one");
+                tracing::warn!(
+                    path = %device_store.path().display(),
+                    "the server does not know this device, registering as a new one; \
+                     the old credentials are kept next to the file as .bak"
+                );
                 match device_store.forget() {
                     Ok(()) => {
                         // Not a lost connection -- retry right away, without

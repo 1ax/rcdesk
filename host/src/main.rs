@@ -667,7 +667,7 @@ async fn run_serve(opts: ServeOptions) -> anyhow::Result<()> {
     // sends on it.
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let device_store = DeviceStore::new(&opts.resolved_data_dir());
+    let device_store = DeviceStore::for_server(&opts.resolved_data_dir(), &opts.server);
 
     // Машинный режим (`--machine`, 4.1a): PIN уходит в `pin.txt` каталога
     // данных, а не в stdout (у помощника службы консоли нет).
