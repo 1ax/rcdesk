@@ -34,6 +34,8 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use windows::Win32::Graphics::Gdi::{
@@ -59,6 +61,7 @@ pub struct GdiSource {
     height: u32,
     pacer: FramePacer,
     prev: Option<Vec<u8>>,
+    stop: Arc<AtomicBool>,
 }
 
 impl GdiSource {
@@ -188,6 +191,7 @@ impl GdiSource {
             height,
             pacer: FramePacer::new(fps),
             prev: None,
+            stop: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -195,6 +199,9 @@ impl GdiSource {
 impl FrameSource for GdiSource {
     fn next_frame(&mut self) -> Result<RawFrame, CaptureError> {
         loop {
+            if self.stop.load(Ordering::Acquire) {
+                return Err(CaptureError::Stopped);
+            }
             self.pacer.wait();
 
             // Safety: `hdc_mem` and `hdc_screen` are valid for the whole

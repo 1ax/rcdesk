@@ -152,6 +152,9 @@ pub struct PipelineHandle {
     pub frames: mpsc::Receiver<EncodedFrame>,
     request_keyframe: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    /// Stop flag of the frame source itself (`FrameSource::stop_signal`), raised
+    /// by `stop()` so a source blocked on a static screen wakes up.
+    source_stop: Option<Arc<AtomicBool>>,
     pub stats: Arc<PipelineStats>,
     rate_control: Arc<RateControl>,
     capture_thread: Option<JoinHandle<()>>,
@@ -183,6 +186,7 @@ impl Pipeline {
         request_keyframe: Arc<AtomicBool>,
     ) -> PipelineHandle {
         let stop = Arc::new(AtomicBool::new(false));
+        let source_stop = source.stop_signal();
         let stats = Arc::new(PipelineStats::default());
         let rate_control = Arc::new(RateControl::new(initial));
         let slot = Arc::new(FrameSlot {
@@ -436,6 +440,7 @@ impl Pipeline {
             frames: rx,
             request_keyframe,
             stop,
+            source_stop,
             stats,
             rate_control,
             capture_thread: Some(capture_thread),
@@ -467,13 +472,15 @@ impl PipelineHandle {
     /// Stops both threads and waits for them to finish.
     ///
     /// For the synthetic source this returns promptly (it sleeps in bounded
-    /// slices). For a live `scap` source the capture thread may be blocked
-    /// inside a blocking `get_next_frame()` call with no external way to
-    /// interrupt it from here; it unblocks once the source itself errors out
-    /// (e.g. `stop_capture` from its own `Drop`) or the next frame arrives.
-    /// Live capture shutdown is exercised manually, not by the test suite.
+    /// slices). Live sources (scap, GDI) expose `FrameSource::stop_signal`;
+    /// `stop()` raises it and they return `Stopped` within `RECV_TIMEOUT`
+    /// (scap) or one pacer tick (GDI), even on a static screen. Live capture
+    /// shutdown itself is exercised manually, not by the test suite.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        if let Some(signal) = &self.source_stop {
+            signal.store(true, Ordering::Release);
+        }
         if let Some(handle) = self.capture_thread.take() {
             let _ = handle.join();
         }
@@ -824,6 +831,42 @@ mod tests {
         }
     }
 
+    /// A static-screen source that, unlike `StaticScreenSource`, honours
+    /// `FrameSource::stop_signal` the way `ScapSource`/`GdiSource` do.
+    struct SignalledStaticSource {
+        served_first: bool,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl FrameSource for SignalledStaticSource {
+        fn next_frame(&mut self) -> Result<RawFrame, crate::capture::CaptureError> {
+            if !self.served_first {
+                self.served_first = true;
+                return Ok(RawFrame::Bgra {
+                    width: 64,
+                    height: 64,
+                    data: vec![0u8; 64 * 64 * 4],
+                    stride: 64 * 4,
+                    ts: Instant::now(),
+                });
+            }
+            loop {
+                if self.stop.load(Ordering::Acquire) {
+                    return Err(crate::capture::CaptureError::Stopped);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn size(&self) -> (u32, u32) {
+            (64, 64)
+        }
+
+        fn stop_signal(&self) -> Option<Arc<AtomicBool>> {
+            Some(Arc::clone(&self.stop))
+        }
+    }
+
     /// D58: a source that serves two frames and then fails.
     struct FailingSource {
         served: u32,
@@ -891,6 +934,42 @@ mod tests {
         );
         // Joins both threads; a hang here would hang the test.
         handle.stop();
+    }
+
+    #[test]
+    fn stop_unblocks_a_source_that_honours_the_stop_signal() {
+        let _guard = serialized();
+        let source = SignalledStaticSource {
+            served_first: false,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let cfg = EncoderConfig {
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_kbps: 2000,
+            keyframe_interval_frames: 60,
+            max_qp: None,
+        };
+        let (encoder, _kind) =
+            build_encoder(Some(EncoderKind::OpenH264), cfg).expect("encoder init");
+        let mut handle = Pipeline::start(
+            Box::new(source),
+            encoder,
+            RateTarget {
+                bitrate_kbps: 2000,
+                fps: 30,
+            },
+        );
+
+        std::thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        handle.stop();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "stop() must wake a source blocked on a static screen, took {elapsed:?}"
+        );
     }
 
     #[test]

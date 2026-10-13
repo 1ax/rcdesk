@@ -38,3 +38,4 @@ hmac = "0.12"
 
 [patch.crates-io]
 rtc-sctp = { path = "vendor/rtc-sctp" }
+scap = { path = "vendor/scap" }

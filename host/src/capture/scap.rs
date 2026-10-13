@@ -8,7 +8,10 @@
 //! nobody to click the TCC dialog in an unattended/terminal session). Live
 //! capture is verified manually by whoever has the permission granted.
 
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ::scap::capturer::{Capturer, Options, Resolution};
 use ::scap::frame::{Frame, FrameType};
@@ -16,10 +19,17 @@ use ::scap::{get_all_targets, has_permission, is_supported, Target};
 
 use super::{CaptureError, FrameSource, RawFrame};
 
+/// How long one `get_next_frame_timeout` waits before the loop re-checks the
+/// stop flag. This is the worst-case cost of stopping a static-screen capture
+/// (up to 250 ms); with a live screen frames arrive well inside it, so frame
+/// latency is unaffected.
+const RECV_TIMEOUT: Duration = Duration::from_millis(250);
+
 pub struct ScapSource {
     capturer: Capturer,
     width: u32,
     height: u32,
+    stop: Arc<AtomicBool>,
 }
 
 // SAFETY: `Capturer` is only ever touched from the single dedicated capture
@@ -123,6 +133,7 @@ impl ScapSource {
             capturer,
             width,
             height,
+            stop: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -130,10 +141,14 @@ impl ScapSource {
 impl FrameSource for ScapSource {
     fn next_frame(&mut self) -> Result<RawFrame, CaptureError> {
         loop {
-            let frame = self
-                .capturer
-                .get_next_frame()
-                .map_err(|_| CaptureError::Stopped)?;
+            if self.stop.load(Ordering::Acquire) {
+                return Err(CaptureError::Stopped);
+            }
+            let frame = match self.capturer.get_next_frame_timeout(RECV_TIMEOUT) {
+                Ok(frame) => frame,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return Err(CaptureError::Stopped),
+            };
 
             match frame {
                 Frame::YUVFrame(f) => {
@@ -170,6 +185,10 @@ impl FrameSource for ScapSource {
 
     fn size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    fn stop_signal(&self) -> Option<Arc<AtomicBool>> {
+        Some(Arc::clone(&self.stop))
     }
 }
 

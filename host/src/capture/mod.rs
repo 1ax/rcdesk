@@ -3,6 +3,8 @@
 //! platform-independent generator used by tests, CI and local development on
 //! machines without screen-recording permission.
 
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub mod synthetic;
@@ -66,6 +68,15 @@ impl RawFrame {
 pub trait FrameSource: Send {
     fn next_frame(&mut self) -> Result<RawFrame, CaptureError>;
     fn size(&self) -> (u32, u32);
+
+    /// Shared flag a `FrameSource` polls so a `next_frame` that would otherwise block
+    /// forever (static screen: SCK/WGC deliver only on change, GDI loops on
+    /// `frame_unchanged`) returns `Err(CaptureError::Stopped)` promptly once
+    /// `PipelineHandle::stop` raises it from another thread. `None` for sources whose
+    /// `next_frame` is bounded on its own (`SyntheticSource`).
+    fn stop_signal(&self) -> Option<Arc<AtomicBool>> {
+        None
+    }
 }
 
 /// A capturable display, as reported by the OS.
