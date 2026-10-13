@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use proto::signal::{ByeReason, DeviceCredentials, IceCandidate, Role, SignalMessage};
-use rcdesk_server::app::{app_with_liveness, Liveness, NEW_DEVICE_BURST, NEW_OWNER_BURST};
+use rcdesk_server::app::{Liveness, NEW_DEVICE_BURST, NEW_OWNER_BURST};
 use rcdesk_server::db::Db;
 use rcdesk_server::ice::IceConfig;
 use rcdesk_server::registry::Registry;
@@ -38,6 +38,22 @@ async fn spawn_server_with(ice: IceConfig, liveness: Liveness) -> String {
 }
 
 async fn spawn_full(ice: IceConfig, liveness: Liveness) -> (String, Db) {
+    spawn_full_with_global(
+        ice,
+        liveness,
+        rcdesk_server::ip_limit::GlobalLimiter::new(
+            rcdesk_server::app::PIN_GLOBAL_BURST,
+            rcdesk_server::app::PIN_GLOBAL_REFILL,
+        ),
+    )
+    .await
+}
+
+async fn spawn_full_with_global(
+    ice: IceConfig,
+    liveness: Liveness,
+    global: rcdesk_server::ip_limit::GlobalLimiter,
+) -> (String, Db) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
@@ -51,7 +67,7 @@ async fn spawn_full(ice: IceConfig, liveness: Liveness) -> (String, Db) {
     tokio::spawn(async move {
         axum::serve(
             listener,
-            app_with_liveness(registry, ice, db, webauthn, liveness)
+            rcdesk_server::app::app_with_limits(registry, ice, db, webauthn, liveness, global)
                 .into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .await
@@ -2332,4 +2348,109 @@ async fn pin_ttl_does_not_touch_host_without_rotation() {
     .await;
     let (mut host, _pin) = register_host_with_rotation(&url, false).await;
     expect_silence(&mut host, Duration::from_millis(1200)).await;
+}
+
+async fn join_and_expect(ws: &mut WsStream, pin: &str, expected: &str) {
+    send(
+        ws,
+        &SignalMessage::Join {
+            pin: pin.to_string(),
+        },
+    )
+    .await;
+    match recv(ws).await {
+        SignalMessage::Error { message } => assert_eq!(message, expected),
+        other => panic!("expected {expected}, got {other:?}"),
+    }
+}
+
+// D2 (audit S-H4): `host busy` confirms a correct PIN, so it spends an attempt.
+#[tokio::test]
+async fn host_busy_spends_a_pin_attempt() {
+    let url = spawn_server().await;
+    let (_host, pin) = register_host_with_rotation(&url, false).await;
+
+    let mut a = connect(&url).await;
+    hello(&mut a, Role::Client).await;
+    send(&mut a, &SignalMessage::Join { pin: pin.clone() }).await;
+    match recv(&mut a).await {
+        SignalMessage::Joined { .. } => {}
+        other => panic!("expected joined, got {other:?}"),
+    }
+
+    let mut attacker = connect_as(&url, "198.51.100.10").await;
+    hello(&mut attacker, Role::Client).await;
+    for _ in 0..10 {
+        join_and_expect(&mut attacker, &pin, "host busy").await;
+    }
+    join_and_expect(&mut attacker, &pin, "too many attempts").await;
+}
+
+// D2: `already in session` also confirms a correct PIN.
+#[tokio::test]
+async fn already_in_session_spends_a_pin_attempt() {
+    let url = spawn_server().await;
+    let (_host1, pin1) = register_host_with_rotation(&url, false).await;
+    let (_host2, pin2) = register_host_with_rotation(&url, false).await;
+
+    let mut client = connect_as(&url, "198.51.100.11").await;
+    hello(&mut client, Role::Client).await;
+    send(&mut client, &SignalMessage::Join { pin: pin1 }).await;
+    match recv(&mut client).await {
+        SignalMessage::Joined { .. } => {}
+        other => panic!("expected joined, got {other:?}"),
+    }
+    for _ in 0..10 {
+        join_and_expect(&mut client, &pin2, "already in session").await;
+    }
+    join_and_expect(&mut client, &pin2, "too many attempts").await;
+}
+
+// D2: IPv6 clients share one bucket per /64.
+#[tokio::test]
+async fn ipv6_prefix_shares_the_pin_bucket() {
+    let url = spawn_server().await;
+
+    let mut attacker = connect_as(&url, "2001:db8:1:2::1").await;
+    hello(&mut attacker, Role::Client).await;
+    for _ in 0..10 {
+        join_and_expect(&mut attacker, "000000", "unknown pin").await;
+    }
+
+    let mut same_prefix = connect_as(&url, "2001:db8:1:2:ffff::9").await;
+    hello(&mut same_prefix, Role::Client).await;
+    join_and_expect(&mut same_prefix, "000000", "too many attempts").await;
+
+    let mut other_prefix = connect_as(&url, "2001:db8:1:3::1").await;
+    hello(&mut other_prefix, Role::Client).await;
+    join_and_expect(&mut other_prefix, "000000", "unknown pin").await;
+}
+
+// D2: the global bucket stops distributed guessing; it is shared, so even a
+// legitimate client with a correct PIN is refused once it is drained.
+#[tokio::test]
+async fn global_pin_bucket_limits_distributed_guessing() {
+    let global = rcdesk_server::ip_limit::GlobalLimiter::new(5, Duration::from_secs(3600));
+    let (url, _db) =
+        spawn_full_with_global(IceConfig::from_env(), Liveness::default(), global).await;
+    let (_host, pin) = register_host_with_rotation(&url, false).await;
+
+    let mut attackers = Vec::new();
+    for last in 21..=23 {
+        let mut ws = connect_as(&url, &format!("198.51.100.{last}")).await;
+        hello(&mut ws, Role::Client).await;
+        attackers.push(ws);
+    }
+    // Attempts 1..=5 spend the global bucket; the 6th (third IP, own limit
+    // intact) is refused globally.
+    join_and_expect(&mut attackers[0], "000000", "unknown pin").await;
+    join_and_expect(&mut attackers[0], "000000", "unknown pin").await;
+    join_and_expect(&mut attackers[1], "000000", "unknown pin").await;
+    join_and_expect(&mut attackers[1], "000000", "unknown pin").await;
+    join_and_expect(&mut attackers[2], "000000", "unknown pin").await;
+    join_and_expect(&mut attackers[2], "000000", "too many attempts").await;
+
+    let mut legit = connect_as(&url, "198.51.100.24").await;
+    hello(&mut legit, Role::Client).await;
+    join_and_expect(&mut legit, &pin, "too many attempts").await;
 }

@@ -9,7 +9,7 @@ use proto::signal::SignalMessage;
 
 use crate::db::Db;
 use crate::ice::IceConfig;
-use crate::ip_limit::IpLimiter;
+use crate::ip_limit::{GlobalLimiter, IpLimiter};
 use crate::passkeys::SharedWebauthn;
 use crate::registry::Registry;
 use crate::ws::ws_handler;
@@ -17,6 +17,12 @@ use crate::ws::ws_handler;
 /// Wrong-PIN guesses allowed in a burst per IP (slice 3.6a).
 pub const PIN_BURST: u32 = 10;
 pub const PIN_REFILL: Duration = Duration::from_secs(60);
+/// Global wrong-PIN bucket (D2, audit S-H4): 300 attempts in a burst, then one
+/// per 2 s, about 43k per day per server against 10^6 codes. Bound devices
+/// connect via `ConnectDevice` without a PIN, so draining the bucket does not
+/// affect them.
+pub const PIN_GLOBAL_BURST: u32 = 300;
+pub const PIN_GLOBAL_REFILL: Duration = Duration::from_secs(2);
 /// New anonymous owners an IP may create in a burst (B2, audit S-H2).
 pub const NEW_OWNER_BURST: u32 = 20;
 pub const NEW_OWNER_REFILL: Duration = Duration::from_secs(60);
@@ -56,6 +62,8 @@ pub struct AppState {
     pub db: Db,
     /// Per-IP limit on wrong-PIN guesses (slice 3.6a).
     pub pin_limiter: IpLimiter,
+    /// Server-wide limit on wrong-PIN guesses (D1).
+    pub pin_global_limiter: GlobalLimiter,
     /// Per-IP limit on creating new owners (B2).
     pub owner_limiter: IpLimiter,
     /// Per-IP limit on registering new devices (B2).
@@ -77,6 +85,24 @@ pub fn app_with_liveness(
     webauthn: SharedWebauthn,
     liveness: Liveness,
 ) -> Router {
+    app_with_limits(
+        registry,
+        ice,
+        db,
+        webauthn,
+        liveness,
+        GlobalLimiter::new(PIN_GLOBAL_BURST, PIN_GLOBAL_REFILL),
+    )
+}
+
+pub fn app_with_limits(
+    registry: Registry,
+    ice: IceConfig,
+    db: Db,
+    webauthn: SharedWebauthn,
+    liveness: Liveness,
+    pin_global: GlobalLimiter,
+) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/ws", get(ws_handler))
@@ -85,6 +111,7 @@ pub fn app_with_liveness(
             ice,
             db,
             pin_limiter: IpLimiter::new(PIN_BURST, PIN_REFILL),
+            pin_global_limiter: pin_global,
             owner_limiter: IpLimiter::new(NEW_OWNER_BURST, NEW_OWNER_REFILL),
             device_limiter: IpLimiter::new(NEW_DEVICE_BURST, NEW_DEVICE_REFILL),
             webauthn,

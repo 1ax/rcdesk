@@ -25,10 +25,10 @@ use crate::app::AppState;
 use crate::db::Db;
 use crate::devices::{self, DeviceAuth};
 use crate::ice::{self, IceConfig};
-use crate::ip_limit::IpLimiter;
+use crate::ip_limit::{GlobalLimiter, IpLimiter};
 use crate::owners;
 use crate::passkeys::{self, PasskeyError, SharedWebauthn};
-use crate::registry::{JoinError, Registry, Tx};
+use crate::registry::{Registry, Tx};
 
 /// Максимальный размер входящего WebSocket-сообщения/кадра. Самый большой
 /// легитимный кадр: `Offer.sdp` — единицы КБ, JSON WebAuthn — 1–2 КБ. Дефолт
@@ -135,6 +135,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
         &state.ice,
         &state.db,
         &state.pin_limiter,
+        &state.pin_global_limiter,
         &state.owner_limiter,
         &state.device_limiter,
         &state.webauthn,
@@ -217,6 +218,7 @@ async fn run_connection(
     ice: &IceConfig,
     db: &Db,
     pin_limiter: &IpLimiter,
+    pin_global_limiter: &GlobalLimiter,
     owner_limiter: &IpLimiter,
     device_limiter: &IpLimiter,
     webauthn: &SharedWebauthn,
@@ -257,6 +259,7 @@ async fn run_connection(
                 ice,
                 db,
                 pin_limiter,
+                pin_global_limiter,
                 owner_limiter,
                 webauthn,
                 info,
@@ -713,6 +716,7 @@ async fn run_client(
     ice: &IceConfig,
     db: &Db,
     pin_limiter: &IpLimiter,
+    pin_global_limiter: &GlobalLimiter,
     owner_limiter: &IpLimiter,
     webauthn: &SharedWebauthn,
     info: ClientInfo,
@@ -1056,6 +1060,13 @@ async fn run_client(
                     });
                     continue;
                 }
+                if !pin_global_limiter.check() {
+                    tracing::warn!(%ip, "pin attempts rate-limited globally");
+                    let _ = tx.send(SignalMessage::Error {
+                        message: "too many attempts".to_string(),
+                    });
+                    continue;
+                }
                 match registry.join(&pin, tx.clone(), pin_ttl, Instant::now()) {
                     Ok((session_id, host_id, host_name, host_tx, new_pin)) => {
                         tracing::info!(%session_id, "client joined");
@@ -1089,10 +1100,12 @@ async fn run_client(
                         }
                     }
                     Err(err) => {
-                        if err == JoinError::UnknownPin {
-                            pin_limiter.spend(ip);
-                            tracing::info!(%ip, "wrong pin");
-                        }
+                        // Any failed join is an attempt: `host busy` or
+                        // `already in session` would otherwise confirm for
+                        // free that the PIN is correct.
+                        pin_limiter.spend(ip);
+                        pin_global_limiter.spend();
+                        tracing::info!(%ip, error = err.message(), "join rejected");
                         let _ = tx.send(SignalMessage::Error {
                             message: err.message().to_string(),
                         });
