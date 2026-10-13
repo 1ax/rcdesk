@@ -4,6 +4,7 @@ pub mod curtain;
 pub mod display_wake;
 pub mod event_loop;
 pub mod input_source;
+pub mod update;
 
 pub(super) fn name() -> &'static str {
     "macos"

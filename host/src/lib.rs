@@ -38,3 +38,4 @@ pub mod signaling;
 pub mod transport;
 pub mod update_check;
 pub mod update_verify;
+pub mod updater;

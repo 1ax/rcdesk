@@ -8,6 +8,7 @@ pub mod monitors;
 pub mod mouse;
 pub mod power;
 pub mod service;
+pub mod update;
 
 pub(super) fn name() -> &'static str {
     "windows"

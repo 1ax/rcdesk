@@ -35,3 +35,21 @@ pub(super) fn computer_name() -> Option<String> {
         Some(name)
     }
 }
+
+/// Самообновление не поддерживается (D50c): хосты только macOS/Windows, модуль
+/// нужен, чтобы workspace собирался на Linux в CI.
+pub mod update {
+    use std::path::{Path, PathBuf};
+
+    pub const ASSET_NAME: &str = "";
+
+    pub fn curl_path() -> PathBuf {
+        PathBuf::from("curl")
+    }
+
+    pub fn hide_console(_command: &mut tokio::process::Command) {}
+
+    pub fn launch_installer(_installer: &Path, _log: &Path) -> anyhow::Result<()> {
+        anyhow::bail!("обновление не поддерживается на этой ОС")
+    }
+}

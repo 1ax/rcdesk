@@ -42,7 +42,11 @@ pub fn verify_manifest(json: &[u8], sig: &[u8]) -> anyhow::Result<Manifest> {
     verify_manifest_with(json, sig, &RELEASE_PUBLIC_KEY)
 }
 
-fn verify_manifest_with(json: &[u8], sig: &[u8], public_key: &[u8]) -> anyhow::Result<Manifest> {
+pub(crate) fn verify_manifest_with(
+    json: &[u8],
+    sig: &[u8],
+    public_key: &[u8],
+) -> anyhow::Result<Manifest> {
     // Сначала подпись: недоверенный JSON до проверки не разбирается.
     UnparsedPublicKey::new(&ED25519, public_key)
         .verify(json, sig)

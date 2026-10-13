@@ -44,6 +44,7 @@ mod imp {
     use rcdesk_host::platform;
     use rcdesk_host::signaling::{AgentCommand, AgentStatus, Keepalive};
     use rcdesk_host::update_check::{self, Version};
+    use rcdesk_host::updater;
 
     /// Menu-bar/tray icon size in pixels. macOS: tray-icon draws the image
     /// 18pt tall, so 44px stays sharp on Retina (2x). Windows: the shell
@@ -283,6 +284,7 @@ mod imp {
         // проверка находит новую версию (`menu.insert` сразу после пункта версии).
         let update_item = MenuItem::with_id("update", "", true, None);
         let mut update_shown = false;
+        let update_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let menu = Menu::new();
         menu.append(&version_item)
@@ -361,7 +363,34 @@ mod imp {
                         let _ = cmd_tx.send(AgentCommand::EndSession);
                     }
                     "open_log" => open_log(&log_path),
-                    "update" => open_url(update_check::DOWNLOAD_URL),
+                    "update" => {
+                        if !update_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            let started = update_started.clone();
+                            runtime.spawn(async move {
+                                let result = updater::run_update(
+                                    &agent::paths::data_dir(),
+                                    &agent::paths::log_dir(),
+                                    current_version(),
+                                    |p| tracing::info!(?p, "обновление: этап"),
+                                )
+                                .await;
+                                match result {
+                                    Ok(updater::UpdateOutcome::InstallerLaunched(v)) => {
+                                        tracing::info!(version = %v, "установщик обновления запущен");
+                                    }
+                                    Ok(updater::UpdateOutcome::UpToDate(v)) => {
+                                        tracing::info!(version = %v, "обновление не требуется");
+                                        started.store(false, std::sync::atomic::Ordering::SeqCst);
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!(error = %err, "не удалось обновиться автоматически, открываю страницу загрузки");
+                                        started.store(false, std::sync::atomic::Ordering::SeqCst);
+                                        open_url(update_check::DOWNLOAD_URL);
+                                    }
+                                }
+                            });
+                        }
+                    }
                     "autostart" => toggle_autostart(&autostart_item),
                     #[cfg(target_os = "macos")]
                     "open_screen_prefs" => open_system_settings_pane(
@@ -384,7 +413,7 @@ mod imp {
 
             if update_rx.has_changed().unwrap_or(false) {
                 if let Some(latest) = *update_rx.borrow_and_update() {
-                    update_item.set_text(format!("Доступно обновление {latest} — скачать"));
+                    update_item.set_text(format!("Установить обновление {latest}"));
                     if !update_shown {
                         match menu.insert(&update_item, 1) {
                             Ok(()) => update_shown = true,

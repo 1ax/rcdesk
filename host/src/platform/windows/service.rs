@@ -96,7 +96,7 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
@@ -732,7 +732,9 @@ impl Helper {
         // Safety: хендл только что вернул успешный `CreateJobObjectW`.
         let job = unsafe { Owned::new(job_handle) };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // BREAKAWAY_OK: установщик обновления должен пережить остановку службы (D50c).
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         // Safety: `job` -- живой хендл; `limits` соответствует классу
         // `JobObjectExtendedLimitInformation` и переживает вызов, длина
         // передаётся размером этой же структуры.

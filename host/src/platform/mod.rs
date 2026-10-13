@@ -71,6 +71,15 @@ pub use windows::autostart;
 #[cfg(target_os = "windows")]
 pub use windows::elevation;
 
+/// Самообновление (D50c): имя ассета, путь к curl и запуск установщика --
+/// `platform::{macos,windows,other}::update` под одним cfg-free путём.
+#[cfg(target_os = "macos")]
+pub use macos::update;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub use other::update;
+#[cfg(target_os = "windows")]
+pub use windows::update;
+
 #[cfg(target_os = "macos")]
 pub fn name() -> &'static str {
     macos::name()
