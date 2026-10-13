@@ -5,4 +5,4 @@ import type { OfferedFile } from "./OfferedFile";
 /**
  * A single text message on the `file` channel, JSON-encoded.
  */
-export type FileMessage = { "type": "start", id: number, name: string, size: number, } | { "type": "end", id: number, } | { "type": "abort", id: number, reason: AbortReason, } | { "type": "saved", id: number, name: string, } | { "type": "offer", list_id: number, files: Array<OfferedFile>, skipped_folders: number, } | { "type": "fetch", list_id: number, };
+export type FileMessage = { "type": "start", id: number, name: string, size: number, folder?: number | null, dir?: string | null, } | { "type": "end", id: number, } | { "type": "abort", id: number, reason: AbortReason, } | { "type": "saved", id: number, name: string, } | { "type": "offer", list_id: number, files: Array<OfferedFile>, skipped_folders: number, } | { "type": "fetch", list_id: number, };

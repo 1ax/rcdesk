@@ -20,6 +20,12 @@
 //! A copied folder is offered as `<folder>.zip`: a STORED (uncompressed) zip
 //! assembled on the fly while streaming (`zip`), its exact size known up front.
 //!
+//! A client may also upload a folder (3.4e): a sequence of single-file
+//! transfers whose `Start` names a folder number and a relative directory.
+//! The host recreates the tree under a fresh, de-duplicated root directory
+//! inside Downloads; every path component is sanitized, so nothing can land
+//! outside Downloads.
+//!
 //! Disk safety: data is written to `<name>.rcdesk-part`; the final name is
 //! reserved up front with `create_new` (an empty placeholder, so two
 //! transfers can never pick the same name) and the part file replaces it on
@@ -28,6 +34,7 @@
 //!
 //! Privacy: file names are logged at `debug` only, never file content.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -232,6 +239,37 @@ async fn create_unique(
     ))
 }
 
+/// Longest directory path (in components) accepted for a folder upload.
+const MAX_DIR_COMPONENTS: usize = 32;
+
+/// Splits the `dir` of a folder upload into sanitized components. `None`
+/// when there are none or too many (the file is then saved flat).
+fn split_dir(dir: &str) -> Option<Vec<String>> {
+    let comps: Vec<String> = dir
+        .split(['/', '\\'])
+        .filter(|c| !c.is_empty() && *c != ".")
+        .map(sanitize_file_name)
+        .collect();
+    (!comps.is_empty() && comps.len() <= MAX_DIR_COMPONENTS).then_some(comps)
+}
+
+/// Creates a fresh directory `name` in `parent`, trying `name (1)`, ... when
+/// taken. `create_dir` (not `_all`) fails with `AlreadyExists` atomically.
+async fn create_unique_dir(parent: &Path, name: &str) -> std::io::Result<PathBuf> {
+    for n in 0..10_000u32 {
+        let path = parent.join(with_suffix(name, n));
+        match tokio::fs::create_dir(&path).await {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free directory name",
+    ))
+}
+
 /// One transfer in progress. Dropping it without `finished` removes the
 /// part file and the reserved placeholder (also on task cancellation).
 struct ActiveReceive {
@@ -265,6 +303,9 @@ struct Receiver {
     /// folder could be determined).
     dir: Option<PathBuf>,
     active: Option<ActiveReceive>,
+    /// Uploaded folders of this session: client folder number -> the root
+    /// directory chosen for it on disk (slice 3.4e).
+    folders: HashMap<u32, PathBuf>,
 }
 
 impl Receiver {
@@ -286,7 +327,13 @@ impl Receiver {
 
     async fn on_control(&mut self, msg: FileMessage) {
         match msg {
-            FileMessage::Start { id, name, size } => self.on_start(id, name, size).await,
+            FileMessage::Start {
+                id,
+                name,
+                size,
+                folder,
+                dir,
+            } => self.on_start(id, name, size, folder, dir).await,
             FileMessage::End { id } => self.on_end(id).await,
             FileMessage::Abort { id, .. } => {
                 if self.active.as_ref().is_some_and(|a| a.id == id) {
@@ -300,7 +347,56 @@ impl Receiver {
         }
     }
 
-    async fn on_start(&mut self, id: u32, name: String, size: u64) {
+    /// Directory for the file of a `Start`: Downloads itself for an ordinary
+    /// upload, or (folder upload) a directory inside the folder's root,
+    /// created on demand. The result is always inside `base`.
+    async fn target_dir(
+        &mut self,
+        base: &Path,
+        folder: Option<u32>,
+        dir: Option<&str>,
+    ) -> std::io::Result<PathBuf> {
+        let (Some(folder), Some(dir)) = (folder, dir) else {
+            if folder.is_some() || dir.is_some() {
+                tracing::debug!("folder and dir must come together, saving flat");
+            }
+            return Ok(base.to_path_buf());
+        };
+        let Some(components) = split_dir(dir) else {
+            tracing::debug!("unusable folder dir, saving flat");
+            return Ok(base.to_path_buf());
+        };
+        let root = match self.folders.get(&folder) {
+            Some(root) => root.clone(),
+            None => {
+                let root = create_unique_dir(base, &components[0]).await?;
+                self.folders.insert(folder, root.clone());
+                root
+            }
+        };
+        let mut target = root;
+        for comp in &components[1..] {
+            target.push(comp);
+        }
+        debug_assert!(target.starts_with(base));
+        if !target.starts_with(base) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "folder path escapes the download directory",
+            ));
+        }
+        tokio::fs::create_dir_all(&target).await?;
+        Ok(target)
+    }
+
+    async fn on_start(
+        &mut self,
+        id: u32,
+        name: String,
+        size: u64,
+        folder: Option<u32>,
+        rel_dir: Option<String>,
+    ) {
         if let Some(old) = self.active.take() {
             tracing::debug!(id = old.id, "new start over active receive, aborting old");
             let old_id = old.id;
@@ -321,7 +417,10 @@ impl Receiver {
         };
         let clean = sanitize_file_name(&name);
         let created = match tokio::fs::create_dir_all(&dir).await {
-            Ok(()) => create_unique(&dir, &clean).await,
+            Ok(()) => match self.target_dir(&dir, folder, rel_dir.as_deref()).await {
+                Ok(target) => create_unique(&target, &clean).await,
+                Err(e) => Err(e),
+            },
             Err(e) => Err(e),
         };
         match created {
@@ -684,6 +783,8 @@ async fn send_one(
                     id,
                     name: entry.name.clone(),
                     size: entry.size,
+                    folder: None,
+                    dir: None,
                 },
             )
             .await?;
@@ -704,6 +805,8 @@ async fn send_one(
             id,
             name: entry.name.clone(),
             size,
+            folder: None,
+            dir: None,
         },
     )
     .await?;
@@ -772,6 +875,8 @@ async fn send_folder(
                 id,
                 name: entry.name.clone(),
                 size: entry.size,
+                folder: None,
+                dir: None,
             },
         )
         .await?;
@@ -785,6 +890,8 @@ async fn send_folder(
             id,
             name: entry.name.clone(),
             size,
+            folder: None,
+            dir: None,
         },
     )
     .await?;
@@ -873,6 +980,7 @@ pub async fn run(
             channel: Arc::clone(&channel),
             dir,
             active: None,
+            folders: HashMap::new(),
         },
         downloader: Downloader::new(channel),
     };
@@ -1018,6 +1126,8 @@ mod tests {
             id,
             name: name.to_string(),
             size,
+            folder: None,
+            dir: None,
         })
     }
 
@@ -1040,6 +1150,7 @@ mod tests {
                     channel: Arc::clone(&channel),
                     dir: enabled.then(|| dir.clone()),
                     active: None,
+                    folders: HashMap::new(),
                 },
                 downloader: Downloader::new(channel),
             };
@@ -1144,6 +1255,175 @@ mod tests {
             std::fs::read(h.dir.join("hello.txt")).unwrap(),
             b"hello world"
         );
+    }
+
+    fn start_in(id: u32, name: &str, folder: Option<u32>, dir: Option<&str>) -> FileChannelMessage {
+        text(&FileMessage::Start {
+            id,
+            name: name.to_string(),
+            size: 1,
+            folder,
+            dir: dir.map(str::to_string),
+        })
+    }
+
+    async fn upload_in(
+        h: &mut Harness,
+        id: u32,
+        name: &str,
+        folder: Option<u32>,
+        dir: Option<&str>,
+    ) {
+        h.feed(vec![
+            start_in(id, name, folder, dir),
+            chunk(b"x"),
+            text(&FileMessage::End { id }),
+        ])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn folder_files_keep_their_tree() {
+        let mut h = Harness::new(true);
+        upload_in(&mut h, 1, "a.txt", Some(1), Some("Фото")).await;
+        upload_in(&mut h, 2, "b.txt", Some(1), Some("Фото/2024")).await;
+        assert!(h.dir.join("Фото/a.txt").is_file());
+        assert!(h.dir.join("Фото/2024/b.txt").is_file());
+        assert_eq!(h.files(), vec!["Фото".to_string()]);
+        let saved: Vec<String> = h
+            .sent()
+            .into_iter()
+            .map(|m| match m {
+                FileMessage::Saved { name, .. } => name,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(saved, vec!["a.txt", "b.txt"]);
+    }
+
+    #[tokio::test]
+    async fn existing_root_gets_a_suffix_once_per_folder() {
+        let mut h = Harness::new(true);
+        std::fs::create_dir_all(h.dir.join("Фото")).unwrap();
+        upload_in(&mut h, 1, "a.txt", Some(1), Some("Фото")).await;
+        upload_in(&mut h, 2, "b.txt", Some(1), Some("Фото/sub")).await;
+        upload_in(&mut h, 3, "c.txt", Some(2), Some("Фото")).await;
+        assert!(h.dir.join("Фото (1)/a.txt").is_file());
+        assert!(h.dir.join("Фото (1)/sub/b.txt").is_file());
+        assert!(h.dir.join("Фото (2)/c.txt").is_file());
+        assert!(!h.dir.join("Фото/a.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn later_files_use_the_folder_root_from_the_map() {
+        let mut h = Harness::new(true);
+        upload_in(&mut h, 1, "a.txt", Some(5), Some("Один")).await;
+        // The first component of a later dir is ignored.
+        upload_in(&mut h, 2, "b.txt", Some(5), Some("Другой/x")).await;
+        assert!(h.dir.join("Один/a.txt").is_file());
+        assert!(h.dir.join("Один/x/b.txt").is_file());
+        assert!(!h.dir.join("Другой").exists());
+    }
+
+    #[tokio::test]
+    async fn escaping_dirs_stay_inside_downloads() {
+        let outer = scratch_dir();
+        let dir = outer.join("Downloads");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = Arc::new(FakeChannel {
+            sent: Mutex::new(vec![]),
+            outstanding: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let channel = Arc::clone(&fake) as Arc<dyn FileChannel>;
+        let mut session = Session {
+            receiver: Receiver {
+                channel: Arc::clone(&channel),
+                dir: Some(dir.clone()),
+                active: None,
+                folders: HashMap::new(),
+            },
+            downloader: Downloader::new(channel),
+        };
+        let dirs = ["../x", "/etc", "C:\\Windows", "a/../../b", ".."];
+        for (i, d) in dirs.iter().enumerate() {
+            let id = i as u32 + 1;
+            for m in [
+                start_in(id, "f.txt", Some(id), Some(d)),
+                chunk(b"x"),
+                text(&FileMessage::End { id }),
+            ] {
+                session.on_message(m).await;
+            }
+        }
+        for root in session.receiver.folders.values() {
+            assert!(root.starts_with(&dir), "{root:?}");
+        }
+        assert_eq!(session.receiver.folders.len(), dirs.len());
+        // Nothing was created next to Downloads.
+        let outside: Vec<_> = std::fs::read_dir(&outer)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(outside, vec!["Downloads".to_string()]);
+        // Every saved file is inside Downloads.
+        fn walk(p: &Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(p).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = vec![];
+        walk(&dir, &mut files);
+        assert_eq!(files.len(), dirs.len());
+        assert!(files.iter().all(|f| f.starts_with(&dir)));
+        let _ = std::fs::remove_dir_all(&outer);
+    }
+
+    #[test]
+    fn split_dir_sanitizes_and_limits() {
+        assert_eq!(
+            split_dir("a/./b//c"),
+            Some(vec!["a".into(), "b".into(), "c".into()])
+        );
+        assert_eq!(
+            split_dir("a\\b"),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(split_dir(".."), Some(vec!["file".to_string()]));
+        assert_eq!(
+            split_dir("a/../../b"),
+            Some(vec!["a".into(), "file".into(), "file".into(), "b".into()])
+        );
+        assert_eq!(
+            split_dir("C:\\Windows"),
+            Some(vec!["C_".to_string(), "Windows".to_string()])
+        );
+        assert_eq!(split_dir(""), None);
+        assert_eq!(split_dir("/./"), None);
+        assert!(split_dir(&vec!["a"; 32].join("/")).is_some());
+        assert_eq!(split_dir(&vec!["a"; 33].join("/")), None);
+    }
+
+    #[tokio::test]
+    async fn unusable_folder_fields_save_flat() {
+        let mut h = Harness::new(true);
+        let deep = vec!["d"; 33].join("/");
+        upload_in(&mut h, 1, "a.txt", Some(1), Some(&deep)).await;
+        upload_in(&mut h, 2, "b.txt", Some(2), None).await;
+        upload_in(&mut h, 3, "c.txt", None, Some("Фото")).await;
+        assert_eq!(
+            h.files(),
+            vec![
+                "a.txt".to_string(),
+                "b.txt".to_string(),
+                "c.txt".to_string()
+            ]
+        );
+        assert!(h.session.receiver.folders.is_empty());
     }
 
     #[tokio::test]
@@ -1432,7 +1712,9 @@ mod tests {
             msg(FileMessage::Start {
                 id: HOST_ID_BASE,
                 name: "a.txt".into(),
-                size: 5
+                size: 5,
+                folder: None,
+                dir: None
             })
         );
         assert_eq!(log[3], msg(FileMessage::End { id: HOST_ID_BASE }));
@@ -1441,7 +1723,9 @@ mod tests {
             msg(FileMessage::Start {
                 id: HOST_ID_BASE + 1,
                 name: "pack.zip".into(),
-                size: zip_size
+                size: zip_size,
+                folder: None,
+                dir: None
             })
         );
         let mut total = 0u64;
@@ -1524,7 +1808,9 @@ mod tests {
             msg(FileMessage::Start {
                 id: HOST_ID_BASE,
                 name: "big.bin".into(),
-                size: big.len() as u64
+                size: big.len() as u64,
+                folder: None,
+                dir: None
             })
         );
         let mut got = Vec::new();
@@ -1544,7 +1830,9 @@ mod tests {
             msg(FileMessage::Start {
                 id: HOST_ID_BASE + 1,
                 name: "empty.txt".into(),
-                size: 0
+                size: 0,
+                folder: None,
+                dir: None
             })
         );
         assert_eq!(
@@ -1603,7 +1891,9 @@ mod tests {
                 FileMessage::Start {
                     id: HOST_ID_BASE,
                     name: "a.txt".into(),
-                    size: 3
+                    size: 3,
+                    folder: None,
+                    dir: None
                 },
                 FileMessage::Abort {
                     id: HOST_ID_BASE,
@@ -1612,7 +1902,9 @@ mod tests {
                 FileMessage::Start {
                     id: HOST_ID_BASE + 1,
                     name: "b.txt".into(),
-                    size: 2
+                    size: 2,
+                    folder: None,
+                    dir: None
                 },
                 FileMessage::End {
                     id: HOST_ID_BASE + 1

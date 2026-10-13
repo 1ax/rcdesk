@@ -28,6 +28,16 @@
 //! may `Abort` a single file with `Io` (vanished, shorter than announced,
 //! read error); the client discards it and waits for the next `Start`.
 //! `Saved` is not used for downloads.
+//!
+//! Folder upload (slice 3.4e): the client sends a folder as a plain sequence
+//! of single-file transfers. Each `Start` of such a file carries `folder`
+//! (a number the client picks, unique per sent root folder within the
+//! session) and `dir` (the file's directory relative to Downloads, `/`
+//! separated, the root folder name first, e.g. `Photos/2024/may`). The host
+//! creates the root folder once per `folder` (de-duplicating its name) and
+//! puts every file of that `folder` under it. Both fields are sent together;
+//! if only one arrives, the file is saved flat like an ordinary upload. Both
+//! are omitted from the JSON when absent, so the old format stays valid.
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -69,11 +79,17 @@ pub enum FileMessage {
     /// in later messages; `name` is the file name as the sender knows it
     /// (the receiver sanitizes it); `size` is the exact total byte count
     /// (always below 2^53, so it is a plain `number` in TypeScript).
+    /// `folder` / `dir` (slice 3.4e, see the module docs) place the file
+    /// inside an uploaded folder; `name` stays the bare file name.
     Start {
         id: u32,
         name: String,
         #[ts(type = "number")]
         size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<String>,
     },
     /// Sender -> receiver: all chunks of transfer `id` have been sent.
     End { id: u32 },
@@ -113,8 +129,40 @@ mod tests {
                 id: 7,
                 name: "a.txt".to_string(),
                 size: 9_007_199_254_740_000,
+                folder: None,
+                dir: None,
             },
             r#"{"type":"start","id":7,"name":"a.txt","size":9007199254740000}"#,
+        );
+    }
+
+    #[test]
+    fn start_with_folder_has_exact_shape() {
+        check(
+            FileMessage::Start {
+                id: 8,
+                name: "b.txt".to_string(),
+                size: 5,
+                folder: Some(2),
+                dir: Some("Фото/2024".to_string()),
+            },
+            r#"{"type":"start","id":8,"name":"b.txt","size":5,"folder":2,"dir":"Фото/2024"}"#,
+        );
+    }
+
+    #[test]
+    fn start_without_folder_fields_deserializes_to_none() {
+        let msg: FileMessage =
+            serde_json::from_str(r#"{"type":"start","id":1,"name":"a","size":0}"#).unwrap();
+        assert_eq!(
+            msg,
+            FileMessage::Start {
+                id: 1,
+                name: "a".into(),
+                size: 0,
+                folder: None,
+                dir: None
+            }
         );
     }
 
