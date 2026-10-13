@@ -84,6 +84,33 @@ cd ~/app && IMAGE_TAG=sha-<предыдущий> docker compose -f docker-compos
 
 Следующий деплой вернёт свежий sha.
 
+## nginx (FastPanel)
+
+Конфиг сайта `rcdesk.app` делает FastPanel и в репо не хранится. В репо лежат
+только дополнительные директивы: `infra/nginx/rcdesk.app.conf` (кеширование
+`index.html` и ассетов, CSP).
+
+Применение (root / панель владельца): вставить содержимое файла в
+дополнительные директивы секции `server` сайта `rcdesk.app` в FastPanel, затем
+
+```bash
+nginx -t && systemctl reload nginx
+```
+
+Проверка:
+
+```bash
+curl -sI https://rcdesk.app/ | grep -i -E "cache-control|content-security"
+curl -sI https://rcdesk.app/assets/<файл> | grep -i cache-control
+```
+
+Для `/` ожидается `Cache-Control: no-cache` и
+`Content-Security-Policy-Report-Only`, для ассета -- `public, max-age=31536000, immutable`.
+
+Порядок включения CSP: Report-Only -> живой сеанс (вход, видео, буфер обмена,
+передача файла, passkey) без сообщений `Content Security Policy` в консоли ->
+переименовать заголовок в `Content-Security-Policy`.
+
 ## Монитор трафика
 
 `traffic-monitor.sh` считает исходящий трафик VPS за месяц и уведомляет в
@@ -187,6 +214,22 @@ docker run --rm --user 0 -v rcdesk_db-data:/data -v "$PWD:/in" --entrypoint sh <
   -c 'cp /in/rcdesk.db /data/rcdesk.db && rm -f /data/rcdesk.db-wal /data/rcdesk.db-shm && chown nobody:nogroup /data/rcdesk.db'
 docker compose -f docker-compose.prod.yml start server
 ```
+
+## Внешний мониторинг (Better Stack)
+
+Аккаунт владельца, настройка в дашборде, в репо не хранится. Три монитора:
+
+1. Keyword-монитор `https://rcdesk.app/healthz`, интервал 3 мин, алерт «тело не
+   содержит `ok`» -- ловит падение и деградацию (healthz делает `SELECT 1` и
+   берёт мьютекс реестра).
+2. TCP-монитор `turn.rcdesk.app:3478` -- coturn лёг.
+3. Heartbeat «rcdesk backup», период 1 день, grace 2 ч; URL лежит в
+   `~/app/.env` как `BACKUP_HEARTBEAT_URL` (см. «Бэкап БД»).
+
+Канал -- email владельца (free-tier).
+
+Не покрыто и остаётся долгом: диск; сертификат (можно добавить SSL-монитор
+Better Stack на `rcdesk.app`).
 
 ## Релиз
 
