@@ -105,12 +105,14 @@ curl -sI https://rcdesk.app/ | grep -i -E "cache-control|content-security|strict
 curl -sI https://rcdesk.app/assets/<файл> | grep -i cache-control
 ```
 
-Для `/` ожидается `Cache-Control: no-cache` и
-`Content-Security-Policy-Report-Only`, для ассета -- `public, max-age=31536000, immutable`.
+Для `/` ожидается `Cache-Control: no-cache` и `Content-Security-Policy`, для
+ассета -- `public, max-age=31536000, immutable`.
 
-Порядок включения CSP: Report-Only -> живой сеанс (вход, видео, буфер обмена,
-передача файла, passkey) без сообщений `Content Security Policy` в консоли ->
-переименовать заголовок в `Content-Security-Policy` (в обоих `location`).
+CSP включён enforcing (2026-10-13) после живого сеанса под Report-Only без
+сообщений `Content Security Policy` в консоли. При изменении клиента, которое
+может упереться в CSP (новый внешний ресурс, инлайн-стиль, worker), сначала
+временно переименовать заголовок в `Content-Security-Policy-Report-Only` в обоих
+`location`, проверить консоль, вернуть обратно.
 
 ## Монитор трафика
 
