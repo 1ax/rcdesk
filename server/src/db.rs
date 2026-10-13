@@ -22,6 +22,10 @@ use rusqlite::{Connection, OptionalExtension};
 /// idempotent (safe to run against an already-migrated database).
 const SCHEMA_VERSION: i64 = 3;
 
+/// Сколько секунд владелец без устройств и passkey может не появляться,
+/// прежде чем `prune_empty_owners` его удалит (долг D53).
+pub const OWNER_IDLE_TTL_SECS: u64 = 30 * 24 * 3600;
+
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -422,6 +426,30 @@ impl Db {
         Ok(true)
     }
 
+    /// Удаляет пустых анонимных владельцев (долг D53): без привязанных
+    /// устройств (`ownership`), без passkey и с последней активностью
+    /// (`MAX(owner_tokens.last_used_at)`, а без токенов -- `owners.created_at`)
+    /// старше `now - max_idle_secs`. Владелец с `webauthn_user_id`, но без
+    /// passkey -- тоже кандидат (регистрация не завершена). Токены уходят
+    /// каскадом (`foreign_keys = ON` на каждом соединении). Один SQL,
+    /// возвращает число удалённых владельцев.
+    pub fn prune_empty_owners(&self, now: u64, max_idle_secs: u64) -> anyhow::Result<usize> {
+        let cutoff = now.saturating_sub(max_idle_secs) as i64;
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let removed = conn.execute(
+            "DELETE FROM owners
+             WHERE NOT EXISTS (SELECT 1 FROM ownership WHERE ownership.owner_id = owners.owner_id)
+               AND NOT EXISTS (SELECT 1 FROM passkeys WHERE passkeys.owner_id = owners.owner_id)
+               AND COALESCE(
+                       (SELECT MAX(last_used_at) FROM owner_tokens
+                        WHERE owner_tokens.owner_id = owners.owner_id),
+                       owners.created_at
+                   ) < ?1",
+            [cutoff],
+        )?;
+        Ok(removed)
+    }
+
     /// Links an owner to a device. Calling this again for the same pair is
     /// not an error (`INSERT OR IGNORE`).
     pub fn link_device(&self, owner_id: &str, device_id: &str, now: i64) -> anyhow::Result<()> {
@@ -636,6 +664,98 @@ fn migrate_v1_to_v2(conn: &Connection) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn owner_count(db: &Db) -> i64 {
+        let conn = db.conn.lock().expect("db mutex poisoned");
+        conn.query_row("SELECT COUNT(*) FROM owners", [], |r| r.get(0))
+            .expect("count owners")
+    }
+
+    fn token_count(db: &Db, owner_id: &str) -> i64 {
+        let conn = db.conn.lock().expect("db mutex poisoned");
+        conn.query_row(
+            "SELECT COUNT(*) FROM owner_tokens WHERE owner_id = ?1",
+            [owner_id],
+            |r| r.get(0),
+        )
+        .expect("count tokens")
+    }
+
+    #[test]
+    fn prune_removes_old_empty_owner_with_tokens() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("old", 100).expect("owner");
+        db.insert_token("old", "t1", "h1", "", 100).expect("token");
+        let n = db.prune_empty_owners(10_000, 1_000).expect("prune");
+        assert_eq!(n, 1);
+        assert_eq!(owner_count(&db), 0);
+        assert_eq!(token_count(&db, "old"), 0);
+    }
+
+    #[test]
+    fn prune_removes_old_owner_with_webauthn_id_but_no_passkey() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("o", 100).expect("owner");
+        db.set_webauthn_user_id("o", "uuid").expect("webauthn id");
+        assert_eq!(db.prune_empty_owners(10_000, 1_000).expect("prune"), 1);
+    }
+
+    #[test]
+    fn prune_keeps_owner_with_device() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_device("d", "h", "Mac", 100).expect("device");
+        db.insert_owner("o", 100).expect("owner");
+        db.link_device("o", "d", 100).expect("link");
+        assert_eq!(db.prune_empty_owners(10_000, 1_000).expect("prune"), 0);
+        assert_eq!(owner_count(&db), 1);
+    }
+
+    #[test]
+    fn prune_keeps_owner_with_passkey() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("o", 100).expect("owner");
+        db.insert_passkey("pk", "o", "c", "{}", "", 100)
+            .expect("passkey");
+        assert_eq!(db.prune_empty_owners(10_000, 1_000).expect("prune"), 0);
+        assert_eq!(owner_count(&db), 1);
+    }
+
+    #[test]
+    fn prune_keeps_owner_with_fresh_token_despite_old_created_at() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("o", 100).expect("owner");
+        db.insert_token("o", "t1", "h1", "", 9_500).expect("token");
+        assert_eq!(db.prune_empty_owners(10_000, 1_000).expect("prune"), 0);
+        assert_eq!(owner_count(&db), 1);
+    }
+
+    #[test]
+    fn prune_keeps_fresh_owner_without_tokens() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("o", 9_500).expect("owner");
+        assert_eq!(db.prune_empty_owners(10_000, 1_000).expect("prune"), 0);
+        assert_eq!(owner_count(&db), 1);
+    }
+
+    #[test]
+    fn prune_keeps_old_owner_when_one_of_two_tokens_is_fresh() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("o", 100).expect("owner");
+        db.insert_token("o", "t1", "h1", "", 100).expect("token");
+        db.insert_token("o", "t2", "h2", "", 9_500).expect("token");
+        assert_eq!(db.prune_empty_owners(10_000, 1_000).expect("prune"), 0);
+        assert_eq!(token_count(&db, "o"), 2);
+    }
+
+    #[test]
+    fn prune_returns_count_of_removed_owners_only() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("a", 100).expect("owner");
+        db.insert_owner("b", 200).expect("owner");
+        db.insert_owner("fresh", 9_900).expect("owner");
+        assert_eq!(db.prune_empty_owners(10_000, 1_000).expect("prune"), 2);
+        assert_eq!(owner_count(&db), 1);
+    }
 
     #[test]
     fn fresh_db_has_user_version_three() {

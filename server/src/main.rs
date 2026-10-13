@@ -1,6 +1,6 @@
 use rcdesk_server::app::app;
-use rcdesk_server::db::Db;
-use rcdesk_server::ice::IceConfig;
+use rcdesk_server::db::{Db, OWNER_IDLE_TTL_SECS};
+use rcdesk_server::ice::{now_unix, IceConfig};
 use rcdesk_server::passkeys;
 use rcdesk_server::registry::Registry;
 
@@ -21,6 +21,21 @@ async fn main() -> anyhow::Result<()> {
     let db_path = std::env::var("RCDESK_DB_PATH").unwrap_or_else(|_| "rcdesk.db".to_string());
     tracing::info!("opening database at {db_path}");
     let db = Db::open(std::path::Path::new(&db_path))?;
+
+    // Долг D53: раз в сутки (и сразу при старте) чистим пустых анонимных
+    // владельцев. Короткий запрос под std-мьютексом, как остальной код.
+    let prune_db = db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+        loop {
+            interval.tick().await;
+            match prune_db.prune_empty_owners(now_unix(), OWNER_IDLE_TTL_SECS) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("pruned {n} empty owners"),
+                Err(err) => tracing::warn!("failed to prune empty owners: {err:#}"),
+            }
+        }
+    });
 
     let webauthn = passkeys::webauthn_from_env()?;
 
