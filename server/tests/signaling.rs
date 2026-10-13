@@ -47,6 +47,7 @@ async fn spawn_full(ice: IceConfig, liveness: Liveness) -> (String, Db) {
     let db_handle = db.clone();
     let webauthn = rcdesk_server::passkeys::build_webauthn("localhost", "http://localhost:5173")
         .expect("build webauthn");
+    rcdesk_server::app::spawn_pin_rotation(registry.clone(), liveness.pin_ttl);
     tokio::spawn(async move {
         axum::serve(
             listener,
@@ -143,6 +144,7 @@ async fn host_and_joined_client(url: &str) -> (WsStream, WsStream, String, Strin
             name: "Test Host".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -178,6 +180,7 @@ async fn host_registers_and_receives_six_digit_pin() {
             name: "My Mac".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -212,6 +215,7 @@ async fn client_join_succeeds_and_host_is_notified() {
             name: "My Mac".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -497,6 +501,7 @@ async fn register_plain_host(url: &str) -> (WsStream, String) {
             name: "Test Host".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -603,6 +608,7 @@ async fn host_without_device_credentials_is_issued_fresh_ones() {
             name: "My Mac".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -632,6 +638,7 @@ async fn reconnecting_with_issued_credentials_reuses_host_id() {
             name: "My Mac".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -654,6 +661,7 @@ async fn reconnecting_with_issued_credentials_reuses_host_id() {
             name: "My Mac".to_string(),
             device: Some(credentials),
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -684,6 +692,7 @@ async fn reconnecting_with_wrong_secret_is_rejected() {
             name: "My Mac".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -706,6 +715,7 @@ async fn reconnecting_with_wrong_secret_is_rejected() {
                 secret: format!("{}-wrong", credentials.secret),
             }),
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -733,6 +743,7 @@ async fn reconnecting_with_unknown_device_id_is_rejected() {
                 secret: "whatever".to_string(),
             }),
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -760,6 +771,7 @@ async fn re_registering_same_device_displaces_old_connection_without_bye_to_its_
             name: "Test Host".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -797,6 +809,7 @@ async fn re_registering_same_device_displaces_old_connection_without_bye_to_its_
             name: "Test Host".to_string(),
             device: Some(credentials),
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -876,6 +889,7 @@ async fn joining_by_pin_after_client_auth_links_device_to_owner() {
             name: "Test Host".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -930,6 +944,7 @@ async fn connect_device_starts_a_session_for_a_linked_device() {
             name: "Test Host".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -1035,6 +1050,7 @@ async fn connect_device_for_offline_device_returns_error() {
             name: "Test Host".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -1122,6 +1138,7 @@ async fn rename_device_updates_alias_and_forget_device_removes_it() {
             name: "Test Host".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -1186,6 +1203,7 @@ async fn bye_for_unknown_session_from_host_or_client_is_a_silent_no_op() {
             name: "Test Host".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -1234,6 +1252,7 @@ async fn host_reconnect_with_live_session_id_marks_device_busy_until_bye() {
             name: "Test Host".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -1293,6 +1312,7 @@ async fn host_reconnect_with_live_session_id_marks_device_busy_until_bye() {
             name: "Test Host".to_string(),
             device: Some(credentials),
             session_id: Some("s-live".to_string()),
+            pin_rotation: false,
         },
     )
     .await;
@@ -1377,6 +1397,7 @@ async fn wrong_pin_attempts_are_rate_limited_per_ip() {
             name: "Test Host".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -1456,6 +1477,7 @@ async fn second_connection_with_same_token_shares_devices_and_lists_one_browser(
             name: "Test Host".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -1814,6 +1836,7 @@ async fn host_name_and_alias_are_truncated_to_64_chars() {
             name: "й".repeat(100),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -1953,6 +1976,7 @@ async fn register_host_as(
             name: "Test Host".to_string(),
             device,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -2024,6 +2048,7 @@ async fn registered_has_only_stun_but_joined_and_peer_joined_have_turn() {
             name: "Test Host".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -2061,6 +2086,7 @@ async fn server_pings_idle_connection() {
     let liveness = Liveness {
         ping_interval: Duration::from_millis(100),
         read_timeout: Duration::from_secs(5),
+        ..Default::default()
     };
     let url = spawn_server_with(IceConfig::from_env(), liveness).await;
     let mut ws = connect(&url).await;
@@ -2086,6 +2112,7 @@ async fn silent_peer_is_disconnected_after_read_timeout() {
     let liveness = Liveness {
         ping_interval: Duration::from_millis(100),
         read_timeout: Duration::from_millis(400),
+        ..Default::default()
     };
     let url = spawn_server_with(IceConfig::from_env(), liveness).await;
 
@@ -2097,6 +2124,7 @@ async fn silent_peer_is_disconnected_after_read_timeout() {
             name: "Silent".to_string(),
             device: None,
             session_id: None,
+            pin_rotation: false,
         },
     )
     .await;
@@ -2133,4 +2161,175 @@ async fn silent_peer_is_disconnected_after_read_timeout() {
         SignalMessage::Error { message } => assert_eq!(message, "unknown pin"),
         other => panic!("expected error, got {other:?}"),
     }
+}
+
+/// Registers a host (optionally opted into PIN rotation); returns the socket
+/// and its first PIN.
+async fn register_host_with_rotation(url: &str, pin_rotation: bool) -> (WsStream, String) {
+    let mut host = connect(url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: None,
+            session_id: None,
+            pin_rotation,
+        },
+    )
+    .await;
+    let pin = match recv(&mut host).await {
+        SignalMessage::Registered { pin, .. } => pin,
+        other => panic!("expected registered, got {other:?}"),
+    };
+    (host, pin)
+}
+
+async fn join_expecting_error(url: &str, pin: &str, expected: &str) {
+    let mut client = connect(url).await;
+    hello(&mut client, Role::Client).await;
+    send(
+        &mut client,
+        &SignalMessage::Join {
+            pin: pin.to_string(),
+        },
+    )
+    .await;
+    match recv(&mut client).await {
+        SignalMessage::Error { message } => assert_eq!(message, expected),
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+// D44: a host that opted in gets a fresh PIN after every successful join.
+#[tokio::test]
+async fn join_rotates_pin_for_host_that_opted_in() {
+    let url = spawn_server().await;
+    let (mut host, old) = register_host_with_rotation(&url, true).await;
+
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    send(&mut client, &SignalMessage::Join { pin: old.clone() }).await;
+    let session_id = match recv(&mut client).await {
+        SignalMessage::Joined { session_id, .. } => session_id,
+        other => panic!("expected joined, got {other:?}"),
+    };
+    match recv(&mut host).await {
+        SignalMessage::PeerJoined { .. } => {}
+        other => panic!("expected peer_joined, got {other:?}"),
+    }
+    let new = match recv(&mut host).await {
+        SignalMessage::PinChanged { pin } => pin,
+        other => panic!("expected pin_changed, got {other:?}"),
+    };
+    assert_ne!(new, old);
+    assert_eq!(new.len(), 6);
+
+    join_expecting_error(&url, &old, "unknown pin").await;
+
+    send(
+        &mut host,
+        &SignalMessage::Bye {
+            session_id,
+            reason: None,
+        },
+    )
+    .await;
+    match recv(&mut client).await {
+        SignalMessage::Bye { .. } => {}
+        other => panic!("expected bye, got {other:?}"),
+    }
+    let mut client2 = connect(&url).await;
+    hello(&mut client2, Role::Client).await;
+    send(&mut client2, &SignalMessage::Join { pin: new }).await;
+    match recv(&mut client2).await {
+        SignalMessage::Joined { .. } => {}
+        other => panic!("expected joined, got {other:?}"),
+    }
+}
+
+// D44: an older host (no `pin_rotation`) keeps a static PIN.
+#[tokio::test]
+async fn join_keeps_pin_static_for_host_without_rotation() {
+    let url = spawn_server().await;
+    let (mut host, pin) = register_host_with_rotation(&url, false).await;
+
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    send(&mut client, &SignalMessage::Join { pin: pin.clone() }).await;
+    let session_id = match recv(&mut client).await {
+        SignalMessage::Joined { session_id, .. } => session_id,
+        other => panic!("expected joined, got {other:?}"),
+    };
+    match recv(&mut host).await {
+        SignalMessage::PeerJoined { .. } => {}
+        other => panic!("expected peer_joined, got {other:?}"),
+    }
+    expect_silence(&mut host, SILENCE_TIMEOUT).await;
+
+    send(
+        &mut host,
+        &SignalMessage::Bye {
+            session_id,
+            reason: None,
+        },
+    )
+    .await;
+    match recv(&mut client).await {
+        SignalMessage::Bye { .. } => {}
+        other => panic!("expected bye, got {other:?}"),
+    }
+    let mut client2 = connect(&url).await;
+    hello(&mut client2, Role::Client).await;
+    send(&mut client2, &SignalMessage::Join { pin }).await;
+    match recv(&mut client2).await {
+        SignalMessage::Joined { .. } => {}
+        other => panic!("expected joined, got {other:?}"),
+    }
+}
+
+// D44: an opted-in host's PIN is rotated by TTL, with `PinChanged`.
+#[tokio::test]
+async fn pin_expires_after_ttl() {
+    // 1 s: the fresh PIN must still be valid by the time the client below
+    // joins with it, and `PinChanged` must arrive within `recv`'s 2 s.
+    let url = spawn_server_with(
+        IceConfig::from_env(),
+        Liveness {
+            pin_ttl: Duration::from_millis(1000),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (mut host, old) = register_host_with_rotation(&url, true).await;
+    let new = match recv(&mut host).await {
+        SignalMessage::PinChanged { pin } => pin,
+        other => panic!("expected pin_changed, got {other:?}"),
+    };
+    assert_ne!(new, old);
+    assert_eq!(new.len(), 6);
+
+    join_expecting_error(&url, &old, "unknown pin").await;
+
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    send(&mut client, &SignalMessage::Join { pin: new }).await;
+    match recv(&mut client).await {
+        SignalMessage::Joined { .. } => {}
+        other => panic!("expected joined, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn pin_ttl_does_not_touch_host_without_rotation() {
+    let url = spawn_server_with(
+        IceConfig::from_env(),
+        Liveness {
+            pin_ttl: Duration::from_millis(500),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (mut host, _pin) = register_host_with_rotation(&url, false).await;
+    expect_silence(&mut host, Duration::from_millis(1200)).await;
 }

@@ -1,4 +1,4 @@
-use rcdesk_server::app::app;
+use rcdesk_server::app::{app, spawn_pin_rotation, Liveness};
 use rcdesk_server::db::{Db, DEVICE_IDLE_TTL_SECS, OWNER_IDLE_TTL_SECS};
 use rcdesk_server::ice::{now_unix, IceConfig};
 use rcdesk_server::passkeys;
@@ -47,6 +47,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+
+    spawn_pin_rotation(registry.clone(), Liveness::default().pin_ttl);
 
     let webauthn = passkeys::webauthn_from_env()?;
 

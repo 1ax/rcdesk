@@ -112,6 +112,11 @@ pub enum SignalMessage {
         device: Option<DeviceCredentials>,
         #[serde(default)]
         session_id: Option<String>,
+        /// D44: the host can accept `PinChanged`, so the server may rotate
+        /// its PIN (after a `Join` and by TTL). `#[serde(default)]`: an older
+        /// host sends nothing (= `false`) and keeps a static PIN.
+        #[serde(default)]
+        pin_rotation: bool,
     },
     /// server -> host. `device` carries freshly issued credentials (slice
     /// 3.1) only on a host's very first registration; on a successful
@@ -124,6 +129,10 @@ pub enum SignalMessage {
         #[serde(default)]
         device: Option<DeviceCredentials>,
     },
+    /// server -> host (D44): the host has a new PIN, issued after a
+    /// successful `Join` or by TTL. Only sent to hosts that registered with
+    /// `pin_rotation: true`.
+    PinChanged { pin: String },
     /// client -> server
     Join { pin: String },
     /// server -> client. `device_id` (slice 3.5b) is the persistent id of
@@ -408,6 +417,7 @@ mod tests {
                 name: "My Mac".to_string(),
                 device: None,
                 session_id: None,
+                pin_rotation: false,
             }
         );
     }
@@ -418,6 +428,7 @@ mod tests {
             name: "My Mac".to_string(),
             device: None,
             session_id: Some("sess-live".to_string()),
+            pin_rotation: false,
         };
 
         let json = serde_json::to_string(&host_register).expect("serialize");
@@ -436,6 +447,7 @@ mod tests {
                 name: "My Mac".to_string(),
                 device: None,
                 session_id: None,
+                pin_rotation: false,
             }
         );
     }
@@ -662,5 +674,24 @@ mod tests {
                 retry_after_secs: None,
             }
         );
+    }
+
+    #[test]
+    fn host_register_without_pin_rotation_field_deserializes_to_false() {
+        let json = r#"{"type":"host_register","name":"My Mac"}"#;
+        let msg: SignalMessage = serde_json::from_str(json).expect("deserialize");
+        match msg {
+            SignalMessage::HostRegister { pin_rotation, .. } => assert!(!pin_rotation),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pin_changed_serializes_to_exact_json() {
+        let json = serde_json::to_string(&SignalMessage::PinChanged {
+            pin: "123456".to_string(),
+        })
+        .expect("serialize");
+        assert_eq!(json, r#"{"type":"pin_changed","pin":"123456"}"#);
     }
 }

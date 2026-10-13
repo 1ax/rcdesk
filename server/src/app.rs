@@ -5,6 +5,8 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Router;
 
+use proto::signal::SignalMessage;
+
 use crate::db::Db;
 use crate::ice::IceConfig;
 use crate::ip_limit::IpLimiter;
@@ -30,6 +32,8 @@ pub const NEW_DEVICE_REFILL: Duration = Duration::from_secs(600);
 pub struct Liveness {
     pub ping_interval: Duration,
     pub read_timeout: Duration,
+    /// TTL PIN (D44): ротация только для хостов с `pin_rotation`.
+    pub pin_ttl: Duration,
 }
 
 impl Default for Liveness {
@@ -37,6 +41,7 @@ impl Default for Liveness {
         Self {
             ping_interval: Duration::from_secs(30),
             read_timeout: Duration::from_secs(90),
+            pin_ttl: Duration::from_secs(600),
         }
     }
 }
@@ -85,6 +90,25 @@ pub fn app_with_liveness(
             webauthn,
             liveness,
         })
+}
+
+/// Фоновая ротация PIN по TTL (D44): на каждом тике выдаёт новый PIN хостам с
+/// `pin_rotation`, чей PIN просрочен, и шлёт им `PinChanged`.
+pub fn spawn_pin_rotation(registry: Registry, pin_ttl: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let period = (pin_ttl / 10).max(Duration::from_millis(100));
+        let mut interval = tokio::time::interval(period);
+        loop {
+            interval.tick().await;
+            let rotated = registry.rotate_expired_pins(std::time::Instant::now(), pin_ttl);
+            if !rotated.is_empty() {
+                tracing::info!("rotated {} expired pins", rotated.len());
+            }
+            for (tx, pin) in rotated {
+                let _ = tx.send(SignalMessage::PinChanged { pin });
+            }
+        }
+    })
 }
 
 /// Liveness plus a check that the DB and the registry mutexes are usable.

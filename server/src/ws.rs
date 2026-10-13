@@ -17,7 +17,7 @@ use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
 use proto::signal::{BrowserEntry, DeviceEntry, Role, SignalMessage};
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use webauthn_rs::prelude::{DiscoverableAuthentication, PasskeyRegistration};
 
@@ -140,6 +140,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
         &state.webauthn,
         info,
         read_timeout,
+        liveness.pin_ttl,
     )
     .await;
     tracing::info!("websocket connection closed");
@@ -221,6 +222,7 @@ async fn run_connection(
     webauthn: &SharedWebauthn,
     info: ClientInfo,
     read_timeout: Duration,
+    pin_ttl: Duration,
 ) {
     let role = match next_message(stream, &tx, read_timeout).await {
         Some(SignalMessage::Hello { role, .. }) => role,
@@ -259,6 +261,7 @@ async fn run_connection(
                 webauthn,
                 info,
                 read_timeout,
+                pin_ttl,
             )
             .await
         }
@@ -276,20 +279,22 @@ async fn run_host(
     ip: IpAddr,
     read_timeout: Duration,
 ) {
-    let (name, device, session_id) = match next_message(stream, &tx, read_timeout).await {
-        Some(SignalMessage::HostRegister {
-            name,
-            device,
-            session_id,
-        }) => (name, device, session_id),
-        Some(_) => {
-            let _ = tx.send(SignalMessage::Error {
-                message: "expected host_register".to_string(),
-            });
-            return;
-        }
-        None => return,
-    };
+    let (name, device, session_id, pin_rotation) =
+        match next_message(stream, &tx, read_timeout).await {
+            Some(SignalMessage::HostRegister {
+                name,
+                device,
+                session_id,
+                pin_rotation,
+            }) => (name, device, session_id, pin_rotation),
+            Some(_) => {
+                let _ = tx.send(SignalMessage::Error {
+                    message: "expected host_register".to_string(),
+                });
+                return;
+            }
+            None => return,
+        };
 
     if device.is_none() && !device_limiter.check(ip) {
         tracing::warn!(%ip, "new device registration rate-limited");
@@ -334,8 +339,13 @@ async fn run_host(
         DeviceAuth::Known { device_id } => (device_id, None),
     };
 
-    let (pin, displaced) =
-        registry.register_host(host_id.clone(), name, tx.clone(), session_id.clone());
+    let (pin, displaced) = registry.register_host(
+        host_id.clone(),
+        name,
+        tx.clone(),
+        session_id.clone(),
+        pin_rotation,
+    );
     tracing::info!(host_id = %host_id, "host registered");
     // Slice 3.2a (D35): the host reported a still-live session_id at
     // registration (survived a signaling-only reconnect, slice 3.5a).
@@ -707,6 +717,7 @@ async fn run_client(
     webauthn: &SharedWebauthn,
     info: ClientInfo,
     read_timeout: Duration,
+    pin_ttl: Duration,
 ) {
     let ClientInfo { ip, user_agent } = info;
     // The owner this connection has authenticated as (slice 3.1), if any --
@@ -1045,8 +1056,8 @@ async fn run_client(
                     });
                     continue;
                 }
-                match registry.join(&pin, tx.clone()) {
-                    Ok((session_id, host_id, host_name, host_tx)) => {
+                match registry.join(&pin, tx.clone(), pin_ttl, Instant::now()) {
+                    Ok((session_id, host_id, host_name, host_tx, new_pin)) => {
                         tracing::info!(%session_id, "client joined");
                         let _ = tx.send(SignalMessage::Joined {
                             session_id: session_id.clone(),
@@ -1062,6 +1073,9 @@ async fn run_client(
                             session_id,
                             ice_servers: ice.ice_servers(ice::now_unix()),
                         });
+                        if let Some(pin) = new_pin {
+                            let _ = host_tx.send(SignalMessage::PinChanged { pin });
+                        }
                         match current_owner(db, &mut session) {
                             Ok(Some(owner_id)) => {
                                 if let Err(err) =

@@ -401,6 +401,7 @@ impl SignalingClient {
                 name: name.to_string(),
                 device,
                 session_id,
+                pin_rotation: false,
             },
         )
         .await?;
