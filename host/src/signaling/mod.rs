@@ -2809,6 +2809,12 @@ async fn start_session_with_display_wait(
                 tracing::warn!(?err, "failed to send cursor control message");
             }
         }
+        // `rx` only closes when the watcher's thread is gone. On an orderly
+        // shutdown this task is aborted first (`ActiveSession::shutdown`),
+        // so reaching this line means the thread died mid-session (slice A
+        // of the 2026-10-13 audit: a panic is logged by the hook in
+        // `agent::logging`, but nothing said the session lost its cursor).
+        tracing::warn!("cursor watcher thread exited, cursor shape updates stop for this session");
     });
 
     // The `file` channel gets its own task (slice 3.4a), fed by the
@@ -2867,6 +2873,11 @@ async fn start_session_with_display_wait(
                             }
                         }
                     }
+                    // Same reasoning as `cursor_task` above: only a dead
+                    // watcher thread closes `rx` while this task is alive.
+                    tracing::warn!(
+                        "clipboard watcher thread exited, clipboard sync stops for this session"
+                    );
                 });
                 (Some(sync), Some(task))
             }
