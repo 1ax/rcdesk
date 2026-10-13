@@ -2134,6 +2134,7 @@ fn host_info_message(
         files_enabled,
         curtain_available,
         input_source_available,
+        version: Some(crate::build_info::VERSION.to_string()),
     }
 }
 
@@ -3156,7 +3157,8 @@ mod tests {
                 os: crate::platform::host_os(),
                 files_enabled: true,
                 curtain_available: false,
-                input_source_available: false
+                input_source_available: false,
+                version: Some(crate::build_info::VERSION.to_string()),
             }
         );
         assert_eq!(
@@ -3165,7 +3167,8 @@ mod tests {
                 os: crate::platform::host_os(),
                 files_enabled: false,
                 curtain_available: true,
-                input_source_available: true
+                input_source_available: true,
+                version: Some(crate::build_info::VERSION.to_string()),
             }
         );
     }

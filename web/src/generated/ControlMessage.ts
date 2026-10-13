@@ -17,4 +17,8 @@ curtain_available: boolean,
  * Хост умеет переключать раскладку клавиатуры (слайс 4.6c) --
  * сейчас только агент macOS. Старый JSON без поля -- `false`.
  */
-input_source_available: boolean, } | { "type": "set_curtain", on: boolean, } | { "type": "curtain_status", on: boolean, reason: string | null, } | { "type": "switch_input_source" } | { "type": "input_source", label: string, };
+input_source_available: boolean, 
+/**
+ * Версия хоста `X.Y.Z` (слайс D50a); старые хосты поле не шлют.
+ */
+version: string | null, } | { "type": "set_curtain", on: boolean, } | { "type": "curtain_status", on: boolean, reason: string | null, } | { "type": "switch_input_source" } | { "type": "input_source", label: string, };

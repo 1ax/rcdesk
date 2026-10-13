@@ -571,6 +571,12 @@ body {
   text-transform: none;
 }
 
+/* Слайс D50a: хост старее клиента. */
+.host-outdated {
+  color: var(--danger);
+  text-transform: none;
+}
+
 .curtain-status {
   color: var(--danger);
   text-transform: none;

@@ -165,6 +165,9 @@ pub enum ControlMessage {
         /// сейчас только агент macOS. Старый JSON без поля -- `false`.
         #[serde(default)]
         input_source_available: bool,
+        /// Версия хоста `X.Y.Z` (слайс D50a); старые хосты поле не шлют.
+        #[serde(default)]
+        version: Option<String>,
     },
     /// client -> host: включить (`on: true`) или выключить шторку (слайс
     /// 4.2c). Шторка закрывает физический монитор хоста чёрным окном
@@ -414,13 +417,14 @@ mod tests {
                 files_enabled: true,
                 curtain_available: false,
                 input_source_available: true,
+                version: Some("0.1.1".to_string()),
             };
 
             let json = serde_json::to_string(&msg).expect("serialize");
             assert_eq!(
                 json,
                 format!(
-                    r#"{{"type":"host_info","os":"{wire}","files_enabled":true,"curtain_available":false,"input_source_available":true}}"#
+                    r#"{{"type":"host_info","os":"{wire}","files_enabled":true,"curtain_available":false,"input_source_available":true,"version":"0.1.1"}}"#
                 )
             );
 
@@ -476,8 +480,33 @@ mod tests {
                 files_enabled: true,
                 curtain_available: true,
                 input_source_available: false,
+                version: None,
             }
         );
+    }
+
+    /// Слайс D50a: JSON без `version` (хосты 0.1.0) разбирается в `None`.
+    #[test]
+    fn host_info_without_version_parses_as_none() {
+        let json = r#"{"type":"host_info","os":"macos","files_enabled":true,"curtain_available":true,"input_source_available":false}"#;
+        let msg: ControlMessage = serde_json::from_str(json).expect("deserialize");
+        assert!(matches!(
+            msg,
+            ControlMessage::HostInfo { version: None, .. }
+        ));
+    }
+
+    /// Слайс D50a: `version` переживает круговой round-trip.
+    #[test]
+    fn host_info_with_version_round_trips() {
+        let json = r#"{"type":"host_info","os":"windows","files_enabled":true,"curtain_available":false,"input_source_available":false,"version":"0.2.3"}"#;
+        let msg: ControlMessage = serde_json::from_str(json).expect("deserialize");
+        assert!(matches!(
+            &msg,
+            ControlMessage::HostInfo { version: Some(v), .. } if v == "0.2.3"
+        ));
+        let again = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(again, json);
     }
 
     #[test]

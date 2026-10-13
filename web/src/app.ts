@@ -38,6 +38,7 @@ import {
 } from "./fullscreen";
 import type { NavigatorWithKeyboard } from "./fullscreen";
 import { inputBlockedLabel } from "./inputBlocked";
+import { hostOutdatedLabel } from "./hostVersion";
 import { viewOnlyLabel } from "./inputStatus";
 import {
   type CurtainState,
@@ -373,6 +374,7 @@ export function mount(root: Element | null): void {
           </label>
           <span id="view-only" class="status view-only" hidden></span>
           <span id="input-blocked" class="status input-blocked" hidden></span>
+          <span id="host-outdated" class="status host-outdated" hidden></span>
           <span id="curtain-status" class="status curtain-status" hidden></span>
           <span id="clipboard-note" class="status clipboard-note" hidden></span>
           <span id="fullscreen-note" class="status fullscreen-note" hidden></span>
@@ -501,6 +503,7 @@ export function mount(root: Element | null): void {
   cmdAsCtrlCheckbox.checked = cmdAsCtrl;
   const viewOnlyEl = root.querySelector<HTMLSpanElement>("#view-only")!;
   const inputBlockedEl = root.querySelector<HTMLSpanElement>("#input-blocked")!;
+  const hostOutdatedEl = root.querySelector<HTMLSpanElement>("#host-outdated")!;
   const clipboardNoteEl = root.querySelector<HTMLSpanElement>("#clipboard-note")!;
   const fullscreenNoteEl = root.querySelector<HTMLSpanElement>("#fullscreen-note")!;
   const fileStatusEl = root.querySelector<HTMLSpanElement>("#file-status")!;
@@ -1504,6 +1507,10 @@ export function mount(root: Element | null): void {
         renderCurtain();
         inputSourceAvailable = msg.input_source_available;
         renderLayoutBtn(null);
+        // Слайс D50a: плашка, если хост старее клиента.
+        const outdated = hostOutdatedLabel(msg.version, __APP_VERSION__);
+        hostOutdatedEl.textContent = outdated ?? "";
+        hostOutdatedEl.hidden = outdated === null;
         return;
       }
       if (msg.type === "input_source") {
@@ -1838,6 +1845,8 @@ export function mount(root: Element | null): void {
     viewOnlyEl.textContent = "";
     inputBlockedEl.hidden = true;
     inputBlockedEl.textContent = "";
+    hostOutdatedEl.hidden = true;
+    hostOutdatedEl.textContent = "";
     if (clipboardBridge) {
       window.removeEventListener("focus", onClipboardFocusOrGesture);
       document.removeEventListener("pointerdown", onClipboardFocusOrGesture, true);
