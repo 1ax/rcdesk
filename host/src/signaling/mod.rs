@@ -401,7 +401,8 @@ impl SignalingClient {
                 name: name.to_string(),
                 device,
                 session_id,
-                pin_rotation: false,
+                // D44: the host understands `PinChanged` (see `apply_pin_change`).
+                pin_rotation: true,
             },
         )
         .await?;
@@ -504,7 +505,7 @@ impl SignalingClient {
     ) -> anyhow::Result<()> {
         let SignalingClient {
             host_id,
-            pin,
+            mut pin,
             ice_servers: registered_ice_servers,
             issued_device: _,
             mut read,
@@ -569,6 +570,11 @@ impl SignalingClient {
                         }
                     };
 
+                    if let SignalMessage::PinChanged { pin: new_pin } = msg {
+                        apply_pin_change(new_pin, &mut pin, status);
+                        continue;
+                    }
+
                     handle_signal_message(
                         msg,
                         ctx,
@@ -630,6 +636,27 @@ impl SignalingClient {
             );
         }
         anyhow::bail!("signaling connection to server closed (host_id={host_id})")
+    }
+}
+
+/// D44: the server issued a new PIN (after a client joined, or by TTL).
+/// Updates the local PIN and re-publishes the current status with it, so the
+/// tray, `serve` and `pin.txt` show the fresh code; the status phase is
+/// unchanged.
+fn apply_pin_change(new_pin: String, pin: &mut String, status: &watch::Sender<AgentStatus>) {
+    if new_pin == *pin {
+        tracing::debug!("pin_changed with the same pin, ignoring");
+        return;
+    }
+    tracing::info!(pin = %new_pin, "pin rotated by server");
+    *pin = new_pin;
+    let next = match &*status.borrow() {
+        AgentStatus::Registered { .. } => Some(AgentStatus::Registered { pin: pin.clone() }),
+        AgentStatus::InSession { .. } => Some(AgentStatus::InSession { pin: pin.clone() }),
+        AgentStatus::Connecting | AgentStatus::Reconnecting { .. } => None,
+    };
+    if let Some(next) = next {
+        status.send_replace(next);
     }
 }
 
@@ -5745,6 +5772,122 @@ mod tests {
         }
     }
 
+    #[test]
+    fn apply_pin_change_updates_registered_status() {
+        let (status_tx, status_rx) = watch::channel(AgentStatus::Registered {
+            pin: "111111".to_string(),
+        });
+        let mut pin = "111111".to_string();
+        apply_pin_change("222222".to_string(), &mut pin, &status_tx);
+        assert_eq!(pin, "222222");
+        assert_eq!(
+            *status_rx.borrow(),
+            AgentStatus::Registered {
+                pin: "222222".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn apply_pin_change_keeps_in_session_phase() {
+        let (status_tx, status_rx) = watch::channel(AgentStatus::InSession {
+            pin: "111111".to_string(),
+        });
+        let mut pin = "111111".to_string();
+        apply_pin_change("222222".to_string(), &mut pin, &status_tx);
+        assert_eq!(pin, "222222");
+        assert_eq!(
+            *status_rx.borrow(),
+            AgentStatus::InSession {
+                pin: "222222".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn apply_pin_change_does_not_touch_other_phases() {
+        let (status_tx, status_rx) = watch::channel(AgentStatus::Connecting);
+        let mut pin = "111111".to_string();
+        apply_pin_change("222222".to_string(), &mut pin, &status_tx);
+        assert_eq!(pin, "222222");
+        assert_eq!(*status_rx.borrow(), AgentStatus::Connecting);
+        assert!(!status_rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn apply_pin_change_same_pin_is_noop() {
+        let (status_tx, status_rx) = watch::channel(AgentStatus::Registered {
+            pin: "111111".to_string(),
+        });
+        let mut pin = "111111".to_string();
+        apply_pin_change("111111".to_string(), &mut pin, &status_tx);
+        assert_eq!(pin, "111111");
+        assert!(!status_rx.has_changed().unwrap());
+    }
+
+    /// D44: a `pin_changed` message arriving on the live socket makes `run`
+    /// re-publish `Registered` with the new PIN.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_applies_pin_changed_to_status() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}/ws");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = ws.next().await; // Hello
+            let _ = ws.next().await; // HostRegister
+            let registered = serde_json::to_string(&SignalMessage::Registered {
+                host_id: "host-1".to_string(),
+                pin: "111111".to_string(),
+                ice_servers: vec![],
+                device: None,
+            })
+            .unwrap();
+            ws.send(Message::text(registered)).await.unwrap();
+            ws.send(Message::text(r#"{"type":"pin_changed","pin":"222222"}"#))
+                .await
+                .unwrap();
+            // Keep the socket open until the test ends.
+            while ws.next().await.is_some() {}
+        });
+
+        let client = SignalingClient::connect(&url, "test-host", None, None)
+            .await
+            .expect("connect");
+        let ctx = test_ctx();
+        let (status_tx, mut status_rx) = watch::channel(AgentStatus::Registered {
+            pin: "111111".to_string(),
+        });
+        status_rx.mark_unchanged();
+        let (_cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<AgentCommand>();
+        let mut slot = SessionSlot::new();
+
+        let run = client.run(
+            &ctx,
+            &status_tx,
+            Keepalive::default(),
+            &mut cmd_rx,
+            &mut slot,
+        );
+        let wait = async {
+            tokio::time::timeout(Duration::from_secs(5), status_rx.changed())
+                .await
+                .expect("status must change in time")
+                .expect("status sender alive");
+        };
+        tokio::select! {
+            _ = run => panic!("run must not return while the socket is open"),
+            _ = wait => {}
+        }
+        assert_eq!(
+            *status_rx.borrow(),
+            AgentStatus::Registered {
+                pin: "222222".to_string()
+            }
+        );
+    }
+
     /// Slice 3.2a/D35: `connect` puts the `session_id` argument into
     /// `HostRegister.session_id` -- `Some` when the caller (`app::run_agent`,
     /// via `SessionSlot::current_session_id`) has a live session from before
@@ -5765,8 +5908,13 @@ mod tests {
                 other => panic!("expected HostRegister, got {other:?}"),
             };
             match host_register {
-                SignalMessage::HostRegister { session_id, .. } => {
+                SignalMessage::HostRegister {
+                    session_id,
+                    pin_rotation,
+                    ..
+                } => {
                     assert_eq!(session_id, expected);
+                    assert!(pin_rotation, "host must announce pin_rotation (D44)");
                 }
                 other => panic!("expected host_register, got {other:?}"),
             }
