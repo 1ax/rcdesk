@@ -1201,7 +1201,7 @@ async fn run_client(
         }
     }
 
-    if let Some((session_id, _host_tx)) = registry.disconnect_client(&tx) {
+    for (session_id, _host_tx) in registry.disconnect_client(&tx) {
         // Same reasoning as the host-side disconnect above: the socket
         // closing doesn't mean the P2P session is over, so no `Bye`.
         tracing::info!(%session_id, "session left to p2p after signaling loss");

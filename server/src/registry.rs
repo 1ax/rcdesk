@@ -99,6 +99,9 @@ pub enum JoinError {
     /// `join_by_host_id` (slice 3.1): no host is currently registered under
     /// that `host_id`.
     HostOffline,
+    /// B4: this client connection already has a session; one client holds
+    /// at most one session at a time.
+    AlreadyInSession,
 }
 
 impl JoinError {
@@ -107,6 +110,7 @@ impl JoinError {
             JoinError::UnknownPin => "unknown pin",
             JoinError::HostBusy => "host busy",
             JoinError::HostOffline => "device offline",
+            JoinError::AlreadyInSession => "already in session",
         }
     }
 }
@@ -179,7 +183,9 @@ impl Registry {
     ///   `join`/`join_by_host_id` refuse new joins, but there's no
     ///   `SessionEntry` (and, in the foreign-id case, that other host_id's
     ///   own session is left untouched) -- only the host's own `Bye` for
-    ///   `sid` (`close_session_by_host`) frees it.
+    ///   `sid` (`close_session_by_host`) frees it. In the foreign-id case
+    ///   the other host's session is not touched either on re-registration
+    ///   or on disconnect.
     /// - `None` -- unchanged from before 3.2a: the new registration starts
     ///   with no session.
     pub fn register_host(
@@ -216,6 +222,15 @@ impl Registry {
                 None
             } else {
                 old.session_id.and_then(|old_sid| {
+                    // A detached session id may name another host's live
+                    // session: only remove what this host_id owns.
+                    if !inner
+                        .sessions
+                        .get(&old_sid)
+                        .is_some_and(|s| s.host_id == host_id)
+                    {
+                        return None;
+                    }
                     inner
                         .sessions
                         .remove(&old_sid)
@@ -343,7 +358,8 @@ impl Registry {
     /// is confirmed linked to it). Returns the same triple as `join` minus
     /// `host_id` (the caller already has it). `HostOffline` if no host is
     /// currently registered under that id, `HostBusy` if it already has an
-    /// active session.
+    /// active session. `AlreadyInSession` if this client connection already holds
+    /// a session (checked first).
     pub fn join_by_host_id(
         &self,
         host_id: &str,
@@ -352,6 +368,13 @@ impl Registry {
         let mut inner = self.inner.lock().expect("registry mutex poisoned");
 
         let host = inner.hosts.get(host_id).ok_or(JoinError::HostOffline)?;
+        if inner
+            .sessions
+            .values()
+            .any(|s| s.client_tx.same_channel(&client_tx))
+        {
+            return Err(JoinError::AlreadyInSession);
+        }
         if host.session_id.is_some() {
             return Err(JoinError::HostBusy);
         }
@@ -475,22 +498,29 @@ impl Registry {
     }
 
     /// Called when a client connection is dropped without an explicit `Bye`.
-    /// Scans active sessions for one whose client tx is `client_tx`, removes
-    /// it, frees the host, and returns `(session_id, host_tx)` for the
-    /// caller to log (slice 3.5a: no `Bye` is sent for a signaling-only
-    /// disconnect -- the P2P session is left running).
-    pub fn disconnect_client(&self, client_tx: &Tx) -> Option<(String, Tx)> {
+    /// Removes every session whose client tx is `client_tx` (normally at most
+    /// one, see `JoinError::AlreadyInSession`), frees their hosts, and
+    /// returns `(session_id, host_tx)` pairs for the caller to log (slice
+    /// 3.5a: no `Bye` is sent for a signaling-only disconnect -- the P2P
+    /// session is left running).
+    pub fn disconnect_client(&self, client_tx: &Tx) -> Vec<(String, Tx)> {
         let mut inner = self.inner.lock().expect("registry mutex poisoned");
-        let session_id = inner
+        let session_ids: Vec<String> = inner
             .sessions
             .iter()
-            .find(|(_, s)| s.client_tx.same_channel(client_tx))
-            .map(|(id, _)| id.clone())?;
-        let session = inner.sessions.remove(&session_id)?;
-        if let Some(host) = inner.hosts.get_mut(&session.host_id) {
-            host.session_id = None;
+            .filter(|(_, s)| s.client_tx.same_channel(client_tx))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut freed = Vec::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            if let Some(session) = inner.sessions.remove(&session_id) {
+                if let Some(host) = inner.hosts.get_mut(&session.host_id) {
+                    host.session_id = None;
+                }
+                freed.push((session_id, session.host_tx));
+            }
         }
-        Some((session_id, session.host_tx))
+        freed
     }
 }
 
@@ -931,5 +961,59 @@ mod tests {
         assert!(registry
             .peer_tx_for_host("host2", &host1_session_id)
             .is_none());
+    }
+
+    #[test]
+    fn join_by_host_id_refuses_a_client_already_in_session() {
+        let registry = Registry::new();
+        let (h1, _r1) = channel();
+        let (h2, _r2) = channel();
+        registry.register_host("host1".to_string(), "one".to_string(), h1, None);
+        registry.register_host("host2".to_string(), "two".to_string(), h2, None);
+
+        let (client_tx, _rx) = channel();
+        registry
+            .join_by_host_id("host1", client_tx.clone())
+            .expect("first join ok");
+        assert_eq!(
+            registry.join_by_host_id("host2", client_tx).unwrap_err(),
+            JoinError::AlreadyInSession
+        );
+        assert_eq!(registry.host_presence("host2"), Some(false));
+    }
+
+    #[test]
+    fn disconnect_client_frees_every_session_of_that_client() {
+        let registry = Registry::new();
+        let (h1, _r1) = channel();
+        registry.register_host("host1".to_string(), "one".to_string(), h1, None);
+        let (client_tx, _rx) = channel();
+        registry
+            .join_by_host_id("host1", client_tx.clone())
+            .expect("join ok");
+        assert_eq!(registry.host_presence("host1"), Some(true));
+
+        assert_eq!(registry.disconnect_client(&client_tx).len(), 1);
+        assert_eq!(registry.host_presence("host1"), Some(false));
+        assert!(registry.disconnect_client(&client_tx).is_empty());
+    }
+
+    #[test]
+    fn register_host_with_foreign_session_id_does_not_remove_that_session() {
+        let registry = Registry::new();
+        let (a_tx, _a_rx) = channel();
+        registry.register_host("A".to_string(), "a".to_string(), a_tx, None);
+        let (client_tx, _client_rx) = channel();
+        let (sid, _name, _host_tx) = registry.join_by_host_id("A", client_tx).expect("join ok");
+
+        let (b_tx, _b_rx) = channel();
+        registry.register_host("B".to_string(), "b".to_string(), b_tx, Some(sid.clone()));
+        let (b_tx2, _b_rx2) = channel();
+        let (_pin, displaced) =
+            registry.register_host("B".to_string(), "b".to_string(), b_tx2, None);
+
+        let displaced = displaced.expect("B is displaced");
+        assert!(displaced.session.is_none());
+        assert!(registry.peer_tx_for_host("A", &sid).is_some());
     }
 }

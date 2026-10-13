@@ -488,6 +488,53 @@ async fn second_client_on_busy_host_gets_error() {
     }
 }
 
+async fn register_plain_host(url: &str) -> (WsStream, String) {
+    let mut host = connect(url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: None,
+            session_id: None,
+        },
+    )
+    .await;
+    let pin = match recv(&mut host).await {
+        SignalMessage::Registered { pin, .. } => pin,
+        other => panic!("expected registered, got {other:?}"),
+    };
+    (host, pin)
+}
+
+#[tokio::test]
+async fn client_in_session_cannot_join_a_second_host() {
+    let url = spawn_server().await;
+    let (_host1, pin1) = register_plain_host(&url).await;
+    let (_host2, pin2) = register_plain_host(&url).await;
+
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    send(&mut client, &SignalMessage::Join { pin: pin1 }).await;
+    match recv(&mut client).await {
+        SignalMessage::Joined { .. } => {}
+        other => panic!("expected joined, got {other:?}"),
+    }
+    send(&mut client, &SignalMessage::Join { pin: pin2.clone() }).await;
+    match recv(&mut client).await {
+        SignalMessage::Error { message } => assert_eq!(message, "already in session"),
+        other => panic!("expected error, got {other:?}"),
+    }
+
+    let mut other_client = connect(&url).await;
+    hello(&mut other_client, Role::Client).await;
+    send(&mut other_client, &SignalMessage::Join { pin: pin2 }).await;
+    match recv(&mut other_client).await {
+        SignalMessage::Joined { .. } => {}
+        other => panic!("expected joined, got {other:?}"),
+    }
+}
+
 // (f) client disconnects -> the P2P session is left running, so the host
 // gets no `Bye` (slice 3.5a) -- but the registry still frees the host, so a
 // new client can join with the same PIN. Joining may need a retry or two:
