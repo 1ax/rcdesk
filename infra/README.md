@@ -86,12 +86,13 @@ cd ~/app && IMAGE_TAG=sha-<предыдущий> docker compose -f docker-compos
 
 ## nginx (FastPanel)
 
-Конфиг сайта `rcdesk.app` делает FastPanel и в репо не хранится. В репо лежат
-только дополнительные директивы: `infra/nginx/rcdesk.app.conf` (кеширование
-`index.html` и ассетов, CSP).
+Конфиг сайта `rcdesk.app` лежит на VPS в `/etc/nginx/fastpanel2-sites/rcdesk/rcdesk.app.conf`
+(root). Источник правды -- `infra/nginx/rcdesk.app.conf`: полный `server {}` с нашими
+добавками (security-заголовки, `Cache-Control` на `index.html` и `/assets/`, CSP).
+Строки панели (`listen`, `ssl_certificate*`, `root`, `include`, логи) в нём как у панели;
+при перевыпуске сертификата пути к `.crt`/`.key` брать из живого файла.
 
-Применение (root / панель владельца): вставить содержимое файла в
-дополнительные директивы секции `server` сайта `rcdesk.app` в FastPanel, затем
+Применение (root): заменить файл целиком, затем
 
 ```bash
 nginx -t && systemctl reload nginx
@@ -100,7 +101,7 @@ nginx -t && systemctl reload nginx
 Проверка:
 
 ```bash
-curl -sI https://rcdesk.app/ | grep -i -E "cache-control|content-security"
+curl -sI https://rcdesk.app/ | grep -i -E "cache-control|content-security|strict-transport"
 curl -sI https://rcdesk.app/assets/<файл> | grep -i cache-control
 ```
 
@@ -109,7 +110,7 @@ curl -sI https://rcdesk.app/assets/<файл> | grep -i cache-control
 
 Порядок включения CSP: Report-Only -> живой сеанс (вход, видео, буфер обмена,
 передача файла, passkey) без сообщений `Content Security Policy` в консоли ->
-переименовать заголовок в `Content-Security-Policy`.
+переименовать заголовок в `Content-Security-Policy` (в обоих `location`).
 
 ## Монитор трафика
 
