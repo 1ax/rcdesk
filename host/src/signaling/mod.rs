@@ -2927,6 +2927,127 @@ async fn start_session_with_display_wait(
     })
 }
 
+/// Number of adapt ticks (1 s each) per `StatsWindow` summary.
+const SUMMARY_TICKS: u32 = 5;
+
+/// One finished `StatsWindow`: deltas over the window, not cumulative totals.
+struct StatsSummary {
+    seconds: u32,
+    captured: u64,
+    encoded: u64,
+    dropped: u64,
+    paced_out: u64,
+    overwritten: u64,
+    keyframes: u64,
+    keyframe_repeats: u64,
+    kbps: u64,
+    encode_ms_avg: f64,
+    encode_ms_max: f64,
+    loss: f32,
+    remb_kbps: Option<u32>,
+}
+
+/// Rolls the pipeline counters up into one `info!` line every `SUMMARY_TICKS`
+/// adapt ticks (5 s at `adapt::TICK` = 1 s) -- the per-session diagnostic the
+/// 2026-10-13 audit found missing: without it `agent.log` says nothing about
+/// whether frames were captured, encoded or sent when a user reports a freeze.
+/// Deterministic (no clock inside): the caller drives it with `tick`.
+struct StatsWindow {
+    ticks: u32,
+    bytes: u64,
+    last_loss: f32,
+    last_remb_kbps: Option<u32>,
+    captured: u64,
+    encoded: u64,
+    dropped: u64,
+    paced_out: u64,
+    overwritten: u64,
+    keyframes: u64,
+    keyframe_repeats: u64,
+    encode_us_total: u64,
+}
+
+impl StatsWindow {
+    fn new(stats: &crate::pipeline::PipelineStats) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        Self {
+            ticks: 0,
+            bytes: 0,
+            last_loss: 0.0,
+            last_remb_kbps: None,
+            captured: stats.captured.load(Relaxed),
+            encoded: stats.encoded.load(Relaxed),
+            dropped: stats.dropped.load(Relaxed),
+            paced_out: stats.paced_out.load(Relaxed),
+            overwritten: stats.overwritten.load(Relaxed),
+            keyframes: stats.keyframes.load(Relaxed),
+            keyframe_repeats: stats.keyframe_repeats.load(Relaxed),
+            encode_us_total: stats.encode_us_total.load(Relaxed),
+        }
+    }
+
+    fn frame(&mut self, bytes: usize) {
+        self.bytes += bytes as u64;
+    }
+
+    fn loss(&mut self, fraction: f32) {
+        self.last_loss = fraction;
+    }
+
+    fn remb(&mut self, kbps: u32) {
+        self.last_remb_kbps = Some(kbps);
+    }
+
+    fn tick(&mut self, stats: &crate::pipeline::PipelineStats) -> Option<StatsSummary> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.ticks += 1;
+        if self.ticks < SUMMARY_TICKS {
+            return None;
+        }
+        let seconds = self.ticks;
+        let captured = stats.captured.load(Relaxed);
+        let encoded = stats.encoded.load(Relaxed);
+        let dropped = stats.dropped.load(Relaxed);
+        let paced_out = stats.paced_out.load(Relaxed);
+        let overwritten = stats.overwritten.load(Relaxed);
+        let keyframes = stats.keyframes.load(Relaxed);
+        let keyframe_repeats = stats.keyframe_repeats.load(Relaxed);
+        let encode_us_total = stats.encode_us_total.load(Relaxed);
+        let d_encoded = encoded.saturating_sub(self.encoded);
+        let d_us = encode_us_total.saturating_sub(self.encode_us_total);
+        let summary = StatsSummary {
+            seconds,
+            captured: captured.saturating_sub(self.captured),
+            encoded: d_encoded,
+            dropped: dropped.saturating_sub(self.dropped),
+            paced_out: paced_out.saturating_sub(self.paced_out),
+            overwritten: overwritten.saturating_sub(self.overwritten),
+            keyframes: keyframes.saturating_sub(self.keyframes),
+            keyframe_repeats: keyframe_repeats.saturating_sub(self.keyframe_repeats),
+            kbps: self.bytes * 8 / 1000 / u64::from(seconds),
+            encode_ms_avg: if d_encoded == 0 {
+                0.0
+            } else {
+                d_us as f64 / d_encoded as f64 / 1000.0
+            },
+            encode_ms_max: stats.encode_us_max.swap(0, Relaxed) as f64 / 1000.0,
+            loss: self.last_loss,
+            remb_kbps: self.last_remb_kbps,
+        };
+        self.ticks = 0;
+        self.bytes = 0;
+        self.captured = captured;
+        self.encoded = encoded;
+        self.dropped = dropped;
+        self.paced_out = paced_out;
+        self.overwritten = overwritten;
+        self.keyframes = keyframes;
+        self.keyframe_repeats = keyframe_repeats;
+        self.encode_us_total = encode_us_total;
+        Some(summary)
+    }
+}
+
 /// Drives the adaptation controller for one session: applies every
 /// `Feedback` as it arrives, ticks the controller once a second, and on
 /// every `Decision` updates the encoder's rate (via `rate_control`) and
@@ -2942,6 +3063,7 @@ async fn run_adapt_task(
 ) {
     let now = Instant::now();
     let mut controller = Controller::new(cfg, now);
+    let mut window = StatsWindow::new(&pipeline_stats);
     // Capture-slot overwrites are read off the pipeline's counter as a delta
     // per tick (see `Feedback::Overrun`), not pushed per event.
     let mut overwritten_seen = pipeline_stats
@@ -2966,7 +3088,15 @@ async fn run_adapt_task(
         tokio::select! {
             fb = rx.recv() => {
                 match fb {
-                    Some(fb) => controller.feedback(fb, Instant::now()),
+                    Some(fb) => {
+                        match &fb {
+                            Feedback::Frame { bytes } => window.frame(*bytes),
+                            Feedback::Loss { fraction } => window.loss(*fraction),
+                            Feedback::Remb { bitrate_bps } => window.remb((bitrate_bps / 1000) as u32),
+                            _ => {}
+                        }
+                        controller.feedback(fb, Instant::now());
+                    }
                     None => break,
                 }
             }
@@ -2978,6 +3108,27 @@ async fn run_adapt_task(
                 overwritten_seen = overwritten_now;
                 if overrun > 0 {
                     controller.feedback(Feedback::Overrun { frames: overrun }, Instant::now());
+                }
+                if let Some(s) = window.tick(&pipeline_stats) {
+                    let target = controller.target();
+                    tracing::info!(
+                        captured = s.captured,
+                        encoded = s.encoded,
+                        dropped = s.dropped,
+                        paced_out = s.paced_out,
+                        overwritten = s.overwritten,
+                        keyframes = s.keyframes,
+                        keyframe_repeats = s.keyframe_repeats,
+                        kbps = s.kbps,
+                        encode_ms_avg = format_args!("{:.1}", s.encode_ms_avg),
+                        encode_ms_max = format_args!("{:.1}", s.encode_ms_max),
+                        loss = format_args!("{:.3}", s.loss),
+                        remb_kbps = ?s.remb_kbps,
+                        target_kbps = target.bitrate_kbps,
+                        target_fps = target.fps,
+                        "video: {}s summary",
+                        s.seconds
+                    );
                 }
                 if let Some(decision) = controller.tick(Instant::now()) {
                     rate_control.set(decision.target);
@@ -3103,6 +3254,51 @@ pub(crate) fn test_ctx() -> HostContext {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stats_window_summarises_every_five_ticks() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let stats = crate::pipeline::PipelineStats::default();
+        let mut w = StatsWindow::new(&stats);
+        for _ in 0..4 {
+            assert!(w.tick(&stats).is_none());
+        }
+        stats.captured.store(150, Relaxed);
+        stats.encoded.store(140, Relaxed);
+        stats.encode_us_total.store(140 * 3000, Relaxed);
+        stats.encode_us_max.store(12_000, Relaxed);
+        for _ in 0..140 {
+            w.frame(5000);
+        }
+        w.loss(0.02);
+        let s = w.tick(&stats).expect("fifth tick yields a summary");
+        assert_eq!(s.captured, 150);
+        assert_eq!(s.encoded, 140);
+        assert_eq!(s.kbps, 1120);
+        assert!((s.encode_ms_avg - 3.0).abs() < 0.01);
+        assert!((s.encode_ms_max - 12.0).abs() < 0.01);
+        assert_eq!(s.loss, 0.02);
+        assert_eq!(stats.encode_us_max.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn stats_window_reports_deltas_not_totals() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let stats = crate::pipeline::PipelineStats::default();
+        let mut w = StatsWindow::new(&stats);
+        stats.captured.store(150, Relaxed);
+        for _ in 0..4 {
+            assert!(w.tick(&stats).is_none());
+        }
+        assert!(w.tick(&stats).is_some());
+        stats.captured.fetch_add(10, Relaxed);
+        for _ in 0..4 {
+            assert!(w.tick(&stats).is_none());
+        }
+        let s = w.tick(&stats).expect("second summary");
+        assert_eq!(s.captured, 10);
+        assert_eq!(s.kbps, 0);
+    }
+
     use super::*;
 
     // `tokio/test-util` в воркспейсе не включён, поэтому вместо paused-времени

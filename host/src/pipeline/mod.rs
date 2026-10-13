@@ -95,6 +95,13 @@ pub struct PipelineStats {
     /// changes. Included in `keyframes` too; this counts the subset that
     /// came from a repeat rather than a freshly captured frame.
     pub keyframe_repeats: AtomicU64,
+    /// Sum of wall-clock time spent inside `Encoder::encode` for every call that returned
+    /// `Ok(Some(_))`, in microseconds -- read as a delta per window together with `encoded`
+    /// to get an average (see `signaling::StatsWindow`).
+    pub encode_us_total: AtomicU64,
+    /// Longest single `Encoder::encode` call seen since the last reader reset it with
+    /// `swap(0)` (`StatsWindow` does, once per summary window).
+    pub encode_us_max: AtomicU64,
 }
 
 /// Runtime bitrate/fps target shared between whoever drives adaptation
@@ -307,8 +314,12 @@ impl Pipeline {
                                 let force_keyframe = request_keyframe.swap(false, Ordering::AcqRel);
                                 if force_keyframe {
                                     last.set_ts(Instant::now());
+                                    let started = Instant::now();
                                     match encoder.encode(last, true) {
                                         Ok(Some(encoded)) => {
+                                            let us = started.elapsed().as_micros() as u64;
+                                            stats.encode_us_total.fetch_add(us, Ordering::Relaxed);
+                                            stats.encode_us_max.fetch_max(us, Ordering::Relaxed);
                                             stats.encoded.fetch_add(1, Ordering::Relaxed);
                                             stats.keyframes.fetch_add(1, Ordering::Relaxed);
                                             stats.keyframe_repeats.fetch_add(1, Ordering::Relaxed);
@@ -378,8 +389,12 @@ impl Pipeline {
 
                     let force_keyframe = request_keyframe.swap(false, Ordering::AcqRel);
 
+                    let started = Instant::now();
                     match encoder.encode(&raw, force_keyframe) {
                         Ok(Some(encoded)) => {
+                            let us = started.elapsed().as_micros() as u64;
+                            stats.encode_us_total.fetch_add(us, Ordering::Relaxed);
+                            stats.encode_us_max.fetch_max(us, Ordering::Relaxed);
                             stats.encoded.fetch_add(1, Ordering::Relaxed);
                             if encoded.keyframe {
                                 stats.keyframes.fetch_add(1, Ordering::Relaxed);
