@@ -32,8 +32,8 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE, MFT_OUTPUT_STREAM_INFO,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NONE,
-    MF_EVENT_FLAG_NO_WAIT, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT,
+    MF_E_NOTACCEPTING, MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT,
     MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC,
     MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
@@ -48,6 +48,11 @@ use crate::encode::convert::i420_to_nv12;
 use crate::encode::{nal_types, to_i420};
 
 use super::{EncodeError, EncodedFrame, Encoder, EncoderConfig, RateTarget};
+
+/// Maximum time `encode()` waits for a `METransformNeedInput` credit. A
+/// hardware MFT returns `NeedInput` within milliseconds; 2 s means the encoder
+/// is stuck, and an honest `Err` (the D58 path) beats waiting forever.
+const CREDIT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct MediaFoundationEncoder {
     transform: IMFTransform,
@@ -488,11 +493,12 @@ impl MediaFoundationEncoder {
         self.drain_output()
     }
 
+    /// Async-MFT submit path. Hardware MFTs may deliver `METransformHaveOutput`
+    /// before the next `METransformNeedInput`, so `ProcessInput` is called only
+    /// once `wait_for_credit` has secured a credit (otherwise `MF_E_NOTACCEPTING`).
     fn encode_async(&mut self, sample: IMFSample) -> Result<Option<EncodedFrame>, EncodeError> {
         self.drain_events_no_wait()?;
-        if self.credits == 0 {
-            self.wait_for_event()?;
-        }
+        self.wait_for_credit()?;
         // SAFETY: `sample` was just built by `build_input_sample`.
         unsafe { self.transform.ProcessInput(0, &sample, 0) }.map_err(|err| {
             EncodeError::Backend(format!("MediaFoundation ProcessInput (async): {err}"))
@@ -521,18 +527,37 @@ impl MediaFoundationEncoder {
         }
     }
 
-    /// Blocks for exactly one event and handles it -- used when `encode()`
-    /// has no `METransformNeedInput` credit left and must wait for one
-    /// before it can submit the next frame.
-    fn wait_for_event(&mut self) -> Result<(), EncodeError> {
+    /// Waits (bounded by `CREDIT_WAIT_TIMEOUT`) until at least one
+    /// `METransformNeedInput` credit is available, handling every event that
+    /// arrives meanwhile. A hardware MFT can emit `METransformHaveOutput`
+    /// before `NeedInput`, so waiting for a single event is not enough.
+    fn wait_for_credit(&mut self) -> Result<(), EncodeError> {
         let Some(events) = self.events.clone() else {
             return Ok(());
         };
-        // SAFETY: same as `drain_events_no_wait`; `MF_EVENT_FLAG_NONE`
-        // blocks until an event is available.
-        let event = unsafe { events.GetEvent(MF_EVENT_FLAG_NONE) }
-            .map_err(|err| EncodeError::Backend(format!("MediaFoundation GetEvent: {err}")))?;
-        self.handle_event(&event)
+        let deadline = Instant::now() + CREDIT_WAIT_TIMEOUT;
+        while self.credits == 0 {
+            if Instant::now() >= deadline {
+                return Err(EncodeError::Backend(format!(
+                    "MediaFoundation: no METransformNeedInput within {:?} (async MFT starved of input credits)",
+                    CREDIT_WAIT_TIMEOUT
+                )));
+            }
+            // SAFETY: same as `drain_events_no_wait`; `MF_EVENT_FLAG_NO_WAIT`
+            // never blocks.
+            match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                Ok(event) => self.handle_event(&event)?,
+                Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) => {
+                    return Err(EncodeError::Backend(format!(
+                        "MediaFoundation GetEvent: {err}"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn handle_event(&mut self, event: &IMFMediaEvent) -> Result<(), EncodeError> {
