@@ -229,6 +229,12 @@ pub enum AgentStatus {
 /// `DisconnectTimeout` arms.
 const DISCONNECT_GRACE: Duration = Duration::from_secs(15);
 
+/// Upper bound for the whole signaling handshake (TCP + WS + `Hello` +
+/// `HostRegister` + waiting for `Registered`). 30 s is far beyond any honest
+/// RTT, while an accept that never answers would otherwise freeze
+/// `run_agent` forever.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Slice 3.2c: how long a `PendingAuth` (armed on `AuthRequired`, see
 /// `handle_signal_message`'s `PeerJoined` arm) waits for the client to
 /// finish its OPAQUE login before the host gives up and sends `Bye`. Same
@@ -345,6 +351,32 @@ impl SignalingClient {
     /// reconnect -- slice 3.2a/D35, see `SessionSlot::current_session_id`),
     /// and waits for `Registered`.
     pub async fn connect(
+        url: &str,
+        name: &str,
+        device: Option<DeviceCredentials>,
+        session_id: Option<String>,
+    ) -> Result<Self, ConnectError> {
+        Self::connect_with_timeout(url, name, device, session_id, CONNECT_TIMEOUT).await
+    }
+
+    /// Same as [`Self::connect`], but the whole handshake is bounded by
+    /// `timeout`.
+    pub async fn connect_with_timeout(
+        url: &str,
+        name: &str,
+        device: Option<DeviceCredentials>,
+        session_id: Option<String>,
+        timeout: Duration,
+    ) -> Result<Self, ConnectError> {
+        match tokio::time::timeout(timeout, Self::handshake(url, name, device, session_id)).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(ConnectError::Other(anyhow::anyhow!(
+                "signaling connect timed out after {timeout:?}"
+            ))),
+        }
+    }
+
+    async fn handshake(
         url: &str,
         name: &str,
         device: Option<DeviceCredentials>,
@@ -5370,6 +5402,42 @@ mod tests {
             !status_rx.has_changed().unwrap(),
             "status must not change -- it was already Registered"
         );
+    }
+
+    /// A server that accepts TCP + WS but never answers must not freeze
+    /// `connect`: the handshake is bounded by the timeout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_times_out_when_the_server_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}/ws");
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            // Read everything, answer nothing, keep the connection open.
+            while ws.next().await.is_some() {}
+        });
+
+        let started = Instant::now();
+        let result = SignalingClient::connect_with_timeout(
+            &url,
+            "test-host",
+            None,
+            None,
+            Duration::from_millis(300),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        match result {
+            Err(ConnectError::Other(err)) => {
+                assert!(err.to_string().contains("timed out"), "got: {err}");
+            }
+            Err(ConnectError::UnknownDevice) => panic!("expected a timeout, got UnknownDevice"),
+            Ok(_) => panic!("expected a timeout, got a connection"),
+        }
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
     }
 
     /// Slice 3.5a: `run` must not shut an active session down when it
