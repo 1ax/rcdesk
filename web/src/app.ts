@@ -22,7 +22,10 @@ import {
   downloadFailLabel,
   dragHasFiles,
   failReasonLabel,
+  groupByRelativePath,
   pickDroppedFiles,
+  readFolder,
+  type DirEntryLike,
 } from "./fileTransfer";
 import type { OfferedFile } from "./generated/OfferedFile";
 import { applyCursor } from "./cursor";
@@ -360,6 +363,8 @@ export function mount(root: Element | null): void {
           <button id="file-fetch-btn" class="btn btn-secondary" hidden>Скачать</button>
           <button id="file-send-btn" class="btn btn-secondary" hidden>Отправить файлы</button>
           <input id="file-input" type="file" multiple hidden />
+          <button id="folder-send-btn" class="btn btn-secondary" hidden>Отправить папку</button>
+          <input id="folder-input" type="file" webkitdirectory multiple hidden />
           <select id="display-select" class="display-select" hidden></select>
           <select id="quality-select" class="quality-select" title="Качество"></select>
           <label id="cmd-as-ctrl-label" class="cmd-as-ctrl-toggle" hidden>
@@ -507,6 +512,8 @@ export function mount(root: Element | null): void {
   const fileFetchBtn = root.querySelector<HTMLButtonElement>("#file-fetch-btn")!;
   const fileSendBtn = root.querySelector<HTMLButtonElement>("#file-send-btn")!;
   const fileInput = root.querySelector<HTMLInputElement>("#file-input")!;
+  const folderSendBtn = root.querySelector<HTMLButtonElement>("#folder-send-btn")!;
+  const folderInput = root.querySelector<HTMLInputElement>("#folder-input")!;
   const fileDropHint = root.querySelector<HTMLDivElement>("#file-drop-hint")!;
   const sessionVideoEl = root.querySelector<HTMLDivElement>(".session-video")!;
   const fullscreenBtn = root.querySelector<HTMLButtonElement>("#fullscreen-btn")!;
@@ -793,6 +800,7 @@ export function mount(root: Element | null): void {
 
   function updateFileUi(): void {
     fileSendBtn.hidden = !filesAvailable();
+    folderSendBtn.hidden = !filesAvailable();
     if (!filesAvailable()) {
       fileStatusEl.hidden = true;
       fileStatusTextEl.textContent = "";
@@ -826,11 +834,27 @@ export function mount(root: Element | null): void {
     fileDropHint.hidden = true;
   }
 
-  /** Queues `files` for upload and reports skipped folders (slice 3.4b). */
-  function submitFiles(files: File[], folders: number): void {
+  /** Queues `files` for upload (slice 3.4b). */
+  function submitFiles(files: File[]): void {
     if (!fileSender || !filesEnabled) return;
-    if (folders > 0) showClipboardNote(`Папки пока не поддерживаются: пропущено ${folders}`);
     fileSender.enqueue(files);
+  }
+
+  /** Reads dropped folders one by one and queues each as a folder upload. */
+  async function submitDroppedFolders(folders: DirEntryLike[]): Promise<void> {
+    for (const folder of folders) {
+      try {
+        const { entries, skipped } = await readFolder(folder);
+        if (entries.length === 0) {
+          showClipboardNote(`Пустая папка не отправлена: ${folder.name}`);
+        } else if (fileSender && filesEnabled) {
+          fileSender.enqueueFolder(entries);
+        }
+        if (skipped > 0) showClipboardNote(`Не удалось прочитать: ${skipped}`);
+      } catch {
+        showClipboardNote(`Не удалось прочитать: ${folder.name}`);
+      }
+    }
   }
 
   function setupFileChannel(dc: RTCDataChannel): void {
@@ -1533,7 +1557,17 @@ export function mount(root: Element | null): void {
     const files = Array.from(fileInput.files ?? []);
     // Reset so picking the same file again fires `change` again.
     fileInput.value = "";
-    submitFiles(files, 0);
+    submitFiles(files);
+  });
+  folderSendBtn.addEventListener("click", () => {
+    folderInput.click();
+  });
+  folderInput.addEventListener("change", () => {
+    const entries = groupByRelativePath(Array.from(folderInput.files ?? []));
+    folderInput.value = "";
+    if (entries.length === 0) return;
+    if (!fileSender || !filesEnabled) return;
+    fileSender.enqueueFolder(entries);
   });
   fileCancelBtn.addEventListener("click", () => {
     fileSender?.cancelAll();
@@ -1582,7 +1616,8 @@ export function mount(root: Element | null): void {
     hideFileDropHint();
     if (!filesAvailable() || !e.dataTransfer) return;
     const { files, folders } = pickDroppedFiles(e.dataTransfer);
-    submitFiles(files, folders);
+    submitFiles(files);
+    void submitDroppedFolders(folders);
   });
 
   function setSessionStatus(status: SessionStatus): void {

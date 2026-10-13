@@ -10,7 +10,11 @@ import {
   downloadFailLabel,
   dragHasFiles,
   failReasonLabel,
+  groupByRelativePath,
   pickDroppedFiles,
+  readFolder,
+  type DirEntryLike,
+  type EntryLike,
   type DataTransferLike,
   type FileChannelLike,
   type DownloadFailReason,
@@ -287,31 +291,156 @@ describe("failReasonLabel", () => {
 
 describe("pickDroppedFiles", () => {
   const file = (name: string) => ({ name }) as unknown as File;
+  const folderEntry = { isDirectory: true, isFile: false, name: "Фото" };
   const item = (f: File | null, dir: boolean | null, kind = "file") => ({
     kind,
     getAsFile: () => f,
-    webkitGetAsEntry: () => (dir === null ? null : { isDirectory: dir }),
+    webkitGetAsEntry: () =>
+      dir === null ? null : dir ? folderEntry : { isDirectory: false, isFile: true, name: "x" },
   });
 
-  it("keeps files and counts folders", () => {
+  it("separates files and folder entries", () => {
     const a = file("a");
     const b = file("b");
     const dt: DataTransferLike = {
       items: [item(a, false), item(null, true), item(b, null), item(null, null, "string")],
       files: [],
     };
-    expect(pickDroppedFiles(dt)).toEqual({ files: [a, b], folders: 1 });
+    const res = pickDroppedFiles(dt);
+    expect(res.files).toEqual([a, b]);
+    expect(res.folders).toHaveLength(1);
+    expect(res.folders[0]).toBe(folderEntry);
   });
 
   it("falls back to files when items are unavailable", () => {
     const a = file("a");
-    expect(pickDroppedFiles({ files: [a] })).toEqual({ files: [a], folders: 0 });
+    expect(pickDroppedFiles({ files: [a] })).toEqual({ files: [a], folders: [] });
   });
 
   it("detects file drags", () => {
     expect(dragHasFiles({ types: ["Files"] })).toBe(true);
     expect(dragHasFiles({ types: ["text/plain"] })).toBe(false);
     expect(dragHasFiles(null)).toBe(false);
+  });
+});
+
+describe("FileSender folders", () => {
+  it("sends folder and dir in start, numbering folders from 1", async () => {
+    const ch = new FakeChannel();
+    const tx = new FileSender(ch, 100);
+    tx.enqueueFolder([
+      { file: fakeFile("a", 0), dir: "Фото" },
+      { file: fakeFile("b", 0), dir: "Фото/2024" },
+    ]);
+    await flush();
+    ch.hostSays({ type: "saved", id: 1, name: "a" });
+    await flush();
+    ch.hostSays({ type: "saved", id: 2, name: "b" });
+    await flush();
+    tx.enqueue([fakeFile("plain", 0)]);
+    await flush();
+    ch.hostSays({ type: "saved", id: 3, name: "plain" });
+    await flush();
+    tx.enqueueFolder([{ file: fakeFile("c", 0), dir: "Док" }]);
+    await flush();
+    const starts = ch.trace().filter((m) => (m as { type?: string }).type === "start");
+    expect(starts).toEqual([
+      { type: "start", id: 1, name: "a", size: 0, folder: 1, dir: "Фото" },
+      { type: "start", id: 2, name: "b", size: 0, folder: 1, dir: "Фото/2024" },
+      { type: "start", id: 3, name: "plain", size: 0 },
+      { type: "start", id: 4, name: "c", size: 0, folder: 2, dir: "Док" },
+    ]);
+  });
+
+  it("empty folder sends nothing and does not use a number", async () => {
+    const ch = new FakeChannel();
+    const tx = new FileSender(ch, 100);
+    tx.enqueueFolder([]);
+    await flush();
+    expect(ch.sent).toHaveLength(0);
+    tx.enqueueFolder([{ file: fakeFile("a", 0), dir: "D" }]);
+    await flush();
+    expect(ch.trace()[0]).toEqual({ type: "start", id: 1, name: "a", size: 0, folder: 1, dir: "D" });
+  });
+});
+
+type FakeNode = EntryLike & Partial<DirEntryLike> & { file?: FakeFileFn };
+type FakeFileFn = (ok: (f: File) => void, err: (e: unknown) => void) => void;
+
+const fakeFileEntry = (name: string, fail = false): FakeNode => ({
+  isDirectory: false,
+  isFile: true,
+  name,
+  file: (ok, err) => (fail ? err(new Error("x")) : ok({ name } as unknown as File)),
+});
+
+/** `batches` are returned by successive `readEntries` calls, then `[]`;
+ * a `fail` directory errors on read. */
+const fakeDir = (name: string, batches: FakeNode[][], fail = false): DirEntryLike => ({
+  isDirectory: true,
+  isFile: false,
+  name,
+  createReader: () => {
+    let i = 0;
+    return {
+      readEntries: (ok, err) => {
+        if (fail) err(new Error("x"));
+        else ok(i < batches.length ? (batches[i++] as EntryLike[]) : []);
+      },
+    };
+  },
+});
+
+describe("readFolder", () => {
+  it("walks nested folders with dir from names", async () => {
+    const sub = fakeDir("2024", [[fakeFileEntry("b")]]);
+    const root = fakeDir("Фото", [[fakeFileEntry("a"), sub as FakeNode]]);
+    const res = await readFolder(root);
+    expect(res.skipped).toBe(0);
+    expect(res.entries.map((e) => [e.file.name, e.dir])).toEqual([
+      ["a", "Фото"],
+      ["b", "Фото/2024"],
+    ]);
+  });
+
+  it("reads entries in batches until empty", async () => {
+    const root = fakeDir("R", [[fakeFileEntry("a")], [fakeFileEntry("b")]]);
+    const res = await readFolder(root);
+    expect(res.entries.map((e) => e.file.name)).toEqual(["a", "b"]);
+  });
+
+  it("empty subfolder yields nothing", async () => {
+    const root = fakeDir("R", [[fakeDir("empty", []) as FakeNode]]);
+    expect(await readFolder(root)).toEqual({ entries: [], skipped: 0 });
+  });
+
+  it("skips .DS_Store silently", async () => {
+    const root = fakeDir("R", [[fakeFileEntry(".DS_Store"), fakeFileEntry("a")]]);
+    const res = await readFolder(root);
+    expect(res.entries.map((e) => e.file.name)).toEqual(["a"]);
+    expect(res.skipped).toBe(0);
+  });
+
+  it("counts failed file() and failed subfolder reads", async () => {
+    const bad = fakeDir("bad", [], true);
+    const root = fakeDir("R", [[fakeFileEntry("x", true), bad as FakeNode, fakeFileEntry("ok")]]);
+    const res = await readFolder(root);
+    expect(res.entries.map((e) => e.file.name)).toEqual(["ok"]);
+    expect(res.skipped).toBe(2);
+  });
+});
+
+describe("groupByRelativePath", () => {
+  it("derives dir, skipping .DS_Store and empty paths", () => {
+    const f = (name: string, rel: string) => ({ name, webkitRelativePath: rel });
+    const res = groupByRelativePath([
+      f("a.txt", "Фото/2024/a.txt"),
+      f("b.txt", "Фото/b.txt"),
+      f(".DS_Store", "Фото/.DS_Store"),
+      f("loose", ""),
+    ]);
+    expect(res.map((e) => e.dir)).toEqual(["Фото/2024", "Фото"]);
+    expect(res.map((e) => e.file.name)).toEqual(["a.txt", "b.txt"]);
   });
 });
 

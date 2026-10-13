@@ -91,16 +91,23 @@ interface Current {
   outcome: "saved" | "aborted" | "cancelled" | null;
 }
 
+interface QueueItem {
+  file: FileLike;
+  folder?: number;
+  dir?: string;
+}
+
 /** Sends queued files one at a time over a `file` channel. */
 export class FileSender {
   private readonly channel: FileChannelLike;
   private readonly chunkSize: number;
   private readonly cb: FileSenderCallbacks;
-  private queue: FileLike[] = [];
+  private queue: QueueItem[] = [];
   private current: Current | null = null;
   private running = false;
   private closed = false;
   private nextId = 1;
+  private nextFolder = 1;
   private total = 0;
   private done = 0;
   private waiters: Array<() => void> = [];
@@ -123,8 +130,22 @@ export class FileSender {
       for (const f of files) this.cb.onError?.(f.name, "closed");
       return;
     }
-    this.queue.push(...files);
+    this.queue.push(...files.map((file) => ({ file })));
     this.total += files.length;
+    if (!this.running) void this.run();
+  }
+
+  /** Queues the files of one folder under a fresh folder number; `dir` is
+   * each file's directory relative to the receiving root (root included). */
+  enqueueFolder(entries: Array<{ file: FileLike; dir: string }>): void {
+    if (entries.length === 0) return;
+    if (this.closed) {
+      for (const e of entries) this.cb.onError?.(e.file.name, "closed");
+      return;
+    }
+    const folder = this.nextFolder++;
+    this.queue.push(...entries.map((e) => ({ file: e.file, folder, dir: e.dir })));
+    this.total += entries.length;
     if (!this.running) void this.run();
   }
 
@@ -209,8 +230,8 @@ export class FileSender {
     this.running = true;
     try {
       while (this.queue.length > 0 && !this.closed) {
-        const file = this.queue.shift()!;
-        await this.transfer(file);
+        const item = this.queue.shift()!;
+        await this.transfer(item);
         this.done += 1;
       }
     } finally {
@@ -232,11 +253,23 @@ export class FileSender {
     });
   }
 
-  private async transfer(file: FileLike): Promise<void> {
+  private async transfer(item: QueueItem): Promise<void> {
+    const file = item.file;
     const cur: Current = { id: this.nextId++, outcome: null };
     this.current = cur;
     try {
-      this.sendJson({ type: "start", id: cur.id, name: file.name, size: file.size });
+      if (item.folder !== undefined && item.dir !== undefined) {
+        this.sendJson({
+          type: "start",
+          id: cur.id,
+          name: file.name,
+          size: file.size,
+          folder: item.folder,
+          dir: item.dir,
+        });
+      } else {
+        this.sendJson({ type: "start", id: cur.id, name: file.name, size: file.size });
+      }
       this.progress(file, 0);
       let offset = 0;
       while (offset < file.size) {
@@ -505,10 +538,29 @@ export class FileReceiver {
   }
 }
 
+/** Minimal shape of a `FileSystemEntry` (file or directory). */
+export interface EntryLike {
+  readonly isDirectory: boolean;
+  readonly isFile: boolean;
+  readonly name: string;
+}
+
+/** Minimal shape of a `FileSystemFileEntry`. */
+export interface FileEntryLike extends EntryLike {
+  file(ok: (file: File) => void, err: (error: unknown) => void): void;
+}
+
+/** Minimal shape of a `FileSystemDirectoryEntry`. */
+export interface DirEntryLike extends EntryLike {
+  createReader(): {
+    readEntries(ok: (entries: EntryLike[]) => void, err: (error: unknown) => void): void;
+  };
+}
+
 /** Minimal shape of a `DataTransferItem`. */
 export interface DropItemLike {
   readonly kind: string;
-  webkitGetAsEntry?(): { isDirectory: boolean } | null;
+  webkitGetAsEntry?(): EntryLike | null;
   getAsFile(): File | null;
 }
 
@@ -518,18 +570,19 @@ export interface DataTransferLike {
   readonly files: ArrayLike<File>;
 }
 
-/** Picks the plain files out of a drop: folders are skipped and counted.
- * Must be called synchronously in the `drop` handler (Safari clears the
- * `DataTransfer` afterwards). */
-export function pickDroppedFiles(dt: DataTransferLike): { files: File[]; folders: number } {
+/** Splits a drop into plain files and folder entries. Must be called
+ * synchronously in the `drop` handler (Safari clears the `DataTransfer`
+ * afterwards); the folders are read later with `readFolder`. */
+export function pickDroppedFiles(dt: DataTransferLike): { files: File[]; folders: DirEntryLike[] } {
   const files: File[] = [];
-  let folders = 0;
+  const folders: DirEntryLike[] = [];
   if (dt.items && dt.items.length > 0) {
     for (let i = 0; i < dt.items.length; i++) {
       const item = dt.items[i]!;
       if (item.kind !== "file") continue;
-      if (item.webkitGetAsEntry?.()?.isDirectory) {
-        folders += 1;
+      const entry = item.webkitGetAsEntry?.();
+      if (entry?.isDirectory) {
+        folders.push(entry as DirEntryLike);
         continue;
       }
       const f = item.getAsFile();
@@ -539,6 +592,81 @@ export function pickDroppedFiles(dt: DataTransferLike): { files: File[]; folders
     for (let i = 0; i < dt.files.length; i++) files.push(dt.files[i]!);
   }
   return { files, folders };
+}
+
+const IGNORED_FILE_NAME = ".DS_Store";
+
+/** Walks a dropped folder recursively. `dir` is the file's directory path
+ * from the root (root name included, `/`-separated), built from entry names.
+ * Unreadable subfolders/files are skipped and counted. */
+export async function readFolder(
+  root: DirEntryLike,
+): Promise<{ entries: Array<{ file: File; dir: string }>; skipped: number }> {
+  const entries: Array<{ file: File; dir: string }> = [];
+  let skipped = 0;
+
+  const readAll = (dir: DirEntryLike): Promise<EntryLike[]> =>
+    new Promise((resolve, reject) => {
+      const reader = dir.createReader();
+      const all: EntryLike[] = [];
+      const next = (): void => {
+        reader.readEntries((batch) => {
+          if (batch.length === 0) {
+            resolve(all);
+            return;
+          }
+          all.push(...batch);
+          next();
+        }, reject);
+      };
+      next();
+    });
+
+  const getFile = (entry: FileEntryLike): Promise<File> =>
+    new Promise((resolve, reject) => entry.file(resolve, reject));
+
+  const walk = async (dir: DirEntryLike, path: string): Promise<void> => {
+    let children: EntryLike[];
+    try {
+      children = await readAll(dir);
+    } catch {
+      skipped += 1;
+      return;
+    }
+    for (const child of children) {
+      if (child.isDirectory) {
+        await walk(child as DirEntryLike, `${path}/${child.name}`);
+      } else if (child.isFile) {
+        if (child.name === IGNORED_FILE_NAME) continue;
+        try {
+          entries.push({ file: await getFile(child as FileEntryLike), dir: path });
+        } catch {
+          skipped += 1;
+        }
+      }
+    }
+  };
+
+  await walk(root, root.name);
+  return { entries, skipped };
+}
+
+/** Groups a `webkitdirectory` pick into folder entries: `dir` comes from
+ * `webkitRelativePath` (`Фото/2024/a.txt` -> `Фото/2024`). Files without a
+ * relative path and `.DS_Store` are skipped. */
+export function groupByRelativePath(
+  files: ArrayLike<{ name: string; webkitRelativePath: string }>,
+): Array<{ file: File; dir: string }> {
+  const out: Array<{ file: File; dir: string }> = [];
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i]!;
+    const rel = file.webkitRelativePath;
+    if (!rel || file.name === IGNORED_FILE_NAME) continue;
+    const slash = rel.lastIndexOf("/");
+    if (slash <= 0) continue;
+    out.push({ file: file as unknown as File, dir: rel.slice(0, slash) });
+  }
+  return out;
 }
 
 /** Whether a drag carries files (as opposed to text/links). */
