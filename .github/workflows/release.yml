@@ -67,6 +67,10 @@ jobs:
   release:
     needs: [version, build-host]
     runs-on: ubuntu-latest
+    # Окружение `release` (слайс G): секрет RELEASE_SIGN_KEY живёт в нём, а не в
+    # репозитории, и доступен только этому job после одобрения владельца
+    # (required reviewer). Остальные job ключ не видят.
+    environment: release
     permissions:
       contents: write
     env:
