@@ -514,6 +514,48 @@ describe("FileReceiver", () => {
     expect(rx.fetch()).toBe(true);
   });
 
+  it("aborts with protocol when start claims more than the offer (slice E4)", () => {
+    const { ch, ev, rx } = setupRecv();
+    ch.hostSays(offerMsg(1, [["a.bin", 5]]));
+    rx.fetch();
+    ch.hostSays({ type: "start", id: H, name: "a.bin", size: 6 });
+    expect(ch.trace()).toContainEqual({ type: "abort", id: H, reason: "protocol" });
+    expect(ev.errors).toEqual([["a.bin", "protocol"]]);
+    const sent = ch.trace().length;
+    hostChunk(ch, bin(1, 2, 3));
+    ch.hostSays({ type: "end", id: H });
+    expect(ch.trace().length).toBe(sent);
+    expect(ev.files).toEqual([]);
+    expect(ev.errors.length).toBe(1);
+  });
+
+  it("aborts with protocol when the second start exceeds the remaining budget (slice E4)", () => {
+    const { ch, ev, rx } = setupRecv();
+    ch.hostSays(offerMsg(1, [["a", 3], ["b", 2]]));
+    rx.fetch();
+    ch.hostSays({ type: "start", id: H, name: "a", size: 3 });
+    hostChunk(ch, bin(1, 2, 3));
+    ch.hostSays({ type: "end", id: H });
+    expect(ev.files.map((f) => f.name)).toEqual(["a"]);
+    ch.hostSays({ type: "start", id: H + 1, name: "b", size: 3 });
+    expect(ch.trace()).toContainEqual({ type: "abort", id: H + 1, reason: "protocol" });
+    expect(ev.errors).toEqual([["b", "protocol"]]);
+  });
+
+  it("accepts a start within the remaining budget (slice E4)", () => {
+    const { ch, ev, rx } = setupRecv();
+    ch.hostSays(offerMsg(1, [["a", 3], ["b", 2]]));
+    rx.fetch();
+    ch.hostSays({ type: "start", id: H, name: "a", size: 3 });
+    hostChunk(ch, bin(1, 2, 3));
+    ch.hostSays({ type: "end", id: H });
+    ch.hostSays({ type: "start", id: H + 1, name: "b", size: 2 });
+    hostChunk(ch, bin(4, 5));
+    ch.hostSays({ type: "end", id: H + 1 });
+    expect(ev.files.map((f) => f.name)).toEqual(["a", "b"]);
+    expect(ev.errors).toEqual([]);
+  });
+
   it("assembles files into blobs with the right size and content", async () => {
     const { ch, ev, rx } = setupRecv();
     ch.hostSays(offerMsg(1, [["a.bin", 5], ["b.txt", 0]]));

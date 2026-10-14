@@ -14,7 +14,7 @@ import { PeerSession, toRtcIceServers } from "./session";
 import { summarizeStats, takeSnapshot } from "./stats";
 import type { Snapshot, StatsSummary } from "./stats";
 import { attachInput } from "./input";
-import { ClipboardBridge, isSafari } from "./clipboard";
+import { ClipboardBridge, isSafari, loadClipboardSyncSetting, saveClipboardSyncSetting } from "./clipboard";
 import {
   FileReceiver,
   FileSender,
@@ -357,6 +357,10 @@ export function mount(root: Element | null): void {
             <input type="checkbox" id="stats-checkbox" />
             Статистика
           </label>
+          <label class="stats-toggle" title="Синхронизировать буфер обмена с хостом в обе стороны">
+            <input type="checkbox" id="clipboard-sync-checkbox" />
+            Буфер обмена
+          </label>
           <span class="overlay" id="stats-overlay" hidden></span>
         </div>
         <div class="controls">
@@ -623,6 +627,10 @@ export function mount(root: Element | null): void {
   const sessionBarHandle = root.querySelector<HTMLButtonElement>("#session-bar-handle")!;
   const barCollapseBtn = root.querySelector<HTMLButtonElement>("#bar-collapse-btn")!;
   const statsCheckbox = root.querySelector<HTMLInputElement>("#stats-checkbox")!;
+  // Slice E4: clipboard sync is opt-in (off by default), remembered per browser.
+  const clipboardSyncCheckbox = root.querySelector<HTMLInputElement>("#clipboard-sync-checkbox")!;
+  let clipboardSyncEnabled = initialStorage ? loadClipboardSyncSetting(initialStorage) : false;
+  clipboardSyncCheckbox.checked = clipboardSyncEnabled;
   let statsVisible = initialStorage ? loadStatsVisible(initialStorage) : false;
   statsCheckbox.checked = statsVisible;
   overlay.hidden = !statsVisible;
@@ -963,6 +971,57 @@ export function mount(root: Element | null): void {
     }
     fullscreenNoteEl.hidden = true;
     fullscreenNoteEl.textContent = "";
+  }
+
+  /** Creates the `ClipboardBridge` and its listeners (slice E4: only when
+   * the user enabled clipboard sync; also called on toggle mid-session). */
+  function attachClipboardBridge(): void {
+    if (clipboardBridge) return;
+    if (navigator.clipboard) {
+      const clipboard = navigator.clipboard;
+      clipboardBridge = new ClipboardBridge({
+        writeText: (text) => clipboard.writeText(text),
+        readText: () => clipboard.readText(),
+        // The deferred `ClipboardItem` write (decision 3) is a
+        // Safari-only trick -- Chrome already gets the same result from
+        // `writeText` in `onHostText` (decision 1b).
+        writeDeferred: isSafari(navigator.userAgent)
+          ? (blob) => clipboard.write([new ClipboardItem({ "text/plain": blob })])
+          : undefined,
+        send: (msg) => {
+          if (inputChannel?.readyState === "open") {
+            inputChannel.send(JSON.stringify(msg));
+          }
+        },
+        notify: (note) => showClipboardNote(note),
+        setTimeout: (handler, ms) => setTimeout(handler, ms),
+        clearTimeout: (handle) => clearTimeout(handle),
+      });
+      window.addEventListener("focus", onClipboardFocusOrGesture);
+      document.addEventListener("pointerdown", onClipboardFocusOrGesture, true);
+      document.addEventListener("keydown", onClipboardFocusOrGesture, true);
+      if ("onclipboardchange" in clipboard) {
+        clipboard.addEventListener("clipboardchange", onClipboardChange);
+        clipboardChangeAttached = true;
+      }
+    } else {
+      console.warn("navigator.clipboard unavailable; clipboard sync disabled");
+    }
+  }
+
+  /** Removes the bridge and its listeners; with no bridge every
+   * `clipboardBridge?.…` call is a no-op (slice E4). */
+  function detachClipboardBridge(): void {
+    if (clipboardBridge) {
+      window.removeEventListener("focus", onClipboardFocusOrGesture);
+      document.removeEventListener("pointerdown", onClipboardFocusOrGesture, true);
+      document.removeEventListener("keydown", onClipboardFocusOrGesture, true);
+      if (clipboardChangeAttached) {
+        navigator.clipboard.removeEventListener("clipboardchange", onClipboardChange);
+        clipboardChangeAttached = false;
+      }
+    }
+    clipboardBridge = null;
   }
 
   function onClipboardFocusOrGesture(): void {
@@ -1399,14 +1458,15 @@ export function mount(root: Element | null): void {
   // reaching "connected" -- attach as soon as both are in hand.
   function maybeAttachInput(): void {
     if (detachInput || inputBlocked || !inputChannel || !pointerChannel) return;
-    const bridge = clipboardBridge;
     detachInput = attachInput(
       video,
       { input: inputChannel, pointer: pointerChannel },
-      bridge
+      // Slice E4: resolved at call time, so toggling the clipboard-sync
+      // checkbox mid-session takes effect without re-attaching input.
+      navigator.clipboard
         ? {
-            beforePaste: () => bridge.syncBeforePaste(),
-            onCopyShortcut: () => bridge.beginDeferredCopy(),
+            beforePaste: () => clipboardBridge?.syncBeforePaste() ?? Promise.resolve(),
+            onCopyShortcut: () => clipboardBridge?.beginDeferredCopy(),
           }
         : undefined,
       // Slice 3.5f: a getter, not `cmdAsCtrl` itself, so a later toggle
@@ -1902,16 +1962,7 @@ export function mount(root: Element | null): void {
     hostUpdateAvailable = false;
     hostUpdateBtn.hidden = true;
     hostUpdateBtn.disabled = false;
-    if (clipboardBridge) {
-      window.removeEventListener("focus", onClipboardFocusOrGesture);
-      document.removeEventListener("pointerdown", onClipboardFocusOrGesture, true);
-      document.removeEventListener("keydown", onClipboardFocusOrGesture, true);
-      if (clipboardChangeAttached) {
-        navigator.clipboard.removeEventListener("clipboardchange", onClipboardChange);
-        clipboardChangeAttached = false;
-      }
-    }
-    clipboardBridge = null;
+    detachClipboardBridge();
     if (clipboardNoteTimer !== undefined) {
       clearTimeout(clipboardNoteTimer);
       clipboardNoteTimer = undefined;
@@ -2148,36 +2199,7 @@ export function mount(root: Element | null): void {
     setSessionStatus("connecting");
     updateConnectionBanner();
 
-    if (navigator.clipboard) {
-      const clipboard = navigator.clipboard;
-      clipboardBridge = new ClipboardBridge({
-        writeText: (text) => clipboard.writeText(text),
-        readText: () => clipboard.readText(),
-        // The deferred `ClipboardItem` write (decision 3) is a
-        // Safari-only trick -- Chrome already gets the same result from
-        // `writeText` in `onHostText` (decision 1b).
-        writeDeferred: isSafari(navigator.userAgent)
-          ? (blob) => clipboard.write([new ClipboardItem({ "text/plain": blob })])
-          : undefined,
-        send: (msg) => {
-          if (inputChannel?.readyState === "open") {
-            inputChannel.send(JSON.stringify(msg));
-          }
-        },
-        notify: (note) => showClipboardNote(note),
-        setTimeout: (handler, ms) => setTimeout(handler, ms),
-        clearTimeout: (handle) => clearTimeout(handle),
-      });
-      window.addEventListener("focus", onClipboardFocusOrGesture);
-      document.addEventListener("pointerdown", onClipboardFocusOrGesture, true);
-      document.addEventListener("keydown", onClipboardFocusOrGesture, true);
-      if ("onclipboardchange" in clipboard) {
-        clipboard.addEventListener("clipboardchange", onClipboardChange);
-        clipboardChangeAttached = true;
-      }
-    } else {
-      console.warn("navigator.clipboard unavailable; clipboard sync disabled");
-    }
+    if (clipboardSyncEnabled) attachClipboardBridge();
 
     // Bound to `session` right after construction, below; captured by
     // `onConnectionStateChange` so a stray event delivered from *this*
@@ -2675,6 +2697,17 @@ export function mount(root: Element | null): void {
     if (controlChannel) sendQualityPreset(controlChannel, preset);
     // Give focus back to the video, same reasoning as `displaySelect`'s
     // change listener above.
+    video.focus();
+  });
+
+  clipboardSyncCheckbox.addEventListener("change", () => {
+    clipboardSyncEnabled = clipboardSyncCheckbox.checked;
+    const storage = ownerStorage();
+    if (storage) saveClipboardSyncSetting(storage, clipboardSyncEnabled);
+    if (session !== null) {
+      if (clipboardSyncEnabled) attachClipboardBridge();
+      else detachClipboardBridge();
+    }
     video.focus();
   });
 

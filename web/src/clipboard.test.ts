@@ -2,7 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Mock } from "vitest";
 import {
   ClipboardBridge,
+  CLIPBOARD_SYNC_STORAGE_KEY,
   MAX_CLIPBOARD_BYTES,
+  loadClipboardSyncSetting,
+  saveClipboardSyncSetting,
   exceedsLimit,
   isCopyShortcut,
   isPasteShortcut,
@@ -168,6 +171,25 @@ describe("ClipboardBridge.onHostText", () => {
     await vi.waitFor(() => expect(deps.writeText).toHaveBeenCalledWith("hello from host"));
   });
 
+  it("shows a note after a successful write (slice E4)", async () => {
+    const deps = makeDeps();
+    const bridge = new ClipboardBridge(deps);
+    bridge.onHostText("hello");
+    await vi.waitFor(() => expect(deps.notify).toHaveBeenCalledWith("Буфер обновлён с хоста"));
+  });
+
+  it("shows no note when the write fails, but one after the deferred retry (slice E4)", async () => {
+    const writeText = vi.fn().mockRejectedValueOnce(new Error("no focus")).mockResolvedValue(undefined);
+    const deps = makeDeps({ writeText });
+    const bridge = new ClipboardBridge(deps);
+    bridge.onHostText("t");
+    await flushMicrotasks();
+    expect(deps.notify).not.toHaveBeenCalled();
+    bridge.onFocusOrGesture();
+    await flushMicrotasks();
+    expect(deps.notify).toHaveBeenCalledWith("Буфер обновлён с хоста");
+  });
+
   it("falls back to pending and retries on the next focus/gesture when writeText fails", async () => {
     const writeText = vi.fn().mockRejectedValueOnce(new Error("NotAllowedError")).mockResolvedValue(undefined);
     const deps = makeDeps({ writeText });
@@ -248,6 +270,8 @@ describe("ClipboardBridge deferred Safari copy", () => {
     const blob = await capturedBlobPromise!;
     const text = await blob.text();
     expect(text).toBe("copied text");
+    // Slice E4: the user pressed copy themselves -- no "updated" note.
+    expect(deps.notify).not.toHaveBeenCalled();
   });
 
   it("rejects the deferred blob after 3s when no host text arrives", async () => {
@@ -374,5 +398,45 @@ describe("ClipboardBridge.onLocalClipboardChange", () => {
     const bridge = new ClipboardBridge(deps);
 
     await expect(bridge.onLocalClipboardChange()).resolves.toBeUndefined();
+  });
+});
+
+describe("clipboard sync setting (slice E4)", () => {
+  it("is off by default and when storage throws", () => {
+    expect(loadClipboardSyncSetting({ getItem: () => null })).toBe(false);
+    expect(
+      loadClipboardSyncSetting({
+        getItem: () => {
+          throw new Error("denied");
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("is on only for \"1\"", () => {
+    expect(loadClipboardSyncSetting({ getItem: () => "1" })).toBe(true);
+    expect(loadClipboardSyncSetting({ getItem: () => "0" })).toBe(false);
+    expect(loadClipboardSyncSetting({ getItem: () => "true" })).toBe(false);
+  });
+
+  it("saves under the storage key and ignores a throwing storage", () => {
+    const calls: Array<[string, string]> = [];
+    saveClipboardSyncSetting({ setItem: (k, v) => calls.push([k, v]) }, true);
+    saveClipboardSyncSetting({ setItem: (k, v) => calls.push([k, v]) }, false);
+    expect(calls).toEqual([
+      [CLIPBOARD_SYNC_STORAGE_KEY, "1"],
+      [CLIPBOARD_SYNC_STORAGE_KEY, "0"],
+    ]);
+    expect(CLIPBOARD_SYNC_STORAGE_KEY).toBe("rcdesk.clipboardSync");
+    expect(() =>
+      saveClipboardSyncSetting(
+        {
+          setItem: () => {
+            throw new Error("denied");
+          },
+        },
+        true,
+      ),
+    ).not.toThrow();
   });
 });

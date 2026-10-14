@@ -356,7 +356,14 @@ export class FileReceiver {
   private readonly cb: FileReceiverCallbacks;
   private offer: { listId: number; files: OfferedFile[] } | null = null;
   /** The list being downloaded, or null. */
-  private list: { total: number; done: number } | null = null;
+  private list: {
+    total: number;
+    done: number;
+    /** Bytes the offer still allows the host to send: the sum of offered
+     * sizes minus files already over. A `start` larger than this is a
+     * protocol violation (slice E4). */
+    budget: number;
+  } | null = null;
   private current: Incoming | null = null;
   private lastId = HOST_ID_BASE;
   /** After `cancel`, everything the host still sends is dropped until the
@@ -388,7 +395,7 @@ export class FileReceiver {
       this.cb.onError?.("", "closed");
       return false;
     }
-    this.list = { total: offer.files.length, done: 0 };
+    this.list = { total: offer.files.length, done: 0, budget: total };
     return true;
   }
 
@@ -445,8 +452,12 @@ export class FileReceiver {
 
   /** A file of the list is over (saved or failed). */
   private fileOver(): void {
+    // Slice E4: the finished file's size leaves the budget (taken before
+    // `current` is cleared).
+    const size = this.current?.size ?? 0;
     this.current = null;
     if (!this.list) return;
+    this.list.budget -= size;
     this.list.done += 1;
     if (this.list.done >= this.list.total) this.finish();
   }
@@ -489,6 +500,13 @@ export class FileReceiver {
     if (!this.list || this.cancelled) return;
     this.lastId = id;
     this.current = { id, name, size, received: 0, chunks: [] };
+    // Slice E4: the host cannot announce more than the accepted offer
+    // (the 2 GiB check in `fetch` only saw the offer, not what `start`
+    // claims).
+    if (!Number.isFinite(size) || size < 0 || size > this.list.budget) {
+      this.protocolError(this.current);
+      return;
+    }
     this.progress(this.current);
   }
 

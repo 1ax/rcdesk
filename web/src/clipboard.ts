@@ -72,6 +72,34 @@ const PASTE_READ_TIMEOUT_MS = 10_000;
  * reject (see that method's doc comment). */
 const DEFERRED_COPY_TIMEOUT_MS = 3_000;
 
+/** Note shown when the host's text lands in the local clipboard (slice E4);
+ * not shown for a Safari deferred copy, where the user pressed copy. */
+const HOST_CLIPBOARD_NOTE = "Буфер обновлён с хоста";
+
+/** localStorage key of the clipboard-sync opt-in (slice E4). */
+export const CLIPBOARD_SYNC_STORAGE_KEY = "rcdesk.clipboardSync";
+
+/** Whether clipboard sync is enabled. Off by default: auto-sync would send
+ * every local copy (password-manager entries included) to the host, so the
+ * user turns it on explicitly (slice E4). Only "1" means on; a throwing
+ * storage means off. */
+export function loadClipboardSyncSetting(storage: Pick<Storage, "getItem">): boolean {
+  try {
+    return storage.getItem(CLIPBOARD_SYNC_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** Saves `enabled`, silently doing nothing if `storage` throws. */
+export function saveClipboardSyncSetting(storage: Pick<Storage, "setItem">, enabled: boolean): void {
+  try {
+    storage.setItem(CLIPBOARD_SYNC_STORAGE_KEY, enabled ? "1" : "0");
+  } catch {
+    // Ignored: the choice simply won't survive a reload.
+  }
+}
+
 type TimeoutHandle = ReturnType<typeof setTimeout>;
 
 /** Browser/transport dependencies `ClipboardBridge` needs, injected so it
@@ -149,6 +177,8 @@ export class ClipboardBridge {
       .then(() => {
         this.lastText = text;
         this.pendingHostText = null;
+        // Slice E4: tell the user their clipboard was replaced by the host.
+        this.deps.notify(HOST_CLIPBOARD_NOTE);
       })
       .catch(() => {
         this.pendingHostText = text;
@@ -165,6 +195,7 @@ export class ClipboardBridge {
       .writeText(text)
       .then(() => {
         this.lastText = text;
+        this.deps.notify(HOST_CLIPBOARD_NOTE);
       })
       .catch(() => {
         this.pendingHostText = text;
