@@ -52,12 +52,24 @@
 //! pub unsafe fn DuplicateTokenEx(hexistingtoken: HANDLE, dwdesiredaccess: TOKEN_ACCESS_MASK, lptokenattributes: Option<*const SECURITY_ATTRIBUTES>, impersonationlevel: SECURITY_IMPERSONATION_LEVEL, tokentype: TOKEN_TYPE, phnewtoken: *mut HANDLE) -> Result<()>
 //! pub unsafe fn SetTokenInformation(tokenhandle: HANDLE, tokeninformationclass: TOKEN_INFORMATION_CLASS, tokeninformation: *const c_void, tokeninformationlength: u32) -> Result<()>
 //! pub unsafe fn GetSecurityDescriptorDacl(psecuritydescriptor: PSECURITY_DESCRIPTOR, lpbdaclpresent: *mut BOOL, pdacl: *mut *mut ACL, lpbdacldefaulted: *mut BOOL) -> Result<()>
+//! pub unsafe fn CreateWellKnownSid(wellknownsidtype: WELL_KNOWN_SID_TYPE, domainsid: Option<PSID>, psid: Option<PSID>, cbsid: *mut u32) -> Result<()>
+//! pub unsafe fn EqualSid(psid1: PSID, psid2: PSID) -> Result<()>   // Ok = SID равны
+//! pub const SECURITY_MAX_SID_SIZE: u32 = 68
+//! pub const OWNER_SECURITY_INFORMATION: OBJECT_SECURITY_INFORMATION
+//! pub const WinLocalSystemSid / WinBuiltinAdministratorsSid: WELL_KNOWN_SID_TYPE
+//! pub struct PSID(pub *mut c_void); pub struct PSECURITY_DESCRIPTOR(pub *mut c_void)
 //! // Security/Authorization (feature Win32_Security_Authorization)
 //! pub unsafe fn ConvertStringSecurityDescriptorToSecurityDescriptorW<P0>(stringsecuritydescriptor: P0, stringsdrevision: u32, securitydescriptor: *mut PSECURITY_DESCRIPTOR, securitydescriptorsize: Option<*mut u32>) -> Result<()>
+//! pub unsafe fn GetNamedSecurityInfoW<P0>(pobjectname: P0, objecttype: SE_OBJECT_TYPE, securityinfo: OBJECT_SECURITY_INFORMATION, ppsidowner: Option<*mut PSID>, ppsidgroup: Option<*mut PSID>, ppdacl: Option<*mut *mut ACL>, ppsacl: Option<*mut *mut ACL>, ppsecuritydescriptor: *mut PSECURITY_DESCRIPTOR) -> WIN32_ERROR
 //! pub unsafe fn SetNamedSecurityInfoW<P0>(pobjectname: P0, objecttype: SE_OBJECT_TYPE, securityinfo: OBJECT_SECURITY_INFORMATION, psidowner: Option<PSID>, psidgroup: Option<PSID>, pdacl: Option<*const ACL>, psacl: Option<*const ACL>) -> WIN32_ERROR
 //! // Foundation (no feature)
 //! pub unsafe fn LocalFree(hmem: Option<HLOCAL>) -> HLOCAL
 //! ```
+//!
+//! Проверка владельца `%ProgramData%\rcdesk` перед установкой:
+//! `create_dir_all` на существующем каталоге -- no-op, а `%ProgramData%` по
+//! умолчанию даёт Users право создавать подкаталоги, так что не-админ мог
+//! создать каталог заранее и остаться его владельцем (неявный WRITE_DAC).
 //!
 //! `Result<T>` -- `windows_core::Result<T>`, `Err` несёт `GetLastError`;
 //! `SC_HANDLE` и `HANDLE` реализуют `windows_core::Free` (закрытие), поэтому
@@ -85,14 +97,15 @@ use windows::Win32::Foundation::{
     WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SDDL_REVISION_1,
-    SE_FILE_OBJECT,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
+    SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    DuplicateTokenEx, GetSecurityDescriptorDacl, SecurityImpersonation, SetTokenInformation,
-    TokenPrimary, TokenSessionId, ACL, DACL_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
-    TOKEN_QUERY,
+    CreateWellKnownSid, DuplicateTokenEx, EqualSid, GetSecurityDescriptorDacl,
+    SecurityImpersonation, SetTokenInformation, TokenPrimary, TokenSessionId,
+    WinBuiltinAdministratorsSid, WinLocalSystemSid, ACL, DACL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_MAX_SID_SIZE, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
 };
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -220,10 +233,108 @@ pub fn is_installed() -> bool {
     matches!(status(), Ok(state) if state != ServiceState::NotInstalled)
 }
 
+/// SID известной группы (`WinLocalSystemSid` и т.п.) в буфере `buf`.
+fn well_known_sid(
+    kind: WELL_KNOWN_SID_TYPE,
+    buf: &mut [u8; SECURITY_MAX_SID_SIZE as usize],
+) -> anyhow::Result<PSID> {
+    let mut size = SECURITY_MAX_SID_SIZE;
+    let sid = PSID(buf.as_mut_ptr().cast());
+    // Safety: `buf` -- SECURITY_MAX_SID_SIZE байт, `size` сообщает его
+    // размер; `domainsid` не нужен (None); буфер переживает возвращаемый PSID
+    // (владелец -- вызывающий).
+    unsafe { CreateWellKnownSid(kind, None, Some(sid), &mut size) }
+        .context("CreateWellKnownSid")?;
+    Ok(sid)
+}
+
+/// Отказывает, если каталог уже существует и принадлежит не SYSTEM и не
+/// Administrators (`create_dir_all` на существующем каталоге -- no-op, а
+/// владелец с неявным WRITE_DAC мог бы переписать DACL). Нет каталога --
+/// `Ok`: создадим сами под токеном администратора.
+fn check_machine_dir_owner(dir: &Path) -> anyhow::Result<()> {
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("проверка {}", dir.display())),
+    };
+    // На Windows std считает ссылкой и symlink, и junction.
+    if meta.file_type().is_symlink() {
+        anyhow::bail!(
+            "каталог {} является ссылкой (symlink/junction) -- удалите его и повторите установку",
+            dir.display()
+        );
+    }
+    if !meta.is_dir() {
+        anyhow::bail!(
+            "{} не каталог -- удалите его и повторите установку",
+            dir.display()
+        );
+    }
+
+    let path = wide_path(dir);
+    let mut owner = PSID::default();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // Safety: `path` -- валидная NUL-терминированная строка, переживает
+    // вызов; `owner` и `descriptor` -- валидные out-параметры; остальные
+    // части дескриптора не запрашиваются (None). Память под дескриптор
+    // выделяет система, `owner` указывает внутрь неё; освобождается
+    // `LocalFree` ниже.
+    let error = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(path.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            &mut descriptor,
+        )
+    };
+    if let Err(e) = error.ok() {
+        return Err(win_err(
+            &format!("GetNamedSecurityInfoW({})", dir.display()),
+            e,
+        ));
+    }
+
+    let trusted = owner_is_trusted(owner);
+
+    // Safety: `descriptor.0` выделен системой (`LocalAlloc`) внутри
+    // `GetNamedSecurityInfoW` и освобождается ровно один раз, здесь, на всех
+    // путях после успеха; `owner` после этого не используется.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+    }
+
+    if !trusted? {
+        anyhow::bail!(
+            "каталог {} уже существует и создан не администратором -- удалите его (от имени администратора) и повторите установку",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// `owner` равен SYSTEM или Administrators. `owner` должен быть валидным.
+fn owner_is_trusted(owner: PSID) -> anyhow::Result<bool> {
+    let mut system_buf = [0u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut admins_buf = [0u8; SECURITY_MAX_SID_SIZE as usize];
+    let system = well_known_sid(WinLocalSystemSid, &mut system_buf)?;
+    let admins = well_known_sid(WinBuiltinAdministratorsSid, &mut admins_buf)?;
+    // Safety: все три SID валидны (`owner` -- от вызывающего, остальные --
+    // в локальных буферах, живых до конца функции); `Err` значит «не равны».
+    let equal = |a: PSID, b: PSID| unsafe { EqualSid(a, b) }.is_ok();
+    Ok(equal(owner, system) || equal(owner, admins))
+}
+
 /// Создаёт машинный каталог, закрывает его DACL (SYSTEM + Administrators,
 /// наследуется) и только потом подкаталог логов -- он унаследует DACL.
+/// Заранее отказывает, если каталог уже есть и принадлежит не админу.
 fn prepare_machine_dir() -> anyhow::Result<()> {
     let dir = machine_data_dir();
+    check_machine_dir_owner(&dir)?;
     std::fs::create_dir_all(&dir).with_context(|| format!("создание {}", dir.display()))?;
     apply_data_dir_acl(&dir)?;
     let logs = machine_log_dir();
