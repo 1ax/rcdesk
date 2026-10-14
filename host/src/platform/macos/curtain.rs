@@ -133,13 +133,18 @@ enum Reply {
 /// Реализация `Curtain` для не-главных потоков.
 pub struct MacCurtain {
     client: BridgeClient<Command, Reply>,
+    /// Окна показанной сейчас шторки (для `Curtain::shown`).
+    shown_ids: Mutex<Vec<u32>>,
 }
 
 /// Создаёт пару: прокси для `HostContext` и сторону главного потока.
 pub fn create() -> (MacCurtain, CurtainMain) {
     let (client, rx) = bridge(BRIDGE_TIMEOUT);
     (
-        MacCurtain { client },
+        MacCurtain {
+            client,
+            shown_ids: Mutex::new(Vec::new()),
+        },
         CurtainMain {
             rx,
             controller: Controller::default(),
@@ -150,20 +155,41 @@ pub fn create() -> (MacCurtain, CurtainMain) {
 impl Curtain for MacCurtain {
     fn show(&self) -> anyhow::Result<Vec<u32>> {
         match self.client.call(Command::Show) {
-            Ok(Reply::Shown(result)) => result.map_err(|e| anyhow!(e)),
+            Ok(Reply::Shown(result)) => {
+                let ids = result.map_err(|e| anyhow!(e))?;
+                if let Ok(mut shown) = self.shown_ids.lock() {
+                    *shown = ids.clone();
+                }
+                Ok(ids)
+            }
             Ok(Reply::Hidden) => Err(anyhow!("неожиданный ответ главного потока")),
             Err(err) => Err(anyhow!("шторка: главный поток не ответил ({err:?})")),
         }
     }
 
     fn hide(&self) {
-        if let Err(err) = self.client.call(Command::Hide) {
-            tracing::warn!(?err, "шторка: hide не выполнен главным потоком");
+        match self.client.call(Command::Hide) {
+            Ok(Reply::Hidden) => {
+                if let Ok(mut shown) = self.shown_ids.lock() {
+                    shown.clear();
+                }
+            }
+            Ok(Reply::Shown(_)) => {
+                tracing::warn!("шторка: неожиданный ответ главного потока на hide");
+            }
+            Err(err) => tracing::warn!(?err, "шторка: hide не выполнен главным потоком"),
         }
     }
 
     fn lock_screen(&self) -> anyhow::Result<()> {
         lock_screen_with(std::thread::sleep)
+    }
+
+    fn shown(&self) -> Vec<u32> {
+        self.shown_ids
+            .lock()
+            .map(|ids| ids.clone())
+            .unwrap_or_default()
     }
 }
 

@@ -1124,17 +1124,16 @@ impl ActiveSession {
         if let (Some(curtain), false) = (self.curtain, self.curtain_windows.is_empty()) {
             let result = tokio::task::spawn_blocking(move || {
                 let locked = curtain.lock_screen();
-                curtain.hide();
+                if locked.is_ok() {
+                    curtain.hide();
+                }
                 locked
             })
             .await;
             match result {
                 Ok(Ok(())) => tracing::info!("curtain: screen locked, curtain hidden"),
                 Ok(Err(err)) => {
-                    tracing::warn!(
-                        ?err,
-                        "curtain: failed to lock screen, curtain hidden anyway"
-                    );
+                    tracing::warn!(?err, "curtain: screen not locked, curtain stays up");
                 }
                 Err(err) => tracing::warn!(?err, "curtain: teardown task failed"),
             }
@@ -1731,7 +1730,7 @@ async fn begin_session(
                     session_tag,
                     quality_preset: QualityPreset::Auto,
                     curtain: ctx.curtain.clone(),
-                    curtain_windows: Vec::new(),
+                    curtain_windows: parts.curtain_windows,
                     input_source: ctx.input_source.clone(),
                     input_source_task: ctx.input_source.clone().map(|switcher| {
                         spawn_input_source_poll(
@@ -2227,6 +2226,17 @@ async fn handle_session_event(
                         tracing::warn!(?err, "failed to send host info");
                     }
                 }
+                if let Some(msg) = curtain_announce_message(&active.curtain_windows) {
+                    match active.peer.send_control(&msg).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::warn!("control channel not open yet, dropped curtain status");
+                        }
+                        Err(err) => {
+                            tracing::warn!(?err, "failed to send curtain status");
+                        }
+                    }
+                }
                 if let Some(msg) = active
                     .input_source
                     .as_deref()
@@ -2278,6 +2288,15 @@ fn apply_remote_clipboard_text(clipboard: Option<&Arc<Mutex<ClipboardSync>>>, te
             );
         }
     }
+}
+
+/// Сообщение о уже показанной шторке для вновь открытого канала `control`;
+/// `None`, если шторка не показана.
+fn curtain_announce_message(curtain_windows: &[u32]) -> Option<ControlMessage> {
+    (!curtain_windows.is_empty()).then_some(ControlMessage::CurtainStatus {
+        on: true,
+        reason: None,
+    })
 }
 
 /// Builds the `ControlMessage::HostInfo` announcement (slice 3.5f), sent
@@ -2638,6 +2657,8 @@ struct SessionParts {
     files_task: tokio::task::JoinHandle<()>,
     /// See `ActiveSession::files_enabled`.
     files_enabled: bool,
+    /// See `ActiveSession::curtain_windows`.
+    curtain_windows: Vec<u32>,
 }
 
 /// Combines one session's ICE credentials with the extra `--stun` servers
@@ -2815,13 +2836,15 @@ async fn start_session_with_display_wait(
     // `video_rx` pair and shares `keyframe_flag` -- see their doc comments.
     peer.start_video(video_rx, Arc::clone(&keyframe_flag));
 
+    // Шторка могла остаться от прошлого сеанса: исключаем её окна из захвата.
+    let curtain_windows = ctx.curtain.as_ref().map(|c| c.shown()).unwrap_or_default();
     let video = VideoPipeline::start(
         ctx,
         start_display,
         Arc::clone(&peer),
         video_tx.clone(),
         Arc::clone(&keyframe_flag),
-        &[],
+        &curtain_windows,
     )
     .await?;
 
@@ -2976,6 +2999,7 @@ async fn start_session_with_display_wait(
         elevation_task,
         files_task,
         files_enabled,
+        curtain_windows,
     })
 }
 
@@ -5276,6 +5300,8 @@ mod tests {
         log: Arc<Mutex<Vec<String>>>,
         ids: Vec<u32>,
         show_error: Option<String>,
+        lock_error: Option<String>,
+        shown: Mutex<Vec<u32>>,
     }
 
     impl Curtain for FakeCurtain {
@@ -5283,15 +5309,25 @@ mod tests {
             self.log.lock().unwrap().push("show".to_string());
             match &self.show_error {
                 Some(msg) => Err(anyhow::anyhow!(msg.clone())),
-                None => Ok(self.ids.clone()),
+                None => {
+                    *self.shown.lock().unwrap() = self.ids.clone();
+                    Ok(self.ids.clone())
+                }
             }
         }
         fn hide(&self) {
             self.log.lock().unwrap().push("hide".to_string());
+            self.shown.lock().unwrap().clear();
         }
         fn lock_screen(&self) -> anyhow::Result<()> {
             self.log.lock().unwrap().push("lock_screen".to_string());
-            Ok(())
+            match &self.lock_error {
+                Some(msg) => Err(anyhow::anyhow!(msg.clone())),
+                None => Ok(()),
+            }
+        }
+        fn shown(&self) -> Vec<u32> {
+            self.shown.lock().unwrap().clone()
         }
     }
 
@@ -5302,6 +5338,14 @@ mod tests {
         ids: Vec<u32>,
         show_error: Option<&str>,
     ) -> (HostContext, Arc<Mutex<Vec<String>>>, SourceCalls) {
+        curtain_ctx_with_lock_error(ids, show_error, None)
+    }
+
+    fn curtain_ctx_with_lock_error(
+        ids: Vec<u32>,
+        show_error: Option<&str>,
+        lock_error: Option<&str>,
+    ) -> (HostContext, Arc<Mutex<Vec<String>>>, SourceCalls) {
         let log = Arc::new(Mutex::new(Vec::new()));
         let calls: SourceCalls = Arc::new(Mutex::new(Vec::new()));
         let mut ctx = test_ctx();
@@ -5309,6 +5353,8 @@ mod tests {
             log: Arc::clone(&log),
             ids,
             show_error: show_error.map(str::to_string),
+            lock_error: lock_error.map(str::to_string),
+            shown: Mutex::new(Vec::new()),
         }));
         let spy = Arc::clone(&calls);
         ctx.build_source = Box::new(move |id, exclude| {
@@ -5474,6 +5520,43 @@ mod tests {
         active.shutdown().await;
 
         assert_eq!(journal(&log), vec!["show", "lock_screen", "hide"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_keeps_curtain_when_lock_fails() {
+        let (ctx, log, _calls) = curtain_ctx_with_lock_error(vec![101], None, Some("no lock"));
+        let (mut active, _out, _etx, _erx) = start_active_session(&ctx).await;
+        set_curtain(&ctx, &mut active, true).await;
+
+        active.shutdown().await;
+
+        assert_eq!(journal(&log), vec!["show", "lock_screen"]);
+        assert!(!ctx.curtain.as_ref().unwrap().shown().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_session_excludes_already_shown_curtain_windows() {
+        let (ctx, _log, calls) = curtain_ctx(vec![101, 102], None);
+        ctx.curtain.as_ref().unwrap().show().unwrap();
+
+        let (active, _out, _etx, _erx) = start_active_session(&ctx).await;
+
+        assert_eq!(active.curtain_windows, vec![101, 102]);
+        let first = calls.lock().unwrap().first().cloned().unwrap();
+        assert_eq!(first.1, vec![101, 102]);
+        active.shutdown().await;
+    }
+
+    /// Перехватить control-сообщения в тестах нельзя без расширения
+    /// инфраструктуры `PeerSession`, поэтому проверяем чистую функцию,
+    /// из которой `DataChannelOpen` берёт сообщение.
+    #[test]
+    fn control_open_announces_curtain_on_when_already_shown() {
+        assert_eq!(
+            curtain_announce_message(&[101, 102]),
+            Some(curtain_status(true, None))
+        );
+        assert_eq!(curtain_announce_message(&[]), None);
     }
 
     #[tokio::test(flavor = "multi_thread")]
