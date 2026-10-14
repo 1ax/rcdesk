@@ -39,6 +39,9 @@ import {
 import type { NavigatorWithKeyboard } from "./fullscreen";
 import { inputBlockedLabel } from "./inputBlocked";
 import { hostOutdatedLabel, updateStatusLabel } from "./hostVersion";
+import { hostSupportsText } from "./softKeyboard";
+import { mountSoftKeyboard } from "./softKeyboardUi";
+import type { SoftKeyboardController } from "./softKeyboardUi";
 import { viewOnlyLabel } from "./inputStatus";
 import {
   type CurtainState,
@@ -410,6 +413,7 @@ export function mount(root: Element | null): void {
           >
             Яз
           </button>
+          <button id="keyboard-btn" class="btn btn-secondary" hidden>Клавиатура</button>
           <button id="fullscreen-btn" class="btn btn-secondary" hidden>На весь экран</button>
           <button id="disconnect-btn" class="btn btn-secondary">Отключиться</button>
           <button
@@ -450,6 +454,8 @@ export function mount(root: Element | null): void {
           </div>
         </div>
       </div>
+      <div id="soft-keys" class="soft-keys" hidden></div>
+      <input id="soft-input" class="soft-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" inputmode="text" aria-label="Ввод текста" />
     </div>
   `;
 
@@ -476,7 +482,12 @@ export function mount(root: Element | null): void {
   // `attachInput`, which listens on the video element itself); a click
   // gives it focus the same way clicking any input widget would.
   video.tabIndex = 0;
-  video.addEventListener("click", () => video.focus());
+  // Slice H2b: while the phone keyboard is up (`#soft-keys` shown), focus
+  // stays in the hidden text field -- moving it to the video would dismiss
+  // the keyboard on every tap.
+  video.addEventListener("click", () => {
+    if (softKeysEl.hidden) video.focus();
+  });
   // D32: the first real frame of a (re)started session -- `playing` rather
   // than `loadeddata` since it only fires once decoding/rendering actually
   // resumes (`loadeddata` can fire for a frame that's then immediately
@@ -547,6 +558,22 @@ export function mount(root: Element | null): void {
   const touchCursorEl = root.querySelector<HTMLImageElement>("#touch-cursor")!;
   const sessionVideoEl = root.querySelector<HTMLDivElement>(".session-video")!;
   const fullscreenBtn = root.querySelector<HTMLButtonElement>("#fullscreen-btn")!;
+  const keyboardBtn = root.querySelector<HTMLButtonElement>("#keyboard-btn")!;
+  const softKeysEl = root.querySelector<HTMLDivElement>("#soft-keys")!;
+  const softInputEl = root.querySelector<HTMLInputElement>("#soft-input")!;
+  softInputEl.setAttribute("autocorrect", "off");
+  keyboardBtn.hidden = !matchMedia("(pointer: coarse)").matches;
+  // Slice H2b: версия хоста из `host_info` (null -- поле не пришло).
+  let hostVersion: string | null = null;
+  const softKeyboard: SoftKeyboardController = mountSoftKeyboard({
+    button: keyboardBtn,
+    strip: softKeysEl,
+    field: softInputEl,
+    send: (msg) => {
+      if (inputChannel?.readyState === "open") inputChannel.send(JSON.stringify(msg));
+    },
+    isTextSupported: () => hostSupportsText(hostVersion),
+  });
   const curtainBtn = root.querySelector<HTMLButtonElement>("#curtain-btn")!;
   const curtainStatusEl = root.querySelector<HTMLSpanElement>("#curtain-status")!;
   // Slice 4.2c3: reset in `stopSessionResources`; see `curtain.ts`.
@@ -1486,6 +1513,7 @@ export function mount(root: Element | null): void {
           touchCursorEl.hidden = true;
           return;
         }
+        keyboardBtn.hidden = false;
         const videoRect = video.getBoundingClientRect();
         const hx = Number(touchCursorEl.dataset.hx ?? 0) || 0;
         const hy = Number(touchCursorEl.dataset.hy ?? 0) || 0;
@@ -1602,6 +1630,8 @@ export function mount(root: Element | null): void {
       }
       if (msg.type === "host_info") {
         hostOs = msg.os;
+        hostVersion = msg.version ?? null;
+        softKeyboard.setHostOs(hostOs === "other" ? null : hostOs);
         updateCmdAsCtrlVisibility();
         filesEnabled = msg.files_enabled;
         updateFileUi();
@@ -1948,6 +1978,9 @@ export function mount(root: Element | null): void {
     displaySelect.hidden = true;
     displaySelect.innerHTML = "";
     hostOs = null;
+    hostVersion = null;
+    softKeyboard.setHostOs(null);
+    softKeyboard.reset();
     updateCmdAsCtrlVisibility();
     curtain = initialCurtainState();
     renderCurtain();

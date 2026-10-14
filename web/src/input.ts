@@ -410,6 +410,10 @@ export function attachInput(
 
   function onPointerDown(e: PointerEvent): void {
     if (e.pointerType === "touch") {
+      // No focus change and no compatibility mouse events for a touch: the
+      // gesture recognizer owns it (and a focus move would dismiss the
+      // phone keyboard, slice H2b).
+      e.preventDefault();
       enterTouch();
       feedTouch("down", e.pointerId, e.clientX, e.clientY);
       return;

@@ -738,3 +738,45 @@ body {
 .account-status {
   overflow-wrap: anywhere;
 }
+
+/* Slice H2b: экранная клавиатура телефона. */
+.soft-keys {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 20;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+}
+.soft-keys[hidden] {
+  display: none;
+}
+.soft-keys .btn {
+  margin: 0;
+  padding: 10px 12px;
+  font-size: 14px;
+  min-width: 44px;
+}
+.soft-keys .is-once {
+  outline: 2px solid var(--accent);
+}
+.soft-keys .is-locked {
+  background: var(--accent);
+  color: #fff;
+}
+.soft-input {
+  position: fixed;
+  left: 0;
+  bottom: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0.01;
+  font-size: 16px;
+  border: 0;
+  padding: 0;
+}
