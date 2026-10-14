@@ -29,6 +29,9 @@ run_manifest() {
   out="$(bash "$MANIFEST" "$@" 2>&1)" || rc=$?
 }
 
+# Все сценарии, кроме отдельно оговорённых, идут с фиксированным временем выпуска.
+export RELEASE_MANIFEST_ISSUED_AT=1700000000
+
 KEY="$WORK_DIR/key.pem"
 openssl genpkey -algorithm ed25519 -out "$KEY"
 openssl pkey -in "$KEY" -pubout -out "$WORK_DIR/pub.pem"
@@ -49,7 +52,7 @@ fi
 run_manifest 1.2.3 "$KEY" "$WORK_DIR/out" "$WORK_DIR/in/rcdesk-setup.exe" "$WORK_DIR/in/rcdesk-macos.pkg"
 if [[ $rc -eq 0 ]]; then report "успешный запуск" 1; else report "успешный запуск" 0; fi
 
-expected="{\"version\":\"1.2.3\",\"assets\":{\"rcdesk-macos.pkg\":\"$h_pkg\",\"rcdesk-setup.exe\":\"$h_exe\"}}"
+expected="{\"version\":\"1.2.3\",\"issued_at\":1700000000,\"assets\":{\"rcdesk-macos.pkg\":\"$h_pkg\",\"rcdesk-setup.exe\":\"$h_exe\"}}"
 actual="$(cat "$WORK_DIR/out/rcdesk-update.json")"
 if [[ "$actual" == "$expected" && "$(wc -l < "$WORK_DIR/out/rcdesk-update.json" | tr -d ' ')" -eq 1 ]]; then
   report "манифест точного вида" 1
@@ -90,5 +93,20 @@ if [[ $rc -eq 2 && "$out" == *"не найден"* ]]; then report "нет фа�
 
 run_manifest 1.2.3 "$KEY" "$WORK_DIR/нет-каталога" "$WORK_DIR/in/rcdesk-setup.exe"
 if [[ $rc -eq 2 && "$out" == *"не найден"* ]]; then report "нет каталога" 1; else report "нет каталога" 0; fi
+
+# Без переменной issued_at -- текущее время (допуск ±120 с).
+before="$(date -u +%s)"
+rc=0
+out="$(env -u RELEASE_MANIFEST_ISSUED_AT bash "$MANIFEST" 1.2.3 "$KEY" "$WORK_DIR/out" "$WORK_DIR/in/rcdesk-setup.exe" 2>&1)" || rc=$?
+after="$(date -u +%s)"
+issued="$(sed -n 's/^{"version":"1.2.3","issued_at":\([0-9]*\),.*/\1/p' "$WORK_DIR/out/rcdesk-update.json")"
+if [[ $rc -eq 0 && -n "$issued" && "$issued" -ge $(( before - 120 )) && "$issued" -le $(( after + 120 )) ]]; then
+  report "issued_at по умолчанию -- текущее время" 1
+else
+  report "issued_at по умолчанию -- текущее время" 0
+fi
+
+RELEASE_MANIFEST_ISSUED_AT=abc run_manifest 1.2.3 "$KEY" "$WORK_DIR/out" "$WORK_DIR/in/rcdesk-setup.exe"
+if [[ $rc -eq 2 ]]; then report "нецифровой issued_at" 1; else report "нецифровой issued_at" 0; fi
 
 exit "$fail"

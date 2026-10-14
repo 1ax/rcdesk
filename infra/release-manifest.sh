@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Подписанный манифест релиза (D50b): rcdesk-update.json + rcdesk-update.json.sig.
 # Использование: release-manifest.sh <version> <key.pem> <out_dir> <file>...
-# Манифест -- одна строка JSON: {"version":"X.Y.Z","assets":{"<имя>":"<sha256>",...}}
-# (имена по алфавиту), подпись -- сырой ed25519 (64 байта) над байтами файла манифеста.
+# Манифест -- одна строка JSON:
+#   {"version":"X.Y.Z","issued_at":N,"assets":{"<имя>":"<sha256>",...}}
+# (имена по алфавиту), N -- unix-секунды UTC момента выпуска (без кавычек); берётся из
+# переменной окружения RELEASE_MANIFEST_ISSUED_AT (только цифры), иначе `date -u +%s`.
+# Подпись -- сырой ed25519 (64 байта) над байтами файла манифеста.
 # Выход 0 -- готово; 1 -- сбой подписи; 2 -- неверные аргументы/нет файла.
 set -euo pipefail
 
@@ -30,6 +33,12 @@ for f in "$@"; do
   fi
 done
 
+issued_at="${RELEASE_MANIFEST_ISSUED_AT:-$(date -u +%s)}"
+if [[ ! "$issued_at" =~ ^[0-9]+$ ]]; then
+  echo "ошибка: RELEASE_MANIFEST_ISSUED_AT='$issued_at' -- ожидались только цифры (unix-секунды)" >&2
+  exit 2
+fi
+
 sha256_hex() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | cut -d' ' -f1
@@ -49,7 +58,7 @@ done <<< "$pairs"
 
 manifest="$out_dir/rcdesk-update.json"
 sig="$out_dir/rcdesk-update.json.sig"
-printf '{"version":"%s","assets":{%s}}\n' "$version" "$assets" > "$manifest"
+printf '{"version":"%s","issued_at":%s,"assets":{%s}}\n' "$version" "$issued_at" "$assets" > "$manifest"
 
 openssl pkeyutl -sign -inkey "$key" -rawin -in "$manifest" -out "$sig"
 size="$(wc -c < "$sig" | tr -d ' ')"
