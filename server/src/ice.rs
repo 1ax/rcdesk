@@ -1,7 +1,7 @@
 //! ICE server configuration for `Registered`/`Joined` replies (see
 //! ARCHITECTURE.md §11 and §6): STUN URLs from env, plus optional
 //! short-lived TURN credentials generated the way coturn's REST API
-//! (`use-auth-secret`) expects: `username = "{expiry}:rcdesk"`,
+//! (`use-auth-secret`) expects: `username = "{expiry}:{session_id}"`,
 //! `credential = base64(HMAC-SHA1(secret, username))`.
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -85,12 +85,19 @@ impl IceConfig {
     /// `IceServer` covering every `RCDESK_TURN_URLS` entry with short-lived
     /// REST-API credentials -- only when both `RCDESK_TURN_URLS` and
     /// `RCDESK_TURN_SECRET` are set; otherwise TURN is omitted entirely.
-    pub fn ice_servers(&self, now_unix: u64) -> Vec<IceServer> {
+    ///
+    /// The username is `"{expiry}:{session_id}"`. coturn's `user-quota` is
+    /// counted per the part after ':' (`get_real_username` strips the numeric
+    /// expiry), so tagging it with the session id makes the quota per session
+    /// instead of one shared bucket for every user; the overall cap is
+    /// `total-quota`. `session_id` comes from `registry::random_id`, which
+    /// only emits `a-z0-9`, so it never contains ':'.
+    pub fn ice_servers(&self, now_unix: u64, session_id: &str) -> Vec<IceServer> {
         let mut servers = self.stun_servers();
 
         if !self.turn_urls.is_empty() && !self.turn_secret.is_empty() {
             let expiry = now_unix + self.turn_ttl_secs;
-            let username = format!("{expiry}:rcdesk");
+            let username = format!("{expiry}:{session_id}");
             let credential = turn_credential(&self.turn_secret, &username);
             servers.push(IceServer {
                 urls: self.turn_urls.clone(),
@@ -160,7 +167,7 @@ mod tests {
             86400,
         );
 
-        let servers = cfg.ice_servers(1_000_000);
+        let servers = cfg.ice_servers(1_000_000, "sess123");
 
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].urls, vec!["stun:stun.l.google.com:19302"]);
@@ -178,13 +185,13 @@ mod tests {
         );
 
         let now = 1_000_000u64;
-        let servers = cfg.ice_servers(now);
+        let servers = cfg.ice_servers(now, "sess123");
 
         assert_eq!(servers.len(), 2);
         let turn = &servers[1];
         assert_eq!(turn.urls, vec!["turn:turn.rcdesk.app:3478"]);
         let username = turn.username.as_ref().expect("turn server has a username");
-        assert_eq!(username, &format!("{}:rcdesk", now + 86400));
+        assert_eq!(username, &format!("{}:sess123", now + 86400));
         assert!(!turn
             .credential
             .as_ref()
@@ -207,8 +214,25 @@ mod tests {
             .iter()
             .all(|s| s.username.is_none() && s.credential.is_none()));
         assert!(cfg
-            .ice_servers(1_000_000)
+            .ice_servers(1_000_000, "sess123")
             .iter()
             .any(|s| s.username.is_some()));
+    }
+
+    #[test]
+    fn turn_usernames_differ_per_session() {
+        let cfg = IceConfig::new(
+            vec!["stun:stun.l.google.com:19302".to_string()],
+            vec!["turn:turn.rcdesk.app:3478".to_string()],
+            "s3cret".to_string(),
+            86400,
+        );
+
+        let now = 1_000_000u64;
+        let a = cfg.ice_servers(now, "sessa");
+        let b = cfg.ice_servers(now, "sessb");
+
+        assert_ne!(a[1].username, b[1].username);
+        assert_ne!(a[1].credential, b[1].credential);
     }
 }

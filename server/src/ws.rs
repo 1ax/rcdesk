@@ -970,7 +970,7 @@ async fn run_client(
                         let _ = tx.send(SignalMessage::Joined {
                             session_id: session_id.clone(),
                             host_name,
-                            ice_servers: ice.ice_servers(ice::now_unix()),
+                            ice_servers: ice.ice_servers(ice::now_unix(), &session_id),
                             // `device_id` is the same id the client already
                             // used to ask for this connection (slice 3.5b):
                             // every registered host is a persistent device
@@ -978,8 +978,8 @@ async fn run_client(
                             device_id: Some(device_id.clone()),
                         });
                         let _ = host_tx.send(SignalMessage::PeerJoined {
+                            ice_servers: ice.ice_servers(ice::now_unix(), &session_id),
                             session_id,
-                            ice_servers: ice.ice_servers(ice::now_unix()),
                         });
                     }
                     Err(err) => {
@@ -1073,7 +1073,7 @@ async fn run_client(
                         let _ = tx.send(SignalMessage::Joined {
                             session_id: session_id.clone(),
                             host_name,
-                            ice_servers: ice.ice_servers(ice::now_unix()),
+                            ice_servers: ice.ice_servers(ice::now_unix(), &session_id),
                             // `host_id` is the device's persistent id (slice
                             // 3.1: every registered host is one) -- carried
                             // back so the client can reconnect to the same
@@ -1081,8 +1081,8 @@ async fn run_client(
                             device_id: Some(host_id.clone()),
                         });
                         let _ = host_tx.send(SignalMessage::PeerJoined {
+                            ice_servers: ice.ice_servers(ice::now_unix(), &session_id),
                             session_id,
-                            ice_servers: ice.ice_servers(ice::now_unix()),
                         });
                         if let Some(pin) = new_pin {
                             let _ = host_tx.send(SignalMessage::PinChanged { pin });

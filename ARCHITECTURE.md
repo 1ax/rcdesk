@@ -574,7 +574,9 @@ Telegram-бот (`TRAFFIC_TG_BOT_TOKEN`/`TRAFFIC_TG_CHAT_ID` в `~/app/.env`); �
 
 **Ужесточение инфраструктуры (слайс C, 2026-10-13).** coturn `4.18.0` (пин), `--denied-peer-ip` на
 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.168/16, `::1`, `fc00::/7`, `fe80::/10` (внешний IP VPS не
-запрещён, см. §6), `--no-tcp-relay`, `--user-quota=8`, `--total-quota=200`; контейнеры с `cap_drop: ALL` (coturn
+запрещён, см. §6), `--no-tcp-relay`, `--user-quota=8`, `--total-quota=200` (квота на сеанс: coturn считает `user-quota` по части
+имени после `:`, поэтому сервер выдаёт TURN-имя `"{expiry}:{session_id}"`; до I3, 2026-10-14, было `:rcdesk` —
+одна квота на всех, `486` в живых сеансах); контейнеры с `cap_drop: ALL` (coturn
 `+NET_BIND_SERVICE`, без `no-new-privileges` — порт 3478 под `nobody` держится file-capability), сервер `read_only`
 + tmpfs `/tmp`, логи json-file 10m × 3. **Бэкап БД** (аудит I-H1): `infra/backup-db.sh` по cron `rcdesk` в 04:30
 UTC — `sqlite3 .backup` через `docker run --entrypoint sqlite3` из образа сервера (поэтому в образ добавлен
