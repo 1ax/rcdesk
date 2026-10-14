@@ -708,7 +708,10 @@ impl VideoPipeline {
             height,
             fps,
             bitrate_kbps: ctx.bitrate_kbps,
-            keyframe_interval_frames: fps * 10,
+            // Periodic IDR is only a safety net; recovery after loss goes
+            // via PLI/FIR. Every 10 s it cost ~250 kbit/s and a burst of
+            // packets for nothing (audit 2026-10-13).
+            keyframe_interval_frames: fps * 60,
             max_qp: ctx.max_qp,
         };
         let (encoder, encoder_kind) = build_encoder(ctx.encoder, encoder_cfg)?;

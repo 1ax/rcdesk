@@ -52,6 +52,12 @@ pub const MIN_FPS: u32 = 5;
 /// fine) and is ignored rather than acted on.
 pub const REMB_FRESH: Duration = Duration::from_secs(3);
 
+/// A loss fraction from an RTCP RR older than this counts as zero. Chrome
+/// sends RRs about once a second; when they stop, acting on the last value
+/// forever would cut the target to the floor every tick, so instead the
+/// target recovers by probing.
+pub const LOSS_FRESH: Duration = Duration::from_secs(3);
+
 /// A REMB below this fraction of what we actually sent last tick signals
 /// congestion -- but only while the link is loaded (`REMB_LOADED_RATIO`)
 /// and only after `REMB_CONGESTION_TICKS` ticks in a row (see the module
@@ -259,6 +265,7 @@ pub struct Controller {
     /// estimate (still ramping, not congestion) from a falling one.
     prev_tick_remb_kbps: Option<f64>,
     last_loss: f32,
+    last_loss_at: Option<Instant>,
     window: Window,
     /// Consecutive ticks the loaded-link REMB signal has said "congested"
     /// (see `REMB_CONGESTION_TICKS`).
@@ -287,6 +294,7 @@ impl Controller {
             last_remb_at: None,
             prev_tick_remb_kbps: None,
             last_loss: 0.0,
+            last_loss_at: None,
             window: Window::default(),
             congested_ticks: 0,
             fast_ticks: 0,
@@ -314,6 +322,7 @@ impl Controller {
             }
             Feedback::Loss { fraction } => {
                 self.last_loss = fraction;
+                self.last_loss_at = Some(now);
             }
             Feedback::Frame { bytes } => {
                 self.window.bytes += bytes as u64;
@@ -435,16 +444,21 @@ impl Controller {
             self.congested_ticks = 0;
         }
 
-        let (mut b, bitrate_reason) = if self.last_loss > LOSS_HIGH {
-            (old_b * (1.0 - 0.5 * self.last_loss as f64), Some("loss"))
+        let loss = if self
+            .last_loss_at
+            .is_some_and(|at| now.saturating_duration_since(at) <= LOSS_FRESH)
+        {
+            self.last_loss
+        } else {
+            0.0
+        };
+        let (mut b, bitrate_reason) = if loss > LOSS_HIGH {
+            (old_b * (1.0 - 0.5 * loss as f64), Some("loss"))
         } else if remb_congested && self.congested_ticks >= REMB_CONGESTION_TICKS {
             // `remb_congested` implies `remb_kbps` is `Some`.
             let remb = remb_kbps.unwrap_or(old_b);
             (old_b.min(remb), Some("remb"))
-        } else if !remb_congested
-            && self.last_loss < LOSS_LOW
-            && old_b < self.cfg.max_bitrate_kbps as f64
-        {
+        } else if !remb_congested && loss < LOSS_LOW && old_b < self.cfg.max_bitrate_kbps as f64 {
             // Nothing says the path is short of bandwidth: probe upward.
             // REMB itself can't tell us to go up (it is capped by what it
             // received, i.e. by our own content), so this is the only way
@@ -784,6 +798,33 @@ mod tests {
     }
 
     #[test]
+    fn stale_loss_does_not_keep_cutting() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0 + TICK;
+
+        c.feedback(Feedback::Loss { fraction: 0.2 }, now);
+        let decision = c.tick(now).expect("expected a decision");
+        assert_eq!(decision.reason, "loss");
+        assert_eq!(decision.target.bitrate_kbps, 5400);
+
+        // Within LOSS_FRESH (ages 1 s, 2 s, 3 s) the old RR still counts:
+        // three more cuts of x0.9, 5400 -> 4860 -> 4374 -> 3937.
+        for expected in [4860u32, 4374, 3937] {
+            now += TICK;
+            let d = c.tick(now).expect("expected a loss cut");
+            assert_eq!(d.reason, "loss");
+            assert_eq!(d.target.bitrate_kbps, expected);
+        }
+        // Age 4 s > LOSS_FRESH: loss counts as zero, so probe x1.10
+        // (3936.6 * 1.1 = 4330.26, published as 4331).
+        now += TICK;
+        let decision = c.tick(now).expect("expected a probe");
+        assert_eq!(decision.reason, "probe");
+        assert_eq!(decision.target.bitrate_kbps, 4331);
+    }
+
+    #[test]
     fn encoder_overruns_step_fps_down() {
         let t0 = Instant::now();
         let mut c = Controller::new(cfg(), t0);
@@ -921,14 +962,15 @@ mod tests {
         // just above MIN_BITRATE_KBPS rather than exactly on it:
         // 6000 -> 3300 -> 1815 -> 998 -> 549 -> 302, then 302*0.55=166.1
         // clamps to 300, but (302-300)/302 = 0.66% < 5% is never published.
-        // The invariant that matters is the floor itself.
+        // The invariant that matters is the floor itself. Loss is re-fed
+        // before every tick, since it goes stale after LOSS_FRESH.
         let t0 = Instant::now();
         let mut c = Controller::new(cfg(), t0);
         let mut now = t0;
 
-        c.feedback(Feedback::Loss { fraction: 0.9 }, now);
         for _ in 0..10 {
             now += TICK;
+            c.feedback(Feedback::Loss { fraction: 0.9 }, now);
             c.tick(now);
             assert!(
                 c.target().bitrate_kbps >= MIN_BITRATE_KBPS,
