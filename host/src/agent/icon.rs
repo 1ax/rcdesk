@@ -1,17 +1,20 @@
-//! Draws the tray/menu-bar icon in code -- no bundled image resources, no
-//! new asset pipeline, just a small monitor silhouette whose fill/indicator
-//! differs by `IconState`.
+//! Tray/menu-bar icon: the rcdesk logo, as a prebuilt raw-RGBA base image
+//! (`icon/mono-44.rgba` on macOS, `icon/color-32.rgba` elsewhere) embedded
+//! with `include_bytes!`. The files come from `installer/logo.svg` via
+//! `python3 installer/make-icons.py` (see `icon/README.md`); do not edit
+//! them by hand.
 //!
 //! macOS menu bar icons are conventionally monochrome "template" images:
 //! black pixels with the shape carried entirely in the alpha channel, and
 //! the system re-tints them for light/dark mode and highlight state (see
 //! `TrayIconBuilder::with_icon_as_template`, which `agent_main` sets `true`
-//! for exactly this reason). Windows has no such convention -- the taskbar
-//! shows the icon's own RGB verbatim on both light and dark backgrounds --
-//! so this draws flat, saturated colors there instead. `render_icon` picks
-//! between the two styles with `cfg!(target_os = "macos")` rather than a
-//! runtime flag: there is exactly one real answer per build, the same
-//! reasoning `capture`/`cursor`/`clipboard`'s per-OS backend selection uses.
+//! for exactly this reason). The three states there differ only in alpha
+//! (full / 0.55 / 0.25). Windows has no such convention -- the taskbar shows
+//! the icon's own RGB verbatim -- so the logo keeps its colors for `Session`
+//! and is turned gray for `Idle` / `Offline` (the latter also half
+//! transparent). `render_icon` picks the base with `cfg!(target_os =
+//! "macos")` rather than a runtime flag: there is exactly one real answer
+//! per build. Other targets (Linux CI builds the library) use the color base.
 
 /// Which of the tray icon's three looks to draw. See `menu::menu_model`'s
 /// doc comment for how `signaling::AgentStatus` maps onto this.
@@ -25,78 +28,62 @@ pub enum IconState {
     Offline,
 }
 
+#[cfg(target_os = "macos")]
+const BASE: &[u8] = include_bytes!("icon/mono-44.rgba");
+#[cfg(target_os = "macos")]
+const BASE_SIZE: usize = 44;
+#[cfg(not(target_os = "macos"))]
+const BASE: &[u8] = include_bytes!("icon/color-32.rgba");
+#[cfg(not(target_os = "macos"))]
+const BASE_SIZE: usize = 32;
+
+/// Scales `px` by `factor` (0.0..=1.0), rounding to nearest.
+fn scale_u8(v: u8, factor: f32) -> u8 {
+    (f32::from(v) * factor).round().clamp(0.0, 255.0) as u8
+}
+
 /// Renders `state` as a `size` x `size` RGBA buffer (row-major, 4 bytes per
-/// pixel, straight alpha) -- a monitor silhouette (bezel + stand) whose
-/// screen fill is state-dependent. See the module doc comment for the
-/// macOS-template vs. Windows-color split.
+/// pixel, straight alpha): the logo base image, nearest-neighbor scaled when
+/// `size` differs from the base, with the state look applied. See the module
+/// doc comment for the macOS-template vs. Windows-color split.
 pub fn render_icon(state: IconState, size: u32) -> Vec<u8> {
-    let s = i64::from(size);
-    let mut buf = vec![0u8; (size as usize) * (size as usize) * 4];
+    let size = size as usize;
     let is_macos = cfg!(target_os = "macos");
-
-    // Monitor bezel: inset rectangle, roughly 4:3, with a small stand below
-    // it. All bounds are fractions of `size` so this scales to any
-    // reasonable tray icon size (16px menu bar icons up to Windows' larger
-    // taskbar sizes) without hard-coded pixel offsets.
-    let left = s / 6;
-    let right = s - s / 6;
-    let top = s / 6;
-    let bottom = top + (right - left) * 3 / 4;
-    let stroke = (s / 12).max(1);
-
-    let put = |buf: &mut [u8], x: i64, y: i64, rgba: (u8, u8, u8, u8)| {
-        if x < 0 || y < 0 || x >= s || y >= s {
-            return;
-        }
-        let idx = ((y * s + x) * 4) as usize;
-        buf[idx] = rgba.0;
-        buf[idx + 1] = rgba.1;
-        buf[idx + 2] = rgba.2;
-        buf[idx + 3] = rgba.3;
-    };
-
-    let bezel_color: (u8, u8, u8, u8) = if is_macos {
-        (0, 0, 0, 255)
-    } else {
-        (90, 90, 90, 255)
-    };
-    let screen_color: (u8, u8, u8, u8) = match (state, is_macos) {
-        // macOS: shape/alpha only -- flat black at three different alpha
-        // levels, faint (idle) -> solid (session) -> almost invisible
-        // (offline, "screen is off").
-        (IconState::Idle, true) => (0, 0, 0, 90),
-        (IconState::Session, true) => (0, 0, 0, 220),
-        (IconState::Offline, true) => (0, 0, 0, 25),
-        // Windows: real color, opaque so it reads on any taskbar theme.
-        (IconState::Idle, false) => (190, 190, 190, 255),
-        (IconState::Session, false) => (40, 170, 70, 255),
-        (IconState::Offline, false) => (220, 130, 30, 255),
-    };
-
-    for y in top..bottom {
-        for x in left..right {
-            let on_bezel = x < left + stroke
-                || x >= right - stroke
-                || y < top + stroke
-                || y >= bottom - stroke;
-            put(
-                &mut buf,
-                x,
-                y,
-                if on_bezel { bezel_color } else { screen_color },
-            );
+    let mut buf = Vec::with_capacity(size * size * 4);
+    for y in 0..size {
+        let sy = y * BASE_SIZE / size;
+        for x in 0..size {
+            let sx = x * BASE_SIZE / size;
+            let i = (sy * BASE_SIZE + sx) * 4;
+            let (r, g, b, a) = (BASE[i], BASE[i + 1], BASE[i + 2], BASE[i + 3]);
+            let px = if is_macos {
+                let k = match state {
+                    IconState::Session => 1.0,
+                    IconState::Idle => 0.55,
+                    IconState::Offline => 0.25,
+                };
+                [r, g, b, scale_u8(a, k)]
+            } else {
+                match state {
+                    IconState::Session => [r, g, b, a],
+                    IconState::Idle | IconState::Offline => {
+                        // Rec. 601 luma.
+                        let luma =
+                            (0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b))
+                                .round()
+                                .clamp(0.0, 255.0) as u8;
+                        let k = if state == IconState::Offline {
+                            0.5
+                        } else {
+                            1.0
+                        };
+                        [luma, luma, luma, scale_u8(a, k)]
+                    }
+                }
+            };
+            buf.extend_from_slice(&px);
         }
     }
-
-    // Stand, shared shape across all three states.
-    let stand_w = (right - left) / 3;
-    let stand_x = (left + right) / 2 - stand_w / 2;
-    for y in bottom..(bottom + stroke).min(s) {
-        for x in stand_x..(stand_x + stand_w) {
-            put(&mut buf, x, y, bezel_color);
-        }
-    }
-
     buf
 }
 
@@ -114,11 +101,18 @@ mod tests {
 
     #[test]
     fn has_opaque_pixels() {
-        for state in [IconState::Idle, IconState::Session, IconState::Offline] {
+        // Only `Session` keeps the base alpha; `Idle`/`Offline` are dimmed on
+        // purpose, so they only need to be visible (non-zero alpha).
+        let buf = render_icon(IconState::Session, 22);
+        assert!(
+            buf.as_chunks::<4>().0.iter().any(|px| px[3] == 255),
+            "Session icon has no fully opaque pixel"
+        );
+        for state in [IconState::Idle, IconState::Offline] {
             let buf = render_icon(state, 22);
             assert!(
-                buf.as_chunks::<4>().0.iter().any(|px| px[3] == 255),
-                "{state:?} icon has no fully opaque pixel (the bezel should always be)"
+                buf.as_chunks::<4>().0.iter().any(|px| px[3] > 0),
+                "{state:?} icon is fully transparent"
             );
         }
     }
@@ -132,5 +126,13 @@ mod tests {
         assert_ne!(idle, session);
         assert_ne!(idle, offline);
         assert_ne!(session, offline);
+    }
+
+    #[test]
+    fn base_size_render_matches_base_length_and_is_not_empty() {
+        let buf = render_icon(IconState::Session, BASE_SIZE as u32);
+        assert_eq!(BASE.len(), BASE_SIZE * BASE_SIZE * 4);
+        assert_eq!(buf.len(), BASE.len());
+        assert!(buf.as_chunks::<4>().0.iter().any(|px| px[3] > 0));
     }
 }

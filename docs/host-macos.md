@@ -60,4 +60,4 @@ bash installer/macos/build-pkg.sh target/release 0.1.0 pkg-out
 (base64 от `.p12`) и `MACOS_SIGN_P12_PASSWORD` -- как в CI (секреты GitHub с теми
 же именами); временная связка создаётся и удаляется самим скриптом.
 Результат -- `pkg-out/rcdesk-macos.pkg`. Иконка `installer/macos/rcdesk.icns`
-перегенерируется по инструкции в `installer/windows/make-icon.py`.
+перегенерируется скриптом `installer/make-icons.py`.
