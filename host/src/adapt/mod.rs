@@ -31,6 +31,9 @@
 //!   5800, loss up to 42 %): a burst overran the channel, each loss cut the
 //!   target by 10-20 % and probing climbed straight back. After observed loss
 //!   REMB therefore becomes a ceiling for `LOSS_CAP_HOLD`.
+//! - On the second live check (2026-10-14) fps got stuck at 5 for 36 minutes:
+//!   the `min_fps` floor returned by `bitrate_fps_step` is not a rung of the
+//!   fps ladder, and `step_up` could not find it there.
 
 use std::time::{Duration, Instant};
 
@@ -99,6 +102,14 @@ pub const LOSS_CAP_HOLD: Duration = Duration::from_secs(10);
 /// of the fresh REMB (second user's live log, 2026-10-14: channel ~2 Mbit/s,
 /// REMB 1986, target 5800, loss up to 42 %).
 pub const LOSS_CAP_RATIO: f64 = 0.9;
+
+/// The loss ceiling never drops below this (kbps). On a static screen the
+/// browser's REMB is "hungry" (capped at ~1.5x of what it received) and says
+/// nothing about the channel capacity: Mac log 0.1.9, 1920x1080, REMB 68-115
+/// kbps collapsed the target to `MIN_BITRATE_KBPS`. A genuinely narrow channel
+/// is still cut by the `LOSS_HIGH` and REMB-congestion paths; this is only an
+/// additional ceiling.
+pub const LOSS_CAP_FLOOR_KBPS: f64 = 1000.0;
 
 /// Bitrate growth factor applied once per tick while probing for more
 /// bandwidth (REMB only ever tells us to go *down*; growth has to be our
@@ -478,7 +489,7 @@ impl Controller {
         }
         let loss_cap = remb_kbps
             .filter(|_| self.loss_cap_until.is_some_and(|until| now < until))
-            .map(|r| r * LOSS_CAP_RATIO);
+            .map(|r| (r * LOSS_CAP_RATIO).max(LOSS_CAP_FLOOR_KBPS));
         let (mut b, mut bitrate_reason) = if loss > LOSS_HIGH {
             (old_b * (1.0 - 0.5 * loss as f64), Some("loss"))
         } else if remb_congested && self.congested_ticks >= REMB_CONGESTION_TICKS {
@@ -593,21 +604,28 @@ impl Controller {
 }
 
 /// The next lower rung than `current` in `steps` (sorted highest first), or
-/// `current` if it's already the lowest rung.
+/// `current` if there is none. `current` may be off the ladder
+/// (`policy.min_fps` is the fallback floor of `bitrate_fps_step`); then the
+/// nearest rung below it is taken.
 fn step_down(steps: &[u32], current: u32) -> u32 {
-    match steps.iter().position(|&s| s == current) {
-        Some(i) if i + 1 < steps.len() => steps[i + 1],
-        _ => current,
-    }
+    steps
+        .iter()
+        .copied()
+        .find(|&s| s < current)
+        .unwrap_or(current)
 }
 
 /// The next higher rung than `current` in `steps` (sorted highest first), or
-/// `current` if it's already the highest rung.
+/// `current` if there is none. `current` may be off the ladder
+/// (`policy.min_fps` is the fallback floor of `bitrate_fps_step`); then the
+/// nearest rung above it is taken.
 fn step_up(steps: &[u32], current: u32) -> u32 {
-    match steps.iter().position(|&s| s == current) {
-        Some(i) if i > 0 => steps[i - 1],
-        _ => current,
-    }
+    steps
+        .iter()
+        .copied()
+        .rev()
+        .find(|&s| s > current)
+        .unwrap_or(current)
 }
 
 #[cfg(test)]
@@ -1041,6 +1059,72 @@ mod tests {
         let decision = c.tick(now).expect("expected an encoder step up");
         assert_eq!(decision.reason, "encoder");
         assert_eq!(decision.target.fps, 20);
+    }
+
+    #[test]
+    fn step_up_and_step_down_handle_off_ladder_current() {
+        let steps = [30, 24, 20, 15, 12, 10, 8];
+        assert_eq!(step_up(&steps, 5), 8);
+        assert_eq!(step_down(&steps, 5), 5);
+        assert_eq!(step_up(&steps, 12), 15);
+        assert_eq!(step_down(&steps, 12), 10);
+        assert_eq!(step_up(&steps, 30), 30);
+        assert_eq!(step_down(&steps, 8), 8);
+        assert_eq!(step_up(&steps, 9), 10);
+        assert_eq!(step_down(&steps, 9), 8);
+    }
+
+    #[test]
+    fn fps_recovers_from_min_fps_floor_after_bitrate_recovers() {
+        // 2560x1440: 73_728 bits/frame, so 8 fps needs ~590 kbps; below that
+        // `bitrate_fps_step` falls through to `MIN_FPS`, which is not a rung
+        // of the ladder (live log, 2026-10-14).
+        let cfg = AdaptConfig {
+            width: 2560,
+            height: 1440,
+            ..cfg()
+        };
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg, t0);
+        let mut now = t0;
+        for _ in 0..5 {
+            now += TICK;
+            frames(&mut c, now, 1_000);
+            c.feedback(Feedback::Loss { fraction: 0.9 }, now);
+            c.tick(now);
+        }
+        assert_eq!(c.target().fps, MIN_FPS);
+        assert!(c.target().bitrate_kbps < 590);
+
+        // Loss gone, frames every tick, no overruns: probing grows the
+        // bitrate and the encoder streak must lift fps off the floor.
+        let mut max_fps_seen = MIN_FPS;
+        for _ in 0..60 {
+            now += TICK;
+            frames(&mut c, now, 1_000);
+            c.tick(now);
+            max_fps_seen = max_fps_seen.max(c.target().fps);
+        }
+        assert!(c.target().bitrate_kbps > 590);
+        assert!(c.target().fps > MIN_FPS, "fps stuck at {}", c.target().fps);
+        assert!(max_fps_seen >= 8);
+    }
+
+    #[test]
+    fn loss_cap_never_drops_below_floor_on_starved_remb() {
+        // Static screen: little is sent, the browser's REMB is starved
+        // (115 kbps). 0.9 * 115 would collapse the target to 300; the floor
+        // keeps it at 1000. At 1280x720 (18_432 bits/frame) 1000 kbps
+        // affords 30 fps (33_333 bits/frame), so fps stays 30.
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let now = t0 + TICK;
+        frames(&mut c, now, 1_000);
+        remb(&mut c, now, 115_000);
+        c.feedback(Feedback::Loss { fraction: 0.05 }, now);
+        let decision = c.tick(now).expect("expected a decision");
+        assert_eq!(decision.target.bitrate_kbps, 1000);
+        assert_eq!(decision.target.fps, 30);
     }
 
     #[test]
