@@ -32,6 +32,19 @@ const MIN_QP: u8 = 1;
 /// 2–3.5 Mbit/s of the 6 Mbit/s target. `--max-qp` overrides it.
 const DEFAULT_MAX_QP: u8 = 30;
 
+/// Upper bound on openh264 encoder threads. The software encoder is the
+/// fallback path (CI, VMs, Windows without Media Foundation), so it must not
+/// take every core from the capture and transport tasks; beyond 4 slices the
+/// gain flattens anyway.
+const OPENH264_MAX_THREADS: u16 = 4;
+
+/// Maximum slice size in bytes (`SM_SIZELIMITED_SLICE`). With a single slice
+/// openh264 encodes a 1080p frame on one thread (~20 ms); size-limited slices
+/// let `num_threads` encode them in parallel. 8000 was picked by bench on
+/// 1080p (avg capture-to-encoded ~24.8 ms -> ~19.5 ms, no per-frame size
+/// penalty); 1200 (<= `RTP_MTU`, no FU-A fragmentation) cost ~12 % bitrate.
+const OPENH264_SLICE_BYTES: u32 = 8000;
+
 pub struct OpenH264Encoder {
     inner: Oh264Encoder,
     /// Wall-clock reference for `Timestamp::from_millis` below: the encoder
@@ -44,7 +57,14 @@ pub struct OpenH264Encoder {
 
 impl OpenH264Encoder {
     pub fn new(cfg: EncoderConfig) -> Result<Self, EncodeError> {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(OPENH264_MAX_THREADS as usize) as u16;
+        let slice_bytes = OPENH264_SLICE_BYTES;
         tracing::info!(
+            threads,
+            slice_bytes,
             width = cfg.width,
             height = cfg.height,
             fps = cfg.fps,
@@ -65,7 +85,8 @@ impl OpenH264Encoder {
                 cfg.keyframe_interval_frames,
             ))
             .skip_frames(false)
-            .num_threads(0);
+            .num_threads(threads)
+            .max_slice_len(slice_bytes);
         // The lower bound must be >= 1: openh264's `ParamValidationExt`
         // (`encoder_ext.cpp`, "Change QP Range") throws the *whole* range
         // away and reinstates its screen-content defaults when either bound
@@ -83,6 +104,11 @@ impl OpenH264Encoder {
             started: Instant::now(),
         })
     }
+}
+
+/// True when any NAL of the (possibly multi-slice) frame is an IDR slice.
+fn has_idr_slice(annexb: &[u8]) -> bool {
+    super::nal_types(annexb).contains(&5)
 }
 
 impl Encoder for OpenH264Encoder {
@@ -114,8 +140,7 @@ impl Encoder for OpenH264Encoder {
             return Ok(None);
         }
 
-        let keyframe =
-            bitstream.frame_type() == FrameType::IDR || super::nal_types(&data).contains(&5);
+        let keyframe = bitstream.frame_type() == FrameType::IDR || has_idr_slice(&data);
 
         Ok(Some(EncodedFrame {
             data,
@@ -195,6 +220,24 @@ mod tests {
     use crate::capture::synthetic::SyntheticSource;
     use crate::capture::FrameSource;
     use crate::encode::nal_types;
+
+    #[test]
+    fn multi_slice_frame_is_keyframe_iff_any_idr_nal() {
+        #[rustfmt::skip]
+        let idr: Vec<u8> = vec![
+            0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 2,
+            0, 0, 1, 0x65, 3, 0, 0, 1, 0x65, 4, 0, 0, 1, 0x65, 5,
+        ];
+        #[rustfmt::skip]
+        let delta: Vec<u8> = vec![
+            0, 0, 1, 0x41, 3, 0, 0, 1, 0x41, 4, 0, 0, 1, 0x41, 5,
+        ];
+        #[rustfmt::skip]
+        let mixed: Vec<u8> = vec![0, 0, 1, 0x41, 3, 0, 0, 1, 0x65, 4];
+        assert!(has_idr_slice(&idr));
+        assert!(!has_idr_slice(&delta));
+        assert!(has_idr_slice(&mixed));
+    }
 
     fn test_cfg() -> EncoderConfig {
         EncoderConfig {
