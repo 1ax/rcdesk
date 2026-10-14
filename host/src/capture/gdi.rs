@@ -47,20 +47,31 @@ use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_
 
 use super::{frame_unchanged, CaptureError, FramePacer, FrameSource, RawFrame};
 
+/// One DIB section plus the pointer to its pixel memory.
+struct Dib {
+    hbitmap: HBITMAP,
+    /// Points into the DIB section backing `hbitmap`; valid for as long as
+    /// `hbitmap` is (i.e. until `GdiSource` is dropped).
+    pixels: *mut u8,
+}
+
 pub struct GdiSource {
     hdc_screen: HDC,
     hdc_mem: HDC,
-    hbitmap: HBITMAP,
+    /// Two DIB sections used in turn (see `next_frame` for the invariant).
+    dibs: [Dib; 2],
+    /// Index of the active section, the one the next `BitBlt` writes into.
+    cur: usize,
+    /// The bitmap `hdc_mem` had selected before our first `SelectObject`.
     old_bitmap: HGDIOBJ,
-    /// Points into the DIB section backing `hbitmap`; valid for as long as
-    /// `hbitmap` is (i.e. for the lifetime of `self`).
-    pixels: *mut u8,
+    /// False until the first frame has been handed out; until then section
+    /// `1 - cur` holds no valid previous frame to compare against.
+    has_prev: bool,
     /// Top-left of the captured region in virtual-screen coordinates.
     origin: (i32, i32),
     width: u32,
     height: u32,
     pacer: FramePacer,
-    prev: Option<Vec<u8>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -141,21 +152,10 @@ impl GdiSource {
             ..Default::default()
         };
 
-        let mut pixels_ptr: *mut c_void = std::ptr::null_mut();
-        // Safety: `hdc_screen` is valid, `bitmap_info` describes a 32bpp
-        // top-down DIB sized `width` x `height`, `pixels_ptr` is a valid
-        // out-parameter.
-        let hbitmap = match unsafe {
-            CreateDIBSection(
-                Some(hdc_screen),
-                &bitmap_info,
-                DIB_RGB_COLORS,
-                &mut pixels_ptr,
-                None,
-                0,
-            )
-        } {
-            Ok(hbitmap) => hbitmap,
+        // Safety: `hdc_screen` is valid and `bitmap_info` describes a 32bpp
+        // top-down DIB sized `width` x `height`.
+        let dib0 = match unsafe { create_dib(hdc_screen, &bitmap_info) } {
+            Ok(dib) => dib,
             Err(err) => {
                 // Safety: both were created above and not used again on
                 // this path.
@@ -166,14 +166,29 @@ impl GdiSource {
                 return Err(CaptureError::Backend(format!("CreateDIBSection: {err}")));
             }
         };
+        // Safety: as above.
+        let dib1 = match unsafe { create_dib(hdc_screen, &bitmap_info) } {
+            Ok(dib) => dib,
+            Err(err) => {
+                // Safety: all three were created above and not used again on
+                // this path.
+                unsafe {
+                    let _ = DeleteObject(dib0.hbitmap.into());
+                    let _ = DeleteDC(hdc_mem);
+                    ReleaseDC(None, hdc_screen);
+                }
+                return Err(CaptureError::Backend(format!("CreateDIBSection: {err}")));
+            }
+        };
 
-        // Safety: `hdc_mem` and `hbitmap` were both just created above.
-        let old_bitmap = unsafe { SelectObject(hdc_mem, hbitmap.into()) };
+        // Safety: `hdc_mem` and `dib0.hbitmap` were both just created above.
+        let old_bitmap = unsafe { SelectObject(hdc_mem, dib0.hbitmap.into()) };
         if old_bitmap.is_invalid() {
-            // Safety: all three were created above and not used again on
+            // Safety: all four were created above and not used again on
             // this path.
             unsafe {
-                let _ = DeleteObject(hbitmap.into());
+                let _ = DeleteObject(dib1.hbitmap.into());
+                let _ = DeleteObject(dib0.hbitmap.into());
                 let _ = DeleteDC(hdc_mem);
                 ReleaseDC(None, hdc_screen);
             }
@@ -183,17 +198,44 @@ impl GdiSource {
         Ok(Self {
             hdc_screen,
             hdc_mem,
-            hbitmap,
+            dibs: [dib0, dib1],
+            cur: 0,
             old_bitmap,
-            pixels: pixels_ptr.cast(),
+            has_prev: false,
             origin,
             width,
             height,
             pacer: FramePacer::new(fps),
-            prev: None,
             stop: Arc::new(AtomicBool::new(false)),
         })
     }
+}
+
+/// Creates one DIB section described by `bitmap_info`.
+///
+/// # Safety
+/// `hdc_screen` must be a valid DC and `bitmap_info` a valid 32bpp
+/// description.
+unsafe fn create_dib(
+    hdc_screen: HDC,
+    bitmap_info: &BITMAPINFO,
+) -> Result<Dib, windows::core::Error> {
+    let mut pixels_ptr: *mut c_void = std::ptr::null_mut();
+    // Safety: upheld by the caller; `pixels_ptr` is a valid out-parameter.
+    let hbitmap = unsafe {
+        CreateDIBSection(
+            Some(hdc_screen),
+            bitmap_info,
+            DIB_RGB_COLORS,
+            &mut pixels_ptr,
+            None,
+            0,
+        )
+    }?;
+    Ok(Dib {
+        hbitmap,
+        pixels: pixels_ptr.cast(),
+    })
 }
 
 impl FrameSource for GdiSource {
@@ -203,6 +245,19 @@ impl FrameSource for GdiSource {
                 return Err(CaptureError::Stopped);
             }
             self.pacer.wait();
+
+            // Invariant: section `1 - cur` always holds the last frame handed
+            // out; the active section `cur` is overwritten by every `BitBlt`.
+            // So an unchanged (static) screen costs no copies at all, and a
+            // changed one costs exactly one (`to_vec` below).
+            //
+            // Safety: `hdc_mem` is valid for the whole lifetime of `self` and
+            // `dibs[cur]` is a live bitmap not selected elsewhere. Selecting
+            // unconditionally is a cheap GDI call, simpler than tracking
+            // which section is currently selected.
+            unsafe {
+                SelectObject(self.hdc_mem, self.dibs[self.cur].hbitmap.into());
+            }
 
             // Safety: `hdc_mem` and `hdc_screen` are valid for the whole
             // lifetime of `self`. No `CAPTUREBLT` flag: this blits only
@@ -226,25 +281,25 @@ impl FrameSource for GdiSource {
             .map_err(|err| CaptureError::Backend(format!("BitBlt: {err}")))?;
 
             let len = self.width as usize * self.height as usize * 4;
-            // Safety: `self.pixels` points into the DIB section backing
-            // `self.hbitmap`, which stays selected into `self.hdc_mem` (and
-            // therefore alive and sized for exactly `width * height * 4`
-            // bytes of 32bpp pixels) for the whole lifetime of `self`; GDI
-            // calls are synchronous, so `BitBlt` above has finished writing
-            // every pixel by the time it returns control here.
-            let cur: &[u8] = unsafe { slice::from_raw_parts(self.pixels, len) };
+            // Safety: each `pixels` points into a DIB section that stays
+            // alive (and sized for exactly `width * height * 4` bytes of
+            // 32bpp pixels) for the whole lifetime of `self`; GDI calls are
+            // synchronous, so `BitBlt` above has finished writing every
+            // pixel by the time it returns control here. The inactive
+            // section is not being written by anyone.
+            let cur: &[u8] = unsafe { slice::from_raw_parts(self.dibs[self.cur].pixels, len) };
+            let prev: &[u8] = unsafe { slice::from_raw_parts(self.dibs[1 - self.cur].pixels, len) };
 
-            if frame_unchanged(self.prev.as_deref(), cur) {
+            if self.has_prev && frame_unchanged(Some(prev), cur) {
                 continue;
             }
 
-            // One copy per changed frame: `data` is what `RawFrame` carries
-            // out, `prev` needs its own owned copy to compare the next
-            // `BitBlt` result against (the DIB's bytes change in place on
-            // every `BitBlt`, so nothing here can be borrowed across
-            // iterations).
+            // The single copy per changed frame: `data` is what `RawFrame`
+            // carries out. The section itself becomes the "previous frame"
+            // by flipping `cur`.
             let data = cur.to_vec();
-            self.prev = Some(data.clone());
+            self.has_prev = true;
+            self.cur = 1 - self.cur;
 
             return Ok(RawFrame::Bgra {
                 width: self.width,
@@ -267,7 +322,8 @@ impl Drop for GdiSource {
         // was created there and is not touched again after this.
         unsafe {
             SelectObject(self.hdc_mem, self.old_bitmap);
-            let _ = DeleteObject(self.hbitmap.into());
+            let _ = DeleteObject(self.dibs[1].hbitmap.into());
+            let _ = DeleteObject(self.dibs[0].hbitmap.into());
             let _ = DeleteDC(self.hdc_mem);
             ReleaseDC(None, self.hdc_screen);
         }
@@ -277,6 +333,6 @@ impl Drop for GdiSource {
 // SAFETY: like `ScapSource`, `GdiSource` is only ever touched from the
 // single dedicated capture thread that owns it for its entire lifetime
 // (created, used and dropped there); we only need `Send` to move the
-// freshly-built value into that thread once. The raw `pixels` pointer is
+// freshly-built value into that thread once. The raw `pixels` pointers are
 // never read or written from any other thread.
 unsafe impl Send for GdiSource {}
