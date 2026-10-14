@@ -33,6 +33,7 @@ use rtc::rtp_transceiver::rtp_sender::{
 use rtc::sansio::Protocol;
 use rtc::shared::error::Error;
 
+use rtc::statistics::stats::ice_candidate_pair::RTCStatsIceCandidatePairState;
 use webrtc::data_channel::{
     DataChannel, DataChannelEvent, RTCDataChannelInit, RTCDataChannelState,
 };
@@ -42,7 +43,8 @@ use webrtc::media_stream::Track;
 use webrtc::peer_connection::{
     register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder,
     PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceServer,
-    RTCPeerConnectionIceEvent, RTCPeerConnectionState, RTCSessionDescription, Registry,
+    RTCPeerConnectionIceEvent, RTCPeerConnectionState, RTCSessionDescription, RTCStatsReport,
+    RTCStatsReportEntry, Registry, StatsSelector,
 };
 use webrtc::rtp_transceiver::RtpSender;
 use webrtc::runtime::Runtime;
@@ -490,6 +492,105 @@ pub struct PeerSession {
     tag: u64,
 }
 
+/// One end of the selected ICE candidate pair, for the `agent.log` path line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateInfo {
+    /// `host`, `srflx`, `prflx` or `relay`.
+    pub typ: String,
+    pub protocol: String,
+    /// `ip:port`.
+    pub address: String,
+}
+
+impl CandidateInfo {
+    fn from_stats(c: &rtc::statistics::stats::ice_candidate::RTCIceCandidateStats) -> Self {
+        Self {
+            typ: c.candidate_type.to_string(),
+            protocol: c.protocol.clone(),
+            address: format!("{}:{}", c.address.as_deref().unwrap_or("?"), c.port),
+        }
+    }
+
+    /// `host/udp 192.168.1.77:55544`.
+    pub fn describe(&self) -> String {
+        format!("{}/{} {}", self.typ, self.protocol, self.address)
+    }
+}
+
+/// The selected ICE candidate pair plus what the ICE layer knows about it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathInfo {
+    pub local: CandidateInfo,
+    pub remote: CandidateInfo,
+    /// `current_round_trip_time` in ms; `None` while it is still 0.
+    pub rtt_ms: Option<f64>,
+    pub packets_discarded_on_send: u32,
+}
+
+impl PathInfo {
+    /// Compact `local>remote` candidate types, e.g. `host>srflx`; `?` when unknown.
+    pub fn path_label(path: Option<&PathInfo>) -> String {
+        match path {
+            Some(p) => format!("{}>{}", p.local.typ, p.remote.typ),
+            None => "?".to_string(),
+        }
+    }
+
+    /// Same pair (candidates identical), ignoring RTT and counters.
+    pub fn same_pair(&self, other: &PathInfo) -> bool {
+        self.local == other.local && self.remote == other.remote
+    }
+}
+
+/// webrtc-rs 0.20.5 names candidate entries `RTCLocalIceCandidate_<id>` /
+/// `RTCRemoteIceCandidate_<id>` while a pair refers to the bare `<id>`
+/// (`candidate:56o...`), so accept an exact match or a `_<id>` suffix.
+fn candidate_id_matches(entry_id: &str, wanted: &str) -> bool {
+    !wanted.is_empty() && (entry_id == wanted || entry_id.ends_with(&format!("_{wanted}")))
+}
+
+/// Picks the selected pair out of a stats report: the one named by the
+/// transport's `selected_candidate_pair_id`, else a nominated, succeeded pair.
+fn path_from_report(report: &RTCStatsReport) -> Option<PathInfo> {
+    let selected_id = report
+        .transport()
+        .map(|t| t.selected_candidate_pair_id.as_str())
+        .filter(|id| !id.is_empty());
+    let pair = selected_id
+        .and_then(|id| match report.get(id) {
+            Some(RTCStatsReportEntry::IceCandidatePair(p)) => Some(p),
+            _ => None,
+        })
+        .or_else(|| {
+            report
+                .candidate_pairs()
+                .find(|p| p.nominated && p.state == RTCStatsIceCandidatePairState::Succeeded)
+        })?;
+    let local = report.iter().find_map(|e| match e {
+        RTCStatsReportEntry::LocalCandidate(c)
+            if candidate_id_matches(&c.stats.id, &pair.local_candidate_id) =>
+        {
+            Some(CandidateInfo::from_stats(c))
+        }
+        _ => None,
+    })?;
+    let remote = report.iter().find_map(|e| match e {
+        RTCStatsReportEntry::RemoteCandidate(c)
+            if candidate_id_matches(&c.stats.id, &pair.remote_candidate_id) =>
+        {
+            Some(CandidateInfo::from_stats(c))
+        }
+        _ => None,
+    })?;
+    Some(PathInfo {
+        local,
+        remote,
+        rtt_ms: (pair.current_round_trip_time > 0.0)
+            .then_some(pair.current_round_trip_time * 1000.0),
+        packets_discarded_on_send: pair.packets_discarded_on_send,
+    })
+}
+
 /// `(label, RTCDataChannelInit)` for the four channels every session opens
 /// before the offer is created (see ARCHITECTURE.md §5).
 fn data_channel_specs() -> [(&'static str, RTCDataChannelInit); 4] {
@@ -692,6 +793,13 @@ impl PeerSession {
         });
 
         Ok(session)
+    }
+
+    /// The currently selected ICE candidate pair (host/srflx/relay, RTT), or
+    /// `None` while ICE has not selected one. Diagnostics only.
+    pub async fn selected_path(&self) -> Option<PathInfo> {
+        let report = self.pc.get_stats(Instant::now(), StatsSelector::None).await;
+        path_from_report(&report)
     }
 
     /// This session's unique tag (fix to slice 3.5b) -- see
@@ -1157,6 +1265,68 @@ fn ntp_mid32_now() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cand(typ: &str, addr: &str) -> CandidateInfo {
+        CandidateInfo {
+            typ: typ.into(),
+            protocol: "udp".into(),
+            address: addr.into(),
+        }
+    }
+
+    fn path(l: &str, r: &str) -> PathInfo {
+        PathInfo {
+            local: cand(l, "192.168.1.77:55544"),
+            remote: cand(r, "192.168.1.50:61234"),
+            rtt_ms: Some(1.2),
+            packets_discarded_on_send: 0,
+        }
+    }
+
+    #[test]
+    fn path_label_formats_types_or_question_mark() {
+        assert_eq!(
+            PathInfo::path_label(Some(&path("host", "srflx"))),
+            "host>srflx"
+        );
+        assert_eq!(PathInfo::path_label(None), "?");
+    }
+
+    #[test]
+    fn candidate_describe_and_same_pair() {
+        assert_eq!(
+            cand("host", "192.168.1.77:55544").describe(),
+            "host/udp 192.168.1.77:55544"
+        );
+        let a = path("host", "host");
+        let mut b = a.clone();
+        b.rtt_ms = Some(9.0);
+        assert!(a.same_pair(&b));
+        assert!(!a.same_pair(&path("host", "relay")));
+    }
+
+    #[test]
+    fn candidate_id_matches_real_webrtc_rs_ids() {
+        assert!(candidate_id_matches("candidate:56o", "candidate:56o"));
+        assert!(candidate_id_matches(
+            "RTCLocalIceCandidate_candidate:56o",
+            "candidate:56o"
+        ));
+        assert!(candidate_id_matches(
+            "RTCRemoteIceCandidate_candidate:bXv",
+            "candidate:bXv"
+        ));
+        assert!(!candidate_id_matches(
+            "RTCLocalIceCandidate_candidate:56o",
+            "candidate:bXv"
+        ));
+        assert!(!candidate_id_matches("anything", ""));
+    }
+
+    #[test]
+    fn empty_report_has_no_path() {
+        assert!(path_from_report(&RTCStatsReport::default()).is_none());
+    }
 
     #[test]
     fn pace_gap_small_frame_never_pauses() {

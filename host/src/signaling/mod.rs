@@ -2186,13 +2186,20 @@ async fn handle_session_event(
             }
         }
         SessionEvent::ReceiverReport {
-            fraction_lost, rtt, ..
+            fraction_lost,
+            rtt,
+            jitter,
+            ..
         } => {
             tracing::debug!(fraction_lost, ?rtt, "receiver report from peer");
             if let Some(active) = active.as_ref() {
                 if let Some(adapt_tx) = &active.video.adapt_tx {
                     let _ = adapt_tx.send(Feedback::Loss {
                         fraction: fraction_lost,
+                    });
+                    let _ = adapt_tx.send(Feedback::ReceiverStats {
+                        rtt,
+                        jitter_ms: jitter as f32 / 90.0,
                     });
                 }
             }
@@ -3021,6 +3028,13 @@ struct StatsSummary {
     encode_ms_max: f64,
     loss: f32,
     remb_kbps: Option<u32>,
+    rr_rtt_ms: Option<f64>,
+    rr_jitter_ms: Option<f32>,
+}
+
+/// `1.2`, or `-` when the value is unknown (log fields).
+fn fmt_opt<T: std::fmt::Display>(v: Option<T>) -> String {
+    v.map_or_else(|| "-".to_string(), |v| format!("{v:.1}"))
 }
 
 /// Rolls the pipeline counters up into one `info!` line every `SUMMARY_TICKS`
@@ -3033,6 +3047,8 @@ struct StatsWindow {
     bytes: u64,
     last_loss: f32,
     last_remb_kbps: Option<u32>,
+    last_rr_rtt_ms: Option<f64>,
+    last_rr_jitter_ms: Option<f32>,
     captured: u64,
     encoded: u64,
     dropped: u64,
@@ -3051,6 +3067,8 @@ impl StatsWindow {
             bytes: 0,
             last_loss: 0.0,
             last_remb_kbps: None,
+            last_rr_rtt_ms: None,
+            last_rr_jitter_ms: None,
             captured: stats.captured.load(Relaxed),
             encoded: stats.encoded.load(Relaxed),
             dropped: stats.dropped.load(Relaxed),
@@ -3072,6 +3090,11 @@ impl StatsWindow {
 
     fn remb(&mut self, kbps: u32) {
         self.last_remb_kbps = Some(kbps);
+    }
+
+    fn receiver_stats(&mut self, rtt: Option<Duration>, jitter_ms: f32) {
+        self.last_rr_rtt_ms = rtt.map(|d| d.as_secs_f64() * 1000.0);
+        self.last_rr_jitter_ms = Some(jitter_ms);
     }
 
     fn tick(&mut self, stats: &crate::pipeline::PipelineStats) -> Option<StatsSummary> {
@@ -3109,6 +3132,8 @@ impl StatsWindow {
             encode_ms_max: stats.encode_us_max.swap(0, Relaxed) as f64 / 1000.0,
             loss: self.last_loss,
             remb_kbps: self.last_remb_kbps,
+            rr_rtt_ms: self.last_rr_rtt_ms,
+            rr_jitter_ms: self.last_rr_jitter_ms,
         };
         self.ticks = 0;
         self.bytes = 0;
@@ -3159,6 +3184,10 @@ async fn run_adapt_task(
     // `send_control` drops messages into a closed channel -- so the
     // announcement is retried on every tick until it is actually delivered.
     let mut unannounced: Option<ControlMessage> = None;
+    // Selected ICE pair as last logged, and the pair's discard counter at the
+    // previous summary (for the per-window delta).
+    let mut logged_path: Option<crate::transport::PathInfo> = None;
+    let mut discarded_seen: u32 = 0;
 
     loop {
         tokio::select! {
@@ -3169,6 +3198,9 @@ async fn run_adapt_task(
                             Feedback::Frame { bytes } => window.frame(*bytes),
                             Feedback::Loss { fraction } => window.loss(*fraction),
                             Feedback::Remb { bitrate_bps } => window.remb((bitrate_bps / 1000) as u32),
+                            Feedback::ReceiverStats { rtt, jitter_ms } => {
+                                window.receiver_stats(*rtt, *jitter_ms)
+                            }
                             _ => {}
                         }
                         controller.feedback(fb, Instant::now());
@@ -3187,6 +3219,27 @@ async fn run_adapt_task(
                 }
                 if let Some(s) = window.tick(&pipeline_stats) {
                     let target = controller.target();
+                    let path = peer.selected_path().await;
+                    match &path {
+                        Some(p) => {
+                            if !logged_path.as_ref().is_some_and(|l| l.same_pair(p)) {
+                                tracing::info!(
+                                    "ice path selected local={} remote={} ice_rtt_ms={}",
+                                    p.local.describe(),
+                                    p.remote.describe(),
+                                    fmt_opt(p.rtt_ms)
+                                );
+                                discarded_seen = 0;
+                            }
+                            logged_path = Some(p.clone());
+                        }
+                        None => tracing::debug!("ice path: no selected candidate pair"),
+                    }
+                    let send_discarded = path.as_ref().map_or(0, |p| {
+                        let d = p.packets_discarded_on_send.saturating_sub(discarded_seen);
+                        discarded_seen = p.packets_discarded_on_send;
+                        d
+                    });
                     tracing::info!(
                         captured = s.captured,
                         encoded = s.encoded,
@@ -3202,6 +3255,11 @@ async fn run_adapt_task(
                         remb_kbps = ?s.remb_kbps,
                         target_kbps = target.bitrate_kbps,
                         target_fps = target.fps,
+                        path = %crate::transport::PathInfo::path_label(path.as_ref()),
+                        ice_rtt_ms = %fmt_opt(path.as_ref().and_then(|p| p.rtt_ms)),
+                        rr_rtt_ms = %fmt_opt(s.rr_rtt_ms),
+                        rr_jitter_ms = %fmt_opt(s.rr_jitter_ms),
+                        send_discarded,
                         "video: {}s summary",
                         s.seconds
                     );
@@ -3346,7 +3404,10 @@ mod tests {
             w.frame(5000);
         }
         w.loss(0.02);
+        w.receiver_stats(Some(Duration::from_millis(12)), 3.5);
         let s = w.tick(&stats).expect("fifth tick yields a summary");
+        assert_eq!(s.rr_rtt_ms.map(|r| r.round()), Some(12.0));
+        assert_eq!(s.rr_jitter_ms, Some(3.5));
         assert_eq!(s.captured, 150);
         assert_eq!(s.encoded, 140);
         assert_eq!(s.kbps, 1120);
@@ -3354,6 +3415,12 @@ mod tests {
         assert!((s.encode_ms_max - 12.0).abs() < 0.01);
         assert_eq!(s.loss, 0.02);
         assert_eq!(stats.encode_us_max.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn fmt_opt_prints_value_or_dash() {
+        assert_eq!(fmt_opt(Some(1.23_f64)), "1.2");
+        assert_eq!(fmt_opt(None::<f32>), "-");
     }
 
     #[test]

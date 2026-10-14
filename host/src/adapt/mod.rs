@@ -189,6 +189,12 @@ pub enum Feedback {
     Remb { bitrate_bps: u64 },
     /// Derived from `transport::SessionEvent::ReceiverReport::fraction_lost`.
     Loss { fraction: f32 },
+    /// RTT and jitter from the same RTCP receiver report as `Loss`. Pure
+    /// diagnostics for the `video: 5s summary` line; the controller ignores it.
+    ReceiverStats {
+        rtt: Option<std::time::Duration>,
+        jitter_ms: f32,
+    },
     /// One encoded frame, reported by the forward task in `signaling/mod.rs`
     /// for every frame the pipeline produces.
     Frame { bytes: usize },
@@ -356,6 +362,7 @@ impl Controller {
                 self.last_loss = fraction;
                 self.last_loss_at = Some(now);
             }
+            Feedback::ReceiverStats { .. } => {}
             Feedback::Frame { bytes } => {
                 self.window.bytes += bytes as u64;
                 self.window.frames += 1;
@@ -657,6 +664,27 @@ mod tests {
 
     fn remb(c: &mut Controller, now: Instant, bitrate_bps: u64) {
         c.feedback(Feedback::Remb { bitrate_bps }, now);
+    }
+
+    #[test]
+    fn receiver_stats_feedback_is_ignored() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let before = c.target();
+        let mut now = t0;
+        for _ in 0..3 {
+            now += TICK;
+            frames(&mut c, now, 25_000);
+            c.feedback(
+                Feedback::ReceiverStats {
+                    rtt: Some(Duration::from_millis(900)),
+                    jitter_ms: 500.0,
+                },
+                now,
+            );
+            assert_eq!(c.tick(now), None);
+        }
+        assert_eq!(c.target(), before);
     }
 
     #[test]
