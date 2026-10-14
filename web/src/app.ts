@@ -50,6 +50,7 @@ import {
   supportsKeyboardLock,
 } from "./fullscreen";
 import type { NavigatorWithKeyboard } from "./fullscreen";
+import { ScreenWakeLock } from "./wakeLock";
 import { inputBlockedLabel } from "./inputBlocked";
 import { hostOutdatedLabel, updateStatusLabel } from "./hostVersion";
 import { hostSupportsText } from "./softKeyboard";
@@ -510,9 +511,12 @@ export function mount(root: Element | null): void {
   // stalled). Attached once, here, since `video` itself persists across
   // sessions -- `srcObject` is what gets reassigned on each new one (see
   // `joined`, which resets `firstFrameShown` before that reassignment).
+  const wakeLock = new ScreenWakeLock(navigator, () => !document.hidden);
+  document.addEventListener("visibilitychange", () => wakeLock.onVisibilityChange());
   video.addEventListener("playing", () => {
     if (firstFrameShown) return;
     firstFrameShown = true;
+    wakeLock.enable();
     updateConnectionBanner();
   });
   const overlay = root.querySelector<HTMLSpanElement>("#stats-overlay")!;
@@ -2034,6 +2038,7 @@ export function mount(root: Element | null): void {
    * screen, `pinStatus`/`connectBtn`, and the recovery/grace-window state
    * machine itself untouched -- callers decide those. */
   function stopSessionResources(): void {
+    wakeLock.disable();
     stopStatsLoop();
     stopPingLoop();
     detachInput?.();
