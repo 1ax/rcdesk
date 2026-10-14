@@ -26,6 +26,11 @@
 //!   thread overwriting a frame the encoder hasn't taken yet
 //!   (`pipeline::PipelineStats::overwritten`): that is exactly "frames arrive
 //!   faster than they are encoded".
+//! - Ignoring REMB on an unloaded link let the target sit at 3x the real
+//!   capacity (second user's live log, 2026-10-14: ~2 Mbit/s channel, target
+//!   5800, loss up to 42 %): a burst overran the channel, each loss cut the
+//!   target by 10-20 % and probing climbed straight back. After observed loss
+//!   REMB therefore becomes a ceiling for `LOSS_CAP_HOLD`.
 
 use std::time::{Duration, Instant};
 
@@ -83,6 +88,17 @@ pub const LOSS_HIGH: f32 = 0.10;
 /// Packet loss fraction below which the link is healthy enough to probe for
 /// more bandwidth.
 pub const LOSS_LOW: f32 = 0.02;
+
+/// How long after the last observed loss (with a fresh REMB at the time) the
+/// REMB ceiling (`LOSS_CAP_RATIO`) stays in force even though the link looks
+/// unloaded. Live log of the second user, 2026-10-14: channel ~2 Mbit/s,
+/// REMB 1986, target 5800, loss up to 42 %.
+pub const LOSS_CAP_HOLD: Duration = Duration::from_secs(10);
+
+/// While the loss ceiling is active the target may not exceed this fraction
+/// of the fresh REMB (second user's live log, 2026-10-14: channel ~2 Mbit/s,
+/// REMB 1986, target 5800, loss up to 42 %).
+pub const LOSS_CAP_RATIO: f64 = 0.9;
 
 /// Bitrate growth factor applied once per tick while probing for more
 /// bandwidth (REMB only ever tells us to go *down*; growth has to be our
@@ -266,6 +282,10 @@ pub struct Controller {
     prev_tick_remb_kbps: Option<f64>,
     last_loss: f32,
     last_loss_at: Option<Instant>,
+    /// Until when REMB acts as a bitrate ceiling after observed loss (see
+    /// `LOSS_CAP_HOLD`); re-armed by every tick that sees fresh loss
+    /// >= `LOSS_LOW` together with a fresh REMB.
+    loss_cap_until: Option<Instant>,
     window: Window,
     /// Consecutive ticks the loaded-link REMB signal has said "congested"
     /// (see `REMB_CONGESTION_TICKS`).
@@ -295,6 +315,7 @@ impl Controller {
             prev_tick_remb_kbps: None,
             last_loss: 0.0,
             last_loss_at: None,
+            loss_cap_until: None,
             window: Window::default(),
             congested_ticks: 0,
             fast_ticks: 0,
@@ -452,7 +473,13 @@ impl Controller {
         } else {
             0.0
         };
-        let (mut b, bitrate_reason) = if loss > LOSS_HIGH {
+        if loss >= LOSS_LOW && remb_kbps.is_some() {
+            self.loss_cap_until = Some(now + LOSS_CAP_HOLD);
+        }
+        let loss_cap = remb_kbps
+            .filter(|_| self.loss_cap_until.is_some_and(|until| now < until))
+            .map(|r| r * LOSS_CAP_RATIO);
+        let (mut b, mut bitrate_reason) = if loss > LOSS_HIGH {
             (old_b * (1.0 - 0.5 * loss as f64), Some("loss"))
         } else if remb_congested && self.congested_ticks >= REMB_CONGESTION_TICKS {
             // `remb_congested` implies `remb_kbps` is `Some`.
@@ -467,6 +494,14 @@ impl Controller {
         } else {
             (old_b, None)
         };
+        if let Some(cap) = loss_cap {
+            if b > cap {
+                b = cap;
+                if matches!(bitrate_reason, Some("probe") | None) {
+                    bitrate_reason = Some("remb");
+                }
+            }
+        }
         b = b.clamp(
             self.cfg.min_bitrate_kbps as f64,
             self.cfg.max_bitrate_kbps as f64,
@@ -795,6 +830,140 @@ mod tests {
         assert_eq!(decision.reason, "loss");
         assert_eq!(decision.target.bitrate_kbps, 5400);
         assert_eq!(decision.target.fps, 30);
+    }
+
+    #[test]
+    fn loss_with_fresh_remb_caps_target_at_remb_and_probe_stays_under_it() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        c.target = RateTarget {
+            bitrate_kbps: 5800,
+            fps: 30,
+        };
+        let mut now = t0 + TICK;
+
+        frames(&mut c, now, 375_000);
+        remb(&mut c, now, 1_986_000);
+        c.feedback(Feedback::Loss { fraction: 0.42 }, now);
+        let d = c.tick(now).expect("expected a loss decision");
+        assert_eq!(d.reason, "loss");
+        assert_eq!(d.target.bitrate_kbps, 1787);
+        let last_loss_at = now;
+
+        // Ticks at +1..+8 s: the old loss stays fresh for +1..+3 s and keeps
+        // re-arming the hold (last arming at +3 s). The target never exceeds
+        // the cap, neither by cuts nor by probing.
+        for _ in 0..8 {
+            now += TICK;
+            frames(&mut c, now, 100_000);
+            remb(&mut c, now, 1_986_000);
+            c.tick(now);
+            assert!(c.target().bitrate_kbps <= 1787, "{:?}", c.target());
+        }
+
+        // The hold runs until last arming (+3 s) + LOSS_CAP_HOLD = +13 s;
+        // at +13 s `now < until` is false. Ticks +9..+12 are still capped.
+        let hold_end = last_loss_at + LOSS_FRESH + LOSS_CAP_HOLD;
+        while now + TICK < hold_end {
+            now += TICK;
+            frames(&mut c, now, 100_000);
+            remb(&mut c, now, 1_986_000);
+            c.tick(now);
+            assert!(c.target().bitrate_kbps <= 1787, "{:?}", c.target());
+        }
+        // The probe climbs 1411 -> 1552 -> 1707 -> ... and the last step
+        // (1717 -> capped 1787) is a 4 % change, under HYSTERESIS, so the
+        // committed target settles at 1717.
+        assert_eq!(c.target().bitrate_kbps, 1717);
+
+        now += TICK;
+        assert!(now >= hold_end);
+        frames(&mut c, now, 100_000);
+        remb(&mut c, now, 1_986_000);
+        let d = c.tick(now).expect("expected a probe above the old cap");
+        assert_eq!(d.reason, "probe");
+        assert!(d.target.bitrate_kbps > 1787, "{:?}", d.target);
+    }
+
+    #[test]
+    fn loss_without_remb_keeps_old_behaviour() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0 + TICK;
+
+        c.feedback(Feedback::Loss { fraction: 0.2 }, now);
+        let d = c.tick(now).expect("expected a decision");
+        assert_eq!(d.reason, "loss");
+        assert_eq!(d.target.bitrate_kbps, 5400);
+
+        // Same cuts while the loss stays fresh, then an uncapped probe.
+        for _ in 0..3 {
+            now += TICK;
+            c.tick(now).expect("expected a loss cut");
+        }
+        assert_eq!(c.target().bitrate_kbps, 3937);
+        now += TICK;
+        let d = c.tick(now).expect("expected a probe");
+        assert_eq!(d.reason, "probe");
+        assert_eq!(d.target.bitrate_kbps, 4331);
+    }
+
+    #[test]
+    fn small_loss_below_loss_low_does_not_arm_the_cap() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        c.target = RateTarget {
+            bitrate_kbps: 3000,
+            fps: 30,
+        };
+        let now = t0 + TICK;
+
+        frames(&mut c, now, 125_000);
+        remb(&mut c, now, 2_000_000);
+        c.feedback(Feedback::Loss { fraction: 0.01 }, now);
+        let d = c.tick(now).expect("expected a probe");
+        assert_eq!(d.reason, "probe");
+        assert_eq!(d.target.bitrate_kbps, 3300);
+    }
+
+    #[test]
+    fn cap_is_dropped_when_remb_goes_stale() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        c.target = RateTarget {
+            bitrate_kbps: 5800,
+            fps: 30,
+        };
+        let mut now = t0 + TICK;
+
+        frames(&mut c, now, 375_000);
+        remb(&mut c, now, 1_986_000);
+        c.feedback(Feedback::Loss { fraction: 0.42 }, now);
+        let d = c.tick(now).expect("expected a loss decision");
+        assert_eq!(d.target.bitrate_kbps, 1787);
+        let armed_at = now;
+
+        // No more REMB: it is fresh for REMB_FRESH (+1..+3 s), stale from
+        // +4 s on, while the hold (armed until +13 s at the latest) is
+        // still active. Loss is stale from +4 s too, so the probe runs
+        // uncapped and rises above the old ceiling.
+        for _ in 0..3 {
+            now += TICK;
+            c.tick(now);
+            assert!(c.target().bitrate_kbps <= 1787, "{:?}", c.target());
+        }
+        now += TICK;
+        assert!(now.duration_since(armed_at) > REMB_FRESH);
+        assert!(now < armed_at + LOSS_CAP_HOLD + LOSS_FRESH);
+        let d = c.tick(now).expect("expected an uncapped probe");
+        assert_eq!(d.reason, "probe");
+        // Keep probing without REMB, still inside the hold: the target
+        // climbs past the old ceiling.
+        while c.target().bitrate_kbps <= 1787 {
+            now += TICK;
+            assert!(now < armed_at + LOSS_CAP_HOLD + LOSS_FRESH);
+            c.tick(now);
+        }
     }
 
     #[test]
