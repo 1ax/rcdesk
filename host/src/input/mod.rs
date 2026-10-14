@@ -33,10 +33,19 @@ pub trait Injector: Send {
     /// Presses or releases a key by platform-specific raw keycode (see
     /// `keymap::to_keycode`).
     fn key(&mut self, keycode: u16, pressed: bool);
+    /// Types a string as-is via the Unicode path, bypassing the keyboard
+    /// layout (see `proto::input::InputMessage::Text` and ARCHITECTURE.md
+    /// §7). Errors are logged, not returned, like the other methods.
+    fn text(&mut self, text: &str);
     /// The size, in the same units `pointer_move` expects, of the screen
     /// normalized pointer coordinates are relative to.
     fn screen_size(&self) -> (i32, i32);
 }
+
+/// Longest `InputMessage::Text` (UTF-8 bytes) the host will type; longer
+/// strings are dropped with a `warn`. A phone keyboard produces a few
+/// characters per message, so this is generous.
+pub const MAX_TEXT_BYTES: usize = 4096;
 
 /// An `Injector` that only logs what it would have done. Used on platforms
 /// without a real backend (anything but macOS/Windows), so a session can be
@@ -82,6 +91,10 @@ impl Injector for NoopInjector {
 
     fn key(&mut self, keycode: u16, pressed: bool) {
         tracing::debug!(keycode, pressed, "no-op injector: key");
+    }
+
+    fn text(&mut self, text: &str) {
+        tracing::debug!(len = text.len(), "no-op injector: text");
     }
 
     fn screen_size(&self) -> (i32, i32) {
@@ -188,6 +201,13 @@ fn apply(
         },
         InputMessage::ReleaseAll => {
             release_all(injector, pressed_keys, pressed_buttons);
+        }
+        InputMessage::Text { text } => {
+            if text.len() > MAX_TEXT_BYTES {
+                tracing::warn!(len = text.len(), "text message too long, ignoring");
+            } else {
+                injector.text(text);
+            }
         }
         InputMessage::ClipboardText { .. } => {
             // Never reaches here: `crate::signaling::handle_session_event`
@@ -363,6 +383,7 @@ mod tests {
         Button(PointerButton, bool),
         Wheel(i32, i32),
         Key(u16, bool),
+        Text(String),
     }
 
     struct FakeInjector {
@@ -413,10 +434,24 @@ mod tests {
             let _held = self.gate.lock().unwrap();
             self.calls.lock().unwrap().push(Call::Key(keycode, pressed));
         }
+        fn text(&mut self, text: &str) {
+            let _held = self.gate.lock().unwrap();
+            self.calls
+                .lock()
+                .unwrap()
+                .push(Call::Text(text.to_string()));
+        }
         fn screen_size(&self) -> (i32, i32) {
             self.screen
         }
     }
+
+    const TEST_RECT: CaptureRect = CaptureRect {
+        x: 0,
+        y: 0,
+        width: 1000,
+        height: 500,
+    };
 
     /// Polls `calls` until it has at least `n` entries or a generous timeout
     /// elapses (the router thread applies messages asynchronously).
@@ -610,5 +645,62 @@ mod tests {
         wait_for_calls(&calls, 1);
         let expected = keymap::to_keycode("KeyA").expect("KeyA must be mapped on this platform");
         assert_eq!(calls.lock().unwrap()[0], Call::Key(expected, true));
+    }
+
+    #[test]
+    fn text_reaches_the_injector() {
+        let (mut injector, calls, _gate) = FakeInjector::new((1000, 500));
+        apply(
+            &InputMessage::Text {
+                text: "привет".to_string(),
+            },
+            &mut injector,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            TEST_RECT,
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![Call::Text("привет".to_string())]
+        );
+    }
+
+    #[test]
+    fn too_long_text_is_dropped() {
+        let (mut injector, calls, _gate) = FakeInjector::new((1000, 500));
+        apply(
+            &InputMessage::Text {
+                text: "a".repeat(MAX_TEXT_BYTES + 1),
+            },
+            &mut injector,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            TEST_RECT,
+        );
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn text_does_not_affect_release_all() {
+        let (mut injector, calls, _gate) = FakeInjector::new((1000, 500));
+        let mut keys = HashSet::new();
+        let mut buttons = HashSet::new();
+        apply(
+            &InputMessage::Text {
+                text: "x".to_string(),
+            },
+            &mut injector,
+            &mut keys,
+            &mut buttons,
+            TEST_RECT,
+        );
+        apply(
+            &InputMessage::ReleaseAll,
+            &mut injector,
+            &mut keys,
+            &mut buttons,
+            TEST_RECT,
+        );
+        assert_eq!(*calls.lock().unwrap(), vec![Call::Text("x".to_string())]);
     }
 }

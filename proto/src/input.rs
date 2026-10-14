@@ -67,6 +67,14 @@ pub enum InputMessage {
     /// `proto::control::ControlMessage::ClipboardText` for the host ->
     /// client direction.
     ClipboardText { text: String },
+    /// channel `input`. Printable characters the client cannot express as a
+    /// physical key code (the phone's on-screen keyboard, slice H2; see
+    /// ARCHITECTURE.md §7, where `Text { string }` was promised). Control
+    /// keys (Enter, Backspace, Tab) still travel as `Key`. The host types the
+    /// string as Unicode input, bypassing the keyboard layout. A `text` over
+    /// `host::input::MAX_TEXT_BYTES` (4096 UTF-8 bytes) is dropped on the host
+    /// with a `warn` (length only, never content).
+    Text { text: String },
 }
 
 #[cfg(test)]
@@ -112,6 +120,19 @@ mod tests {
 
         let json = serde_json::to_string(&msg).expect("serialize");
         assert_eq!(json, r#"{"type":"release_all"}"#);
+
+        let round_tripped: InputMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, msg);
+    }
+
+    #[test]
+    fn text_round_trips_through_json_with_exact_shape() {
+        let msg = InputMessage::Text {
+            text: "привет".to_string(),
+        };
+
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(json, r#"{"type":"text","text":"привет"}"#);
 
         let round_tripped: InputMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, msg);

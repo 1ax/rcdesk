@@ -20,7 +20,7 @@ use std::mem::size_of;
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VSC_TO_VK_EX, VIRTUAL_KEY,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VSC_TO_VK_EX, VIRTUAL_KEY,
 };
 
 use crate::input::keymap::scan_parts;
@@ -63,6 +63,43 @@ pub fn send_scancode(scan: u16, pressed: bool) -> Result<(), windows::core::Erro
     // pointer past the call.
     let sent = unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
     if sent != 1 {
+        return Err(windows::core::Error::from_win32());
+    }
+    Ok(())
+}
+
+/// Types `text` as Unicode input (`KEYEVENTF_UNICODE`), bypassing the
+/// keyboard layout. Each UTF-16 code unit becomes a down + up pair
+/// (surrogate pairs go as two consecutive units, the standard path). All
+/// events are sent in ONE `SendInput` call so a focus change cannot split
+/// the text. See `proto::input::InputMessage::Text`.
+pub fn send_unicode(text: &str) -> Result<(), windows::core::Error> {
+    let mut inputs: Vec<INPUT> = Vec::new();
+    for unit in text.encode_utf16() {
+        for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
+            inputs.push(INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(0),
+                        wScan: unit,
+                        dwFlags: flags,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            });
+        }
+    }
+    if inputs.is_empty() {
+        return Ok(());
+    }
+
+    // Safety: `inputs` is a slice of fully-initialized `INPUT`s of the
+    // `INPUT_KEYBOARD` variant; `SendInput` reads them and does not retain
+    // the pointer past the call.
+    let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
+    if (sent as usize) < inputs.len() {
         return Err(windows::core::Error::from_win32());
     }
     Ok(())

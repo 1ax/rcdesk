@@ -125,6 +125,22 @@ impl Injector for EnigoInjector {
         }
     }
 
+    /// See `proto::input::InputMessage::Text` and ARCHITECTURE.md §7.
+    #[cfg(target_os = "windows")]
+    fn text(&mut self, text: &str) {
+        if let Err(err) = crate::platform::windows::keyboard::send_unicode(text) {
+            tracing::warn!(?err, len = text.len(), "failed to type text");
+        }
+    }
+
+    /// See `proto::input::InputMessage::Text` and ARCHITECTURE.md §7.
+    #[cfg(not(target_os = "windows"))]
+    fn text(&mut self, text: &str) {
+        if let Err(err) = self.enigo.text(text) {
+            tracing::warn!(?err, len = text.len(), "failed to type text");
+        }
+    }
+
     fn screen_size(&self) -> (i32, i32) {
         self.enigo.main_display().unwrap_or_else(|err| {
             tracing::warn!(
