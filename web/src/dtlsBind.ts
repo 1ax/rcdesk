@@ -6,14 +6,19 @@
 // for the full scheme; both sides must produce byte-identical tags or every
 // session with a password set would fail to connect.
 
-/** Extracts and normalizes the first `a=fingerprint:<alg> <hex>` line in
- * `sdp` (session level or an m-section, whichever appears first -- SDP
- * lines are read in document order), to `"<alg> <HEX>"` -- algorithm
- * lowercased, hex uppercased, one space between them. `null` when there is
- * no such line, or the line after `a=fingerprint:` doesn't have both an
- * algorithm and a hex value. Mirrors `host/src/dtls_bind.rs::fingerprint_from_sdp`
- * exactly. */
+/** Extracts and normalizes EVERY `a=fingerprint:<alg> <hex>` line in `sdp`
+ * (session level and all m-sections; slice E2), each to `"<alg> <HEX>"` --
+ * algorithm lowercased, hex uppercased, one space between them. Lines with
+ * no algorithm or no hex value are skipped. `null` when there is no valid
+ * line, or when the normalized values are not all identical: per RFC 8122 a
+ * media-level fingerprint overrides the session-level one, so a
+ * man-in-the-middle could keep the genuine fingerprint at session level and
+ * put its own in an m-section; any disagreement is treated as a possible
+ * substitution (callers already treat `null` as a refusal). Mirrors
+ * `host/src/dtls_bind.rs::fingerprint_from_sdp` exactly (updated in the same
+ * slice). */
 export function fingerprintFromSdp(sdp: string): string | null {
+  let found: string | null = null;
   for (const rawLine of sdp.split(/\r?\n/)) {
     const trimmed = rawLine.trim();
     if (!trimmed.startsWith("a=fingerprint:")) continue;
@@ -23,9 +28,14 @@ export function fingerprintFromSdp(sdp: string): string | null {
     const alg = rest.slice(0, spaceIdx).trim();
     const hex = rest.slice(spaceIdx + 1).trim();
     if (!alg || !hex) continue;
-    return `${alg.toLowerCase()} ${hex.toUpperCase()}`;
+    const normalized = `${alg.toLowerCase()} ${hex.toUpperCase()}`;
+    if (found === null) {
+      found = normalized;
+    } else if (found !== normalized) {
+      return null;
+    }
   }
-  return null;
+  return found;
 }
 
 /** Decodes a base64 URL-safe, no-padding string (the alphabet

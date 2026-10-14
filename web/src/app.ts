@@ -110,6 +110,12 @@ import {
 } from "./hostAuth";
 import type { AuthPhase } from "./hostAuth";
 import { authTag, decodeBase64Url, fingerprintFromSdp, verifyAuthTag } from "./dtlsBind";
+import {
+  clearAuthRequired,
+  loadAuthRequired,
+  offerRejectedByTrust,
+  saveAuthRequired,
+} from "./hostTrust";
 import type { ControlMessage } from "./generated/ControlMessage";
 import type { DisplayEntry } from "./generated/DisplayEntry";
 import type { BrowserEntry } from "./generated/BrowserEntry";
@@ -1067,6 +1073,9 @@ export function mount(root: Element | null): void {
       forgetBtn.addEventListener("click", () => {
         if (confirmingForgetId === entry.device_id) {
           signaling.send({ type: "forget_device", device_id: entry.device_id });
+          // Slice E2: drop the remembered "host requires a password" flag.
+          const forgetStorage = ownerStorage();
+          if (forgetStorage !== null) clearAuthRequired(forgetStorage, entry.device_id);
           confirmingForgetId = null;
         } else {
           confirmingForgetId = entry.device_id;
@@ -2243,6 +2252,11 @@ export function mount(root: Element | null): void {
   // `proto::signal::SignalMessage::AuthRequired`.
   signaling.on("auth_required", (msg) => {
     if (msg.session_id !== sessionId) return;
+    // Slice E2: remember that this host requires a password, so a later
+    // `offer` without a completed login (a MITM swallowing `auth_required`)
+    // is refused.
+    const trustStorage = ownerStorage();
+    if (deviceId !== null && trustStorage !== null) saveAuthRequired(trustStorage, deviceId);
     resetAuthAttempt();
     authSessionKey = null;
     authPhase = { kind: "prompt", message: null };
@@ -2318,6 +2332,21 @@ export function mount(root: Element | null): void {
     // Captured so outgoing `bye`/`answer` carry the id this offer belongs to
     // even if `sessionId` changes across the awaits below.
     const offerSessionId = msg.session_id;
+    // Slice E2: a host remembered as password-protected must not get a
+    // session without a completed OPAQUE login. Checked synchronously,
+    // before the auth dialog is closed and before any await.
+    const trustStorage = ownerStorage();
+    const authRequiredRemembered =
+      deviceId !== null && trustStorage !== null && loadAuthRequired(trustStorage, deviceId);
+    if (offerRejectedByTrust(authRequiredRemembered, authSessionKey !== null)) {
+      console.error("offer without password login for a host that requires one");
+      signaling.send({ type: "bye", session_id: offerSessionId });
+      setSessionStatus("error");
+      teardown(
+        "Хост требует пароль, но подтверждения не было: возможна подмена соединения. Если пароль на хосте снят — удалите устройство из списка и привяжите заново по PIN",
+      );
+      return;
+    }
     // Slice 3.2d: a `joined`/`auth_required` host only sends `offer` once
     // the OPAQUE login has succeeded (`pake_finish` accepted) -- close the
     // dialog if it's still up rather than leaving it stuck on

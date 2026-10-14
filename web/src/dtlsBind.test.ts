@@ -80,6 +80,25 @@ describe("fingerprintFromSdp", () => {
       "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n";
     expect(fingerprintFromSdp(sdp)).toBeNull();
   });
+
+  // Slice E2: all fingerprint lines must agree.
+  it("accepts session-level and m-section lines that agree up to case", () => {
+    const sdp =
+      "v=0\r\ns=-\r\na=fingerprint:sha-256 ab:cd:ef\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=fingerprint:SHA-256 AB:CD:EF\r\n";
+    expect(fingerprintFromSdp(sdp)).toBe("sha-256 AB:CD:EF");
+  });
+
+  it("returns null when session-level and m-section fingerprints differ", () => {
+    const sdp =
+      "v=0\r\ns=-\r\na=fingerprint:sha-256 AB:CD:EF\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=fingerprint:sha-256 11:22:33\r\n";
+    expect(fingerprintFromSdp(sdp)).toBeNull();
+  });
+
+  it("accepts two m-sections with the same fingerprint", () => {
+    const sdp =
+      "v=0\r\ns=-\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=fingerprint:sha-256 AB:CD:EF\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=fingerprint:sha-256 AB:CD:EF\r\n";
+    expect(fingerprintFromSdp(sdp)).toBe("sha-256 AB:CD:EF");
+  });
 });
 
 describe("decodeBase64Url / encodeBase64Url", () => {
