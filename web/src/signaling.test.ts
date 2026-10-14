@@ -123,6 +123,33 @@ describe("SignalingClient", () => {
     });
   });
 
+  // Slice E1: server message types live under a `msg:` prefix, so a server
+  // `{"type":"close"}` cannot fake the internal socket-close event.
+  it("does not treat a server close message as the socket closing", () => {
+    let ws!: FakeWebSocket;
+    const client = new SignalingClient((_url) => {
+      ws = new FakeWebSocket();
+      return ws;
+    });
+    client.connect("ws://example.test/ws");
+    ws.open();
+
+    const onClose = vi.fn();
+    const onBye = vi.fn();
+    client.addEventListener("close", onClose);
+    client.on("bye", onBye);
+
+    ws.message({ type: "close" });
+    expect(onClose).not.toHaveBeenCalled();
+
+    ws.message({ type: "bye", session_id: "sess-1" });
+    expect(onBye).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
+
+    ws.close();
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it("does not throw and logs on invalid json", () => {
     let ws!: FakeWebSocket;
     const client = new SignalingClient((_url) => {

@@ -95,6 +95,7 @@ import {
   connectionBannerLabel,
   connectionStateOutcome,
   DISCONNECT_GRACE_MS,
+  RECOVERY_RESPONSE_TIMEOUT_MS,
   recoveryDelayMs,
   recoveryExhausted,
   shouldAttemptRecovery,
@@ -766,6 +767,10 @@ export function mount(root: Element | null): void {
   // only meaningful while `recovering`.
   let recoveryAttempt = 0;
   let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
+  // Slice E1: armed whenever a recovery attempt's `connect_device` is actually
+  // sent; `joined` or `error` is the server's answer. If neither arrives in
+  // `RECOVERY_RESPONSE_TIMEOUT_MS` the attempt is treated as failed.
+  let recoveryResponseTimer: ReturnType<typeof setTimeout> | undefined;
   // Set when a recovery attempt's `connect_device` couldn't be sent because
   // the signaling socket itself is down (`connectionLost`) -- the attempt is
   // retried as soon as `authenticated` confirms the socket is back, without
@@ -1720,6 +1725,16 @@ export function mount(root: Element | null): void {
       clearTimeout(recoveryTimer);
       recoveryTimer = undefined;
     }
+    clearRecoveryResponseTimer();
+  }
+
+  /** Slice E1: cancels the wait for the server's answer to a recovery
+   * attempt's `connect_device` (see `recoveryResponseTimer`). */
+  function clearRecoveryResponseTimer(): void {
+    if (recoveryResponseTimer !== undefined) {
+      clearTimeout(recoveryResponseTimer);
+      recoveryResponseTimer = undefined;
+    }
   }
 
   /** Recomputes and applies the D32 video-overlay banner (`#connection-banner`)
@@ -1918,6 +1933,7 @@ export function mount(root: Element | null): void {
   function teardown(reason: string): void {
     clearDisconnectGraceTimer();
     clearRecoveryTimer();
+    clearRecoveryResponseTimer();
     recovering = false;
     recoveryAttempt = 0;
     recoveryWaitingForSocket = false;
@@ -1968,6 +1984,13 @@ export function mount(root: Element | null): void {
       return;
     }
     signaling.send({ type: "connect_device", device_id: deviceId });
+    // Slice E1: no `joined`/`error` in time means the attempt is lost.
+    clearRecoveryResponseTimer();
+    recoveryResponseTimer = setTimeout(() => {
+      recoveryResponseTimer = undefined;
+      console.warn("recovery attempt timed out");
+      scheduleRecoveryAttempt();
+    }, RECOVERY_RESPONSE_TIMEOUT_MS);
   }
 
   /** Schedules recovery attempt number `recoveryAttempt + 1` after
@@ -2081,6 +2104,13 @@ export function mount(root: Element | null): void {
   });
 
   signaling.on("joined", (msg) => {
+    // Slice E1: a `joined` while a session is still live must not leak the
+    // old `RTCPeerConnection`/channels -- close them before anything else.
+    if (session !== null) {
+      console.warn("joined while a session is live, replacing it");
+      stopSessionResources();
+    }
+    const thisSessionId = msg.session_id;
     sessionId = msg.session_id;
     // Slice 3.2d: shown in `#auth-dialog` if the host turns out to have a
     // password set (`auth_required`, below) -- saved now since `joined`
@@ -2101,6 +2131,7 @@ export function mount(root: Element | null): void {
     firstFrameShown = false;
     clearDisconnectGraceTimer();
     clearRecoveryTimer();
+    clearRecoveryResponseTimer();
     recovering = false;
     recoveryAttempt = 0;
     recoveryWaitingForSocket = false;
@@ -2151,11 +2182,13 @@ export function mount(root: Element | null): void {
       { iceServers: toRtcIceServers(msg.ice_servers) },
       {
         onIceCandidate: (candidate) => {
-          if (sessionId) {
-            signaling.send({ type: "ice", session_id: sessionId, candidate });
-          }
+          // Slice E1: stale callbacks of a superseded session are ignored,
+          // and `ice` carries this session's own id, not the current one.
+          if (session !== thisSession) return;
+          signaling.send({ type: "ice", session_id: thisSessionId, candidate });
         },
         onTrack: (stream) => {
+          if (session !== thisSession) return;
           video.srcObject = stream;
           // A recovery session (slice 3.5b) starts without a user gesture,
           // and `stopSessionResources` left the element paused with no
@@ -2168,6 +2201,7 @@ export function mount(root: Element | null): void {
           });
         },
         onDataChannel: (label, dc) => {
+          if (session !== thisSession) return;
           if (label === "input") inputChannel = dc;
           else if (label === "pointer") pointerChannel = dc;
           else if (label === "control") setupControlChannel(dc);
@@ -2276,6 +2310,14 @@ export function mount(root: Element | null): void {
 
   signaling.on("offer", (msg) => {
     if (!session) return;
+    // Slice E1: an offer for another (older/newer) session is dropped.
+    if (msg.session_id !== sessionId) {
+      console.debug("ignored offer for a different session");
+      return;
+    }
+    // Captured so outgoing `bye`/`answer` carry the id this offer belongs to
+    // even if `sessionId` changes across the awaits below.
+    const offerSessionId = msg.session_id;
     // Slice 3.2d: a `joined`/`auth_required` host only sends `offer` once
     // the OPAQUE login has succeeded (`pake_finish` accepted) -- close the
     // dialog if it's still up rather than leaving it stuck on
@@ -2305,11 +2347,11 @@ export function mount(root: Element | null): void {
           fingerprint !== null &&
           msg.auth !== null &&
           (await verifyAuthTag(decodeBase64Url(sessionKeyB64), "offer", fingerprint, msg.auth));
+        // Slice E1: the session moved on while verifying -- do nothing.
+        if (session !== currentSession) return;
         if (!ok) {
           console.error("offer failed dtls binding check");
-          if (sessionId) {
-            signaling.send({ type: "bye", session_id: sessionId });
-          }
+          signaling.send({ type: "bye", session_id: offerSessionId });
           setSessionStatus("error");
           teardown("Хост не подтверждён: возможна подмена соединения");
           return;
@@ -2317,6 +2359,7 @@ export function mount(root: Element | null): void {
       }
       try {
         const sdp = await currentSession.acceptOffer(msg.sdp);
+        if (session !== currentSession) return;
         let auth: string | null = null;
         if (sessionKeyB64 !== null) {
           // Same binding, the other direction: this client's own answer
@@ -2324,19 +2367,19 @@ export function mount(root: Element | null): void {
           const answerFingerprint = fingerprintFromSdp(sdp);
           if (answerFingerprint === null) {
             console.error("answer sdp has no dtls fingerprint");
-            if (sessionId) {
-              signaling.send({ type: "bye", session_id: sessionId });
-            }
+            signaling.send({ type: "bye", session_id: offerSessionId });
             setSessionStatus("error");
             teardown("Хост не подтверждён: возможна подмена соединения");
             return;
           }
           auth = await authTag(decodeBase64Url(sessionKeyB64), "answer", answerFingerprint);
+          if (session !== currentSession) return;
         }
-        if (sessionId) {
-          signaling.send({ type: "answer", session_id: sessionId, sdp, auth });
-        }
+        signaling.send({ type: "answer", session_id: offerSessionId, sdp, auth });
       } catch (err: unknown) {
+        // Slice E1: a failure of a superseded session must not tear down the
+        // current one.
+        if (session !== currentSession) return;
         console.error("failed to negotiate session", err);
         setSessionStatus("error");
         teardown("Не удалось согласовать сеанс");
@@ -2345,6 +2388,11 @@ export function mount(root: Element | null): void {
   });
 
   signaling.on("ice", (msg) => {
+    // Slice E1: a candidate for another session is dropped.
+    if (msg.session_id !== sessionId) {
+      console.debug("ignored ice for a different session");
+      return;
+    }
     session?.addRemoteIce(msg.candidate).catch((err: unknown) => {
       console.error("failed to add remote ice candidate", err);
     });
@@ -2394,6 +2442,7 @@ export function mount(root: Element | null): void {
       // the specific server message isn't surfaced per-attempt, only the
       // attempt count (the banner/status already show that).
       console.warn("recovery attempt failed", msg.message);
+      clearRecoveryResponseTimer();
       scheduleRecoveryAttempt();
       return;
     }

@@ -5,6 +5,7 @@ import {
   connectionBannerLabel,
   connectionStateOutcome,
   MAX_RECOVERY_ATTEMPTS,
+  RECOVERY_RESPONSE_TIMEOUT_MS,
   recoveryDelayMs,
   recoveryExhausted,
   shouldAttemptRecovery,
@@ -132,5 +133,11 @@ describe("byeReasonOutcome", () => {
     expect(byeReasonOutcome(undefined)).toEqual({ kind: "by-grace" });
     expect(byeReasonOutcome(null)).toEqual({ kind: "by-grace" });
     expect(byeReasonOutcome("something_new")).toEqual({ kind: "by-grace" });
+  });
+});
+
+describe("RECOVERY_RESPONSE_TIMEOUT_MS", () => {
+  it("is a positive number of milliseconds", () => {
+    expect(RECOVERY_RESPONSE_TIMEOUT_MS).toBeGreaterThan(0);
   });
 });

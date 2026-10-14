@@ -67,7 +67,10 @@ export class SignalingClient extends EventTarget {
         console.error("invalid signal message json", err);
         return;
       }
-      this.dispatchEvent(new CustomEvent(msg.type, { detail: msg }));
+      // Slice E1: server messages go out under a `msg:` prefix so a server
+      // `{"type":"close"}` can never be mistaken for the internal `close`
+      // (socket closed) / `socket-error` events dispatched below.
+      this.dispatchEvent(new CustomEvent(`msg:${msg.type}`, { detail: msg }));
     });
 
     ws.addEventListener("close", () => {
@@ -116,8 +119,9 @@ export class SignalingClient extends EventTarget {
     const handler = (event: Event) => {
       listener((event as CustomEvent).detail as Extract<SignalMessage, { type: T }>);
     };
-    this.addEventListener(type, handler);
-    return () => this.removeEventListener(type, handler);
+    const eventName = `msg:${type}`;
+    this.addEventListener(eventName, handler);
+    return () => this.removeEventListener(eventName, handler);
   }
 
   close(): void {

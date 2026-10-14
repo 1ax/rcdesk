@@ -20,6 +20,13 @@ export const DISCONNECT_GRACE_MS = 15000;
 export const RECOVERY_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
 export const MAX_RECOVERY_ATTEMPTS = RECOVERY_DELAYS_MS.length;
 
+/** How long a recovery attempt waits for the server's answer to its
+ * `connect_device` (slice E1). The answer is either `joined` or `error`;
+ * if neither arrives within this window the attempt counts as failed and
+ * the next one is scheduled, so a silently dropped reply cannot stall the
+ * recovery forever. */
+export const RECOVERY_RESPONSE_TIMEOUT_MS = 15000;
+
 /** Delay before recovery attempt number `attempt`. Values outside
  * `1..=MAX_RECOVERY_ATTEMPTS` are clamped -- there is no attempt below 1,
  * and nothing schedules an attempt past `MAX_RECOVERY_ATTEMPTS` (see
