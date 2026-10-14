@@ -252,6 +252,8 @@ objc2-core-video = { version = "0.3", default-features = false, features = [
     "CVBuffer",
     "CVImageBuffer",
     "CVPixelBuffer",
+    # CVPixelBufferPool: pooled IOSurface-backed input buffers for VT (slice F3).
+    "CVPixelBufferPool",
     "CVReturn",
 ] }
 # CMTime/CMSampleBuffer/CMBlockBuffer/CMFormatDescription: VideoToolbox's

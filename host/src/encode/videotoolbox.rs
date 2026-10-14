@@ -19,10 +19,12 @@ use objc2_core_media::{
     CMSampleBuffer, CMTime, CMVideoFormatDescriptionGetH264ParameterSetAtIndex,
 };
 use objc2_core_video::{
-    kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, CVPixelBuffer,
-    CVPixelBufferCreate, CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane,
-    CVPixelBufferGetBytesPerRow, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferLockBaseAddress,
-    CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+    kCVPixelBufferHeightKey, kCVPixelBufferIOSurfacePropertiesKey,
+    kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey, kCVPixelFormatType_32BGRA,
+    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, CVPixelBuffer, CVPixelBufferGetBaseAddress,
+    CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRow,
+    CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
+    CVPixelBufferPool, CVPixelBufferUnlockBaseAddress,
 };
 use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
@@ -76,6 +78,17 @@ pub struct VideoToolboxEncoder {
     /// need to track real elapsed time rather than a frame-count-derived
     /// step -- same reasoning as `openh264::OpenH264Encoder::started`).
     started: Instant,
+    /// IOSurface-backed input buffers, created lazily for the first frame's
+    /// pixel format (slice F3).
+    pool: Option<PixelBufferPool>,
+    /// Set when `encode()` discarded an extra VT output: the reference chain
+    /// is broken, so the next frame is forced to be a keyframe.
+    force_keyframe_next: bool,
+}
+
+struct PixelBufferPool {
+    pixel_format: u32,
+    pool: CFRetained<CVPixelBufferPool>,
 }
 
 // SAFETY: `VideoToolboxEncoder` (like `openh264::OpenH264Encoder`) is only
@@ -171,6 +184,8 @@ impl VideoToolboxEncoder {
             callback_state,
             cfg,
             started: Instant::now(),
+            pool: None,
+            force_keyframe_next: false,
         })
     }
 }
@@ -390,7 +405,7 @@ impl Encoder for VideoToolboxEncoder {
             )));
         }
 
-        let pixel_buffer = create_pixel_buffer(frame)?;
+        let pixel_buffer = self.create_pixel_buffer(frame)?;
 
         let ts_us = self.started.elapsed().as_micros() as i64;
         // SAFETY: `CMTime::new` (aka `CMTimeMake`) is a pure value
@@ -400,6 +415,7 @@ impl Encoder for VideoToolboxEncoder {
         // `CMTime` type.
         let duration = unsafe { kCMTimeInvalid };
 
+        let force_keyframe = force_keyframe || std::mem::take(&mut self.force_keyframe_next);
         let force_key_dict = force_keyframe.then(|| {
             // SAFETY: reading an extern immutable static of the documented
             // `&'static CFString` type.
@@ -457,8 +473,9 @@ impl Encoder for VideoToolboxEncoder {
             tracing::warn!(
                 count = outputs.len(),
                 "VideoToolbox produced more than one output for a single encode() call, \
-                 keeping only the first"
+                 keeping only the first, next frame will be a keyframe"
             );
+            self.force_keyframe_next = true;
         }
 
         match outputs.into_iter().next() {
@@ -499,43 +516,115 @@ fn frame_dims(frame: &RawFrame) -> (u32, u32) {
     }
 }
 
-/// Builds a `CVPixelBuffer` matching `frame`'s dimensions and pixel format,
-/// filled in with `frame`'s pixel data.
-fn create_pixel_buffer(frame: &RawFrame) -> Result<CFRetained<CVPixelBuffer>, EncodeError> {
-    let (width, height) = frame_dims(frame);
-    let pixel_format = match frame {
-        RawFrame::Nv12 { .. } => kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-        RawFrame::Bgra { .. } => kCVPixelFormatType_32BGRA,
-    };
-
-    let mut buffer_ptr: *mut CVPixelBuffer = std::ptr::null_mut();
-    // SAFETY: `buffer_ptr` is a valid stack out-pointer; no pixel buffer
-    // attributes dictionary is needed since we fill every byte ourselves
-    // right after, before handing it to VT.
-    let status = unsafe {
-        CVPixelBufferCreate(
-            None,
-            width as usize,
-            height as usize,
-            pixel_format,
-            None,
-            NonNull::from(&mut buffer_ptr),
-        )
-    };
-    if status != 0 {
-        return Err(EncodeError::Backend(format!(
-            "VideoToolbox CVPixelBufferCreate: CVReturn {status}"
-        )));
+impl VideoToolboxEncoder {
+    /// Returns the pool for `pixel_format`, (re)creating it if absent or if
+    /// the format changed.
+    fn pool_for(&mut self, pixel_format: u32) -> Result<&CVPixelBufferPool, EncodeError> {
+        let stale = self
+            .pool
+            .as_ref()
+            .is_none_or(|p| p.pixel_format != pixel_format);
+        if stale {
+            let format_num = CFNumber::new_i32(pixel_format as i32);
+            let width_num = CFNumber::new_i32(self.cfg.width as i32);
+            let height_num = CFNumber::new_i32(self.cfg.height as i32);
+            let iosurface_props = CFDictionary::<CFString, CFType>::from_slices(&[], &[]);
+            // SAFETY: reading extern immutable statics of the documented
+            // `&'static CFString` type.
+            let (k_fmt, k_w, k_h, k_io) = unsafe {
+                (
+                    kCVPixelBufferPixelFormatTypeKey,
+                    kCVPixelBufferWidthKey,
+                    kCVPixelBufferHeightKey,
+                    kCVPixelBufferIOSurfacePropertiesKey,
+                )
+            };
+            let attrs = CFDictionary::<CFString, CFType>::from_slices(
+                &[k_fmt, k_w, k_h, k_io],
+                &[
+                    format_num.as_ref(),
+                    width_num.as_ref(),
+                    height_num.as_ref(),
+                    iosurface_props.as_ref(),
+                ],
+            );
+            let mut pool_ptr: *mut CVPixelBufferPool = std::ptr::null_mut();
+            // SAFETY: `pool_ptr` is a valid stack out-pointer; `attrs` is a
+            // live CFDictionary of CFString keys / CF values as the API
+            // expects; the pool-attributes dictionary is optional (None).
+            let status = unsafe {
+                CVPixelBufferPool::create(
+                    None,
+                    None,
+                    Some(attrs.as_opaque()),
+                    NonNull::from(&mut pool_ptr),
+                )
+            };
+            if status != 0 {
+                return Err(EncodeError::Backend(format!(
+                    "VideoToolbox CVPixelBufferPoolCreate: CVReturn {status}"
+                )));
+            }
+            let pool_ptr = NonNull::new(pool_ptr).ok_or_else(|| {
+                EncodeError::Backend(
+                    "VideoToolbox CVPixelBufferPoolCreate: succeeded with a null pool".into(),
+                )
+            })?;
+            // SAFETY: `CVPixelBufferPoolCreate` returned success, which per
+            // its contract hands us a +1 reference to a fresh pool.
+            let pool = unsafe { CFRetained::from_raw(pool_ptr) };
+            self.pool = Some(PixelBufferPool { pixel_format, pool });
+        }
+        match &self.pool {
+            Some(p) => Ok(&p.pool),
+            None => Err(EncodeError::Backend(
+                "VideoToolbox: pixel buffer pool missing after creation".into(),
+            )),
+        }
     }
-    let buffer_ptr = NonNull::new(buffer_ptr).ok_or_else(|| {
-        EncodeError::Backend(
-            "VideoToolbox CVPixelBufferCreate: succeeded with a null buffer".into(),
-        )
-    })?;
-    // SAFETY: `CVPixelBufferCreate` returned success (`kCVReturnSuccess`),
-    // which per its contract hands us a +1 reference to a fresh buffer.
-    let buffer: CFRetained<CVPixelBuffer> = unsafe { CFRetained::from_raw(buffer_ptr) };
 
+    /// Takes a `CVPixelBuffer` matching `frame` from the pool and fills it
+    /// with `frame`'s pixel data.
+    fn create_pixel_buffer(
+        &mut self,
+        frame: &RawFrame,
+    ) -> Result<CFRetained<CVPixelBuffer>, EncodeError> {
+        let pixel_format = match frame {
+            RawFrame::Nv12 { .. } => kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            RawFrame::Bgra { .. } => kCVPixelFormatType_32BGRA,
+        };
+        let pool = self.pool_for(pixel_format)?;
+
+        let mut buffer_ptr: *mut CVPixelBuffer = std::ptr::null_mut();
+        // SAFETY: `buffer_ptr` is a valid stack out-pointer; `pool` is a
+        // live pool; we overwrite every pixel right after, before handing
+        // the buffer to VT.
+        let status = unsafe {
+            CVPixelBufferPool::create_pixel_buffer(None, pool, NonNull::from(&mut buffer_ptr))
+        };
+        if status != 0 {
+            return Err(EncodeError::Backend(format!(
+                "VideoToolbox CVPixelBufferPoolCreatePixelBuffer: CVReturn {status}"
+            )));
+        }
+        let buffer_ptr = NonNull::new(buffer_ptr).ok_or_else(|| {
+            EncodeError::Backend(
+                "VideoToolbox CVPixelBufferPoolCreatePixelBuffer: succeeded with a null buffer"
+                    .into(),
+            )
+        })?;
+        // SAFETY: the call returned success, which per its contract hands
+        // us a +1 reference to a pixel buffer.
+        let buffer: CFRetained<CVPixelBuffer> = unsafe { CFRetained::from_raw(buffer_ptr) };
+        fill_pixel_buffer(frame, buffer)
+    }
+}
+
+/// Locks `buffer`, copies `frame` into it, unlocks, returns it.
+fn fill_pixel_buffer(
+    frame: &RawFrame,
+    buffer: CFRetained<CVPixelBuffer>,
+) -> Result<CFRetained<CVPixelBuffer>, EncodeError> {
     // SAFETY: `buffer` was just created above and isn't shared with
     // anything else yet.
     let lock_status =
@@ -938,6 +1027,39 @@ mod tests {
             total_size < 200 * 1024,
             "total encoded size too large: {total_size} bytes"
         );
+    }
+
+    #[test]
+    fn discarded_output_forces_keyframe_on_next_encode() {
+        let mut source = SyntheticSource::new(64, 64, 1000);
+        let mut encoder = VideoToolboxEncoder::new(test_cfg()).expect("encoder init");
+        let mut enc = |encoder: &mut VideoToolboxEncoder| {
+            let raw = source.next_frame().expect("frame");
+            encoder
+                .encode(&raw, false)
+                .expect("encode")
+                .expect("output")
+        };
+        assert!(enc(&mut encoder).keyframe);
+        assert!(!enc(&mut encoder).keyframe);
+        encoder.force_keyframe_next = true;
+        assert!(enc(&mut encoder).keyframe, "flag must force a keyframe");
+        assert!(!encoder.force_keyframe_next);
+        assert!(!enc(&mut encoder).keyframe, "flag is one-shot");
+    }
+
+    #[test]
+    fn pool_is_created_once_per_pixel_format() {
+        let mut source = SyntheticSource::new(64, 64, 1000);
+        let mut encoder = VideoToolboxEncoder::new(test_cfg()).expect("encoder init");
+        assert!(encoder.pool.is_none());
+        let raw = source.next_frame().expect("frame");
+        encoder.encode(&raw, false).expect("encode");
+        let first = encoder.pool.as_ref().expect("pool").pool.as_ref() as *const CVPixelBufferPool;
+        let raw = source.next_frame().expect("frame");
+        encoder.encode(&raw, false).expect("encode");
+        let second = encoder.pool.as_ref().expect("pool").pool.as_ref() as *const CVPixelBufferPool;
+        assert_eq!(first, second);
     }
 
     #[test]
