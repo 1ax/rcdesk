@@ -14,6 +14,7 @@ import type { PointerButton } from "./generated/PointerButton";
 import { isCopyShortcut, isPasteShortcut } from "./clipboard";
 import { remapCode, type KeyRemapMode } from "./keyRemap";
 import { createLayoutChord } from "./layoutChord";
+import type { TouchMode } from "./viewport";
 import {
   TouchRecognizer,
   VirtualCursor,
@@ -229,6 +230,15 @@ export class KeyMessageGate {
  * Omitted (e.g. no `ClipboardBridge` for this session), `attachInput`
  * behaves exactly as it did before this slice: shortcuts are forwarded as
  * plain `key` messages with no gating or copy hook. */
+/** Slices H1/H3: touch-mode callbacks supplied by the app. */
+export interface TouchHooks {
+  mode: () => TouchMode;
+  /** Virtual cursor client position (to draw it) or `null` (hide it). */
+  onCursor: (pos: { clientX: number; clientY: number } | null) => void;
+  onPinch: (factor: number, clientX: number, clientY: number) => void;
+  onPan: (dx: number, dy: number) => void;
+}
+
 export interface InputHooks {
   /** Called on a Cmd/Ctrl+V keydown, before that keydown (and any key
    * event that arrives while this promise is pending) is sent to the host
@@ -259,10 +269,8 @@ export function attachInput(
   // Slice 4.6d: called when the Alt+Shift chord completes (see
   // `layoutChord.ts`). Key forwarding to the host is unchanged.
   onLayoutChord?: () => void,
-  // Slice H1: touch "trackpad" mode. Called with the virtual cursor's
-  // client position (to draw it) or `null` (hide it: mouse took over, or
-  // detach).
-  onTouchCursor?: (pos: { clientX: number; clientY: number } | null) => void,
+  // Slices H1/H3: touch hooks (mode, cursor overlay, pinch, pan).
+  touch?: TouchHooks,
 ): () => void {
   const layoutChord = createLayoutChord();
   let rafHandle: number | null = null;
@@ -293,21 +301,49 @@ export function attachInput(
   }
 
   // --- Touch "trackpad" mode (slice H1) ---
-  const recognizer = new TouchRecognizer();
+  const recognizer = new TouchRecognizer(() => touch?.mode() ?? "trackpad");
   const virtualCursor = new VirtualCursor();
   const wheelAcc = new WheelAccumulator();
   let touchActive = false;
   let touchTimer: ReturnType<typeof setTimeout> | null = null;
 
   function showTouchCursor(): void {
-    if (!onTouchCursor) return;
+    if (!touch) return;
     const rect = video.getBoundingClientRect();
-    onTouchCursor(
+    touch.onCursor(
       unmapPointer(virtualCursor.x, virtualCursor.y, rect, video.videoWidth, video.videoHeight),
     );
   }
 
   function runTouchAction(action: TouchAction): void {
+    switch (action.kind) {
+      case "pinch":
+        touch?.onPinch(action.factor, action.cx, action.cy);
+        return;
+      case "pan":
+        touch?.onPan(action.dx, action.dy);
+        return;
+      case "click": {
+        const point = pointFromClient(action.x, action.y);
+        if (!point) return;
+        virtualCursor.x = point.x;
+        virtualCursor.y = point.y;
+        queuePointerMove(point);
+        showTouchCursor();
+        for (const pressed of [true, false]) {
+          send(channels.input, {
+            type: "pointer_button",
+            button: action.button,
+            pressed,
+            x: point.x,
+            y: point.y,
+          });
+        }
+        return;
+      }
+      default:
+        break;
+    }
     const rect = video.getBoundingClientRect();
     const layout = frameLayout(rect, video.videoWidth, video.videoHeight);
     if (!layout) return;
@@ -382,7 +418,7 @@ export function attachInput(
   function leaveTouch(): void {
     if (!touchActive) return;
     touchActive = false;
-    onTouchCursor?.(null);
+    touch?.onCursor(null);
   }
 
   function onPointerMove(e: PointerEvent): void {
@@ -511,7 +547,7 @@ export function attachInput(
     if (rafHandle !== null) cancelAnimationFrame(rafHandle);
     if (touchTimer !== null) clearTimeout(touchTimer);
     touchTimer = null;
-    onTouchCursor?.(null);
+    touch?.onCursor(null);
     video.removeEventListener("pointermove", onPointerMove);
     video.removeEventListener("pointerdown", onPointerDown);
     video.removeEventListener("pointerup", onPointerUp);

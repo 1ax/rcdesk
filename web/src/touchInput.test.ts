@@ -101,6 +101,81 @@ describe("TouchRecognizer", () => {
   });
 });
 
+describe("TouchRecognizer pinch and direct mode (H3)", () => {
+  it("pinch: growing distance gives pinch with factor and centroid, no scroll", () => {
+    const r = new TouchRecognizer();
+    r.handle(ev("down", 1, 100, 100), 0);
+    r.handle(ev("down", 2, 200, 100), 10);
+    const a = r.handle(ev("move", 2, 240, 100), 30);
+    expect(a).toEqual([{ kind: "pinch", factor: 140 / 100, cx: 170, cy: 100 }]);
+    const b = r.handle(ev("move", 1, 80, 100), 40);
+    expect(b).toHaveLength(1);
+    const act = b[0];
+    expect(act?.kind).toBe("pinch");
+    if (act?.kind === "pinch") expect(act.factor).toBeCloseTo(160 / 140);
+    expect(r.handle(ev("up", 1), 60)).toEqual([]);
+    expect(r.handle(ev("up", 2), 70)).toEqual([]);
+  });
+
+  it("a gesture that began as scroll never becomes a pinch", () => {
+    const r = new TouchRecognizer();
+    r.handle(ev("down", 1, 100, 100), 0);
+    r.handle(ev("down", 2, 160, 100), 10);
+    expect(r.handle(ev("move", 1, 100, 140), 30)[0]?.kind).toBe("scroll");
+    const rest = r.handle(ev("move", 2, 260, 100), 40);
+    expect(rest.every((x) => x.kind === "scroll")).toBe(true);
+  });
+
+  it("direct: tap clicks left at the touch point", () => {
+    const r = new TouchRecognizer(() => "direct");
+    r.handle(ev("down", 1, 40, 70), 0);
+    expect(r.handle(ev("up", 1, 41, 70), 100)).toEqual([
+      { kind: "click", button: "left", x: 40, y: 70 },
+    ]);
+  });
+
+  it("direct: one-finger move pans after the slop", () => {
+    const r = new TouchRecognizer(() => "direct");
+    r.handle(ev("down", 1, 0, 0), 0);
+    expect(r.handle(ev("move", 1, 5, 0), 10)).toEqual([]);
+    expect(r.handle(ev("move", 1, 15, 0), 20)).toEqual([{ kind: "pan", dx: 15, dy: 0 }]);
+    expect(r.handle(ev("move", 1, 20, 3), 30)).toEqual([{ kind: "pan", dx: 5, dy: 3 }]);
+    expect(r.handle(ev("up", 1, 20, 3), 40)).toEqual([]);
+  });
+
+  it("direct: long press right-clicks, then moving pans", () => {
+    const r = new TouchRecognizer(() => "direct");
+    r.handle(ev("down", 1, 30, 30), 0);
+    expect(r.handle(ev("timer", 1), 500)).toEqual([
+      { kind: "click", button: "right", x: 30, y: 30 },
+    ]);
+    expect(r.handle(ev("move", 1, 40, 30), 600)).toEqual([{ kind: "pan", dx: 10, dy: 0 }]);
+    expect(r.handle(ev("up", 1, 40, 30), 700)).toEqual([]);
+  });
+
+  it("direct: two-finger tap right-clicks at the centroid", () => {
+    const r = new TouchRecognizer(() => "direct");
+    r.handle(ev("down", 1, 100, 100), 0);
+    r.handle(ev("down", 2, 200, 120), 10);
+    expect(r.handle(ev("up", 1), 100)).toEqual([]);
+    expect(r.handle(ev("up", 2), 120)).toEqual([
+      { kind: "click", button: "right", x: 150, y: 110 },
+    ]);
+  });
+
+  it("mode change applies at the next first down", () => {
+    let mode: "trackpad" | "direct" = "trackpad";
+    const r = new TouchRecognizer(() => mode);
+    r.handle(ev("down", 1, 10, 10), 0);
+    mode = "direct";
+    expect(r.handle(ev("up", 1, 10, 10), 50)).toEqual(click("left"));
+    r.handle(ev("down", 1, 10, 10), 100);
+    expect(r.handle(ev("up", 1, 10, 10), 150)).toEqual([
+      { kind: "click", button: "left", x: 10, y: 10 },
+    ]);
+  });
+});
+
 describe("WheelAccumulator", () => {
   it("returns whole lines and keeps the remainder", () => {
     const w = new WheelAccumulator();

@@ -1,0 +1,95 @@
+// Pinch-zoom / pan state of the video layer on the mobile client (slice H3).
+// Pure logic, no DOM: the layer sits in a container of `w x h` CSS px and is
+// shown with `transform: translate(tx px, ty px) scale(scale)` and
+// `transform-origin: 0 0`.
+
+export interface Zoom {
+  scale: number;
+  tx: number;
+  ty: number;
+}
+
+export const ZOOM_MIN = 1;
+export const ZOOM_MAX = 4;
+
+export function identityZoom(): Zoom {
+  return { scale: 1, tx: 0, ty: 0 };
+}
+
+/** Keeps `scale` in `[ZOOM_MIN, ZOOM_MAX]` and the container fully covered. */
+export function clampZoom(z: Zoom, w: number, h: number): Zoom {
+  const scale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z.scale));
+  const tx = Math.min(0, Math.max(w - w * scale, z.tx));
+  const ty = Math.min(0, Math.max(h - h * scale, z.ty));
+  return { scale, tx, ty };
+}
+
+/** Zooms by `factor` keeping the container point `(px, py)` in place. */
+export function zoomAt(
+  z: Zoom,
+  factor: number,
+  px: number,
+  py: number,
+  w: number,
+  h: number,
+): Zoom {
+  const scale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z.scale * factor));
+  const ratio = scale / z.scale;
+  return clampZoom(
+    { scale, tx: px - (px - z.tx) * ratio, ty: py - (py - z.ty) * ratio },
+    w,
+    h,
+  );
+}
+
+export function panBy(z: Zoom, dx: number, dy: number, w: number, h: number): Zoom {
+  return clampZoom({ scale: z.scale, tx: z.tx + dx, ty: z.ty + dy }, w, h);
+}
+
+/** Shifts the view so the container point `(px, py)` stays at least
+ * `margin` px away from the edges. */
+export function followPoint(
+  z: Zoom,
+  px: number,
+  py: number,
+  w: number,
+  h: number,
+  margin: number,
+): Zoom {
+  let { tx, ty } = z;
+  if (px < margin) tx += margin - px;
+  else if (px > w - margin) tx -= px - (w - margin);
+  if (py < margin) ty += margin - py;
+  else if (py > h - margin) ty -= py - (h - margin);
+  return clampZoom({ scale: z.scale, tx, ty }, w, h);
+}
+
+/** Value for `style.transform`; `""` for the identity. */
+export function zoomCss(z: Zoom): string {
+  if (z.scale === 1 && z.tx === 0 && z.ty === 0) return "";
+  return `translate(${z.tx}px, ${z.ty}px) scale(${z.scale})`;
+}
+
+export const TOUCH_MODE_STORAGE_KEY = "rcdesk.touch-mode";
+
+export type TouchMode = "trackpad" | "direct";
+
+export function loadTouchMode(storage: Pick<Storage, "getItem"> | null): TouchMode {
+  try {
+    return storage?.getItem(TOUCH_MODE_STORAGE_KEY) === "direct" ? "direct" : "trackpad";
+  } catch {
+    return "trackpad";
+  }
+}
+
+export function saveTouchMode(storage: Pick<Storage, "setItem"> | null, mode: TouchMode): void {
+  try {
+    storage?.setItem(TOUCH_MODE_STORAGE_KEY, mode);
+  } catch {
+    // Storage may be unavailable or full; the mode just won't persist.
+  }
+}
+
+export function touchModeLabel(mode: TouchMode): string {
+  return mode === "direct" ? "Касание" : "Трекпад";
+}

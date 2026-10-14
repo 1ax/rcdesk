@@ -9,6 +9,8 @@ export interface SoftKeyboardOptions {
   field: HTMLInputElement;
   send: (msg: InputMessage) => void;
   isTextSupported: () => boolean;
+  /** Element whose height follows the visual viewport while the keyboard is up. */
+  fit?: HTMLElement;
 }
 
 export interface SoftKeyboardController {
@@ -37,7 +39,7 @@ const MOD_KEYS: Array<[string, string]> = [
 ];
 
 export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardController {
-  const { button, strip, field, send, isTextSupported } = opts;
+  const { button, strip, field, send, isTextSupported, fit } = opts;
   const sticky = new StickyModifiers();
   let prev = SENTINEL;
   let visible = false;
@@ -83,6 +85,8 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
   const updateBottom = (): void => {
     if (!vv) return;
     strip.style.bottom = `${window.innerHeight - vv.offsetTop - vv.height}px`;
+    // iOS does not shrink the layout viewport for the keyboard.
+    if (fit) fit.style.height = `${vv.height}px`;
   };
   const startTracking = (): void => {
     if (!vv) return;
@@ -95,6 +99,7 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
     vv.removeEventListener("resize", updateBottom);
     vv.removeEventListener("scroll", updateBottom);
     strip.style.bottom = "";
+    if (fit) fit.style.height = "";
   };
 
   const resetField = (): void => {

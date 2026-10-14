@@ -14,6 +14,19 @@ import { PeerSession, toRtcIceServers } from "./session";
 import { summarizeStats, takeSnapshot } from "./stats";
 import type { Snapshot, StatsSummary } from "./stats";
 import { attachInput } from "./input";
+import {
+  clampZoom,
+  followPoint,
+  identityZoom,
+  loadTouchMode,
+  panBy,
+  saveTouchMode,
+  touchModeLabel,
+  zoomAt,
+  zoomCss,
+  type TouchMode,
+  type Zoom,
+} from "./viewport";
 import { ClipboardBridge, isSafari, loadClipboardSyncSetting, saveClipboardSyncSetting } from "./clipboard";
 import {
   FileReceiver,
@@ -414,6 +427,7 @@ export function mount(root: Element | null): void {
             Яз
           </button>
           <button id="keyboard-btn" class="btn btn-secondary" hidden>Клавиатура</button>
+          <button id="touch-mode-btn" class="btn btn-secondary" title="Режим касаний" hidden></button>
           <button id="fullscreen-btn" class="btn btn-secondary" hidden>На весь экран</button>
           <button id="disconnect-btn" class="btn btn-secondary">Отключиться</button>
           <button
@@ -432,9 +446,11 @@ export function mount(root: Element | null): void {
         hidden
       ></button>
       <div class="session-video">
-        <video id="video" autoplay playsinline muted></video>
+        <div class="zoom-layer" id="zoom-layer">
+          <video id="video" autoplay playsinline muted></video>
+          <img id="touch-cursor" class="touch-cursor" alt="" hidden />
+        </div>
         <div class="connection-banner" id="connection-banner" hidden></div>
-        <img id="touch-cursor" class="touch-cursor" alt="" hidden />
         <div class="file-drop-hint" id="file-drop-hint" hidden>Отпустите, чтобы отправить на хост</div>
       </div>
       <div class="auth-dialog" id="auth-dialog" hidden>
@@ -562,7 +578,25 @@ export function mount(root: Element | null): void {
   const softKeysEl = root.querySelector<HTMLDivElement>("#soft-keys")!;
   const softInputEl = root.querySelector<HTMLInputElement>("#soft-input")!;
   softInputEl.setAttribute("autocorrect", "off");
+  const touchModeBtn = root.querySelector<HTMLButtonElement>("#touch-mode-btn")!;
+  const zoomLayer = root.querySelector<HTMLDivElement>("#zoom-layer")!;
   keyboardBtn.hidden = !matchMedia("(pointer: coarse)").matches;
+  touchModeBtn.hidden = keyboardBtn.hidden;
+  // Slice H3: touch mode (global setting) and pinch-zoom of the video layer.
+  let touchMode: TouchMode = loadTouchMode(ownerStorage());
+  touchModeBtn.textContent = touchModeLabel(touchMode);
+  touchModeBtn.addEventListener("click", () => {
+    touchMode = touchMode === "direct" ? "trackpad" : "direct";
+    saveTouchMode(ownerStorage(), touchMode);
+    touchModeBtn.textContent = touchModeLabel(touchMode);
+    video.focus();
+  });
+  let zoom: Zoom = identityZoom();
+  function applyZoom(next: Zoom): void {
+    zoom = clampZoom(next, sessionVideoEl.clientWidth, sessionVideoEl.clientHeight);
+    zoomLayer.style.transform = zoomCss(zoom);
+  }
+  window.addEventListener("resize", () => applyZoom(zoom));
   // Slice H2b: версия хоста из `host_info` (null -- поле не пришло).
   let hostVersion: string | null = null;
   const softKeyboard: SoftKeyboardController = mountSoftKeyboard({
@@ -573,6 +607,7 @@ export function mount(root: Element | null): void {
       if (inputChannel?.readyState === "open") inputChannel.send(JSON.stringify(msg));
     },
     isTextSupported: () => hostSupportsText(hostVersion),
+    fit: sessionScreen,
   });
   const curtainBtn = root.querySelector<HTMLButtonElement>("#curtain-btn")!;
   const curtainStatusEl = root.querySelector<HTMLSpanElement>("#curtain-status")!;
@@ -1507,18 +1542,53 @@ export function mount(root: Element | null): void {
       () => {
         if (hostOs === "macos" && inputSourceAvailable) sendSwitchInputSource();
       },
-      // Slice H1: virtual cursor overlay for touch "trackpad" mode.
-      (pos) => {
-        if (!pos) {
-          touchCursorEl.hidden = true;
-          return;
-        }
-        keyboardBtn.hidden = false;
-        const videoRect = video.getBoundingClientRect();
-        const hx = Number(touchCursorEl.dataset.hx ?? 0) || 0;
-        const hy = Number(touchCursorEl.dataset.hy ?? 0) || 0;
-        touchCursorEl.hidden = false;
-        touchCursorEl.style.transform = `translate(${pos.clientX - videoRect.left - hx}px, ${pos.clientY - videoRect.top - hy}px)`;
+      // Slices H1/H3: touch hooks (mode, virtual cursor overlay, pinch, pan).
+      {
+        mode: () => touchMode,
+        onCursor: (pos) => {
+          if (!pos) {
+            touchCursorEl.hidden = true;
+            return;
+          }
+          keyboardBtn.hidden = false;
+          touchModeBtn.hidden = false;
+          const layerRect = zoomLayer.getBoundingClientRect();
+          const hx = Number(touchCursorEl.dataset.hx ?? 0) || 0;
+          const hy = Number(touchCursorEl.dataset.hy ?? 0) || 0;
+          touchCursorEl.hidden = false;
+          touchCursorEl.style.transform = `translate(${(pos.clientX - layerRect.left) / zoom.scale - hx}px, ${(pos.clientY - layerRect.top) / zoom.scale - hy}px)`;
+          if (touchMode === "trackpad") {
+            const c = sessionVideoEl.getBoundingClientRect();
+            applyZoom(
+              followPoint(
+                zoom,
+                pos.clientX - c.left,
+                pos.clientY - c.top,
+                sessionVideoEl.clientWidth,
+                sessionVideoEl.clientHeight,
+                24,
+              ),
+            );
+          }
+        },
+        onPinch: (factor, cx, cy) => {
+          const c = sessionVideoEl.getBoundingClientRect();
+          applyZoom(
+            zoomAt(
+              zoom,
+              factor,
+              cx - c.left,
+              cy - c.top,
+              sessionVideoEl.clientWidth,
+              sessionVideoEl.clientHeight,
+            ),
+          );
+        },
+        onPan: (dx, dy) => {
+          applyZoom(
+            panBy(zoom, dx, dy, sessionVideoEl.clientWidth, sessionVideoEl.clientHeight),
+          );
+        },
       },
     );
   }
@@ -2026,6 +2096,7 @@ export function mount(root: Element | null): void {
     touchCursorEl.removeAttribute("src");
     touchCursorEl.style.visibility = "";
     touchCursorEl.style.transform = "";
+    applyZoom(identityZoom());
     overlay.textContent = "";
     firstFrameShown = false;
     resetAuthAttempt();

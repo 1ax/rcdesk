@@ -16,8 +16,10 @@
 //   - two-finger tap (<= 300 ms, centroid shift < 10 px) -> right click
 //   - two-finger move                            -> scroll
 // A double tap is not recognized here: two taps are two clicks and the
-// host OS assembles the double click by timing. Pinch and a third finger are
-// ignored in H1.
+// host OS assembles the double click by timing. A third finger is ignored. Slice H3 adds pinch
+// and a "direct" mode (taps click at the touch point, one finger pans).
+
+import type { TouchMode } from "./viewport";
 
 export type TouchEventKind = "down" | "move" | "up" | "cancel" | "timer";
 
@@ -32,7 +34,11 @@ export type TouchAction =
   | { kind: "move"; dx: number; dy: number }
   | { kind: "button"; button: "left" | "right"; pressed: boolean }
   | { kind: "scroll"; dx: number; dy: number }
-  | { kind: "drag"; pressed: boolean };
+  | { kind: "drag"; pressed: boolean }
+  // Slice H3: pinch (centroid in client px), view pan and direct-mode click.
+  | { kind: "pinch"; factor: number; cx: number; cy: number }
+  | { kind: "pan"; dx: number; dy: number }
+  | { kind: "click"; button: "left" | "right"; x: number; y: number };
 
 export const TAP_MAX_MS = 300;
 export const LONG_PRESS_MS = 500;
@@ -63,7 +69,16 @@ export class TouchRecognizer {
   private twoStartCy = 0;
   private lastCx = 0;
   private lastCy = 0;
-  private scrolling = false;
+  private twoKind: "none" | "scroll" | "pinch" = "none";
+  private tapLike = false;
+  private dPrev = 0;
+  private mode: TouchMode = "trackpad";
+
+  private readonly getMode: () => TouchMode;
+
+  constructor(getMode: () => TouchMode = () => "trackpad") {
+    this.getMode = getMode;
+  }
 
   /** When the caller must feed a `timer` event (ms, same clock as `now`),
    * or `null` if no timer is needed. */
@@ -89,7 +104,13 @@ export class TouchRecognizer {
   private reset(): void {
     this.phase = "idle";
     this.fingers.clear();
-    this.scrolling = false;
+    this.twoKind = "none";
+    this.tapLike = false;
+  }
+
+  private distance(): number {
+    const [a, b] = [...this.fingers.values()];
+    return a && b ? Math.hypot(a.x - b.x, a.y - b.y) : 0;
   }
 
   private centroid(): { cx: number; cy: number } {
@@ -108,6 +129,7 @@ export class TouchRecognizer {
     if (this.phase === "idle") {
       this.fingers.set(ev.id, { x: ev.x, y: ev.y });
       this.phase = "pending";
+      this.mode = this.getMode();
       this.downAt = now;
       this.startX = ev.x;
       this.startY = ev.y;
@@ -117,7 +139,8 @@ export class TouchRecognizer {
       this.fingers.set(ev.id, { x: ev.x, y: ev.y });
       this.phase = "two";
       this.twoAt = now;
-      this.scrolling = false;
+      this.twoKind = "none";
+      this.dPrev = this.distance();
       const { cx, cy } = this.centroid();
       this.twoStartCx = this.lastCx = cx;
       this.twoStartCy = this.lastCy = cy;
@@ -135,12 +158,22 @@ export class TouchRecognizer {
     f.y = ev.y;
     switch (this.phase) {
       case "pending":
+        if (this.mode === "direct") {
+          if (Math.hypot(ev.x - this.startX, ev.y - this.startY) < SLOP_PX) return [];
+          this.phase = "moving";
+          const pdx = ev.x - this.startX;
+          const pdy = ev.y - this.startY;
+          return [{ kind: "pan", dx: pdx, dy: pdy }];
+        }
         if (Math.hypot(ev.x - this.startX, ev.y - this.startY) >= SLOP_PX) {
           this.phase = "moving";
         }
         return dx === 0 && dy === 0 ? [] : [{ kind: "move", dx, dy }];
       case "moving":
       case "drag":
+        if (this.mode === "direct") {
+          return dx === 0 && dy === 0 ? [] : [{ kind: "pan", dx, dy }];
+        }
         return dx === 0 && dy === 0 ? [] : [{ kind: "move", dx, dy }];
       case "two": {
         const { cx, cy } = this.centroid();
@@ -148,11 +181,20 @@ export class TouchRecognizer {
         const sdy = cy - this.lastCy;
         this.lastCx = cx;
         this.lastCy = cy;
-        if (!this.scrolling) {
-          if (Math.hypot(cx - this.twoStartCx, cy - this.twoStartCy) < SLOP_PX) return [];
-          this.scrolling = true;
+        const d = this.distance();
+        if (this.twoKind === "none") {
+          const shift = Math.hypot(cx - this.twoStartCx, cy - this.twoStartCy);
+          const spread = Math.abs(d - this.dPrev);
+          if (shift < SLOP_PX && spread < SLOP_PX) return [];
+          this.twoKind = spread > shift ? "pinch" : "scroll";
         }
-        return sdx === 0 && sdy === 0 ? [] : [{ kind: "scroll", dx: sdx, dy: sdy }];
+        if (this.twoKind === "scroll") {
+          return sdx === 0 && sdy === 0 ? [] : [{ kind: "scroll", dx: sdx, dy: sdy }];
+        }
+        const prev = this.dPrev;
+        this.dPrev = d;
+        if (prev <= 0 || d <= 0 || d === prev) return [];
+        return [{ kind: "pinch", factor: d / prev, cx, cy }];
       }
       default:
         return [];
@@ -167,12 +209,14 @@ export class TouchRecognizer {
       case "pending": {
         const tap = now - this.downAt <= TAP_MAX_MS;
         this.reset();
-        return tap
-          ? [
-              { kind: "button", button: "left", pressed: true },
-              { kind: "button", button: "left", pressed: false },
-            ]
-          : [];
+        if (!tap) return [];
+        if (this.mode === "direct") {
+          return [{ kind: "click", button: "left", x: this.startX, y: this.startY }];
+        }
+        return [
+          { kind: "button", button: "left", pressed: true },
+          { kind: "button", button: "left", pressed: false },
+        ];
       }
       case "moving":
         this.reset();
@@ -183,14 +227,17 @@ export class TouchRecognizer {
       case "two": {
         // Remember whether this still looks like a two-finger tap; the
         // right click fires when the *second* finger lifts.
-        const tapLike = !this.scrolling && now - this.twoAt <= TAP_MAX_MS;
+        const tapLike = this.twoKind === "none" && now - this.twoAt <= TAP_MAX_MS;
         this.phase = "tail";
-        this.scrolling = tapLike;
+        this.tapLike = tapLike;
         return [];
       }
       case "tail": {
-        const tapLike = this.scrolling && now - this.twoAt <= TAP_MAX_MS;
+        const tapLike = this.tapLike && now - this.twoAt <= TAP_MAX_MS;
         this.reset();
+        if (tapLike && this.mode === "direct") {
+          return [{ kind: "click", button: "right", x: this.twoStartCx, y: this.twoStartCy }];
+        }
         return tapLike
           ? [
               { kind: "button", button: "right", pressed: true },
@@ -212,6 +259,11 @@ export class TouchRecognizer {
 
   private onTimer(now: number): TouchAction[] {
     if (this.phase === "pending" && now >= this.downAt + LONG_PRESS_MS) {
+      if (this.mode === "direct") {
+        // Long press: right click at the touch point, then the finger pans.
+        this.phase = "moving";
+        return [{ kind: "click", button: "right", x: this.startX, y: this.startY }];
+      }
       this.phase = "drag";
       return [{ kind: "drag", pressed: true }];
     }
