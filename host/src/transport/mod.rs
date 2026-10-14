@@ -78,6 +78,35 @@ const MAX_CAPTURE_GAP: Duration = Duration::from_secs(10);
 /// session that never finishes negotiating.
 const KEYFRAME_REARM_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Packets per pacing burst in `PeerSession::start_video` (about 38 KB at
+/// `RTP_MTU`). A frame that fits one burst is sent back to back, as before.
+const PACE_BURST_PACKETS: usize = 32;
+
+/// Pause between two pacing bursts of one video frame.
+const PACE_BURST_GAP: Duration = Duration::from_millis(1);
+
+/// Ceiling on the total time spent sending one frame (about one frame
+/// interval at 30 fps). Once exceeded (e.g. the Windows timer granularity,
+/// up to 15.6 ms per sleep, ate the budget) the rest of the frame goes out
+/// without pauses, so pacing never adds more than one frame of latency.
+const PACE_MAX_SPREAD: Duration = Duration::from_millis(30);
+
+/// Says whether to pause before packet `next` of a `total`-packet frame
+/// whose first packet went out `elapsed` ago. Pauses only at burst
+/// boundaries (`next` a non-zero multiple of `PACE_BURST_PACKETS`, with
+/// packets still left to send) and only while `elapsed < PACE_MAX_SPREAD`.
+fn pace_gap(next: usize, total: usize, elapsed: Duration) -> Option<Duration> {
+    if next > 0
+        && next < total
+        && next.is_multiple_of(PACE_BURST_PACKETS)
+        && elapsed < PACE_MAX_SPREAD
+    {
+        Some(PACE_BURST_GAP)
+    } else {
+        None
+    }
+}
+
 /// How often `PeerSession::start_video`'s startup keyframe task re-requests a
 /// keyframe after the connection reaches `Connected`, until the receiver
 /// confirms it is actually getting video via an RTCP Receiver Report (see
@@ -854,6 +883,7 @@ impl PeerSession {
                     packetizer.skip_samples(skip_samples);
                 }
 
+                let keyframe = frame.keyframe;
                 let packets = match packetizer.packetize(&Bytes::from(frame.data), 0) {
                     Ok(packets) => packets,
                     Err(err) => {
@@ -861,7 +891,19 @@ impl PeerSession {
                         continue;
                     }
                 };
-                for mut pkt in packets {
+                // Pacing (audit 2026-10-13, slice F2): an IDR of 126-322 KB
+                // is 110-270 packets; sent back to back that burst overflows
+                // Wi-Fi/TURN queues -> loss -> PLI -> new IDR -> loop, and
+                // Chrome's GCC cuts REMB. Send in bursts of
+                // `PACE_BURST_PACKETS` with `PACE_BURST_GAP` between them,
+                // but stop pausing after `PACE_MAX_SPREAD` so pacing never
+                // costs more than about one frame interval of latency.
+                let started = Instant::now();
+                let total = packets.len();
+                for (i, mut pkt) in packets.into_iter().enumerate() {
+                    if let Some(gap) = pace_gap(i, total, started.elapsed()) {
+                        tokio::time::sleep(gap).await;
+                    }
                     pkt.header.payload_type = pt;
                     if let Err(err) = session
                         .video_track
@@ -870,6 +912,14 @@ impl PeerSession {
                     {
                         tracing::warn!(?err, "failed to write video packet");
                     }
+                }
+                if total > PACE_BURST_PACKETS {
+                    tracing::debug!(
+                        packets = total,
+                        keyframe,
+                        spread_ms = started.elapsed().as_secs_f64() * 1000.0,
+                        "paced video frame"
+                    );
                 }
             }
         });
@@ -1107,6 +1157,37 @@ fn ntp_mid32_now() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pace_gap_small_frame_never_pauses() {
+        for next in 0..=10 {
+            assert_eq!(pace_gap(next, 10, Duration::ZERO), None);
+        }
+    }
+
+    #[test]
+    fn pace_gap_pauses_at_burst_boundaries_only() {
+        for next in 0..100 {
+            let expected = matches!(next, 32 | 64 | 96);
+            assert_eq!(
+                pace_gap(next, 100, Duration::ZERO).is_some(),
+                expected,
+                "next = {next}"
+            );
+        }
+        assert_eq!(pace_gap(32, 100, Duration::ZERO), Some(PACE_BURST_GAP));
+    }
+
+    #[test]
+    fn pace_gap_exact_burst_frame_has_no_trailing_pause() {
+        assert_eq!(pace_gap(32, 32, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn pace_gap_stops_after_max_spread() {
+        assert_eq!(pace_gap(32, 100, PACE_MAX_SPREAD), None);
+        assert_eq!(pace_gap(64, 100, PACE_MAX_SPREAD * 2), None);
+    }
 
     #[test]
     fn rtt_from_report_computes_expected_round_trip() {
