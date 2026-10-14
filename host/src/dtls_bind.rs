@@ -7,10 +7,14 @@
 //! (`web/src/dtlsBind.ts` -- both sides must produce byte-identical tags or
 //! every session with a password set would fail to connect):
 //!
-//! 1. Extract the DTLS certificate fingerprint from the SDP: the first
-//!    `a=fingerprint:<alg> <hex>` line (session level or the first
-//!    m-section, whichever comes first), normalized to `"<alg> <HEX>"` --
-//!    algorithm lowercased, hex uppercased, one space between them.
+//! 1. Extract the DTLS certificate fingerprint from the SDP: collect EVERY
+//!    `a=fingerprint:<alg> <hex>` line (session level and all m-sections),
+//!    each normalized to `"<alg> <HEX>"` -- algorithm lowercased, hex
+//!    uppercased, one space between them. All normalized values must agree;
+//!    if any two differ there is no fingerprint (slice E3: RFC 8122 lets a
+//!    media-level line override the session-level one, so a man-in-the-middle
+//!    could keep the genuine value at session level and put its own in an
+//!    m-section).
 //! 2. Build the message `"rcdesk-dtls-v1|" + role + "|" + fingerprint`,
 //!    where `role` is `"offer"` (the host's own fingerprint, sent in
 //!    `Offer.auth`) or `"answer"` (the client's fingerprint, sent in
@@ -35,12 +39,14 @@ type HmacSha256 = Hmac<Sha256>;
 /// module's doc comment.
 const AUTH_TAG_PREFIX: &str = "rcdesk-dtls-v1";
 
-/// Extracts and normalizes the first `a=fingerprint:<alg> <hex>` line in
-/// `sdp` (session level or an m-section, whichever appears first -- SDP
-/// lines are read in document order). Returns `None` when there is no such
-/// line, or the line after `a=fingerprint:` doesn't have both an algorithm
-/// and a hex value.
+/// Extracts and normalizes every `a=fingerprint:<alg> <hex>` line in `sdp`
+/// (session level and all m-sections). Returns `None` when there is no valid
+/// line (a line lacking an algorithm or a hex value is skipped), or when the
+/// normalized values are not all identical -- slice E3: a mismatch may be a
+/// substitution (RFC 8122: media level overrides session level), so callers
+/// treat it as "no fingerprint" and refuse the offer/answer.
 pub fn fingerprint_from_sdp(sdp: &str) -> Option<String> {
+    let mut found: Option<String> = None;
     for line in sdp.lines() {
         let trimmed = line.trim();
         let Some(rest) = trimmed.strip_prefix("a=fingerprint:") else {
@@ -55,9 +61,14 @@ pub fn fingerprint_from_sdp(sdp: &str) -> Option<String> {
         if alg.is_empty() || hex.is_empty() {
             continue;
         }
-        return Some(format!("{} {}", alg.to_lowercase(), hex.to_uppercase()));
+        let normalized = format!("{} {}", alg.to_lowercase(), hex.to_uppercase());
+        match &found {
+            None => found = Some(normalized),
+            Some(prev) if *prev == normalized => {}
+            Some(_) => return None,
+        }
     }
-    None
+    found
 }
 
 /// `HMAC-SHA256(key, "rcdesk-dtls-v1|" + role + "|" + fingerprint)`, base64
@@ -147,6 +158,30 @@ mod tests {
     #[test]
     fn fingerprint_normalizes_algorithm_case_and_hex_case() {
         let sdp = "a=fingerprint:SHA-256 ab:cd:ef\r\n";
+        assert_eq!(
+            fingerprint_from_sdp(sdp),
+            Some("sha-256 AB:CD:EF".to_string())
+        );
+    }
+
+    #[test]
+    fn fingerprint_same_at_session_and_media_level_in_different_case_is_some() {
+        let sdp = "v=0\r\ns=-\r\na=fingerprint:sha-256 ab:cd:ef\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=fingerprint:SHA-256 AB:CD:EF\r\n";
+        assert_eq!(
+            fingerprint_from_sdp(sdp),
+            Some("sha-256 AB:CD:EF".to_string())
+        );
+    }
+
+    #[test]
+    fn fingerprint_differing_between_session_and_media_level_is_none() {
+        let sdp = "v=0\r\ns=-\r\na=fingerprint:sha-256 AB:CD:EF\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=fingerprint:sha-256 11:22:33\r\n";
+        assert_eq!(fingerprint_from_sdp(sdp), None);
+    }
+
+    #[test]
+    fn fingerprint_same_in_two_m_sections_is_some() {
+        let sdp = "v=0\r\ns=-\r\nm=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=fingerprint:sha-256 AB:CD:EF\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=fingerprint:sha-256 AB:CD:EF\r\n";
         assert_eq!(
             fingerprint_from_sdp(sdp),
             Some("sha-256 AB:CD:EF".to_string())

@@ -1413,10 +1413,31 @@ async fn handle_signal_message(
                     return;
                 }
             }
-            if let Some(active) = active.as_ref() {
-                if let Err(err) = active.peer.set_answer(sdp).await {
-                    tracing::warn!(?err, "failed to apply remote answer");
+            let set_answer_failed = match active.as_ref() {
+                Some(session) => match session.peer.set_answer(sdp).await {
+                    Ok(()) => false,
+                    Err(err) => {
+                        // Slice E3: a session that cannot apply the answer
+                        // can never connect; end it like a failed binding
+                        // check instead of leaving it hanging.
+                        tracing::warn!(?err, "failed to apply remote answer, ending session");
+                        true
+                    }
+                },
+                None => false,
+            };
+            if set_answer_failed {
+                if let Some(old) = active.take() {
+                    old.shutdown().await;
+                    let _ = status.send(AgentStatus::Registered {
+                        pin: pin.to_string(),
+                    });
                 }
+                *current_session_id = None;
+                let _ = out_tx.send(SignalMessage::Bye {
+                    session_id,
+                    reason: None,
+                });
             }
         }
         SignalMessage::Ice {
@@ -4367,11 +4388,10 @@ mod tests {
 
     /// Slice 3.2e: an `Answer` whose `auth` tag verifies against the
     /// client's session key and the answer's own fingerprint must *not* be
-    /// rejected -- the host goes on to try `set_answer` (which fails here,
-    /// since this is a synthetic SDP rather than a real DTLS answer;
-    /// `set_answer`'s failure path is untouched by this slice and only
-    /// `tracing::warn!`s, it does not end the session -- see the `Answer`
-    /// arm's non-3.2e code below the dtls-binding check).
+    /// rejected by the binding check -- the host goes on to try `set_answer`
+    /// (which fails here, since this is a synthetic SDP rather than a real
+    /// DTLS answer). Slice E3: that failure now ends the session with a
+    /// `Bye`, so the `Bye` below comes from `set_answer`, not the binding.
     #[tokio::test(flavor = "multi_thread")]
     async fn answer_with_a_valid_auth_tag_is_not_rejected() {
         let (
@@ -4410,16 +4430,19 @@ mod tests {
         )
         .await;
 
-        assert!(
-            out_rx.try_recv().is_err(),
-            "a valid auth tag must not trigger a Bye"
+        // Slice E3: binding passed, `set_answer` failed on the synthetic SDP
+        // -> the session is ended with a Bye.
+        assert_eq!(
+            out_rx
+                .try_recv()
+                .expect("expected bye after set_answer failure"),
+            SignalMessage::Bye {
+                session_id: "sess-1".to_string(),
+                reason: None,
+            }
         );
-        assert!(active.is_some(), "session must not have been ended");
-        assert_eq!(current_session_id.as_deref(), Some("sess-1"));
-
-        if let Some(active) = active.take() {
-            active.shutdown().await;
-        }
+        assert!(active.is_none(), "session must have been ended");
+        assert_eq!(current_session_id, None);
     }
 
     /// Slice 3.2c: a client that gets its password wrong fails locally
