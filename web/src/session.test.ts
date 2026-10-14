@@ -116,3 +116,49 @@ describe("PeerSession ondatachannel", () => {
     expect(onDataChannel).toHaveBeenCalledWith("input", fakeChannel);
   });
 });
+
+describe("PeerSession ontrack jitterBufferTarget", () => {
+  function setup(onTrack = vi.fn()) {
+    let pc!: FakePeerConnection;
+    new PeerSession({ iceServers: [] }, { onTrack }, (_config) => {
+      pc = new FakePeerConnection();
+      return pc;
+    });
+    return { pc, onTrack };
+  }
+  const stream = { id: "s" } as unknown as MediaStream;
+
+  it("sets jitterBufferTarget to 0 when the receiver supports it", () => {
+    const { pc } = setup();
+    const receiver = { jitterBufferTarget: null as number | null };
+    pc.ontrack?.({ receiver, streams: [stream] } as unknown as RTCTrackEvent);
+    expect(receiver.jitterBufferTarget).toBe(0);
+  });
+
+  it("does not add jitterBufferTarget to a receiver without the property", () => {
+    const { pc } = setup();
+    const receiver = {};
+    pc.ontrack?.({ receiver, streams: [stream] } as unknown as RTCTrackEvent);
+    expect("jitterBufferTarget" in receiver).toBe(false);
+  });
+
+  it("still calls onTrack when the setter throws", () => {
+    const { pc, onTrack } = setup();
+    const receiver = {
+      set jitterBufferTarget(_v: number | null) {
+        throw new Error("bad value");
+      },
+      get jitterBufferTarget(): number | null {
+        return null;
+      },
+    };
+    pc.ontrack?.({ receiver, streams: [stream] } as unknown as RTCTrackEvent);
+    expect(onTrack).toHaveBeenCalledWith(stream);
+  });
+
+  it("tolerates an event without receiver", () => {
+    const { pc, onTrack } = setup();
+    pc.ontrack?.({ streams: [stream] } as unknown as RTCTrackEvent);
+    expect(onTrack).toHaveBeenCalledWith(stream);
+  });
+});

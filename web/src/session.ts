@@ -90,6 +90,22 @@ export class PeerSession {
     };
 
     this.pc.ontrack = (event) => {
+      // Desktop video arrives irregularly (only when the screen changes), so
+      // Chrome's adaptive jitter buffer (seen at 12-149 ms) only adds latency.
+      // 0 is treated by Chrome as the minimum target; a frame is still
+      // assembled in full, so this is safe. Measure via `jb` in the stats
+      // overlay (slice F5). Optional optimisation: absent in Safari/old
+      // Chrome, and the browser may throw on a bad value - ignore both.
+      const receiver = event.receiver as
+        | (RTCRtpReceiver & { jitterBufferTarget?: number | null })
+        | undefined;
+      if (receiver !== undefined && "jitterBufferTarget" in receiver) {
+        try {
+          receiver.jitterBufferTarget = 0;
+        } catch {
+          // ignored on purpose
+        }
+      }
       const stream = event.streams[0];
       if (stream) {
         callbacks.onTrack?.(stream);
