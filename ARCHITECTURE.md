@@ -83,7 +83,17 @@ RTP-пакетизатор webrtc-rs → сеть. Один рабочий по�
 Пейсинг: целевой fps задаётся клиентом (30/60), кадр кодируется только если
 источник сообщил об изменении (SCK/WGC отдают кадры только при изменении экрана —
 статичный экран стоит ~0 трафика). Ключевой кадр — по PLI/FIR от клиента и при
-подключении.
+подключении; периодический IDR — страховка раз в `fps*60` кадров (слайс F1, было `fps*10`).
+
+Квик-вины видеопути (слайс F, 2026-10-14; каждый с цифрой в SLICES_LOG): RTP-пейсинг в
+`start_video` — кадр длиннее 32 пакетов уходит пачками по 32 с паузой 1 мс, после 30 мс остаток
+без пауз (грубый таймер Windows не должен добавить больше одного кадрового интервала); VideoToolbox
+берёт входные буферы из своего `CVPixelBufferPool` (IOSurface-backed), а если VT отдал больше одного
+выхода за `encode()`, следующий кадр принудительно ключевой; openh264 — слайсы
+`SM_SIZELIMITED_SLICE` по 8000 байт и до 4 потоков (1080p: 24.8 → 19.5 мс/кадр; слайс 1200 без
+FU-A стоил +12 % битрейта); GDI — две DIB-секции по очереди, одна копия на изменённый кадр и ноль
+на статичном. LTO (`thin`/`fat`) измерен и отвергнут: bench не меняется (горячий путь — C-код
+openh264 и системные кодеры), `fat` лишь уменьшает бинарник 14.4 → 10.4 МБ ценой 8× времени линка.
 
 Экран сразу после подключения (слайс 2.6f): если запрошен ключевой кадр, а новый
 кадр от источника не пришёл за `SLOT_WAIT_TIMEOUT` (статичный экран), кодер-поток
@@ -136,7 +146,10 @@ keyframe. Старый pipeline останавливается через `spawn
 `getCoalescedEvents`, `keydown/keyup` по `event.code` (физическая клавиша, не
 символ), колесо с нормализацией `deltaMode`. Pointer Lock по клику,
 Keyboard Lock в Chrome в полноэкранном режиме. Оверлей статистики
-(`getStats()`: fps, битрейт, RTT, jitter, потери, кодек). Селектор дисплеев в панели
+(`getStats()`: fps, битрейт, RTT, jitter, потери, кодек). На приёмнике видео
+`jitterBufferTarget = 0` (слайс F5): кадры рабочего стола идут нерегулярно, адаптивный буфер
+Chrome (12–149 мс в живых сеансах) только добавлял задержку; ставится, если свойство есть.
+Селектор дисплеев в панели
 сессии появляется при двух и более дисплеях и блокируется до ответа хоста `Displays`.
 Идентификатор сборки (слайс 2.6f): `build <short sha>` (`dev` вне CI), приглушённой
 подписью поверх обоих экранов — чтобы вкладка, оставшаяся открытой с прошлого
@@ -218,7 +231,7 @@ TURN-креды выдаются в `Joined` и `PeerJoined`: хост берё�
   и растёт ~8 %/с; сигнал перегрузки только когда канал нагружен — отправлено ≥ 80 % цели — и REMB
   ниже отправленного два тика подряд и при этом не растёт — растущий REMB просто догоняет поток;
   иначе на статичном экране или на старте видео он режет цель без причины),
-  **доля потерь из RTCP RR** (> 10 % — срез; при отсутствии сигналов перегрузки и потерь < 2 % —
+  **доля потерь из RTCP RR** (свежее `LOSS_FRESH` 3 с, иначе ноль — слайс F1; > 10 % — срез; при отсутствии сигналов перегрузки и потерь < 2 % —
   пробинг +10 %/с, единственный путь вверх) и **перезапись слота захвата** (кадр пришёл, пока кодер
   занят предыдущим, ≥ 2 за тик — ступень fps вниз; пять чистых тиков — вверх).
   Порядок «сначала fps, потом битрейт» — через бюджет кадра (0.02 бит/пиксель): при низком
@@ -637,7 +650,7 @@ CSP сначала `Report-Only`, затем enforcing; HSTS/nosniff/X-Frame-Opt
 | objc2 0.6, objc2-foundation 0.3, objc2-app-kit 0.3 | host (macOS) | NSCursor → NSBitmapImageRep (те же версии, что тянет enigo); фича `NSPasteboard` — счётчик изменений буфера обмена (2.5b, для arboard тоже) |
 | windows 0.61 | host (Windows) | курсор (GetCursorInfo/GetIconInfo/GetDIBits), клавиатура (`SendInput`, `MapVirtualKeyW`), GDI-захват (`BitBlt`, `CreateDIBSection`), проба D3D 11 (`D3D11CreateDevice`; фича Dxgi нужна из-за cfg-гейта), DPI (`SetProcessDpiAwarenessContext`), Media Foundation H.264 MFT (`Win32_Media_MediaFoundation`; `Win32_System_{Com,Ole,Variant}` — COM-инициализация и `VARIANT` для `ICodecAPI::SetValue`), буфер обмена (`Win32_System_DataExchange` — `GetClipboardSequenceNumber`, 2.5b), папка «Загрузки» (`Win32_UI_Shell` — `SHGetKnownFolderPath`, 3.4a), полный режим (4.1a): `Win32_System_Services` — SCM, `CreateServiceW`/`StartServiceCtrlDispatcherW`, служба SYSTEM `rcdesk`; `Win32_System_RemoteDesktop` — `WTSGetActiveConsoleSessionId`, активная консольная сессия для помощника; `Win32_System_JobObjects` — Job с `KILL_ON_JOB_CLOSE`, помощник не переживает службу; `Win32_Security_Authorization` — SDDL и `SetNamedSecurityInfoW`, защищённый DACL (SYSTEM + Administrators) на `%ProgramData%\rcdesk`. Та же версия, что у windows-capture |
 | enigo 0.6 | host (macOS/Windows) | инъекция ввода: macOS — `raw()` = CGKeyCode; Windows — только мышь/колесо (`raw()` не принимает E0-префикс, клавиши идут через свой `SendInput`); `main_display()` для масштаба координат |
-| objc2-core-foundation, objc2-core-video, objc2-core-media, objc2-video-toolbox 0.3 | host (macOS) | VideoToolbox: `VTCompressionSession`, `CVPixelBuffer` (NV12 без конверсии), `CMSampleBuffer`/`CMBlockBuffer` (AVCC → Annex-B), CF-словари свойств. Минимальные фичи, без objc2-классов; сидят на тех же objc2 0.6 / core-foundation 0.3, что enigo |
+| objc2-core-foundation, objc2-core-video, objc2-core-media, objc2-video-toolbox 0.3 | host (macOS) | VideoToolbox: `VTCompressionSession`, `CVPixelBuffer` (NV12 без конверсии), `CMSampleBuffer`/`CMBlockBuffer` (AVCC → Annex-B), CF-словари свойств, `CVPixelBufferPool` — пул IOSurface-буферов на вход кодера (слайс F3). Минимальные фичи, без objc2-классов; сидят на тех же objc2 0.6 / core-foundation 0.3, что enigo |
 | arboard 3.6 (default-features = false) | host (macOS/Windows) | текст буфера обмена (2.5); изменения — по счётчику ОС (NSPasteboard changeCount / GetClipboardSequenceNumber); список скопированных файлов `get().file_list()` для скачивания с хоста (3.4c) |
 | tray-icon 0.25 (default-features = false) | host (macOS/Windows) | трей/меню-бар `rcdesk-agent` (2.6c): иконка + меню через реэкспорт `tray_icon::menu` (`muda`, без отдельной зависимости). Без winit/tao — свой минимальный цикл событий (`platform::{macos,windows}::event_loop`) |
 | vite 8, typescript 7, vitest 5 | web | сборка, типы, тесты; `vite.config.ts` использует `defineConfig` из `vitest/config` |
