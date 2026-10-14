@@ -430,6 +430,7 @@ export function mount(root: Element | null): void {
       <div class="session-video">
         <video id="video" autoplay playsinline muted></video>
         <div class="connection-banner" id="connection-banner" hidden></div>
+        <img id="touch-cursor" class="touch-cursor" alt="" hidden />
         <div class="file-drop-hint" id="file-drop-hint" hidden>Отпустите, чтобы отправить на хост</div>
       </div>
       <div class="auth-dialog" id="auth-dialog" hidden>
@@ -543,6 +544,7 @@ export function mount(root: Element | null): void {
   const folderSendBtn = root.querySelector<HTMLButtonElement>("#folder-send-btn")!;
   const folderInput = root.querySelector<HTMLInputElement>("#folder-input")!;
   const fileDropHint = root.querySelector<HTMLDivElement>("#file-drop-hint")!;
+  const touchCursorEl = root.querySelector<HTMLImageElement>("#touch-cursor")!;
   const sessionVideoEl = root.querySelector<HTMLDivElement>(".session-video")!;
   const fullscreenBtn = root.querySelector<HTMLButtonElement>("#fullscreen-btn")!;
   const curtainBtn = root.querySelector<HTMLButtonElement>("#curtain-btn")!;
@@ -1478,6 +1480,18 @@ export function mount(root: Element | null): void {
       () => {
         if (hostOs === "macos" && inputSourceAvailable) sendSwitchInputSource();
       },
+      // Slice H1: virtual cursor overlay for touch "trackpad" mode.
+      (pos) => {
+        if (!pos) {
+          touchCursorEl.hidden = true;
+          return;
+        }
+        const videoRect = video.getBoundingClientRect();
+        const hx = Number(touchCursorEl.dataset.hx ?? 0) || 0;
+        const hy = Number(touchCursorEl.dataset.hy ?? 0) || 0;
+        touchCursorEl.hidden = false;
+        touchCursorEl.style.transform = `translate(${pos.clientX - videoRect.left - hx}px, ${pos.clientY - videoRect.top - hy}px)`;
+      },
     );
   }
 
@@ -1655,7 +1669,7 @@ export function mount(root: Element | null): void {
         clipboardBridge?.onHostText(msg.text);
         return;
       }
-      applyCursor(video, msg);
+      applyCursor(video, msg, touchCursorEl);
     });
   }
 
@@ -1975,6 +1989,10 @@ export function mount(root: Element | null): void {
     prevSnapshot = undefined;
     video.srcObject = null;
     video.style.cursor = "";
+    touchCursorEl.hidden = true;
+    touchCursorEl.removeAttribute("src");
+    touchCursorEl.style.visibility = "";
+    touchCursorEl.style.transform = "";
     overlay.textContent = "";
     firstFrameShown = false;
     resetAuthAttempt();

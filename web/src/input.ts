@@ -14,6 +14,13 @@ import type { PointerButton } from "./generated/PointerButton";
 import { isCopyShortcut, isPasteShortcut } from "./clipboard";
 import { remapCode, type KeyRemapMode } from "./keyRemap";
 import { createLayoutChord } from "./layoutChord";
+import {
+  TouchRecognizer,
+  VirtualCursor,
+  WheelAccumulator,
+  type TouchAction,
+  type TouchEventKind,
+} from "./touchInput";
 
 /** The two data channels `attachInput` needs, opened by the host and handed
  * to the client via `PeerSession`'s `onDataChannel` callback (see
@@ -47,6 +54,45 @@ export function mapPointer(
   videoWidth: number,
   videoHeight: number,
 ): { x: number; y: number } | null {
+  const layout = frameLayout(rect, videoWidth, videoHeight);
+  if (!layout) return null;
+  const { displayWidth, displayHeight, offsetX, offsetY } = layout;
+
+  const frameX = clientX - rect.left - offsetX;
+  const frameY = clientY - rect.top - offsetY;
+  if (frameX < 0 || frameX > displayWidth || frameY < 0 || frameY > displayHeight) {
+    return null;
+  }
+
+  return { x: frameX / displayWidth, y: frameY / displayHeight };
+}
+
+/** Inverse of `mapPointer`: a normalized `[0,1]` position within the frame
+ * back to client-space coordinates (accounting for the same `object-fit:
+ * contain` letterbox). `null` when either dimension is degenerate. Used to
+ * place the touch-mode virtual cursor overlay. */
+export function unmapPointer(
+  x: number,
+  y: number,
+  rect: RectLike,
+  videoWidth: number,
+  videoHeight: number,
+): { clientX: number; clientY: number } | null {
+  const layout = frameLayout(rect, videoWidth, videoHeight);
+  if (!layout) return null;
+  return {
+    clientX: rect.left + layout.offsetX + x * layout.displayWidth,
+    clientY: rect.top + layout.offsetY + y * layout.displayHeight,
+  };
+}
+
+/** Size and offset of the displayed frame inside `rect` under `object-fit:
+ * contain`, or `null` when nothing is rendered yet. */
+function frameLayout(
+  rect: RectLike,
+  videoWidth: number,
+  videoHeight: number,
+): { displayWidth: number; displayHeight: number; offsetX: number; offsetY: number } | null {
   if (rect.width <= 0 || rect.height <= 0 || videoWidth <= 0 || videoHeight <= 0) {
     return null;
   }
@@ -66,16 +112,12 @@ export function mapPointer(
     displayHeight = rect.height;
     displayWidth = rect.height * videoAspect;
   }
-  const offsetX = (rect.width - displayWidth) / 2;
-  const offsetY = (rect.height - displayHeight) / 2;
-
-  const frameX = clientX - rect.left - offsetX;
-  const frameY = clientY - rect.top - offsetY;
-  if (frameX < 0 || frameX > displayWidth || frameY < 0 || frameY > displayHeight) {
-    return null;
-  }
-
-  return { x: frameX / displayWidth, y: frameY / displayHeight };
+  return {
+    displayWidth,
+    displayHeight,
+    offsetX: (rect.width - displayWidth) / 2,
+    offsetY: (rect.height - displayHeight) / 2,
+  };
 }
 
 /** Normalizes a `WheelEvent`'s delta to "lines" (see
@@ -217,6 +259,10 @@ export function attachInput(
   // Slice 4.6d: called when the Alt+Shift chord completes (see
   // `layoutChord.ts`). Key forwarding to the host is unchanged.
   onLayoutChord?: () => void,
+  // Slice H1: touch "trackpad" mode. Called with the virtual cursor's
+  // client position (to draw it) or `null` (hide it: mouse took over, or
+  // detach).
+  onTouchCursor?: (pos: { clientX: number; clientY: number } | null) => void,
 ): () => void {
   const layoutChord = createLayoutChord();
   let rafHandle: number | null = null;
@@ -246,7 +292,106 @@ export function attachInput(
     return mapPointer(clientX, clientY, rect, video.videoWidth, video.videoHeight);
   }
 
+  // --- Touch "trackpad" mode (slice H1) ---
+  const recognizer = new TouchRecognizer();
+  const virtualCursor = new VirtualCursor();
+  const wheelAcc = new WheelAccumulator();
+  let touchActive = false;
+  let touchTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function showTouchCursor(): void {
+    if (!onTouchCursor) return;
+    const rect = video.getBoundingClientRect();
+    onTouchCursor(
+      unmapPointer(virtualCursor.x, virtualCursor.y, rect, video.videoWidth, video.videoHeight),
+    );
+  }
+
+  function runTouchAction(action: TouchAction): void {
+    const rect = video.getBoundingClientRect();
+    const layout = frameLayout(rect, video.videoWidth, video.videoHeight);
+    if (!layout) return;
+    switch (action.kind) {
+      case "move":
+        virtualCursor.moveBy(action.dx, action.dy, layout.displayWidth, layout.displayHeight);
+        queuePointerMove({ x: virtualCursor.x, y: virtualCursor.y });
+        showTouchCursor();
+        break;
+      case "button":
+        send(channels.input, {
+          type: "pointer_button",
+          button: action.button,
+          pressed: action.pressed,
+          x: virtualCursor.x,
+          y: virtualCursor.y,
+        });
+        break;
+      case "drag":
+        send(channels.input, {
+          type: "pointer_button",
+          button: "left",
+          pressed: action.pressed,
+          x: virtualCursor.x,
+          y: virtualCursor.y,
+        });
+        break;
+      case "scroll": {
+        const lines = wheelAcc.add(action.dx, action.dy);
+        if (lines.dx === 0 && lines.dy === 0) break;
+        // Finger up = content up = wheel down (as on a phone).
+        send(channels.input, {
+          type: "wheel",
+          dx: 0 - lines.dx,
+          dy: 0 - lines.dy,
+          x: virtualCursor.x,
+          y: virtualCursor.y,
+        });
+        break;
+      }
+    }
+  }
+
+  function scheduleTouchTimer(): void {
+    if (touchTimer !== null) {
+      clearTimeout(touchTimer);
+      touchTimer = null;
+    }
+    const at = recognizer.nextTimerAt();
+    if (at === null) return;
+    touchTimer = setTimeout(
+      () => {
+        touchTimer = null;
+        feedTouch("timer", 0, 0, 0);
+      },
+      Math.max(0, at - performance.now()),
+    );
+  }
+
+  function feedTouch(kind: TouchEventKind, id: number, x: number, y: number): void {
+    const actions = recognizer.handle({ kind, id, x, y }, performance.now());
+    for (const action of actions) runTouchAction(action);
+    scheduleTouchTimer();
+  }
+
+  function enterTouch(): void {
+    if (touchActive) return;
+    touchActive = true;
+    showTouchCursor();
+  }
+
+  function leaveTouch(): void {
+    if (!touchActive) return;
+    touchActive = false;
+    onTouchCursor?.(null);
+  }
+
   function onPointerMove(e: PointerEvent): void {
+    if (e.pointerType === "touch") {
+      enterTouch();
+      feedTouch("move", e.pointerId, e.clientX, e.clientY);
+      return;
+    }
+    leaveTouch();
     const events =
       typeof e.getCoalescedEvents === "function" ? e.getCoalescedEvents() : [e];
     const latest = events.length > 0 ? events[events.length - 1] : e;
@@ -264,11 +409,27 @@ export function attachInput(
   }
 
   function onPointerDown(e: PointerEvent): void {
+    if (e.pointerType === "touch") {
+      enterTouch();
+      feedTouch("down", e.pointerId, e.clientX, e.clientY);
+      return;
+    }
+    leaveTouch();
     sendPointerButton(e, true);
   }
 
   function onPointerUp(e: PointerEvent): void {
+    if (e.pointerType === "touch") {
+      feedTouch("up", e.pointerId, e.clientX, e.clientY);
+      return;
+    }
     sendPointerButton(e, false);
+  }
+
+  function onPointerCancel(e: PointerEvent): void {
+    if (e.pointerType === "touch") {
+      feedTouch("cancel", e.pointerId, e.clientX, e.clientY);
+    }
   }
 
   function onContextMenu(e: MouseEvent): void {
@@ -334,6 +495,7 @@ export function attachInput(
   video.addEventListener("pointermove", onPointerMove);
   video.addEventListener("pointerdown", onPointerDown);
   video.addEventListener("pointerup", onPointerUp);
+  video.addEventListener("pointercancel", onPointerCancel);
   video.addEventListener("contextmenu", onContextMenu);
   video.addEventListener("wheel", onWheel, { passive: false });
   video.addEventListener("keydown", onKeyDown);
@@ -343,9 +505,13 @@ export function attachInput(
 
   return () => {
     if (rafHandle !== null) cancelAnimationFrame(rafHandle);
+    if (touchTimer !== null) clearTimeout(touchTimer);
+    touchTimer = null;
+    onTouchCursor?.(null);
     video.removeEventListener("pointermove", onPointerMove);
     video.removeEventListener("pointerdown", onPointerDown);
     video.removeEventListener("pointerup", onPointerUp);
+    video.removeEventListener("pointercancel", onPointerCancel);
     video.removeEventListener("contextmenu", onContextMenu);
     video.removeEventListener("wheel", onWheel);
     video.removeEventListener("keydown", onKeyDown);

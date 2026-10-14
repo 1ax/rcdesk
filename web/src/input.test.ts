@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { KeyMessageGate, keyToMessage, mapPointer, normalizeWheel } from "./input";
+import { KeyMessageGate, keyToMessage, mapPointer, normalizeWheel, unmapPointer } from "./input";
 import type { InputMessage } from "./generated/InputMessage";
 
 describe("mapPointer", () => {
@@ -24,6 +24,35 @@ describe("mapPointer", () => {
 
   it("returns null when the video has no intrinsic size yet", () => {
     expect(mapPointer(400, 300, rect, 0, 0)).toBeNull();
+  });
+});
+
+describe("unmapPointer", () => {
+  const rect = { left: 10, top: 20, width: 800, height: 600 };
+
+  it("is the inverse of mapPointer (letterboxed top/bottom)", () => {
+    for (const [cx, cy] of [
+      [410, 320],
+      [10, 95],
+      [500, 400],
+    ] as const) {
+      const p = mapPointer(cx, cy, rect, 1600, 900);
+      expect(p).not.toBeNull();
+      const back = unmapPointer(p!.x, p!.y, rect, 1600, 900);
+      expect(back!.clientX).toBeCloseTo(cx);
+      expect(back!.clientY).toBeCloseTo(cy);
+    }
+  });
+
+  it("is the inverse of mapPointer (letterboxed left/right)", () => {
+    const p = mapPointer(300, 200, rect, 900, 1600);
+    const back = unmapPointer(p!.x, p!.y, rect, 900, 1600);
+    expect(back!.clientX).toBeCloseTo(300);
+    expect(back!.clientY).toBeCloseTo(200);
+  });
+
+  it("returns null for a degenerate video size", () => {
+    expect(unmapPointer(0.5, 0.5, rect, 0, 0)).toBeNull();
   });
 });
 

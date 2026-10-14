@@ -123,40 +123,71 @@ async function renderToDataUrl(
   return output.toDataURL("image/png");
 }
 
-/** Cache of already-encoded cursor CSS values, keyed by the message's raw
+/** Everything one cursor image yields once encoded, so a cache hit serves
+ * both the CSS cursor on the video and the touch-mode overlay `<img>`. */
+interface CursorEntry {
+  css: string;
+  dataUrl: string;
+  logicalWidth: number;
+  logicalHeight: number;
+  hx: number;
+  hy: number;
+}
+
+/** Cache of already-encoded cursor entries, keyed by the message's raw
  * `rgba` base64 string (itself a stable identity for one cursor image --
  * two different shapes producing the exact same bytes is indistinguishable
  * from, and as cheap to handle as, a cache hit). Bounded to avoid unbounded
  * growth over a long session with many distinct cursor shapes (text-editing
  * apps, custom app cursors, ...). */
 const MAX_CACHE_ENTRIES = 32;
-const cssCache = new Map<string, string>();
+const cssCache = new Map<string, CursorEntry>();
 
-function cacheCss(key: string, css: string): void {
+function cacheEntry(key: string, entry: CursorEntry): void {
   if (cssCache.size >= MAX_CACHE_ENTRIES) {
     const oldest = cssCache.keys().next().value;
     if (oldest !== undefined) cssCache.delete(oldest);
   }
-  cssCache.set(key, css);
+  cssCache.set(key, entry);
 }
 
-/** Applies one `control`-channel `ControlMessage` to `video`'s CSS cursor.
+/** Shows `entry` in the touch-mode overlay `<img>` (slice H1): a sensor has
+ * no hover, so the CSS cursor is invisible and the shape is drawn as an
+ * element instead. The hotspot goes to `dataset.hx/hy` for the placement
+ * code in `app.ts`. */
+function showInOverlay(overlay: HTMLImageElement, entry: CursorEntry): void {
+  overlay.src = entry.dataUrl;
+  overlay.style.width = `${entry.logicalWidth}px`;
+  overlay.style.height = `${entry.logicalHeight}px`;
+  overlay.dataset.hx = String(entry.hx);
+  overlay.dataset.hy = String(entry.hy);
+  overlay.style.visibility = "visible";
+}
+
+/** Applies one `control`-channel `ControlMessage` to `video`'s CSS cursor
+ * (and, if given, to the touch-mode `overlay` image).
  * `ping`/`pong` are not cursor messages and are ignored here (see `app.ts`,
  * which handles those for the `app N ms` overlay stat). Encoding a new
  * shape to a data URL is asynchronous (`OffscreenCanvas.convertToBlob`), so
  * this returns immediately and updates `video.style.cursor` once ready --
  * fine for a cursor shape, which humans can't perceive arriving a frame or
  * two late. */
-export function applyCursor(video: HTMLElement, msg: ControlMessage): void {
+export function applyCursor(
+  video: HTMLElement,
+  msg: ControlMessage,
+  overlay?: HTMLImageElement,
+): void {
   if (msg.type === "cursor_hidden") {
     video.style.cursor = "none";
+    if (overlay) overlay.style.visibility = "hidden";
     return;
   }
   if (msg.type !== "cursor_shape") return;
 
   const cached = cssCache.get(msg.rgba);
   if (cached) {
-    video.style.cursor = cached;
+    video.style.cursor = cached.css;
+    if (overlay) showInOverlay(overlay, cached);
     return;
   }
 
@@ -168,9 +199,17 @@ export function applyCursor(video: HTMLElement, msg: ControlMessage): void {
 
   renderToDataUrl(decodeRgba(rgba), width, height, targetWidth, targetHeight)
     .then((dataUrl) => {
-      const css = cursorCss(dataUrl, hotspot_x, hotspot_y, cssScale, useImageSet);
-      cacheCss(rgba, css);
-      video.style.cursor = css;
+      const entry: CursorEntry = {
+        css: cursorCss(dataUrl, hotspot_x, hotspot_y, cssScale, useImageSet),
+        dataUrl,
+        logicalWidth: width / scale,
+        logicalHeight: height / scale,
+        hx: hotspot_x,
+        hy: hotspot_y,
+      };
+      cacheEntry(rgba, entry);
+      video.style.cursor = entry.css;
+      if (overlay) showInOverlay(overlay, entry);
     })
     .catch((err: unknown) => {
       console.error("failed to render cursor shape", err);

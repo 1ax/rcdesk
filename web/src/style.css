@@ -424,6 +424,20 @@ body {
   object-fit: contain;
   background: #000;
   display: block;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* Slice H1: virtual cursor drawn over the video in touch "trackpad" mode
+   (a sensor has no hover, so the CSS cursor is invisible). */
+.touch-cursor {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+  will-change: transform;
 }
 
 /* D32: centered banner shown over the video (now within `.session-video`,
