@@ -412,7 +412,9 @@ WS (`PasskeyRegister*`, `PasskeyLogin*`, `options`/`credential` — JSON webauth
 неверную почту и неверный пароль одинаков (`wrong email or password`, verify против фиктивного хеша). Лимиты IP:
 выдача кодов 5 / 10 мин, неверный пароль или код 10 / мин. Аккаунт по-прежнему необязателен, passkey остаётся;
 анонимный владелец = без passkey и без почты. Отправка писем — трейт `Mailer` (`mail.rs`): `RCDESK_MAIL=log` пишет
-код в лог (локальная разработка), иначе почта выключена (`email unavailable`); SMTP — 3.8b.
+код в лог (локальная разработка), `smtp` — `SmtpMailer` (3.8b: `RCDESK_SMTP_HOST/PORT/USER/PASSWORD`, `RCDESK_MAIL_FROM`,
+по умолчанию Resend и `rcdesk <noreply@rcdesk.app>`; без пароля сервер не стартует), пусто — почта выключена
+(`email unavailable`). Ключ Resend `rcdesk-server-smtp` — только отправка, только домен `rcdesk.app`.
 
 ## 7. Ввод
 
@@ -678,7 +680,7 @@ workflow его не видят, прогон ждёт «Review deployments». �
 - 3.4 Передача файлов: канал `file`, drag-and-drop в клиенте, обе стороны. ✅ (код; стенд — 3.4d)
 - 3.5 Переподключение, настройки качества, fullscreen, Keyboard Lock (Chrome). ✅
 - 3.7 Аккаунт и кабинет: passkey (WebAuthn), несколько браузеров у владельца, отзыв и выход. ✅ Общий доступ команде — позже.
-- 3.8 Учётка почта + пароль: код на почту, регистрация/сброс/вход. 3.8a сервер ✅, 3.8b SMTP, 3.8c веб.
+- 3.8 Учётка почта + пароль: код на почту, регистрация/сброс/вход. 3.8a сервер ✅, 3.8b SMTP ✅, 3.8c веб ✅; прод — после деплоя.
 
 ### Фаза 4 — полный режим и расширения
 - 4.1 Windows: служба SYSTEM + помощник в сессии ✅ (4.1a, окна администратора), «Загрузки» пользователя под SYSTEM ✅ (4.1d); UAC/экран блокировки (4.1b) и Ctrl+Alt+Del (4.1c) — долги.
@@ -728,6 +730,7 @@ workflow его не видят, прогон ждёт «Review deployments». �
 | webauthn-rs 0.5.5 (conditional-ui) | server | passkey (WebAuthn): регистрация к владельцу и вход без логина через discoverable-аутентификацию (3.7b); Cargo-фича `conditional-ui` открывает `start/identify/finish_discoverable_authentication`. Цена: тянет OpenSSL (`openssl-sys`) — в runtime-образ добавлен `libssl3`, а `rcdesk-server` исключён из clippy/test на `windows-latest` (сервер работает только на Linux) |
 | opaque-ke 4.0 (argon2), argon2 0.5, sha2 0.10 | host | OPAQUE-пароль доступа к хосту (3.2b): шифронабор как у `@serenity-kit/opaque`, argon2id — KSF, SHA-512 — TripleDH |
 | argon2 0.5 (из workspace) | server | хеш пароля учётки (3.8a), argon2id по умолчанию; соль 16 байт из `rand` 0.10 — `OsRng` крейта требует фичу `getrandom` |
+| lettre 0.11.23 (builder, smtp-transport, tokio1, tokio1-rustls-tls) | server | отправка кода на почту по SMTP (3.8b), Resend `smtp.resend.com:465` implicit TLS; rustls + ring + webpki-roots — без native-tls и системных корней, рантайм-образ не меняется |
 | rpassword 7 | host | скрытый ввод пароля в терминале для `rcdesk-host password set` (macOS + Windows) |
 | rand_core 0.6 (getrandom) | host | `OsRng` для трейтов `rand_core` 0.6, над которыми обобщён opaque-ke 4.0 (реэкспорт `opaque_ke::rand` без фичи `getrandom` `OsRng` не даёт; воркспейсный `rand` 0.10 — другой мажор трейтов) |
 | @serenity-kit/opaque 1.1 | web | клиентская сторона OPAQUE (3.2d) — `opaque-ke` 4.0 в WASM, первая runtime-зависимость web |
