@@ -61,6 +61,19 @@
   через `try_stop_capture` без паники. Причина остановки системой не известна (системный журнал пуст). Подтверждение
   — по `agent.log` на `0.1.11`: пара `screen capture stream stopped by the system, restarting` / `restarted`.
   Гейты: host `384 passed; 0 failed; 3 ignored`, proto `80`, server `98` + `51`, loopback `1`, fmt/clippy чистые.
+- ✅ **I6** `3c90fa8` (уедет с `0.1.11`): 2026-10-15 13:01 MSK jetsam на Mac (16 ГБ) выгрузил 544 процесса, в том числе
+  агента (`OS_REASON_JETSAM`, проработал 20.8 ч). `JetsamEvent-2026-10-15-024008.ips`: у агента пик 21 649 МБ.
+  Воспроизведено: в сеансе на неподвижном экране агент растёт на 13–16 МБ/с; `heap` — тысячи `NSCursor`/`NSImage`,
+  25 тыс. `CGImage`/`NSBitmapImageRep`. Причина: `MacCursorSource::current()` (30 Гц) вызывает AppKit из Rust-потока
+  без autorelease pool (с `7c592b3`). Фикс: `autoreleasepool` вокруг тела. Ручной тест `cursor_poll_does_not_leak`
+  (3000 вызовов, `footprint`): без пула +949.9 МБ, с пулом +0–1 МБ. Гейты: host `384 passed; 0 failed; 4 ignored`,
+  fmt/clippy чистые. Живая проверка — после `0.1.11`: сеанс 10 мин, footprint ровный.
+- ⚪ **I7 (следующий) автозапуск на Mac сломан примерно с 2026-10-12:** launchd каждые 10 с пытается поднять
+  `app.rcdesk.agent` и получает `exit 78 EX_CONFIG`, `Unable to get updated LWCR … needs LWCR update | managed LWCR`
+  (`runs` ≈ 24 800). Работающий агент был запущен через LaunchServices (перезапуск после обновления), поэтому после
+  jetsam его некому поднять. Похоже на смену бинарника при обновлении.
+- ⚪ Наблюдение 2026-10-15: после закрытия вкладки клиента сеанс на хосте продолжался ещё ≥1.5 мин (видео шло, `session
+  ended` не было) — проверить таймаут ICE/сигналинга.
 - ⚪ Шум `Failed to write packet … os error 10051` с адаптеров Hyper-V/WSL засоряет лог Windows-хоста.
 - ▶️ **Дальше:** владелец (Mac) и пользователь (Win) обновляются до `0.1.10` кнопкой; не проверено вживую: fps
   поднимается с 5 после урезания, после видео картинка восстанавливается. По логам смотреть `target_fps` после
