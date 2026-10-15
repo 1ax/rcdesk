@@ -401,6 +401,19 @@ WS (`PasskeyRegister*`, `PasskeyLogin*`, `options`/`credential` — JSON webauth
 владелец-аккаунт не трогается. RP ID — `rcdesk.app` (`RCDESK_WEBAUTHN_RP_ID`/`RCDESK_WEBAUTHN_ORIGIN`, локально
 `localhost`). Общий доступ команде к компьютерам — следующий шаг.
 
+**Учётка почта + пароль (слайс 3.8, решение владельца 2026-10-15).** Пересматривает решение 3.1 «без почты и
+паролей»: passkey не всем удобен (Windows без Hello, другие браузеры). Логин — почта (trim + lowercase), пароль
+8–128 символов, хеш argon2id с параметрами по умолчанию (`Argon2::default()`), в таблице `accounts` (схема v4,
+`owner_id` → почта UNIQUE + хеш). Регистрация и сброс — один механизм: `EmailCodeRequest` шлёт 6-значный код
+(хранится в памяти сервера, TTL 10 мин, 5 попыток, не чаще раза в минуту и 5 в час на адрес, ответ одинаковый
+независимо от того, есть ли аккаунт), затем `EmailCodeConfirm { email, code, password }`: почта новая — привязывается
+к текущему владельцу соединения (его устройства остаются), почта есть — это сброс пароля, все браузеры аккаунта
+выкидываются, анонимный владелец соединения вливается, как при входе по passkey. Вход — `PasswordLogin`, ответ на
+неверную почту и неверный пароль одинаков (`wrong email or password`, verify против фиктивного хеша). Лимиты IP:
+выдача кодов 5 / 10 мин, неверный пароль или код 10 / мин. Аккаунт по-прежнему необязателен, passkey остаётся;
+анонимный владелец = без passkey и без почты. Отправка писем — трейт `Mailer` (`mail.rs`): `RCDESK_MAIL=log` пишет
+код в лог (локальная разработка), иначе почта выключена (`email unavailable`); SMTP — 3.8b.
+
 ## 7. Ввод
 
 Клиент шлёт `event.code` (например `KeyA`, `MetaLeft`) и состояние модификаторов;
@@ -665,6 +678,7 @@ workflow его не видят, прогон ждёт «Review deployments». �
 - 3.4 Передача файлов: канал `file`, drag-and-drop в клиенте, обе стороны. ✅ (код; стенд — 3.4d)
 - 3.5 Переподключение, настройки качества, fullscreen, Keyboard Lock (Chrome). ✅
 - 3.7 Аккаунт и кабинет: passkey (WebAuthn), несколько браузеров у владельца, отзыв и выход. ✅ Общий доступ команде — позже.
+- 3.8 Учётка почта + пароль: код на почту, регистрация/сброс/вход. 3.8a сервер ✅, 3.8b SMTP, 3.8c веб.
 
 ### Фаза 4 — полный режим и расширения
 - 4.1 Windows: служба SYSTEM + помощник в сессии ✅ (4.1a, окна администратора), «Загрузки» пользователя под SYSTEM ✅ (4.1d); UAC/экран блокировки (4.1b) и Ctrl+Alt+Del (4.1c) — долги.
@@ -713,6 +727,7 @@ workflow его не видят, прогон ждёт «Review deployments». �
 | sha2 0.10 | server | SHA-256-хеши секретов устройств (3.1); секрет полноэнтропийный, KDF не нужен |
 | webauthn-rs 0.5.5 (conditional-ui) | server | passkey (WebAuthn): регистрация к владельцу и вход без логина через discoverable-аутентификацию (3.7b); Cargo-фича `conditional-ui` открывает `start/identify/finish_discoverable_authentication`. Цена: тянет OpenSSL (`openssl-sys`) — в runtime-образ добавлен `libssl3`, а `rcdesk-server` исключён из clippy/test на `windows-latest` (сервер работает только на Linux) |
 | opaque-ke 4.0 (argon2), argon2 0.5, sha2 0.10 | host | OPAQUE-пароль доступа к хосту (3.2b): шифронабор как у `@serenity-kit/opaque`, argon2id — KSF, SHA-512 — TripleDH |
+| argon2 0.5 (из workspace) | server | хеш пароля учётки (3.8a), argon2id по умолчанию; соль 16 байт из `rand` 0.10 — `OsRng` крейта требует фичу `getrandom` |
 | rpassword 7 | host | скрытый ввод пароля в терминале для `rcdesk-host password set` (macOS + Windows) |
 | rand_core 0.6 (getrandom) | host | `OsRng` для трейтов `rand_core` 0.6, над которыми обобщён opaque-ke 4.0 (реэкспорт `opaque_ke::rand` без фичи `getrandom` `OsRng` не даёт; воркспейсный `rand` 0.10 — другой мажор трейтов) |
 | @serenity-kit/opaque 1.1 | web | клиентская сторона OPAQUE (3.2d) — `opaque-ke` 4.0 в WASM, первая runtime-зависимость web |
