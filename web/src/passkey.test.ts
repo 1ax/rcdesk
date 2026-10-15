@@ -277,10 +277,19 @@ describe("account screen logic", () => {
   const pk: PasskeyEntry = { id: "p1", user_agent: "", created_at: 1000n, last_used_at: 1000n };
 
   it("accountRowMode", () => {
-    expect(accountRowMode(false, [])).toBe("hidden");
-    expect(accountRowMode(true, null)).toBe("hidden");
-    expect(accountRowMode(true, [])).toBe("guest");
-    expect(accountRowMode(true, [pk])).toBe("account");
+    // Nothing known yet / account answer missing.
+    expect(accountRowMode(true, null, null)).toBe("hidden");
+    expect(accountRowMode(true, [], undefined)).toBe("hidden");
+    expect(accountRowMode(false, null, undefined)).toBe("hidden");
+    // Guest: no passkeys, no email; unsupported passkeys no longer hide it.
+    expect(accountRowMode(true, [], null)).toBe("guest");
+    expect(accountRowMode(false, [], null)).toBe("guest");
+    expect(accountRowMode(false, null, null)).toBe("guest");
+    // Account: passkey or email.
+    expect(accountRowMode(true, [pk], null)).toBe("account");
+    expect(accountRowMode(true, [], "a@b.co")).toBe("account");
+    expect(accountRowMode(false, [], "a@b.co")).toBe("account");
+    expect(accountRowMode(true, [pk], "a@b.co")).toBe("account");
   });
 
   it("passkeyRowText", () => {

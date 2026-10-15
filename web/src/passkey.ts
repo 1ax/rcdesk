@@ -213,15 +213,20 @@ export function browserLabel(userAgent: string): string {
   return os ? `${browser} · ${os}` : browser;
 }
 
-/** Which account row the first screen shows: nothing while unsupported or
- * before `list_passkeys` answered (`passkeys === null`), the login/save pair
- * without passkeys, the "Аккаунт" button with them. */
+/** Which account row the first screen shows. Hidden until the answers are
+ * known: `passkeys` (`null` before `passkeys` answered; not awaited when
+ * passkeys are unsupported) and `email` (`undefined` before `account`
+ * answered). An account is "has a passkey OR has an email"; otherwise the
+ * guest buttons (email ones always, passkey ones only when supported). */
 export function accountRowMode(
   supported: boolean,
   passkeys: PasskeyEntry[] | null,
+  email: string | null | undefined,
 ): "hidden" | "guest" | "account" {
-  if (!supported || passkeys === null) return "hidden";
-  return passkeys.length === 0 ? "guest" : "account";
+  if (email === undefined) return "hidden";
+  if (supported && passkeys === null) return "hidden";
+  const hasPasskey = (passkeys ?? []).length > 0;
+  return hasPasskey || email !== null ? "account" : "guest";
 }
 
 /** Two-line text of a passkey row: "создан …" and "последний вход …". */

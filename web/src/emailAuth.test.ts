@@ -1,0 +1,82 @@
+import { describe, expect, it } from "vitest";
+import {
+  emailErrorText,
+  normalizeCode,
+  resendSecondsLeft,
+  validateCode,
+  validateEmail,
+  validatePassword,
+} from "./emailAuth";
+
+describe("emailErrorText", () => {
+  it("maps known server errors", () => {
+    expect(emailErrorText("invalid email")).toBe("Неверный адрес почты");
+    expect(emailErrorText("weak password")).toBe("Пароль — от 8 до 128 символов");
+    expect(emailErrorText("wrong code")).toBe("Неверный или просроченный код");
+    expect(emailErrorText("wrong email or password")).toBe("Неверная почта или пароль");
+    expect(emailErrorText("email unavailable")).toBe(
+      "Не удалось отправить письмо — попробуйте позже",
+    );
+    expect(emailErrorText("too many attempts")).toBe(
+      "Слишком много попыток — подождите и попробуйте снова",
+    );
+    expect(emailErrorText("already registered")).toBe("У этого аккаунта уже есть почта");
+  });
+  it("falls back to a generic text", () => {
+    expect(emailErrorText("boom")).toBe("Ошибка: boom");
+  });
+});
+
+describe("validateEmail", () => {
+  it("accepts ordinary addresses (trimmed)", () => {
+    expect(validateEmail("a@b.co")).toBeNull();
+    expect(validateEmail("  user.name+x@mail.example.com ")).toBeNull();
+  });
+  it("rejects bad addresses", () => {
+    for (const bad of ["", "   ", "abc", "a@b", "@b.co", "a@@b.co", "a b@c.de", "a@.co", "a@b."]) {
+      expect(validateEmail(bad), bad).toBe("Неверный адрес почты");
+    }
+  });
+});
+
+describe("validatePassword", () => {
+  it("accepts 8..128 code points", () => {
+    expect(validatePassword("12345678")).toBeNull();
+    expect(validatePassword("a".repeat(128))).toBeNull();
+    expect(validatePassword("😀".repeat(8))).toBeNull();
+  });
+  it("rejects too short and too long", () => {
+    expect(validatePassword("1234567")).toBe("Пароль — от 8 до 128 символов");
+    expect(validatePassword("😀".repeat(7))).not.toBeNull();
+    expect(validatePassword("a".repeat(129))).not.toBeNull();
+  });
+});
+
+describe("code", () => {
+  it("normalizes spaces", () => {
+    expect(normalizeCode(" 123 456 ")).toBe("123456");
+  });
+  it("needs exactly six digits", () => {
+    expect(validateCode("123456")).toBeNull();
+    expect(validateCode("123 456")).toBeNull();
+    expect(validateCode("12345")).not.toBeNull();
+    expect(validateCode("1234567")).not.toBeNull();
+    expect(validateCode("12345a")).not.toBeNull();
+    expect(validateCode("")).not.toBeNull();
+  });
+});
+
+describe("resendSecondsLeft", () => {
+  it("is 0 when never sent", () => {
+    expect(resendSecondsLeft(null, 1000)).toBe(0);
+  });
+  it("counts down and clamps", () => {
+    expect(resendSecondsLeft(0, 0)).toBe(60);
+    expect(resendSecondsLeft(0, 1)).toBe(60);
+    expect(resendSecondsLeft(0, 30_000)).toBe(30);
+    expect(resendSecondsLeft(0, 59_001)).toBe(1);
+    expect(resendSecondsLeft(0, 60_000)).toBe(0);
+    expect(resendSecondsLeft(0, 90_000)).toBe(0);
+    expect(resendSecondsLeft(10_000, 0)).toBe(60);
+  });
+});

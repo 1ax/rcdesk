@@ -811,3 +811,48 @@ body {
   border: 0;
   padding: 0;
 }
+
+/* Slice 3.8c: email + password card. */
+.ea-form {
+  display: flex;
+  flex-direction: column;
+}
+
+.text-input {
+  width: 100%;
+  margin-top: 10px;
+  padding: 10px 12px;
+  font-size: 16px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+}
+
+.text-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.ea-form .link-btn {
+  align-self: center;
+}
+
+.ea-sent {
+  overflow-wrap: anywhere;
+  margin: 0 0 4px;
+}
+
+.email-current {
+  margin: 0 0 4px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+#auth-card .btn-secondary {
+  margin-top: 16px;
+}
+
+#account-guest .btn + .btn {
+  margin-top: 10px;
+}

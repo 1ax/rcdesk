@@ -79,6 +79,14 @@ import {
   requestOptionsFromServer,
 } from "./passkey";
 import {
+  emailErrorText,
+  normalizeCode,
+  resendSecondsLeft,
+  validateCode,
+  validateEmail,
+  validatePassword,
+} from "./emailAuth";
+import {
   canConnect,
   clearOwnerToken,
   deviceLabel,
@@ -325,8 +333,9 @@ export function mount(root: Element | null): void {
         <h1>rcdesk</h1>
         <div class="account" id="account" hidden>
           <div id="account-guest" hidden>
-            <button id="passkey-login-btn" class="btn btn-secondary">Войти с passkey</button>
-            <button id="passkey-save-btn" class="link-btn">Сохранить список в аккаунт</button>
+            <button id="login-open-btn" class="btn">Войти</button>
+            <button id="signup-open-btn" class="btn btn-secondary">Создать аккаунт</button>
+            <button id="passkey-login-btn" class="link-btn">Войти с passkey</button>
             <p class="hint">Тогда список компьютеров откроется в любом браузере</p>
           </div>
           <button id="account-open-btn" class="btn btn-secondary" hidden>Аккаунт</button>
@@ -352,7 +361,12 @@ export function mount(root: Element | null): void {
       </div>
       <div class="card account-card" id="account-card" hidden>
         <h1>Аккаунт</h1>
-        <div class="devices">
+        <div class="devices" id="email-block" hidden>
+          <h2>Почта и пароль</h2>
+          <p id="email-current" class="hint email-current"></p>
+          <button id="email-action-btn" class="btn btn-secondary">Добавить почту и пароль</button>
+        </div>
+        <div class="devices" id="passkey-block">
           <h2>Passkey</h2>
           <ul class="device-list" id="passkey-list"></ul>
           <button id="passkey-add-btn" class="btn btn-secondary">Добавить passkey</button>
@@ -365,6 +379,38 @@ export function mount(root: Element | null): void {
         <p id="sign-out-hint" class="hint"></p>
         <p id="account-card-status" class="hint account-status"></p>
         <button id="account-back-btn" class="btn btn-secondary">Назад</button>
+      </div>
+      <div class="card account-card" id="auth-card" hidden>
+        <h1 id="ea-title">Вход</h1>
+        <form id="ea-login-form" class="ea-form" novalidate>
+          <input id="ea-login-email" class="text-input" type="email" name="email"
+            autocomplete="username" placeholder="Почта" autocapitalize="off" spellcheck="false" />
+          <input id="ea-login-password" class="text-input" type="password" name="password"
+            autocomplete="current-password" placeholder="Пароль" />
+          <button id="ea-login-submit" type="submit" class="btn">Войти</button>
+          <button id="ea-forgot-btn" type="button" class="link-btn">Забыли пароль?</button>
+          <button id="ea-signup-btn" type="button" class="link-btn">Создать аккаунт</button>
+          <button id="ea-passkey-login-btn" type="button" class="link-btn">Войти с passkey</button>
+        </form>
+        <form id="ea-request-form" class="ea-form" novalidate>
+          <input id="ea-request-email" class="text-input" type="email" name="email"
+            autocomplete="username" placeholder="Почта" autocapitalize="off" spellcheck="false" />
+          <button id="ea-request-submit" type="submit" class="btn">Получить код</button>
+          <button id="ea-to-login-btn" type="button" class="link-btn">У меня уже есть аккаунт</button>
+          <button id="ea-passkey-save-btn" type="button" class="link-btn">или сохранить через passkey</button>
+        </form>
+        <form id="ea-confirm-form" class="ea-form" novalidate>
+          <p id="ea-sent-text" class="hint ea-sent"></p>
+          <input id="ea-code" class="text-input" type="text" name="code" inputmode="numeric"
+            pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" placeholder="Код из письма" />
+          <input id="ea-new-password" class="text-input" type="password" name="new-password"
+            autocomplete="new-password" placeholder="Новый пароль (8–128 символов)" />
+          <button id="ea-confirm-submit" type="submit" class="btn">Готово</button>
+          <button id="ea-resend-btn" type="button" class="link-btn">Отправить код ещё раз</button>
+          <button id="ea-change-email-btn" type="button" class="link-btn">Изменить почту</button>
+        </form>
+        <p id="ea-status" class="hint account-status"></p>
+        <button id="ea-back-btn" class="btn btn-secondary">Назад</button>
       </div>
     </div>
     <div class="session-screen" id="session-screen" hidden>
@@ -667,7 +713,35 @@ export function mount(root: Element | null): void {
   const accountOpenBtn = root.querySelector<HTMLButtonElement>("#account-open-btn")!;
   const accountStatusEl = root.querySelector<HTMLParagraphElement>("#account-status")!;
   const passkeyLoginBtn = root.querySelector<HTMLButtonElement>("#passkey-login-btn")!;
-  const passkeySaveBtn = root.querySelector<HTMLButtonElement>("#passkey-save-btn")!;
+  const loginOpenBtn = root.querySelector<HTMLButtonElement>("#login-open-btn")!;
+  const signupOpenBtn = root.querySelector<HTMLButtonElement>("#signup-open-btn")!;
+  const emailBlock = root.querySelector<HTMLDivElement>("#email-block")!;
+  const emailCurrentEl = root.querySelector<HTMLParagraphElement>("#email-current")!;
+  const emailActionBtn = root.querySelector<HTMLButtonElement>("#email-action-btn")!;
+  const passkeyBlock = root.querySelector<HTMLDivElement>("#passkey-block")!;
+  const authCard = root.querySelector<HTMLDivElement>("#auth-card")!;
+  const eaTitle = root.querySelector<HTMLHeadingElement>("#ea-title")!;
+  const eaLoginForm = root.querySelector<HTMLFormElement>("#ea-login-form")!;
+  const eaLoginEmail = root.querySelector<HTMLInputElement>("#ea-login-email")!;
+  const eaLoginPassword = root.querySelector<HTMLInputElement>("#ea-login-password")!;
+  const eaLoginSubmit = root.querySelector<HTMLButtonElement>("#ea-login-submit")!;
+  const eaForgotBtn = root.querySelector<HTMLButtonElement>("#ea-forgot-btn")!;
+  const eaSignupBtn = root.querySelector<HTMLButtonElement>("#ea-signup-btn")!;
+  const eaPasskeyLoginBtn = root.querySelector<HTMLButtonElement>("#ea-passkey-login-btn")!;
+  const eaRequestForm = root.querySelector<HTMLFormElement>("#ea-request-form")!;
+  const eaRequestEmail = root.querySelector<HTMLInputElement>("#ea-request-email")!;
+  const eaRequestSubmit = root.querySelector<HTMLButtonElement>("#ea-request-submit")!;
+  const eaToLoginBtn = root.querySelector<HTMLButtonElement>("#ea-to-login-btn")!;
+  const eaPasskeySaveBtn = root.querySelector<HTMLButtonElement>("#ea-passkey-save-btn")!;
+  const eaConfirmForm = root.querySelector<HTMLFormElement>("#ea-confirm-form")!;
+  const eaSentText = root.querySelector<HTMLParagraphElement>("#ea-sent-text")!;
+  const eaCode = root.querySelector<HTMLInputElement>("#ea-code")!;
+  const eaNewPassword = root.querySelector<HTMLInputElement>("#ea-new-password")!;
+  const eaConfirmSubmit = root.querySelector<HTMLButtonElement>("#ea-confirm-submit")!;
+  const eaResendBtn = root.querySelector<HTMLButtonElement>("#ea-resend-btn")!;
+  const eaChangeEmailBtn = root.querySelector<HTMLButtonElement>("#ea-change-email-btn")!;
+  const eaStatus = root.querySelector<HTMLParagraphElement>("#ea-status")!;
+  const eaBackBtn = root.querySelector<HTMLButtonElement>("#ea-back-btn")!;
   const accountCard = root.querySelector<HTMLDivElement>("#account-card")!;
   const passkeyListEl = root.querySelector<HTMLUListElement>("#passkey-list")!;
   const passkeyAddBtn = root.querySelector<HTMLButtonElement>("#passkey-add-btn")!;
@@ -810,6 +884,20 @@ export function mount(root: Element | null): void {
   // Cabinet two-click confirmation key (`passkey:<id>`, `browser:<id>`,
   // `sign-out`), reset by the document click listener like `confirmingForgetId`.
   let confirmingAccountKey: string | null = null;
+  // Slice 3.8c: the owner's account email (`undefined` until `account`
+  // answers the `get_account` sent after every `authenticated`; `null` = none).
+  let accountEmail: string | null | undefined = undefined;
+  // The email auth card: "login" form or the "code" flow (registration /
+  // password reset / password change, told apart by `authLabel`), its step,
+  // the address the code went to, the request in flight (buttons disabled
+  // while set; server errors go to the card while set) and the resend timer.
+  let authMode: "login" | "code" = "login";
+  let authLabel = "Вход";
+  let authStep: 1 | 2 = 1;
+  let authEmail = "";
+  let authPending: "request" | "confirm" | "login" | null = null;
+  let authLastSentMs: number | null = null;
+  let authTimer: ReturnType<typeof setInterval> | undefined;
   const passkeySupported =
     typeof window !== "undefined" &&
     typeof window.PublicKeyCredential !== "undefined" &&
@@ -1251,19 +1339,208 @@ export function mount(root: Element | null): void {
   function setAccountMessage(text: string): void {
     accountStatusEl.textContent = text;
     accountCardStatusEl.textContent = text;
+    eaStatus.textContent = text;
   }
 
   /** Shows the first-screen account row for the current `passkeys`. */
   function renderAccountRow(): void {
-    const mode = accountRowMode(passkeySupported, passkeys);
+    const mode = accountRowMode(passkeySupported, passkeys, accountEmail);
     accountEl.hidden = mode === "hidden";
     accountGuestEl.hidden = mode !== "guest";
     accountOpenBtn.hidden = mode !== "account";
+    passkeyLoginBtn.hidden = !passkeySupported;
+    passkeyBlock.hidden = !passkeySupported;
     const busy = passkeyFlow !== null || connectionLost;
     passkeyLoginBtn.disabled = busy;
-    passkeySaveBtn.disabled = busy;
     passkeyAddBtn.disabled = busy;
+    loginOpenBtn.disabled = connectionLost;
+    signupOpenBtn.disabled = connectionLost;
+    emailActionBtn.disabled = connectionLost || authPending !== null;
+    renderAuth();
   }
+
+  // ---- Slice 3.8c: email + password card ----
+
+  function stopAuthTimer(): void {
+    if (authTimer !== undefined) clearInterval(authTimer);
+    authTimer = undefined;
+  }
+
+  /** Shows the auth card for the current state (mode, step, pending request). */
+  function renderAuth(): void {
+    const busy = authPending !== null || connectionLost;
+    const registering = authMode === "code" && authLabel === "Регистрация";
+    eaTitle.textContent = authLabel;
+    eaLoginForm.hidden = authMode !== "login";
+    eaRequestForm.hidden = !(authMode === "code" && authStep === 1);
+    eaConfirmForm.hidden = !(authMode === "code" && authStep === 2);
+    eaLoginSubmit.disabled = busy;
+    eaRequestSubmit.disabled = busy;
+    eaConfirmSubmit.disabled = busy;
+    eaForgotBtn.disabled = busy;
+    eaSignupBtn.disabled = busy;
+    eaToLoginBtn.disabled = busy;
+    eaChangeEmailBtn.disabled = busy;
+    eaPasskeyLoginBtn.hidden = !passkeySupported;
+    eaPasskeyLoginBtn.disabled = busy || passkeyFlow !== null;
+    eaPasskeySaveBtn.hidden = !passkeySupported || !registering;
+    eaPasskeySaveBtn.disabled = busy || passkeyFlow !== null;
+    eaToLoginBtn.hidden = !registering;
+    eaSentText.textContent = `Код отправлен на ${authEmail}`;
+    const left = resendSecondsLeft(authLastSentMs, Date.now());
+    eaResendBtn.textContent =
+      left > 0 ? `Отправить код ещё раз (${left} с)` : "Отправить код ещё раз";
+    eaResendBtn.disabled = busy || left > 0;
+    if (left === 0) stopAuthTimer();
+  }
+
+  function openAuth(mode: "login" | "code", label: string, email: string): void {
+    stopAuthTimer();
+    authMode = mode;
+    authLabel = label;
+    authStep = 1;
+    authEmail = email;
+    authPending = null;
+    authLastSentMs = null;
+    eaLoginEmail.value = email;
+    eaRequestEmail.value = email;
+    eaLoginPassword.value = "";
+    eaCode.value = "";
+    eaNewPassword.value = "";
+    confirmingAccountKey = null;
+    setAccountMessage("");
+    mainCard.hidden = true;
+    accountCard.hidden = true;
+    authCard.hidden = false;
+    renderAuth();
+  }
+
+  function closeAuth(): void {
+    stopAuthTimer();
+    authPending = null;
+    authLastSentMs = null;
+    eaLoginPassword.value = "";
+    eaCode.value = "";
+    eaNewPassword.value = "";
+    authCard.hidden = true;
+    mainCard.hidden = !accountCard.hidden;
+  }
+
+  /** Sends `email_code_request` for `email` (first send or resend). */
+  function requestEmailCode(email: string): void {
+    authEmail = email;
+    authPending = "request";
+    setAccountMessage("");
+    renderAuth();
+    signaling.send({ type: "email_code_request", email });
+  }
+
+  /** A server error while an auth request was in flight. */
+  function failAuth(message: string): void {
+    authPending = null;
+    setAccountMessage(emailErrorText(message));
+    renderAuth();
+  }
+
+  eaLoginForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (authPending !== null || connectionLost) return;
+    const email = eaLoginEmail.value.trim();
+    const invalid = validateEmail(email) ?? validatePassword(eaLoginPassword.value);
+    if (invalid !== null) {
+      setAccountMessage(invalid);
+      return;
+    }
+    authEmail = email;
+    authPending = "login";
+    setAccountMessage("");
+    renderAuth();
+    signaling.send({ type: "password_login", email, password: eaLoginPassword.value });
+  });
+  eaRequestForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (authPending !== null || connectionLost) return;
+    const invalid = validateEmail(eaRequestEmail.value);
+    if (invalid !== null) {
+      setAccountMessage(invalid);
+      return;
+    }
+    requestEmailCode(eaRequestEmail.value.trim());
+  });
+  eaConfirmForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (authPending !== null || connectionLost) return;
+    const invalid = validateCode(eaCode.value) ?? validatePassword(eaNewPassword.value);
+    if (invalid !== null) {
+      setAccountMessage(invalid);
+      return;
+    }
+    authPending = "confirm";
+    setAccountMessage("");
+    renderAuth();
+    signaling.send({
+      type: "email_code_confirm",
+      email: authEmail,
+      code: normalizeCode(eaCode.value),
+      password: eaNewPassword.value,
+    });
+  });
+  eaForgotBtn.addEventListener("click", () =>
+    openAuth("code", "Сброс пароля", eaLoginEmail.value.trim()),
+  );
+  eaSignupBtn.addEventListener("click", () =>
+    openAuth("code", "Регистрация", eaLoginEmail.value.trim()),
+  );
+  eaToLoginBtn.addEventListener("click", () => openAuth("login", "Вход", eaRequestEmail.value.trim()));
+  eaResendBtn.addEventListener("click", () => {
+    if (authPending === null && resendSecondsLeft(authLastSentMs, Date.now()) === 0) {
+      requestEmailCode(authEmail);
+    }
+  });
+  eaChangeEmailBtn.addEventListener("click", () => {
+    stopAuthTimer();
+    authStep = 1;
+    authLastSentMs = null;
+    eaRequestEmail.value = authEmail;
+    setAccountMessage("");
+    renderAuth();
+  });
+  eaBackBtn.addEventListener("click", () => {
+    closeAuth();
+    setAccountMessage("");
+  });
+  loginOpenBtn.addEventListener("click", () => openAuth("login", "Вход", ""));
+  signupOpenBtn.addEventListener("click", () => openAuth("code", "Регистрация", ""));
+  eaPasskeyLoginBtn.addEventListener("click", () => startPasskeyFlow("login"));
+  eaPasskeySaveBtn.addEventListener("click", () => startPasskeyFlow("register"));
+  emailActionBtn.addEventListener("click", () => {
+    if (typeof accountEmail === "string") openAuth("code", "Смена пароля", accountEmail);
+    else openAuth("code", "Регистрация", "");
+  });
+
+  signaling.on("email_code_sent", () => {
+    if (authPending !== "request") return;
+    authPending = null;
+    authStep = 2;
+    authLastSentMs = Date.now();
+    stopAuthTimer();
+    authTimer = setInterval(renderAuth, 1000);
+    setAccountMessage("");
+    renderAuth();
+    eaCode.focus();
+  });
+
+  signaling.on("account", (msg) => {
+    accountEmail = msg.email;
+    const finishing = authPending === "confirm" || authPending === "login";
+    if (finishing && msg.email !== null) {
+      // Registration / reset / login done: back to the first screen.
+      closeAuth();
+      closeAccount();
+      setAccountMessage(`Вы вошли как ${msg.email}`);
+    }
+    renderAccount();
+  });
 
   function accountRowEl(
     title: string,
@@ -1345,7 +1622,12 @@ export function mount(root: Element | null): void {
         ),
       );
     }
-    const needConfirm = (passkeys ?? []).length === 0;
+    emailBlock.hidden = accountEmail === undefined;
+    emailCurrentEl.textContent = typeof accountEmail === "string" ? accountEmail : "";
+    emailCurrentEl.hidden = typeof accountEmail !== "string";
+    emailActionBtn.textContent =
+      typeof accountEmail === "string" ? "Сменить пароль" : "Добавить почту и пароль";
+    const needConfirm = (passkeys ?? []).length === 0 && typeof accountEmail !== "string";
     const confirmingSignOut = confirmingAccountKey === "sign-out";
     signOutBtn.dataset.confirmKey = "sign-out";
     signOutBtn.textContent = needConfirm && confirmingSignOut ? "Точно выйти?" : "Выйти";
@@ -1361,6 +1643,7 @@ export function mount(root: Element | null): void {
     accountCard.hidden = false;
     renderAccount();
     signaling.send({ type: "list_passkeys" });
+    signaling.send({ type: "get_account" });
     signaling.send({ type: "list_browsers" });
   }
 
@@ -1377,8 +1660,10 @@ export function mount(root: Element | null): void {
     if (storage) clearOwnerToken(storage);
     passkeyFlow = null;
     passkeys = null;
+    accountEmail = undefined;
     browsers = [];
     devices = [];
+    closeAuth();
     closeAccount();
     setAccountMessage("");
     renderDeviceList();
@@ -1407,12 +1692,12 @@ export function mount(root: Element | null): void {
   }
 
   passkeyLoginBtn.addEventListener("click", () => startPasskeyFlow("login"));
-  passkeySaveBtn.addEventListener("click", () => startPasskeyFlow("register"));
   passkeyAddBtn.addEventListener("click", () => startPasskeyFlow("register"));
   accountOpenBtn.addEventListener("click", openAccount);
   accountBackBtn.addEventListener("click", closeAccount);
   signOutBtn.addEventListener("click", () => {
-    if ((passkeys ?? []).length === 0 && confirmingAccountKey !== "sign-out") {
+    const needConfirm = (passkeys ?? []).length === 0 && typeof accountEmail !== "string";
+    if (needConfirm && confirmingAccountKey !== "sign-out") {
       confirmingAccountKey = "sign-out";
       renderAccount();
       return;
@@ -1466,7 +1751,11 @@ export function mount(root: Element | null): void {
 
   signaling.on("passkeys", (msg) => {
     passkeys = msg.passkeys;
-    if (passkeyFlow === "register") passkeyFlow = null;
+    if (passkeyFlow === "register") {
+      passkeyFlow = null;
+      // Saved through the registration card: nothing more to do there.
+      if (!authCard.hidden) closeAuth();
+    }
     renderAccount();
   });
 
@@ -2259,8 +2548,12 @@ export function mount(root: Element | null): void {
     renderDeviceList();
     // Slice 3.7c: a passkey login finished (or an ordinary (re)auth): learn
     // whether this owner has passkeys, which drives the account row.
-    if (passkeyFlow === "login") passkeyFlow = null;
+    if (passkeyFlow === "login") {
+      passkeyFlow = null;
+      if (!authCard.hidden) closeAuth();
+    }
     signaling.send({ type: "list_passkeys" });
+    signaling.send({ type: "get_account" });
     if (!accountCard.hidden) signaling.send({ type: "list_browsers" });
     // Confirms a reconnect (slice 3.5a) succeeded, if that's what this is --
     // a no-op the rest of the time, since `connectionLost` starts `false`.
@@ -2636,6 +2929,11 @@ export function mount(root: Element | null): void {
         resetOwner();
         return;
       }
+      // Slice 3.8c: an email-flow request failed -- shown in the auth card.
+      if (authPending !== null) {
+        failAuth(msg.message);
+        return;
+      }
       // A passkey flow step failed on the server (`passkey failed` or other).
       if (passkeyFlow !== null) {
         failPasskeyFlow(new Error(msg.message));
@@ -2666,6 +2964,8 @@ export function mount(root: Element | null): void {
   // disabled until `scheduleReconnect` gets the socket back.
   signaling.addEventListener("close", () => {
     connectionLost = true;
+    authPending = null;
+    renderAuth();
     pinStatus.textContent = "Нет связи с сервером — переподключаюсь…";
     connectBtn.disabled = true;
     stopDeviceListLoop();
