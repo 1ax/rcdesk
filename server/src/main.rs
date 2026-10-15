@@ -1,6 +1,7 @@
 use rcdesk_server::app::{app, spawn_pin_rotation, Liveness};
 use rcdesk_server::db::{Db, DEVICE_IDLE_TTL_SECS, OWNER_IDLE_TTL_SECS};
 use rcdesk_server::ice::{now_unix, IceConfig};
+use rcdesk_server::mail::mailer_from_env;
 use rcdesk_server::passkeys;
 use rcdesk_server::registry::Registry;
 
@@ -59,8 +60,14 @@ async fn main() -> anyhow::Result<()> {
 
     axum::serve(
         listener,
-        app(registry, IceConfig::from_env(), db, webauthn)
-            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        app(
+            registry,
+            IceConfig::from_env(),
+            db,
+            webauthn,
+            mailer_from_env(),
+        )
+        .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await?;
 

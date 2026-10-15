@@ -2924,6 +2924,7 @@ name = "rcdesk-server"
 version = "0.1.11"
 dependencies = [
  "anyhow",
+ "argon2",
  "axum",
  "base64 0.22.1",
  "futures-util",

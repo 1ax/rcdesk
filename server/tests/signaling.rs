@@ -54,6 +54,21 @@ async fn spawn_full_with_global(
     liveness: Liveness,
     global: rcdesk_server::ip_limit::GlobalLimiter,
 ) -> (String, Db) {
+    spawn_with_mailer(
+        ice,
+        liveness,
+        global,
+        std::sync::Arc::new(rcdesk_server::mail::DisabledMailer),
+    )
+    .await
+}
+
+async fn spawn_with_mailer(
+    ice: IceConfig,
+    liveness: Liveness,
+    global: rcdesk_server::ip_limit::GlobalLimiter,
+    mailer: rcdesk_server::mail::SharedMailer,
+) -> (String, Db) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
@@ -67,8 +82,10 @@ async fn spawn_full_with_global(
     tokio::spawn(async move {
         axum::serve(
             listener,
-            rcdesk_server::app::app_with_limits(registry, ice, db, webauthn, liveness, global)
-                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            rcdesk_server::app::app_with_limits(
+                registry, ice, db, webauthn, mailer, liveness, global,
+            )
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .await
         .expect("serve");
@@ -2453,4 +2470,331 @@ async fn global_pin_bucket_limits_distributed_guessing() {
     let mut legit = connect_as(&url, "198.51.100.24").await;
     hello(&mut legit, Role::Client).await;
     join_and_expect(&mut legit, &pin, "too many attempts").await;
+}
+
+// ---- Slice 3.8a: accounts "email + password" ----
+
+/// Fake mailer recording every `(to, code)` it is asked to send.
+#[derive(Clone, Default)]
+struct RecordingMailer {
+    sent: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+}
+
+impl rcdesk_server::mail::Mailer for RecordingMailer {
+    fn send_code(
+        &self,
+        to: &str,
+        code: &str,
+    ) -> futures_util::future::BoxFuture<'static, anyhow::Result<()>> {
+        self.sent
+            .lock()
+            .expect("mailer mutex")
+            .push((to.to_string(), code.to_string()));
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl RecordingMailer {
+    fn last_code(&self, to: &str) -> String {
+        self.sent
+            .lock()
+            .expect("mailer mutex")
+            .iter()
+            .rev()
+            .find(|(addr, _)| addr == to)
+            .map(|(_, code)| code.clone())
+            .expect("a code was sent to this address")
+    }
+}
+
+async fn spawn_with_recording_mailer() -> (String, Db, RecordingMailer) {
+    let mailer = RecordingMailer::default();
+    let (url, db) = spawn_with_mailer(
+        IceConfig::from_env(),
+        Liveness::default(),
+        rcdesk_server::ip_limit::GlobalLimiter::new(
+            rcdesk_server::app::PIN_GLOBAL_BURST,
+            rcdesk_server::app::PIN_GLOBAL_REFILL,
+        ),
+        std::sync::Arc::new(mailer.clone()),
+    )
+    .await;
+    (url, db, mailer)
+}
+
+async fn client_conn(url: &str) -> WsStream {
+    let mut ws = connect(url).await;
+    hello(&mut ws, Role::Client).await;
+    ws
+}
+
+fn owner_of_token(db: &Db, token: &str) -> Option<String> {
+    db.token_by_hash(&rcdesk_server::devices::hash_secret(token))
+        .expect("token lookup")
+        .map(|(owner, _)| owner)
+}
+
+fn link_new_device(db: &Db, owner: &str, device_id: &str) {
+    db.insert_device(device_id, "h", device_id, 1)
+        .expect("device");
+    db.link_device(owner, device_id, 2).expect("link");
+}
+
+async fn request_code(ws: &mut WsStream, mailer: &RecordingMailer, email: &str) -> String {
+    send(
+        ws,
+        &SignalMessage::EmailCodeRequest {
+            email: email.to_string(),
+        },
+    )
+    .await;
+    assert_eq!(recv(ws).await, SignalMessage::EmailCodeSent);
+    mailer.last_code(email)
+}
+
+async fn confirm(ws: &mut WsStream, email: &str, code: &str, password: &str) {
+    send(
+        ws,
+        &SignalMessage::EmailCodeConfirm {
+            email: email.to_string(),
+            code: code.to_string(),
+            password: password.to_string(),
+        },
+    )
+    .await;
+}
+
+async fn password_login(ws: &mut WsStream, email: &str, password: &str) {
+    send(
+        ws,
+        &SignalMessage::PasswordLogin {
+            email: email.to_string(),
+            password: password.to_string(),
+        },
+    )
+    .await;
+}
+
+/// Reads `Authenticated` + `Account`, returns the token, devices and email.
+async fn expect_signed_in(ws: &mut WsStream) -> (String, Vec<proto::signal::DeviceEntry>, String) {
+    let (token, devices) = match recv(ws).await {
+        SignalMessage::Authenticated { token, devices } => (token, devices),
+        other => panic!("expected authenticated, got {other:?}"),
+    };
+    let email = match recv(ws).await {
+        SignalMessage::Account { email: Some(email) } => email,
+        other => panic!("expected account with email, got {other:?}"),
+    };
+    (token, devices, email)
+}
+
+#[tokio::test]
+async fn registration_binds_email_to_the_current_owner_and_password_login_finds_it() {
+    let (url, db, mailer) = spawn_with_recording_mailer().await;
+    let mut a = client_conn(&url).await;
+    let (token_a, _) = client_auth(&mut a, None).await;
+    let owner = owner_of_token(&db, &token_a).expect("owner");
+    link_new_device(&db, &owner, "dev1");
+
+    send(&mut a, &SignalMessage::GetAccount).await;
+    assert_eq!(recv(&mut a).await, SignalMessage::Account { email: None });
+
+    let code = request_code(&mut a, &mailer, "bob@example.com").await;
+    confirm(&mut a, " Bob@Example.com ", &code, "hunter22-pass").await;
+    let (token, devices, email) = expect_signed_in(&mut a).await;
+    assert_eq!(token, token_a, "registration keeps the connection's token");
+    assert_eq!(email, "bob@example.com");
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].device_id, "dev1");
+    assert_eq!(owner_of_token(&db, &token).as_deref(), Some(owner.as_str()));
+
+    send(&mut a, &SignalMessage::GetAccount).await;
+    assert_eq!(
+        recv(&mut a).await,
+        SignalMessage::Account {
+            email: Some("bob@example.com".to_string())
+        }
+    );
+
+    // Another browser signs in with the password and sees the same owner.
+    let mut b = client_conn(&url).await;
+    password_login(&mut b, "BOB@example.com", "hunter22-pass").await;
+    let (token_b, devices_b, email_b) = expect_signed_in(&mut b).await;
+    assert_eq!(email_b, "bob@example.com");
+    assert_eq!(devices_b.len(), 1);
+    assert_eq!(devices_b[0].device_id, "dev1");
+    assert_ne!(token_b, token_a);
+    assert_eq!(
+        owner_of_token(&db, &token_b).as_deref(),
+        Some(owner.as_str())
+    );
+}
+
+#[tokio::test]
+async fn password_reset_merges_anonymous_devices_and_revokes_old_sessions() {
+    let (url, db, mailer) = spawn_with_recording_mailer().await;
+    // An existing account with a device, one signed-in browser and a password.
+    let (account, _token_id, old_token) =
+        rcdesk_server::owners::create_owner(&db, "UA", 1).expect("owner");
+    link_new_device(&db, &account, "dev-account");
+    let old_hash = rcdesk_server::accounts::hash_password("old-password-1").expect("hash");
+    assert!(db
+        .insert_account(&account, "bob@example.com", &old_hash, 1)
+        .expect("account"));
+
+    // An anonymous connection with its own device resets the password.
+    let mut anon = client_conn(&url).await;
+    let (anon_token, _) = client_auth(&mut anon, None).await;
+    let anon_owner = owner_of_token(&db, &anon_token).expect("anon owner");
+    link_new_device(&db, &anon_owner, "dev-anon");
+
+    let code = request_code(&mut anon, &mailer, "bob@example.com").await;
+    confirm(&mut anon, "bob@example.com", &code, "new-password-2").await;
+    let (new_token, devices, email) = expect_signed_in(&mut anon).await;
+    assert_eq!(email, "bob@example.com");
+    assert_eq!(
+        owner_of_token(&db, &new_token).as_deref(),
+        Some(account.as_str())
+    );
+    let mut ids: Vec<_> = devices.iter().map(|d| d.device_id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["dev-account", "dev-anon"]);
+
+    // The old browser token no longer works: a fresh anonymous owner appears.
+    assert_eq!(owner_of_token(&db, &old_token), None);
+    let mut stale = client_conn(&url).await;
+    let (fresh_token, fresh_devices) = client_auth(&mut stale, Some(old_token.clone())).await;
+    assert_ne!(fresh_token, old_token);
+    assert!(fresh_devices.is_empty());
+
+    // Old password is rejected, new one works.
+    let mut login = client_conn(&url).await;
+    password_login(&mut login, "bob@example.com", "old-password-1").await;
+    expect_error(&mut login, "wrong email or password").await;
+    password_login(&mut login, "bob@example.com", "new-password-2").await;
+    let (_, devices, _) = expect_signed_in(&mut login).await;
+    assert_eq!(devices.len(), 2);
+}
+
+#[tokio::test]
+async fn wrong_password_is_generic_and_ten_failures_lock_the_ip() {
+    let (url, db, _mailer) = spawn_with_recording_mailer().await;
+    let (account, _, _) = rcdesk_server::owners::create_owner(&db, "UA", 1).expect("owner");
+    let hash = rcdesk_server::accounts::hash_password("right-password").expect("hash");
+    db.insert_account(&account, "bob@example.com", &hash, 1)
+        .expect("account");
+
+    let mut ws = client_conn(&url).await;
+    // Unknown address and malformed address give the same answer.
+    password_login(&mut ws, "nobody@example.com", "whatever-pass").await;
+    expect_error(&mut ws, "wrong email or password").await;
+    password_login(&mut ws, "not an email", "whatever-pass").await;
+    expect_error(&mut ws, "wrong email or password").await;
+    for _ in 0..8 {
+        password_login(&mut ws, "bob@example.com", "wrong-password").await;
+        expect_error(&mut ws, "wrong email or password").await;
+    }
+    // Ten failures spent; even the right password is refused now.
+    password_login(&mut ws, "bob@example.com", "right-password").await;
+    expect_error(&mut ws, "too many attempts").await;
+}
+
+#[tokio::test]
+async fn successful_logins_do_not_spend_the_login_limit() {
+    let (url, db, _mailer) = spawn_with_recording_mailer().await;
+    let (account, _, _) = rcdesk_server::owners::create_owner(&db, "UA", 1).expect("owner");
+    let hash = rcdesk_server::accounts::hash_password("right-password").expect("hash");
+    db.insert_account(&account, "bob@example.com", &hash, 1)
+        .expect("account");
+
+    let mut ws = client_conn(&url).await;
+    for _ in 0..12 {
+        password_login(&mut ws, "bob@example.com", "right-password").await;
+        expect_signed_in(&mut ws).await;
+    }
+}
+
+#[tokio::test]
+async fn wrong_code_weak_password_and_invalid_email_are_rejected() {
+    let (url, _db, mailer) = spawn_with_recording_mailer().await;
+    let mut ws = client_conn(&url).await;
+    client_auth(&mut ws, None).await;
+
+    send(
+        &mut ws,
+        &SignalMessage::EmailCodeRequest {
+            email: "nope".to_string(),
+        },
+    )
+    .await;
+    expect_error(&mut ws, "invalid email").await;
+    confirm(&mut ws, "nope", "123456", "long-enough-pass").await;
+    expect_error(&mut ws, "invalid email").await;
+
+    let code = request_code(&mut ws, &mailer, "bob@example.com").await;
+    let wrong = if code == "000000" { "111111" } else { "000000" };
+    confirm(&mut ws, "bob@example.com", wrong, "long-enough-pass").await;
+    expect_error(&mut ws, "wrong code").await;
+
+    // A weak password does not burn a code attempt: the real code still works.
+    confirm(&mut ws, "bob@example.com", &code, "short").await;
+    expect_error(&mut ws, "weak password").await;
+    confirm(&mut ws, "bob@example.com", &code, "long-enough-pass").await;
+    expect_signed_in(&mut ws).await;
+}
+
+#[tokio::test]
+async fn second_code_request_within_a_minute_is_refused() {
+    let (url, _db, mailer) = spawn_with_recording_mailer().await;
+    let mut ws = client_conn(&url).await;
+    request_code(&mut ws, &mailer, "bob@example.com").await;
+    send(
+        &mut ws,
+        &SignalMessage::EmailCodeRequest {
+            email: "bob@example.com".to_string(),
+        },
+    )
+    .await;
+    expect_error(&mut ws, "too many attempts").await;
+}
+
+#[tokio::test]
+async fn disabled_mailer_reports_email_unavailable() {
+    let url = spawn_server().await;
+    let mut ws = client_conn(&url).await;
+    client_auth(&mut ws, None).await;
+    send(
+        &mut ws,
+        &SignalMessage::EmailCodeRequest {
+            email: "bob@example.com".to_string(),
+        },
+    )
+    .await;
+    expect_error(&mut ws, "email unavailable").await;
+}
+
+#[tokio::test]
+async fn owner_with_an_account_cannot_register_another_email() {
+    let (url, db, mailer) = spawn_with_recording_mailer().await;
+    let mut ws = client_conn(&url).await;
+    let (token, _) = client_auth(&mut ws, None).await;
+    let owner = owner_of_token(&db, &token).expect("owner");
+    let hash = rcdesk_server::accounts::hash_password("right-password").expect("hash");
+    db.insert_account(&owner, "bob@example.com", &hash, 1)
+        .expect("account");
+
+    let code = request_code(&mut ws, &mailer, "other@example.com").await;
+    confirm(&mut ws, "other@example.com", &code, "long-enough-pass").await;
+    expect_error(&mut ws, "already registered").await;
+}
+
+#[tokio::test]
+async fn registration_without_an_owner_is_not_authenticated_and_get_account_too() {
+    let (url, _db, mailer) = spawn_with_recording_mailer().await;
+    let mut ws = client_conn(&url).await;
+    send(&mut ws, &SignalMessage::GetAccount).await;
+    expect_not_authenticated(&mut ws).await;
+    let code = request_code(&mut ws, &mailer, "bob@example.com").await;
+    confirm(&mut ws, "bob@example.com", &code, "long-enough-pass").await;
+    expect_not_authenticated(&mut ws).await;
 }

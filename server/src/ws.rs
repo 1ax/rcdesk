@@ -21,11 +21,13 @@ use std::time::{Duration, Instant};
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use webauthn_rs::prelude::{DiscoverableAuthentication, PasskeyRegistration};
 
+use crate::accounts::{self, EmailCodes};
 use crate::app::AppState;
 use crate::db::Db;
 use crate::devices::{self, DeviceAuth};
 use crate::ice::{self, IceConfig};
 use crate::ip_limit::{GlobalLimiter, IpLimiter};
+use crate::mail::SharedMailer;
 use crate::owners;
 use crate::passkeys::{self, PasskeyError, SharedWebauthn};
 use crate::registry::{Registry, Tx};
@@ -139,6 +141,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
         &state.owner_limiter,
         &state.device_limiter,
         &state.webauthn,
+        AccountDeps {
+            mailer: &state.mailer,
+            email_codes: &state.email_codes,
+            email_code_limiter: &state.email_code_limiter,
+            login_limiter: &state.login_limiter,
+        },
         info,
         read_timeout,
         liveness.pin_ttl,
@@ -222,6 +230,7 @@ async fn run_connection(
     owner_limiter: &IpLimiter,
     device_limiter: &IpLimiter,
     webauthn: &SharedWebauthn,
+    account_deps: AccountDeps<'_>,
     info: ClientInfo,
     read_timeout: Duration,
     pin_ttl: Duration,
@@ -262,6 +271,7 @@ async fn run_connection(
                 pin_global_limiter,
                 owner_limiter,
                 webauthn,
+                account_deps,
                 info,
                 read_timeout,
                 pin_ttl,
@@ -569,7 +579,23 @@ fn device_entries_for_owner(
 struct ClientSession {
     owner_id: String,
     token_id: String,
+    /// Открытый токен соединения: нужен, чтобы вернуть его в `Authenticated`
+    /// при привязке почты к текущему владельцу (на сервере хранится хеш).
+    token: String,
 }
+
+/// Всё, что `run_client` нужно для учётных записей «почта + пароль»
+/// (слайс 3.8a).
+#[derive(Clone, Copy)]
+struct AccountDeps<'a> {
+    mailer: &'a SharedMailer,
+    email_codes: &'a EmailCodes,
+    email_code_limiter: &'a IpLimiter,
+    login_limiter: &'a IpLimiter,
+}
+
+/// Сколько ждём отправки письма с кодом.
+const MAIL_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Владелец соединения, если его токен ещё жив. Токен мог быть отозван
 /// другим браузером — тогда соединение забывает владельца (`session = None`)
@@ -704,8 +730,244 @@ fn switch_to_account(
     *session = Some(ClientSession {
         owner_id: account_id.to_string(),
         token_id,
+        token: token.clone(),
     });
     Ok(token)
+}
+
+fn send_error(tx: &Tx, message: &str) {
+    let _ = tx.send(SignalMessage::Error {
+        message: message.to_string(),
+    });
+}
+
+/// `Authenticated` с устройствами владельца (ошибка загрузки устройств --
+/// в лог и пустой список, как в соседних ветках).
+fn send_authenticated(db: &Db, registry: &Registry, owner_id: &str, token: String, tx: &Tx) {
+    let devices = match device_entries_for_owner(db, registry, owner_id) {
+        Ok(devices) => devices,
+        Err(err) => {
+            tracing::error!(?err, "failed to load devices for owner");
+            Vec::new()
+        }
+    };
+    let _ = tx.send(SignalMessage::Authenticated { token, devices });
+}
+
+/// `Account` с почтой владельца.
+fn send_account(db: &Db, owner_id: &str, tx: &Tx) {
+    match db.email_for_owner(owner_id) {
+        Ok(email) => {
+            let _ = tx.send(SignalMessage::Account { email });
+        }
+        Err(err) => {
+            tracing::error!(?err, "failed to load account for owner");
+            send_error(tx, "internal error");
+        }
+    }
+}
+
+/// `EmailCodeRequest`: валидация, лимиты, выдача кода и отправка письма.
+async fn handle_email_code_request(deps: AccountDeps<'_>, ip: IpAddr, email: &str, tx: &Tx) {
+    let Some(email) = accounts::normalize_email(email) else {
+        send_error(tx, "invalid email");
+        return;
+    };
+    if !deps.email_code_limiter.check(ip) {
+        tracing::warn!(%ip, "email code request rate-limited");
+        send_error(tx, "too many attempts");
+        return;
+    }
+    let Some(code) = deps.email_codes.issue(&email) else {
+        tracing::warn!("email code refused: too frequent for this address");
+        send_error(tx, "too many attempts");
+        return;
+    };
+    deps.email_code_limiter.spend(ip);
+    match timeout(MAIL_SEND_TIMEOUT, deps.mailer.send_code(&email, &code)).await {
+        Ok(Ok(())) => {
+            let _ = tx.send(SignalMessage::EmailCodeSent);
+        }
+        Ok(Err(err)) => {
+            tracing::error!(?err, "failed to send email code");
+            send_error(tx, "email unavailable");
+        }
+        Err(_) => {
+            tracing::error!("sending email code timed out");
+            send_error(tx, "email unavailable");
+        }
+    }
+}
+
+/// `EmailCodeConfirm`: регистрация (почта привязывается к текущему
+/// владельцу) или сброс пароля (вход в существующий аккаунт).
+#[allow(clippy::too_many_arguments)]
+async fn handle_email_code_confirm(
+    deps: AccountDeps<'_>,
+    db: &Db,
+    registry: &Registry,
+    session: &mut Option<ClientSession>,
+    ip: IpAddr,
+    user_agent: &str,
+    tx: &Tx,
+    email: &str,
+    code: &str,
+    password: String,
+) {
+    let Some(email) = accounts::normalize_email(email) else {
+        send_error(tx, "invalid email");
+        return;
+    };
+    if !accounts::password_is_valid(&password) {
+        send_error(tx, "weak password");
+        return;
+    }
+    if !deps.login_limiter.check(ip) {
+        tracing::warn!(%ip, "email code confirm rate-limited");
+        send_error(tx, "too many attempts");
+        return;
+    }
+    if !deps.email_codes.verify(&email, code) {
+        deps.login_limiter.spend(ip);
+        send_error(tx, "wrong code");
+        return;
+    }
+    let existing = match db.account_by_email(&email) {
+        Ok(existing) => existing,
+        Err(err) => {
+            tracing::error!(?err, "failed to look up account");
+            send_error(tx, "internal error");
+            return;
+        }
+    };
+    // Владелец проверяется до argon2: без него регистрация невозможна.
+    let register_owner = if existing.is_none() {
+        match require_owner(db, session, tx) {
+            Some(owner_id) => Some(owner_id),
+            None => return,
+        }
+    } else {
+        None
+    };
+    let hash = match accounts::hash_password_blocking(password).await {
+        Ok(hash) => hash,
+        Err(err) => {
+            tracing::error!(?err, "failed to hash password");
+            send_error(tx, "internal error");
+            return;
+        }
+    };
+    let now = ice::now_unix() as i64;
+
+    if let Some((account_id, _old_hash)) = existing {
+        // Сброс пароля: новый хеш, все старые сессии аккаунта выкидываются.
+        let result = db
+            .set_password_hash(&account_id, &hash, now)
+            .and_then(|_| db.delete_all_tokens(&account_id))
+            .and_then(|_| switch_to_account(db, session, &account_id, user_agent, now));
+        match result {
+            Ok(token) => {
+                send_authenticated(db, registry, &account_id, token, tx);
+                send_account(db, &account_id, tx);
+            }
+            Err(err) => {
+                tracing::error!(?err, "failed to reset password");
+                send_error(tx, "internal error");
+            }
+        }
+        return;
+    }
+
+    let Some(owner_id) = register_owner else {
+        return;
+    };
+    match db.email_for_owner(&owner_id) {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            send_error(tx, "already registered");
+            return;
+        }
+        Err(err) => {
+            tracing::error!(?err, "failed to check owner account");
+            send_error(tx, "internal error");
+            return;
+        }
+    }
+    match db.insert_account(&owner_id, &email, &hash, now) {
+        Ok(true) => {
+            let token = session
+                .as_ref()
+                .map(|s| s.token.clone())
+                .unwrap_or_default();
+            send_authenticated(db, registry, &owner_id, token, tx);
+            send_account(db, &owner_id, tx);
+        }
+        // Гонка: почту заняли между проверкой и вставкой.
+        Ok(false) => send_error(tx, "already registered"),
+        Err(err) => {
+            tracing::error!(?err, "failed to insert account");
+            send_error(tx, "internal error");
+        }
+    }
+}
+
+/// `PasswordLogin`: вход по почте и паролю с выравниванием времени ответа.
+#[allow(clippy::too_many_arguments)]
+async fn handle_password_login(
+    deps: AccountDeps<'_>,
+    db: &Db,
+    registry: &Registry,
+    session: &mut Option<ClientSession>,
+    ip: IpAddr,
+    user_agent: &str,
+    tx: &Tx,
+    email: &str,
+    password: String,
+) {
+    if !deps.login_limiter.check(ip) {
+        tracing::warn!(%ip, "password login rate-limited");
+        send_error(tx, "too many attempts");
+        return;
+    }
+    let account = match accounts::normalize_email(email) {
+        Some(email) => match db.account_by_email(&email) {
+            Ok(account) => account,
+            Err(err) => {
+                tracing::error!(?err, "failed to look up account");
+                send_error(tx, "internal error");
+                return;
+            }
+        },
+        None => None,
+    };
+    let (account_id, hash) = match account {
+        Some((account_id, hash)) => (Some(account_id), Some(hash)),
+        None => (None, None),
+    };
+    let verified = match accounts::verify_password_blocking(hash, password).await {
+        Ok(verified) => verified,
+        Err(err) => {
+            tracing::error!(?err, "failed to verify password");
+            send_error(tx, "internal error");
+            return;
+        }
+    };
+    let Some(account_id) = account_id.filter(|_| verified) else {
+        deps.login_limiter.spend(ip);
+        send_error(tx, "wrong email or password");
+        return;
+    };
+    let now = ice::now_unix() as i64;
+    match switch_to_account(db, session, &account_id, user_agent, now) {
+        Ok(token) => {
+            send_authenticated(db, registry, &account_id, token, tx);
+            send_account(db, &account_id, tx);
+        }
+        Err(err) => {
+            tracing::error!(?err, "failed to sign in with password");
+            send_error(tx, "internal error");
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -719,6 +981,7 @@ async fn run_client(
     pin_global_limiter: &GlobalLimiter,
     owner_limiter: &IpLimiter,
     webauthn: &SharedWebauthn,
+    account_deps: AccountDeps<'_>,
     info: ClientInfo,
     read_timeout: Duration,
     pin_ttl: Duration,
@@ -771,7 +1034,11 @@ async fn run_client(
                                 Vec::new()
                             }
                         };
-                        session = Some(ClientSession { owner_id, token_id });
+                        session = Some(ClientSession {
+                            owner_id,
+                            token_id,
+                            token: token.clone(),
+                        });
                         let _ = tx.send(SignalMessage::Authenticated { token, devices });
                     }
                     Err(err) => {
@@ -941,6 +1208,48 @@ async fn run_client(
                         });
                     }
                 }
+            }
+            SignalMessage::EmailCodeRequest { email } => {
+                handle_email_code_request(account_deps, ip, &email, &tx).await;
+            }
+            SignalMessage::EmailCodeConfirm {
+                email,
+                code,
+                password,
+            } => {
+                handle_email_code_confirm(
+                    account_deps,
+                    db,
+                    registry,
+                    &mut session,
+                    ip,
+                    &user_agent,
+                    &tx,
+                    &email,
+                    &code,
+                    password,
+                )
+                .await;
+            }
+            SignalMessage::PasswordLogin { email, password } => {
+                handle_password_login(
+                    account_deps,
+                    db,
+                    registry,
+                    &mut session,
+                    ip,
+                    &user_agent,
+                    &tx,
+                    &email,
+                    password,
+                )
+                .await;
+            }
+            SignalMessage::GetAccount => {
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                    continue;
+                };
+                send_account(db, &owner_id, &tx);
             }
             SignalMessage::ConnectDevice { device_id } => {
                 let Some(owner_id) = require_owner(db, &mut session, &tx) else {
@@ -1272,6 +1581,7 @@ mod tests {
             Some(ClientSession {
                 owner_id: owner_id.clone(),
                 token_id,
+                token: token.clone(),
             }),
             owner_id,
             token,

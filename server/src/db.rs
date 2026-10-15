@@ -21,7 +21,7 @@ use rusqlite::{Connection, OptionalExtension};
 /// Schema version this binary expects (`PRAGMA user_version`). Bump this
 /// and extend `migrate` when the schema changes; `migrate` itself must stay
 /// idempotent (safe to run against an already-migrated database).
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Сколько секунд владелец без устройств и passkey может не появляться,
 /// прежде чем `prune_empty_owners` его удалит (долг D53).
@@ -400,6 +400,85 @@ impl Db {
         Ok(changed > 0)
     }
 
+    /// Заводит владельцу учётную запись «почта + пароль» (слайс 3.8a).
+    /// `email` уже нормализована. Возвращает `false`, если почта занята или у
+    /// владельца уже есть аккаунт (нарушение уникальности), иначе `true`.
+    pub fn insert_account(
+        &self,
+        owner_id: &str,
+        email: &str,
+        password_hash: &str,
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let result = conn.execute(
+            "INSERT INTO accounts
+                 (owner_id, email, password_hash, created_at, password_changed_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            (owner_id, email, password_hash, now),
+        );
+        match result {
+            Ok(_) => Ok(true),
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Ищет аккаунт по нормализованной почте: `(owner_id, password_hash)`.
+    pub fn account_by_email(&self, email: &str) -> anyhow::Result<Option<(String, String)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let found = conn
+            .query_row(
+                "SELECT owner_id, password_hash FROM accounts WHERE email = ?1",
+                [email],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// Почта аккаунта владельца, если он завёл учётную запись.
+    pub fn email_for_owner(&self, owner_id: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let found = conn
+            .query_row(
+                "SELECT email FROM accounts WHERE owner_id = ?1",
+                [owner_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// Меняет хеш пароля аккаунта и `password_changed_at`. `false`, если у
+    /// владельца нет аккаунта.
+    pub fn set_password_hash(
+        &self,
+        owner_id: &str,
+        password_hash: &str,
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE accounts SET password_hash = ?1, password_changed_at = ?2
+             WHERE owner_id = ?3",
+            (password_hash, now, owner_id),
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Удаляет ВСЕ токены браузеров владельца (сброс пароля выкидывает все
+    /// сессии). Возвращает число удалённых токенов.
+    pub fn delete_all_tokens(&self, owner_id: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let removed = conn.execute("DELETE FROM owner_tokens WHERE owner_id = ?1", [owner_id])?;
+        Ok(removed)
+    }
+
     /// Сливает анонимного владельца `from` (браузер без аккаунта) в
     /// аккаунт `to`: привязки устройств переезжают к `to` (`alias` и
     /// `added_at` сохраняются, уже привязанные к `to` остаются как были),
@@ -413,7 +492,8 @@ impl Db {
         let mut conn = self.conn.lock().expect("db mutex poisoned");
         let tx = conn.transaction()?;
         let has_passkey: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM passkeys WHERE owner_id = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM passkeys WHERE owner_id = ?1)
+                 OR EXISTS(SELECT 1 FROM accounts WHERE owner_id = ?1)",
             [from],
             |row| row.get(0),
         )?;
@@ -432,7 +512,8 @@ impl Db {
     }
 
     /// Удаляет пустых анонимных владельцев (долг D53): без привязанных
-    /// устройств (`ownership`), без passkey и с последней активностью
+    /// устройств (`ownership`), без passkey и без учётной записи
+    /// (`accounts`) и с последней активностью
     /// (`MAX(owner_tokens.last_used_at)`, а без токенов -- `owners.created_at`)
     /// старше `now - max_idle_secs`. Владелец с `webauthn_user_id`, но без
     /// passkey -- тоже кандидат (регистрация не завершена). Токены уходят
@@ -445,6 +526,7 @@ impl Db {
             "DELETE FROM owners
              WHERE NOT EXISTS (SELECT 1 FROM ownership WHERE ownership.owner_id = owners.owner_id)
                AND NOT EXISTS (SELECT 1 FROM passkeys WHERE passkeys.owner_id = owners.owner_id)
+               AND NOT EXISTS (SELECT 1 FROM accounts WHERE accounts.owner_id = owners.owner_id)
                AND COALESCE(
                        (SELECT MAX(last_used_at) FROM owner_tokens
                         WHERE owner_tokens.owner_id = owners.owner_id),
@@ -587,8 +669,8 @@ fn configure(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Полная схема v3.
-const SCHEMA_V3: &str = "CREATE TABLE IF NOT EXISTS devices (
+/// Полная схема v4.
+const SCHEMA_V4: &str = "CREATE TABLE IF NOT EXISTS devices (
             device_id    TEXT PRIMARY KEY,
             secret_hash  TEXT NOT NULL,
             name         TEXT NOT NULL,
@@ -625,11 +707,19 @@ const SCHEMA_V3: &str = "CREATE TABLE IF NOT EXISTS devices (
             user_agent    TEXT NOT NULL DEFAULT '',
             created_at    INTEGER NOT NULL,
             last_used_at  INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS accounts (
+            owner_id            TEXT PRIMARY KEY REFERENCES owners(owner_id) ON DELETE CASCADE,
+            email               TEXT NOT NULL UNIQUE,
+            password_hash       TEXT NOT NULL,
+            created_at          INTEGER NOT NULL,
+            password_changed_at INTEGER NOT NULL
          );";
 
-/// Приводит базу к `SCHEMA_VERSION`: версия 0 — сразу полная схема v3,
+/// Приводит базу к `SCHEMA_VERSION`: версия 0 — сразу полная схема v4,
 /// версия 1 — цепочка v1 -> v2 (токен из `owners` переезжает в
-/// `owner_tokens`) -> v3, версия 2 — v2 -> v3 (passkey). Идемпотентна: на
+/// `owner_tokens`) -> v3 -> v4, версия 2 — v2 -> v3 (passkey) -> v4,
+/// версия 3 — v3 -> v4 (учётные записи «почта + пароль»). Идемпотентна: на
 /// актуальной базе — no-op.
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -638,7 +728,7 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
     }
 
     if version == 0 {
-        conn.execute_batch(SCHEMA_V3)?;
+        conn.execute_batch(SCHEMA_V4)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         return Ok(());
     }
@@ -646,7 +736,28 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
     if version == 1 {
         migrate_v1_to_v2(conn)?;
     }
-    migrate_v2_to_v3(conn)
+    if version <= 2 {
+        migrate_v2_to_v3(conn)?;
+    }
+    migrate_v3_to_v4(conn)
+}
+
+/// v3 -> v4 (слайс 3.8a): таблица `accounts` (почта + хеш пароля владельца).
+/// Одна транзакция; существующие строки не трогаются.
+fn migrate_v3_to_v4(conn: &Connection) -> anyhow::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE accounts (
+            owner_id            TEXT PRIMARY KEY REFERENCES owners(owner_id) ON DELETE CASCADE,
+            email               TEXT NOT NULL UNIQUE,
+            password_hash       TEXT NOT NULL,
+            created_at          INTEGER NOT NULL,
+            password_changed_at INTEGER NOT NULL
+         );",
+    )?;
+    tx.pragma_update(None, "user_version", 4)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// v2 -> v3 (слайс 3.7b): колонка `owners.webauthn_user_id` с уникальным
@@ -869,13 +980,13 @@ mod tests {
     }
 
     #[test]
-    fn fresh_db_has_user_version_three() {
+    fn fresh_db_has_user_version_four() {
         let db = Db::in_memory().expect("open in-memory db");
         let conn = db.conn.lock().expect("db mutex poisoned");
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read user_version");
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     #[test]
@@ -1010,7 +1121,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v1_to_v3_keeps_owners_ownership_devices_and_tokens() {
+    fn migration_v1_to_v4_keeps_owners_ownership_devices_and_tokens() {
         let conn = Connection::open_in_memory().expect("open");
         conn.pragma_update(None, "foreign_keys", true).expect("fk");
         conn.execute_batch(
@@ -1031,12 +1142,12 @@ mod tests {
         )
         .expect("build v1 database");
 
-        migrate(&conn).expect("migrate v1 -> v3");
+        migrate(&conn).expect("migrate v1 -> v4");
 
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let fk: i64 = conn
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .expect("fk");
@@ -1080,10 +1191,14 @@ mod tests {
         assert!(db.set_webauthn_user_id("owner1", "u1").expect("set uuid"));
         db.insert_passkey("pk1", "owner1", "cred1", "{}", "UA", 70)
             .expect("insert passkey");
+        // Новая таблица v4 на месте и работает.
+        assert!(db
+            .insert_account("owner1", "a@b.co", "hash", 80)
+            .expect("insert account"));
     }
 
     #[test]
-    fn migration_v2_to_v3_keeps_owners_tokens_and_ownership() {
+    fn migration_v2_to_v4_keeps_owners_tokens_and_ownership() {
         let conn = Connection::open_in_memory().expect("open");
         conn.pragma_update(None, "foreign_keys", true).expect("fk");
         conn.execute_batch(
@@ -1109,13 +1224,13 @@ mod tests {
         )
         .expect("build v2 database");
 
-        migrate(&conn).expect("migrate v2 -> v3");
+        migrate(&conn).expect("migrate v2 -> v4");
         migrate(&conn).expect("re-run migration is a no-op");
 
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -1128,6 +1243,157 @@ mod tests {
         assert_eq!(owned.len(), 1);
         assert_eq!(owned[0].alias.as_deref(), Some("Work"));
         assert_eq!(db.webauthn_user_id("owner1").expect("uuid"), None);
+        assert!(db
+            .insert_account("owner1", "a@b.co", "hash", 80)
+            .expect("insert account"));
+    }
+
+    #[test]
+    fn migration_v3_to_v4_keeps_rows_and_adds_accounts() {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.pragma_update(None, "foreign_keys", true).expect("fk");
+        conn.execute_batch(
+            "CREATE TABLE devices (
+                device_id TEXT PRIMARY KEY, secret_hash TEXT NOT NULL, name TEXT NOT NULL,
+                created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL);
+             CREATE TABLE owners (
+                owner_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL,
+                webauthn_user_id TEXT);
+             CREATE UNIQUE INDEX owners_webauthn_user_id ON owners(webauthn_user_id);
+             CREATE TABLE owner_tokens (
+                token_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL REFERENCES owners(owner_id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE, user_agent TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL);
+             CREATE TABLE ownership (
+                owner_id TEXT NOT NULL REFERENCES owners(owner_id) ON DELETE CASCADE,
+                device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+                alias TEXT, added_at INTEGER NOT NULL, PRIMARY KEY (owner_id, device_id));
+             CREATE TABLE passkeys (
+                passkey_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL REFERENCES owners(owner_id) ON DELETE CASCADE,
+                credential_id TEXT NOT NULL UNIQUE, passkey_json TEXT NOT NULL,
+                user_agent TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL);
+             INSERT INTO devices VALUES ('dev1', 'sh', 'My Mac', 10, 20);
+             INSERT INTO owners VALUES ('owner1', 50, 'u1');
+             INSERT INTO owner_tokens VALUES ('tok1', 'owner1', 'h1', 'UA', 50, 55);
+             INSERT INTO ownership VALUES ('owner1', 'dev1', 'Work', 60);
+             INSERT INTO passkeys VALUES ('pk1', 'owner1', 'cred1', '{}', 'UA', 70, 71);
+             PRAGMA user_version = 3;",
+        )
+        .expect("build v3 database");
+
+        migrate(&conn).expect("migrate v3 -> v4");
+        migrate(&conn).expect("re-run migration is a no-op");
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 4);
+
+        let db = Db {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        assert_eq!(db.tokens_for_owner("owner1").expect("tokens").len(), 1);
+        assert_eq!(db.devices_for_owner("owner1").expect("devices").len(), 1);
+        assert_eq!(db.passkeys_for_owner("owner1").expect("passkeys").len(), 1);
+        assert_eq!(
+            db.webauthn_user_id("owner1").expect("uuid").as_deref(),
+            Some("u1")
+        );
+        assert!(db
+            .insert_account("owner1", "a@b.co", "hash", 80)
+            .expect("insert account"));
+    }
+
+    #[test]
+    fn account_insert_lookup_and_unique_email() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("a", 1).expect("owner");
+        db.insert_owner("b", 1).expect("owner");
+        assert_eq!(db.email_for_owner("a").expect("email"), None);
+        assert_eq!(db.account_by_email("a@b.co").expect("find"), None);
+
+        assert!(db.insert_account("a", "a@b.co", "h1", 10).expect("insert"));
+        assert_eq!(
+            db.account_by_email("a@b.co").expect("find"),
+            Some(("a".to_string(), "h1".to_string()))
+        );
+        assert_eq!(
+            db.email_for_owner("a").expect("email").as_deref(),
+            Some("a@b.co")
+        );
+
+        // Почта занята другим владельцем; второй аккаунт у того же владельца.
+        assert!(!db.insert_account("b", "a@b.co", "h2", 11).expect("dup"));
+        assert!(!db.insert_account("a", "x@y.co", "h2", 11).expect("dup"));
+        assert_eq!(db.email_for_owner("b").expect("email"), None);
+    }
+
+    #[test]
+    fn set_password_hash_changes_hash_and_timestamp() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("a", 1).expect("owner");
+        db.insert_owner("b", 1).expect("owner");
+        db.insert_account("a", "a@b.co", "h1", 10).expect("insert");
+
+        assert!(db.set_password_hash("a", "h2", 20).expect("set"));
+        assert!(!db.set_password_hash("b", "h2", 20).expect("no account"));
+        assert_eq!(
+            db.account_by_email("a@b.co").expect("find"),
+            Some(("a".to_string(), "h2".to_string()))
+        );
+        let conn = db.conn.lock().expect("db mutex poisoned");
+        let (created, changed): (i64, i64) = conn
+            .query_row(
+                "SELECT created_at, password_changed_at FROM accounts WHERE owner_id = 'a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("timestamps");
+        assert_eq!((created, changed), (10, 20));
+    }
+
+    #[test]
+    fn delete_all_tokens_removes_only_that_owners_tokens() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("a", 1).expect("owner");
+        db.insert_owner("b", 1).expect("owner");
+        db.insert_token("a", "t1", "h1", "", 1).expect("token");
+        db.insert_token("a", "t2", "h2", "", 1).expect("token");
+        db.insert_token("b", "t3", "h3", "", 1).expect("token");
+
+        assert_eq!(db.delete_all_tokens("a").expect("delete"), 2);
+        assert_eq!(token_count(&db, "a"), 0);
+        assert_eq!(token_count(&db, "b"), 1);
+    }
+
+    #[test]
+    fn merge_anonymous_owner_does_not_merge_owner_with_account() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("a", 1).expect("owner");
+        db.insert_owner("b", 1).expect("owner");
+        db.insert_token("a", "tok-a", "ha", "", 1).expect("token");
+        db.insert_device("dev1", "h", "d", 1).expect("device");
+        db.link_device("a", "dev1", 10).expect("link");
+        db.insert_account("a", "a@b.co", "h", 1).expect("account");
+
+        assert!(!db.merge_anonymous_owner("a", "b").expect("merge"));
+        assert_eq!(db.devices_for_owner("a").expect("a").len(), 1);
+        assert!(db.devices_for_owner("b").expect("b").is_empty());
+        assert!(db.token_exists("tok-a").expect("token"));
+    }
+
+    #[test]
+    fn prune_keeps_owner_with_account_and_no_devices() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("old", 100).expect("owner");
+        db.insert_account("old", "a@b.co", "h", 100)
+            .expect("account");
+        let n = db.prune_empty_owners(10_000, 1_000).expect("prune");
+        assert_eq!(n, 0);
+        assert_eq!(owner_count(&db), 1);
     }
 
     #[test]

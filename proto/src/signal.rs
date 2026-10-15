@@ -261,6 +261,30 @@ pub enum SignalMessage {
     /// client -> server: удалить passkey `id` этого владельца. В ответ
     /// сервер шлёт обновлённый `Passkeys`.
     DeletePasskey { id: String },
+    /// client -> server (слайс 3.8a): прислать 6-значный код на почту.
+    /// Сервер отвечает `EmailCodeSent` независимо от того, есть аккаунт с
+    /// этой почтой или нет.
+    EmailCodeRequest { email: String },
+    /// server -> client: код отправлен (или запрос принят) -- ответ на
+    /// `EmailCodeRequest`.
+    EmailCodeSent,
+    /// client -> server: код из письма и новый пароль. Если почта уже
+    /// принадлежит аккаунту, это сброс пароля и вход в аккаунт; иначе --
+    /// регистрация: почта и пароль привязываются к ТЕКУЩЕМУ владельцу
+    /// соединения. Ответ: `Authenticated`, затем `Account`.
+    EmailCodeConfirm {
+        email: String,
+        code: String,
+        password: String,
+    },
+    /// client -> server: вход по почте и паролю. Ответ: `Authenticated`,
+    /// затем `Account`.
+    PasswordLogin { email: String, password: String },
+    /// client -> server: перечитать аккаунт владельца (нужен владелец).
+    /// Сервер отвечает `Account`.
+    GetAccount,
+    /// server -> client: почта аккаунта владельца; `None` -- почты нет.
+    Account { email: Option<String> },
     /// client -> server: подключиться к своему устройству без PIN.
     ConnectDevice { device_id: String },
     /// client -> server: переименовать своё устройство (`alias = None` —
@@ -573,6 +597,54 @@ mod tests {
                 id: "x".to_string()
             }
         );
+    }
+
+    #[test]
+    fn account_messages_round_trip_through_json() {
+        let messages = vec![
+            SignalMessage::EmailCodeRequest {
+                email: "a@b.co".to_string(),
+            },
+            SignalMessage::EmailCodeSent,
+            SignalMessage::EmailCodeConfirm {
+                email: "a@b.co".to_string(),
+                code: "123456".to_string(),
+                password: "secret-pass".to_string(),
+            },
+            SignalMessage::PasswordLogin {
+                email: "a@b.co".to_string(),
+                password: "secret-pass".to_string(),
+            },
+            SignalMessage::GetAccount,
+            SignalMessage::Account {
+                email: Some("a@b.co".to_string()),
+            },
+            SignalMessage::Account { email: None },
+        ];
+        for msg in messages {
+            let json = serde_json::to_string(&msg).expect("serialize");
+            let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(round_tripped, msg);
+        }
+    }
+
+    #[test]
+    fn account_messages_have_the_expected_wire_shape() {
+        let msg: SignalMessage =
+            serde_json::from_str(r#"{"type":"get_account"}"#).expect("deserialize");
+        assert_eq!(msg, SignalMessage::GetAccount);
+        let msg: SignalMessage =
+            serde_json::from_str(r#"{"type":"password_login","email":"a@b.co","password":"p"}"#)
+                .expect("deserialize");
+        assert_eq!(
+            msg,
+            SignalMessage::PasswordLogin {
+                email: "a@b.co".to_string(),
+                password: "p".to_string()
+            }
+        );
+        let json = serde_json::to_string(&SignalMessage::Account { email: None }).expect("ser");
+        assert_eq!(json, r#"{"type":"account","email":null}"#);
     }
 
     #[test]

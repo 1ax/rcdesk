@@ -7,9 +7,11 @@ use axum::Router;
 
 use proto::signal::SignalMessage;
 
+use crate::accounts::EmailCodes;
 use crate::db::Db;
 use crate::ice::IceConfig;
 use crate::ip_limit::{GlobalLimiter, IpLimiter};
+use crate::mail::SharedMailer;
 use crate::passkeys::SharedWebauthn;
 use crate::registry::Registry;
 use crate::ws::ws_handler;
@@ -29,6 +31,13 @@ pub const NEW_OWNER_REFILL: Duration = Duration::from_secs(60);
 /// New devices an IP may register in a burst (B2, audit S-H2).
 pub const NEW_DEVICE_BURST: u32 = 10;
 pub const NEW_DEVICE_REFILL: Duration = Duration::from_secs(600);
+/// Кодов подтверждения почты, которые IP может запросить в burst (слайс 3.8a).
+pub const EMAIL_CODE_BURST: u32 = 5;
+pub const EMAIL_CODE_REFILL: Duration = Duration::from_secs(600);
+/// Неверных паролей/кодов почты, которые IP может потратить в burst
+/// (слайс 3.8a).
+pub const LOGIN_BURST: u32 = 10;
+pub const LOGIN_REFILL: Duration = Duration::from_secs(60);
 
 /// Серверный keepalive (B3): Ping раз в `ping_interval`, закрытие соединения,
 /// если `read_timeout` не пришло ни одного кадра (текст, Ping, Pong — любой).
@@ -72,10 +81,24 @@ pub struct AppState {
     pub webauthn: SharedWebauthn,
     /// Server keepalive parameters (B3).
     pub liveness: Liveness,
+    /// Отправка писем с кодом подтверждения (слайс 3.8a).
+    pub mailer: SharedMailer,
+    /// Выданные коды подтверждения почты, в памяти.
+    pub email_codes: EmailCodes,
+    /// Per-IP limit on issued email codes; spent by each issued code.
+    pub email_code_limiter: IpLimiter,
+    /// Per-IP limit on wrong passwords / email codes; spent by failures.
+    pub login_limiter: IpLimiter,
 }
 
-pub fn app(registry: Registry, ice: IceConfig, db: Db, webauthn: SharedWebauthn) -> Router {
-    app_with_liveness(registry, ice, db, webauthn, Liveness::default())
+pub fn app(
+    registry: Registry,
+    ice: IceConfig,
+    db: Db,
+    webauthn: SharedWebauthn,
+    mailer: SharedMailer,
+) -> Router {
+    app_with_liveness(registry, ice, db, webauthn, mailer, Liveness::default())
 }
 
 pub fn app_with_liveness(
@@ -83,6 +106,7 @@ pub fn app_with_liveness(
     ice: IceConfig,
     db: Db,
     webauthn: SharedWebauthn,
+    mailer: SharedMailer,
     liveness: Liveness,
 ) -> Router {
     app_with_limits(
@@ -90,6 +114,7 @@ pub fn app_with_liveness(
         ice,
         db,
         webauthn,
+        mailer,
         liveness,
         GlobalLimiter::new(PIN_GLOBAL_BURST, PIN_GLOBAL_REFILL),
     )
@@ -100,6 +125,7 @@ pub fn app_with_limits(
     ice: IceConfig,
     db: Db,
     webauthn: SharedWebauthn,
+    mailer: SharedMailer,
     liveness: Liveness,
     pin_global: GlobalLimiter,
 ) -> Router {
@@ -116,6 +142,10 @@ pub fn app_with_limits(
             device_limiter: IpLimiter::new(NEW_DEVICE_BURST, NEW_DEVICE_REFILL),
             webauthn,
             liveness,
+            mailer,
+            email_codes: EmailCodes::new(),
+            email_code_limiter: IpLimiter::new(EMAIL_CODE_BURST, EMAIL_CODE_REFILL),
+            login_limiter: IpLimiter::new(LOGIN_BURST, LOGIN_REFILL),
         })
 }
 
@@ -168,6 +198,7 @@ mod tests {
             crate::db::Db::in_memory().expect("open in-memory db"),
             crate::passkeys::build_webauthn("localhost", "http://localhost:5173")
                 .expect("build webauthn"),
+            std::sync::Arc::new(crate::mail::DisabledMailer),
         )
         .oneshot(
             Request::builder()
@@ -194,6 +225,7 @@ mod tests {
             db,
             crate::passkeys::build_webauthn("localhost", "http://localhost:5173")
                 .expect("build webauthn"),
+            std::sync::Arc::new(crate::mail::DisabledMailer),
         )
         .oneshot(
             Request::builder()

@@ -1,8 +1,10 @@
+pub mod accounts;
 pub mod app;
 pub mod db;
 pub mod devices;
 pub mod ice;
 pub mod ip_limit;
+pub mod mail;
 pub mod owners;
 pub mod passkeys;
 pub mod registry;
