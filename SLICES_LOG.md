@@ -53,6 +53,14 @@
   кандидата `RTCLocalIceCandidate_candidate:…` — сопоставление по суффиксу). Проверено временным вызовом в loopback:
   `host/udp 127.0.0.1 → host/udp`, rtt 0.3 мс. Гейты: host `381 passed; 0 failed; 3 ignored`, proto `80`, server
   `98` + `51`, loopback `1`, fmt/clippy чистые.
+- ✅ **I5** `49e7fe6` (уедет с `0.1.11`): 2026-10-15 на Mac-хосте `0.1.10` дважды (05:40 и 06:36 UTC) картинка
+  замерла через 6–10 с после входа: `captured=0` до конца сеанса, при отключении паника `Failed to stop capture`
+  («трансляция уже остановлена») в `vendor/scap/.../engine/mod.rs:110`. ScreenCaptureKit сам останавливал поток;
+  `didStopWithError` ставил `error_flag`, но его никто не читал. Теперь `ScapSource` на таймауте ожидания проверяет
+  `stream_failed()` и пересобирает `Capturer` (≤3 раз за 60 с, иначе ошибка; при смене размера — ошибка), `Drop`
+  через `try_stop_capture` без паники. Причина остановки системой не известна (системный журнал пуст). Подтверждение
+  — по `agent.log` на `0.1.11`: пара `screen capture stream stopped by the system, restarting` / `restarted`.
+  Гейты: host `384 passed; 0 failed; 3 ignored`, proto `80`, server `98` + `51`, loopback `1`, fmt/clippy чистые.
 - ⚪ Шум `Failed to write packet … os error 10051` с адаптеров Hyper-V/WSL засоряет лог Windows-хоста.
 - ▶️ **Дальше:** владелец (Mac) и пользователь (Win) обновляются до `0.1.10` кнопкой; не проверено вживую: fps
   поднимается с 5 после урезания, после видео картинка восстанавливается. По логам смотреть `target_fps` после
