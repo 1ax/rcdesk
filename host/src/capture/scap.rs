@@ -7,6 +7,10 @@
 //! instead of panicking or calling `scap::request_permission()` (there is
 //! nobody to click the TCC dialog in an unattended/terminal session). Live
 //! capture is verified manually by whoever has the permission granted.
+//!
+//! Если система сама остановила поток (`didStopWithError`), `next_frame`
+//! перезапускает захват внутри того же `ScapSource` (не чаще `RESTART_LIMIT`
+//! раз за `RESTART_WINDOW`), если размер экрана не изменился.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
@@ -25,11 +29,133 @@ use super::{CaptureError, FrameSource, RawFrame};
 /// latency is unaffected.
 const RECV_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Не более `RESTART_LIMIT` перезапусков захвата за скользящее окно
+/// `RESTART_WINDOW`: дальше считаем, что система стабильно рвёт поток.
+const RESTART_LIMIT: usize = 3;
+const RESTART_WINDOW: Duration = Duration::from_secs(60);
+
+/// Бюджет перезапусков; время передаётся аргументом (для тестов).
+struct RestartBudget {
+    marks: Vec<Instant>,
+}
+
+impl RestartBudget {
+    fn new() -> Self {
+        Self { marks: Vec::new() }
+    }
+
+    /// Отметка старше или равная окну выбрасывается; если осталось меньше
+    /// `RESTART_LIMIT` -- записывает `now` и возвращает true.
+    fn try_take(&mut self, now: Instant) -> bool {
+        self.marks
+            .retain(|&mark| now.saturating_duration_since(mark) < RESTART_WINDOW);
+        if self.marks.len() < RESTART_LIMIT {
+            self.marks.push(now);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 pub struct ScapSource {
     capturer: Capturer,
     width: u32,
     height: u32,
     stop: Arc<AtomicBool>,
+    display_id: Option<u32>,
+    fps: u32,
+    exclude_windows: Vec<u32>,
+    restarts: RestartBudget,
+}
+
+/// Собирает и запускает `Capturer`, возвращает его и размер кадра.
+fn build_capturer(
+    display_id: Option<u32>,
+    fps: u32,
+    exclude_windows: &[u32],
+) -> Result<(Capturer, u32, u32), CaptureError> {
+    if !is_supported() {
+        return Err(CaptureError::Unsupported);
+    }
+    if !has_permission() {
+        return Err(CaptureError::PermissionDenied);
+    }
+
+    let target = match display_id {
+        Some(id) => get_all_targets()
+            .into_iter()
+            .find(|t| matches!(t, Target::Display(d) if d.id == id))
+            .ok_or_else(|| CaptureError::Backend(format!("display {id} not found")))?,
+        None => get_all_targets()
+            .into_iter()
+            .find(|t| matches!(t, Target::Display(_)))
+            .ok_or_else(|| CaptureError::Backend("no capturable display found".to_string()))?,
+    };
+
+    #[cfg(target_os = "macos")]
+    let output_type = FrameType::YUVFrame;
+    #[cfg(target_os = "windows")]
+    let output_type = FrameType::BGRAFrame;
+
+    // `scap::Window` не реэкспортирован из крейта (модуль `targets`
+    // приватный), поэтому литерал структуры не написать: берём любое
+    // реальное окно из `get_all_targets()` как заготовку и подменяем в
+    // клоне `id`/`raw_handle`. scap сверяет исключаемые окна только по
+    // `id` (см. `capturer::engine::mac`).
+    #[cfg(target_os = "macos")]
+    let excluded_targets = if exclude_windows.is_empty() {
+        None
+    } else {
+        let template = get_all_targets()
+            .into_iter()
+            .find(|t| matches!(t, Target::Window(_)))
+            .ok_or_else(|| {
+                CaptureError::Backend(
+                    "нет ни одного окна-заготовки для исключения окон шторки".to_string(),
+                )
+            })?;
+        Some(
+            exclude_windows
+                .iter()
+                .map(|&id| {
+                    let mut target = template.clone();
+                    if let Target::Window(w) = &mut target {
+                        w.id = id;
+                        w.raw_handle = id;
+                    }
+                    target
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    let excluded_targets = {
+        let _ = exclude_windows;
+        None
+    };
+
+    let options = Options {
+        fps,
+        show_cursor: false,
+        show_highlight: false,
+        target: Some(target),
+        crop_area: None,
+        output_type,
+        output_resolution: Resolution::Captured,
+        excluded_targets,
+    };
+
+    let mut capturer = Capturer::build(options).map_err(|err| match err {
+        ::scap::capturer::CapturerBuildError::NotSupported => CaptureError::Unsupported,
+        ::scap::capturer::CapturerBuildError::PermissionNotGranted => {
+            CaptureError::PermissionDenied
+        }
+    })?;
+
+    capturer.start_capture();
+    let [width, height] = capturer.get_output_frame_size();
+    Ok((capturer, width, height))
 }
 
 // SAFETY: `Capturer` is only ever touched from the single dedicated capture
@@ -48,93 +174,55 @@ impl ScapSource {
         fps: u32,
         exclude_windows: &[u32],
     ) -> Result<Self, CaptureError> {
-        if !is_supported() {
-            return Err(CaptureError::Unsupported);
-        }
-        if !has_permission() {
-            return Err(CaptureError::PermissionDenied);
-        }
-
-        let target = match display_id {
-            Some(id) => get_all_targets()
-                .into_iter()
-                .find(|t| matches!(t, Target::Display(d) if d.id == id))
-                .ok_or_else(|| CaptureError::Backend(format!("display {id} not found")))?,
-            None => get_all_targets()
-                .into_iter()
-                .find(|t| matches!(t, Target::Display(_)))
-                .ok_or_else(|| CaptureError::Backend("no capturable display found".to_string()))?,
-        };
-
-        #[cfg(target_os = "macos")]
-        let output_type = FrameType::YUVFrame;
-        #[cfg(target_os = "windows")]
-        let output_type = FrameType::BGRAFrame;
-
-        // `scap::Window` не реэкспортирован из крейта (модуль `targets`
-        // приватный), поэтому литерал структуры не написать: берём любое
-        // реальное окно из `get_all_targets()` как заготовку и подменяем в
-        // клоне `id`/`raw_handle`. scap сверяет исключаемые окна только по
-        // `id` (см. `capturer::engine::mac`).
-        #[cfg(target_os = "macos")]
-        let excluded_targets = if exclude_windows.is_empty() {
-            None
-        } else {
-            let template = get_all_targets()
-                .into_iter()
-                .find(|t| matches!(t, Target::Window(_)))
-                .ok_or_else(|| {
-                    CaptureError::Backend(
-                        "нет ни одного окна-заготовки для исключения окон шторки".to_string(),
-                    )
-                })?;
-            Some(
-                exclude_windows
-                    .iter()
-                    .map(|&id| {
-                        let mut target = template.clone();
-                        if let Target::Window(w) = &mut target {
-                            w.id = id;
-                            w.raw_handle = id;
-                        }
-                        target
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        };
-        #[cfg(not(target_os = "macos"))]
-        let excluded_targets = {
-            let _ = exclude_windows;
-            None
-        };
-
-        let options = Options {
-            fps,
-            show_cursor: false,
-            show_highlight: false,
-            target: Some(target),
-            crop_area: None,
-            output_type,
-            output_resolution: Resolution::Captured,
-            excluded_targets,
-        };
-
-        let mut capturer = Capturer::build(options).map_err(|err| match err {
-            ::scap::capturer::CapturerBuildError::NotSupported => CaptureError::Unsupported,
-            ::scap::capturer::CapturerBuildError::PermissionNotGranted => {
-                CaptureError::PermissionDenied
-            }
-        })?;
-
-        capturer.start_capture();
-        let [width, height] = capturer.get_output_frame_size();
-
+        let (capturer, width, height) = build_capturer(display_id, fps, exclude_windows)?;
         Ok(Self {
             capturer,
             width,
             height,
             stop: Arc::new(AtomicBool::new(false)),
+            display_id,
+            fps,
+            exclude_windows: exclude_windows.to_vec(),
+            restarts: RestartBudget::new(),
         })
+    }
+}
+
+impl ScapSource {
+    /// Перезапуск захвата после остановки потока системой. Старый `Capturer`
+    /// просто отбрасывается: Drop у него нет (стоп уже случился сам).
+    fn restart_capture(&mut self) -> Result<(), CaptureError> {
+        tracing::warn!("screen capture stream stopped by the system, restarting");
+        if !self.restarts.try_take(Instant::now()) {
+            tracing::error!(
+                limit = RESTART_LIMIT,
+                window_s = RESTART_WINDOW.as_secs(),
+                "screen capture keeps stopping, giving up"
+            );
+            return Err(CaptureError::Backend(
+                "screen capture keeps stopping".into(),
+            ));
+        }
+        let (capturer, width, height) =
+            build_capturer(self.display_id, self.fps, &self.exclude_windows)?;
+        if (width, height) != (self.width, self.height) {
+            tracing::error!(
+                old_width = self.width,
+                old_height = self.height,
+                new_width = width,
+                new_height = height,
+                "screen size changed after capture restart, stopping"
+            );
+            return Err(CaptureError::Backend(
+                "screen size changed after capture restart".into(),
+            ));
+        }
+        self.capturer = capturer;
+        tracing::info!(
+            attempt = self.restarts.marks.len(),
+            "screen capture restarted"
+        );
+        Ok(())
     }
 }
 
@@ -146,7 +234,12 @@ impl FrameSource for ScapSource {
             }
             let frame = match self.capturer.get_next_frame_timeout(RECV_TIMEOUT) {
                 Ok(frame) => frame,
-                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Timeout) => {
+                    if self.capturer.stream_failed() {
+                        self.restart_capture()?;
+                    }
+                    continue;
+                }
                 Err(RecvTimeoutError::Disconnected) => return Err(CaptureError::Stopped),
             };
 
@@ -194,6 +287,45 @@ impl FrameSource for ScapSource {
 
 impl Drop for ScapSource {
     fn drop(&mut self) {
-        self.capturer.stop_capture();
+        if let Err(err) = self.capturer.try_stop_capture() {
+            tracing::debug!(error = %err, "screen capture was already stopped");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budget_allows_three_then_denies() {
+        let mut b = RestartBudget::new();
+        let t0 = Instant::now();
+        assert!(b.try_take(t0));
+        assert!(b.try_take(t0 + Duration::from_secs(1)));
+        assert!(b.try_take(t0 + Duration::from_secs(2)));
+        assert!(!b.try_take(t0 + Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn budget_recovers_after_window() {
+        let mut b = RestartBudget::new();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            assert!(b.try_take(t0));
+        }
+        assert!(!b.try_take(t0 + Duration::from_secs(59)));
+        assert!(b.try_take(t0 + RESTART_WINDOW + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn budget_mark_equal_to_window_is_dropped() {
+        // Правило: отметка старше или равная окну выбрасывается.
+        let mut b = RestartBudget::new();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            assert!(b.try_take(t0));
+        }
+        assert!(b.try_take(t0 + RESTART_WINDOW));
     }
 }

@@ -171,6 +171,18 @@ impl Capturer {
         }
     }
 
+    /// rcdesk patch: true if the system stopped the stream on its own
+    /// (macOS `didStopWithError`). Always false on other platforms.
+    pub fn stream_failed(&self) -> bool {
+        self.engine.stream_failed()
+    }
+
+    /// rcdesk patch: like `stop_capture`, but returns the error instead of
+    /// panicking (e.g. when the stream was already stopped by the system).
+    pub fn try_stop_capture(&mut self) -> Result<(), String> {
+        self.engine.try_stop()
+    }
+
     /// Get the dimensions the frames will be captured in
     pub fn get_output_frame_size(&mut self) -> [u32; 2] {
         self.engine.get_output_frame_size()

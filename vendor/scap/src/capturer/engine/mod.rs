@@ -121,6 +121,35 @@ impl Engine {
         }
     }
 
+    /// rcdesk patch: true if the system stopped the stream on its own
+    /// (macOS `didStopWithError` sets `error_flag`). False elsewhere.
+    pub fn stream_failed(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.error_flag.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// rcdesk patch: `stop` without the `expect` on macOS, so an already
+    /// stopped stream yields an error instead of a panic.
+    pub fn try_stop(&mut self) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            self.mac.stop_capture().map_err(|e| format!("{e:?}"))
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.stop();
+            Ok(())
+        }
+    }
+
     pub fn get_output_frame_size(&mut self) -> [u32; 2] {
         get_output_frame_size(&self.options)
     }
