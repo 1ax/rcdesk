@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
             IceConfig::from_env(),
             db,
             webauthn,
-            mailer_from_env(),
+            mailer_from_env()?,
         )
         .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
