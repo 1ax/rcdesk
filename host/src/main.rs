@@ -310,6 +310,7 @@ fn init_logging(command: &Command) {
     #[cfg(not(target_os = "windows"))]
     let _ = command;
 
+    use std::io::IsTerminal as _;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -317,8 +318,9 @@ fn init_logging(command: &Command) {
         // Slice 3.2 fix: the classic Windows console (cmd.exe on the Win10
         // stand) doesn't interpret ANSI escapes unless VT processing is
         // switched on, so colors came out as raw `←[2m` noise. Plain text
-        // there; colors stay on macOS terminals.
-        .with_ansi(cfg!(not(target_os = "windows")))
+        // there; colors stay on macOS terminals. Without a terminal (output
+        // captured, e.g. postinstall -> install.log) no color either (D71).
+        .with_ansi(cfg!(not(target_os = "windows")) && std::io::stdout().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 tracing_subscriber::EnvFilter::new(rcdesk_host::DEFAULT_LOG_FILTER)
