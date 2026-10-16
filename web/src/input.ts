@@ -149,9 +149,30 @@ export function normalizeWheel(
   return { dx: toLines(deltaX), dy: toLines(deltaY) };
 }
 
+const MODIFIER_CODES: ReadonlySet<string> = new Set([
+  "ShiftLeft",
+  "ShiftRight",
+  "ControlLeft",
+  "ControlRight",
+  "AltLeft",
+  "AltRight",
+  "MetaLeft",
+  "MetaRight",
+  "OSLeft",
+  "OSRight",
+  "CapsLock",
+]);
+
+/** True for modifier keys (by `KeyboardEvent.code`, before any remap). */
+export function isModifierCode(code: string): boolean {
+  return MODIFIER_CODES.has(code);
+}
+
 /** Builds the `Key` message for a keydown/keyup, or `null` for an
- * auto-repeat keydown -- the OS/host repeats a held key on its own once, so
- * forwarding every repeat event would double it up. `remapMode` (slices
+ * auto-repeat keydown of a modifier. The host OS does not repeat injected
+ * (CGEventPost / SendInput) key presses, so auto-repeat keydowns of ordinary
+ * keys are forwarded as plain `pressed: true` messages (slice I8); a
+ * modifier needs no repeat -- it stays held until its keyup. `remapMode` (slices
  * 3.5f/4.6e, default `"none"`) is applied to `code` via `keyRemap.remapCode`
  * before the message is built -- the same call, with the same flag, for
  * both a keydown and the matching keyup (see `attachInput`'s `onKeyDown`/
@@ -164,7 +185,7 @@ export function keyToMessage(
   repeat: boolean,
   remapMode: KeyRemapMode = "none",
 ): InputMessage | null {
-  if (repeat) return null;
+  if (repeat && isModifierCode(code)) return null;
   return { type: "key", code: remapCode(code, remapMode), pressed };
 }
 

@@ -71,8 +71,23 @@ describe("normalizeWheel", () => {
 });
 
 describe("keyToMessage", () => {
-  it("returns null for an auto-repeat keydown", () => {
-    expect(keyToMessage("KeyA", true, true)).toBeNull();
+  it("forwards an auto-repeat keydown of an ordinary key as pressed", () => {
+    for (const code of ["ArrowLeft", "Backspace"]) {
+      expect(keyToMessage(code, true, true)).toEqual({ type: "key", code, pressed: true });
+    }
+  });
+
+  it("returns null for an auto-repeat keydown of a modifier", () => {
+    for (const code of ["ShiftLeft", "MetaLeft", "ControlRight", "AltLeft", "OSRight", "CapsLock"]) {
+      expect(keyToMessage(code, true, true)).toBeNull();
+    }
+  });
+
+  it("applies the remap to a repeated ordinary key like the first keydown", () => {
+    expect(keyToMessage("ArrowLeft", true, true, "cmd-as-ctrl")).toEqual(
+      keyToMessage("ArrowLeft", true, false, "cmd-as-ctrl"),
+    );
+    expect(keyToMessage("MetaLeft", true, true, "cmd-as-ctrl")).toBeNull();
   });
 
   it("builds a Key message for a non-repeat event", () => {
