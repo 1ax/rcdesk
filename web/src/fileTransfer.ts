@@ -329,17 +329,35 @@ export function downloadFailLabel(reason: DownloadFailReason): string {
 }
 
 /**
- * File name safe to hand to `a.download` (slice I9a). macOS puts U+202F
+ * Longest download name, in UTF-16 units: leaves room for the "Downloads" path
+ * and `.crdownload` inside Windows MAX_PATH 260 (slice I9b).
+ */
+export const MAX_DOWNLOAD_NAME_CHARS = 150;
+
+/** Longest extension (with the dot) kept when a long name is truncated. */
+const MAX_KEPT_EXT_CHARS = 16;
+
+/**
+ * File name safe to hand to `a.download` (slices I9a, I9b). macOS puts U+202F
  * (narrow no-break space) into localized dates, and Chrome on Windows aborts
  * such downloads. Normalizes to NFC, turns every space separator into a plain
- * space, drops control/format characters, trims; falls back to "file".
+ * space, drops control/format characters, trims; falls back to "file". Names
+ * over MAX_DOWNLOAD_NAME_CHARS are truncated, keeping the extension.
  */
 export function downloadFileName(name: string): string {
-  const cleaned = name
+  let cleaned = name
     .normalize("NFC")
     .replace(/\p{Zs}/gu, " ")
     .replace(/[\p{Cc}\p{Cf}]/gu, "")
     .trim();
+  if (cleaned.length > MAX_DOWNLOAD_NAME_CHARS) {
+    const dot = cleaned.lastIndexOf(".");
+    const ext = dot > 0 && cleaned.length - dot <= MAX_KEPT_EXT_CHARS ? cleaned.slice(dot) : "";
+    let base = cleaned.slice(0, MAX_DOWNLOAD_NAME_CHARS - ext.length);
+    const last = base.charCodeAt(base.length - 1);
+    if (last >= 0xd800 && last <= 0xdbff) base = base.slice(0, -1);
+    cleaned = base.trimEnd() + ext;
+  }
   return cleaned === "" ? "file" : cleaned;
 }
 

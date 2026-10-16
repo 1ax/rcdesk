@@ -706,6 +706,33 @@ describe("downloadFailLabel", () => {
 });
 
 describe("downloadFileName", () => {
+  it("truncates a real long name, keeping the extension", () => {
+    const name =
+      "Решение мирового судьи СУ 4 Центрального округа Курска от 28.09.2026 № 2-645-2026 (мотивированное, изготовлено 13.10.2026) Борзенков - Ситилинк, отказ в передаче ноутбука из-за отсутствия предоплаты, 5 000 моральный + 2 500 штраф.pdf";
+    const out = downloadFileName(name);
+    expect(out.length).toBeLessThanOrEqual(150);
+    expect(out.endsWith(".pdf")).toBe(true);
+    expect(out.startsWith("Решение мирового судьи")).toBe(true);
+  });
+
+  it("keeps a name of exactly 150 characters", () => {
+    const name = "a".repeat(146) + ".pdf";
+    expect(name.length).toBe(150);
+    expect(downloadFileName(name)).toBe(name);
+  });
+
+  it("does not leave a lone surrogate at the truncation boundary", () => {
+    const name = "a".repeat(145) + "😀".repeat(10) + ".txt";
+    const out = downloadFileName(name);
+    expect(out).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+    expect(out.length).toBeLessThanOrEqual(150);
+    expect(out.endsWith(".txt")).toBe(true);
+  });
+
+  it("truncates a long name without extension to exactly 150", () => {
+    expect(downloadFileName("б".repeat(300)).length).toBe(150);
+  });
+
   it("replaces U+202F and U+00A0 with a plain space", () => {
     expect(downloadFileName("Сканирование 16\u202Fокт. 2026\u202Fг..pdf")).toBe("Сканирование 16 окт. 2026 г..pdf");
     expect(downloadFileName("a\u00A0b.txt")).toBe("a b.txt");
