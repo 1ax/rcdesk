@@ -197,7 +197,13 @@ pub enum Feedback {
     },
     /// One encoded frame, reported by the forward task in `signaling/mod.rs`
     /// for every frame the pipeline produces.
-    Frame { bytes: usize },
+    ///
+    /// `captured_at` is the moment the frame was captured; it only feeds the
+    /// frame-pacing diagnostics in the summary line, the controller ignores it.
+    Frame {
+        bytes: usize,
+        captured_at: std::time::Instant,
+    },
     /// Captured frames the encoder never got to see because the next one
     /// overwrote them first (`pipeline::PipelineStats::overwritten`, delta
     /// since the previous tick) -- the "encoder can't keep up" signal.
@@ -363,7 +369,7 @@ impl Controller {
                 self.last_loss_at = Some(now);
             }
             Feedback::ReceiverStats { .. } => {}
-            Feedback::Frame { bytes } => {
+            Feedback::Frame { bytes, .. } => {
                 self.window.bytes += bytes as u64;
                 self.window.frames += 1;
             }
@@ -659,7 +665,13 @@ mod tests {
     /// single `Frame` since only the byte sum and "any frames at all" matter
     /// to the controller.
     fn frames(c: &mut Controller, now: Instant, bytes: usize) {
-        c.feedback(Feedback::Frame { bytes }, now);
+        c.feedback(
+            Feedback::Frame {
+                bytes,
+                captured_at: now,
+            },
+            now,
+        );
     }
 
     fn remb(c: &mut Controller, now: Instant, bitrate_bps: u64) {

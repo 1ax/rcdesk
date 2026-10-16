@@ -777,6 +777,7 @@ impl VideoPipeline {
                         if let Some(tx) = &frame_feedback_tx {
                             let _ = tx.send(Feedback::Frame {
                                 bytes: frame.data.len(),
+                                captured_at: frame.captured_at,
                             });
                         }
                         if video_tx.send(frame).await.is_err() {
@@ -3039,6 +3040,20 @@ struct StatsSummary {
     remb_kbps: Option<u32>,
     rr_rtt_ms: Option<f64>,
     rr_jitter_ms: Option<f32>,
+    gap_ms_p50: Option<f64>,
+    gap_ms_p95: Option<f64>,
+    gap_ms_max: Option<f64>,
+}
+
+/// Nearest-rank percentile of an ascending-sorted slice: index
+/// `ceil(p/100 * n) - 1`, clamped to `0..n`. `None` for an empty slice.
+fn percentile_sorted(sorted: &[u64], p: f64) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let rank = (p / 100.0 * sorted.len() as f64).ceil() as usize;
+    let idx = rank.saturating_sub(1).min(sorted.len() - 1);
+    Some(sorted[idx])
 }
 
 /// `1.2`, or `-` when the value is unknown (log fields).
@@ -3066,6 +3081,12 @@ struct StatsWindow {
     keyframes: u64,
     keyframe_repeats: u64,
     encode_us_total: u64,
+    /// Capture time of the previous frame; deliberately kept across window
+    /// boundaries so the first gap of a window is measured from the last
+    /// frame of the previous one.
+    prev_captured_at: Option<Instant>,
+    /// Intervals between consecutive captured frames in this window, in us.
+    gaps_us: Vec<u64>,
 }
 
 impl StatsWindow {
@@ -3086,11 +3107,18 @@ impl StatsWindow {
             keyframes: stats.keyframes.load(Relaxed),
             keyframe_repeats: stats.keyframe_repeats.load(Relaxed),
             encode_us_total: stats.encode_us_total.load(Relaxed),
+            prev_captured_at: None,
+            gaps_us: Vec::new(),
         }
     }
 
-    fn frame(&mut self, bytes: usize) {
+    fn frame(&mut self, bytes: usize, captured_at: Instant) {
         self.bytes += bytes as u64;
+        if let Some(prev) = self.prev_captured_at {
+            self.gaps_us
+                .push(captured_at.saturating_duration_since(prev).as_micros() as u64);
+        }
+        self.prev_captured_at = Some(captured_at);
     }
 
     fn loss(&mut self, fraction: f32) {
@@ -3123,6 +3151,9 @@ impl StatsWindow {
         let encode_us_total = stats.encode_us_total.load(Relaxed);
         let d_encoded = encoded.saturating_sub(self.encoded);
         let d_us = encode_us_total.saturating_sub(self.encode_us_total);
+        let mut gaps = std::mem::take(&mut self.gaps_us);
+        gaps.sort_unstable();
+        let gap_ms = |v: Option<u64>| v.map(|us| us as f64 / 1000.0);
         let summary = StatsSummary {
             seconds,
             captured: captured.saturating_sub(self.captured),
@@ -3143,6 +3174,9 @@ impl StatsWindow {
             remb_kbps: self.last_remb_kbps,
             rr_rtt_ms: self.last_rr_rtt_ms,
             rr_jitter_ms: self.last_rr_jitter_ms,
+            gap_ms_p50: gap_ms(percentile_sorted(&gaps, 50.0)),
+            gap_ms_p95: gap_ms(percentile_sorted(&gaps, 95.0)),
+            gap_ms_max: gap_ms(gaps.last().copied()),
         };
         self.ticks = 0;
         self.bytes = 0;
@@ -3204,7 +3238,9 @@ async fn run_adapt_task(
                 match fb {
                     Some(fb) => {
                         match &fb {
-                            Feedback::Frame { bytes } => window.frame(*bytes),
+                            Feedback::Frame { bytes, captured_at } => {
+                                window.frame(*bytes, *captured_at)
+                            }
                             Feedback::Loss { fraction } => window.loss(*fraction),
                             Feedback::Remb { bitrate_bps } => window.remb((bitrate_bps / 1000) as u32),
                             Feedback::ReceiverStats { rtt, jitter_ms } => {
@@ -3252,6 +3288,9 @@ async fn run_adapt_task(
                     tracing::info!(
                         captured = s.captured,
                         encoded = s.encoded,
+                        gap_ms_p50 = %fmt_opt(s.gap_ms_p50),
+                        gap_ms_p95 = %fmt_opt(s.gap_ms_p95),
+                        gap_ms_max = %fmt_opt(s.gap_ms_max),
                         dropped = s.dropped,
                         paced_out = s.paced_out,
                         overwritten = s.overwritten,
@@ -3410,7 +3449,7 @@ mod tests {
         stats.encode_us_total.store(140 * 3000, Relaxed);
         stats.encode_us_max.store(12_000, Relaxed);
         for _ in 0..140 {
-            w.frame(5000);
+            w.frame(5000, Instant::now());
         }
         w.loss(0.02);
         w.receiver_stats(Some(Duration::from_millis(12)), 3.5);
@@ -3424,6 +3463,91 @@ mod tests {
         assert!((s.encode_ms_max - 12.0).abs() < 0.01);
         assert_eq!(s.loss, 0.02);
         assert_eq!(stats.encode_us_max.load(Relaxed), 0);
+    }
+
+    /// Feeds `n` frames spaced by `gaps_ms` (first frame at `start`), returns
+    /// the capture time of the last one.
+    fn feed_gaps(w: &mut StatsWindow, start: Instant, gaps_ms: &[u64]) -> Instant {
+        let mut t = start;
+        w.frame(1000, t);
+        for g in gaps_ms {
+            t += Duration::from_millis(*g);
+            w.frame(1000, t);
+        }
+        t
+    }
+
+    fn summary_after_ticks(
+        w: &mut StatsWindow,
+        stats: &crate::pipeline::PipelineStats,
+    ) -> StatsSummary {
+        for _ in 0..4 {
+            assert!(w.tick(stats).is_none());
+        }
+        w.tick(stats).expect("fifth tick yields a summary")
+    }
+
+    #[test]
+    fn gap_steady_stream_has_flat_percentiles() {
+        let stats = crate::pipeline::PipelineStats::default();
+        let mut w = StatsWindow::new(&stats);
+        feed_gaps(&mut w, Instant::now(), &[33; 30]);
+        let s = summary_after_ticks(&mut w, &stats);
+        assert_eq!(s.gap_ms_p50, Some(33.0));
+        assert_eq!(s.gap_ms_p95, Some(33.0));
+        assert_eq!(s.gap_ms_max, Some(33.0));
+    }
+
+    #[test]
+    fn gap_outlier_shows_in_max_not_median() {
+        let stats = crate::pipeline::PipelineStats::default();
+        let mut w = StatsWindow::new(&stats);
+        let mut gaps = vec![33_u64; 30];
+        gaps.push(100);
+        feed_gaps(&mut w, Instant::now(), &gaps);
+        let s = summary_after_ticks(&mut w, &stats);
+        assert_eq!(s.gap_ms_max, Some(100.0));
+        assert_eq!(s.gap_ms_p50, Some(33.0));
+    }
+
+    #[test]
+    fn gap_none_for_empty_and_single_frame_windows() {
+        let stats = crate::pipeline::PipelineStats::default();
+        let mut w = StatsWindow::new(&stats);
+        let s = summary_after_ticks(&mut w, &stats);
+        assert_eq!(
+            (s.gap_ms_p50, s.gap_ms_p95, s.gap_ms_max),
+            (None, None, None)
+        );
+        let mut w = StatsWindow::new(&stats);
+        w.frame(1000, Instant::now());
+        let s = summary_after_ticks(&mut w, &stats);
+        assert_eq!(
+            (s.gap_ms_p50, s.gap_ms_p95, s.gap_ms_max),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn gap_carries_over_window_boundary() {
+        let stats = crate::pipeline::PipelineStats::default();
+        let mut w = StatsWindow::new(&stats);
+        let last = feed_gaps(&mut w, Instant::now(), &[33; 10]);
+        summary_after_ticks(&mut w, &stats);
+        w.frame(1000, last + Duration::from_millis(50));
+        let s = summary_after_ticks(&mut w, &stats);
+        assert_eq!(s.gap_ms_p50, Some(50.0));
+        assert_eq!(s.gap_ms_p95, Some(50.0));
+        assert_eq!(s.gap_ms_max, Some(50.0));
+    }
+
+    #[test]
+    fn percentile_sorted_is_nearest_rank() {
+        assert_eq!(percentile_sorted(&[10, 20, 30, 40], 50.0), Some(20));
+        assert_eq!(percentile_sorted(&[10, 20, 30, 40], 95.0), Some(40));
+        assert_eq!(percentile_sorted(&[7], 50.0), Some(7));
+        assert_eq!(percentile_sorted(&[7], 95.0), Some(7));
+        assert_eq!(percentile_sorted(&[], 50.0), None);
     }
 
     #[test]
