@@ -58,6 +58,39 @@ impl RestartBudget {
     }
 }
 
+/// Сколько ждать возвращения дисплея после остановки потока (I7).
+const DISPLAY_RETURN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Шаг опроса при ожидании дисплея.
+const DISPLAY_RETURN_STEP: Duration = Duration::from_millis(250);
+
+/// Ошибка «дисплей не найден» из `build_capturer`.
+fn is_display_missing(err: &CaptureError) -> bool {
+    matches!(err, CaptureError::Backend(m)
+        if (m.starts_with("display ") && m.ends_with(" not found"))
+            || m == "no capturable display found")
+}
+
+/// Повторяет `build`, пока она падает с «дисплей не найден», не дольше
+/// `timeout` (шаг `step`, ожидание через `sleep`). Прочие ошибки -- сразу.
+/// По таймауту возвращает исходную ошибку.
+fn retry_while_display_missing<T>(
+    mut build: impl FnMut() -> Result<T, CaptureError>,
+    timeout: Duration,
+    step: Duration,
+    mut sleep: impl FnMut(Duration),
+) -> Result<T, CaptureError> {
+    let mut waited = Duration::ZERO;
+    loop {
+        match build() {
+            Err(err) if is_display_missing(&err) && waited < timeout => {
+                sleep(step);
+                waited += step;
+            }
+            other => return other,
+        }
+    }
+}
+
 pub struct ScapSource {
     capturer: Capturer,
     width: u32,
@@ -203,8 +236,23 @@ impl ScapSource {
                 "screen capture keeps stopping".into(),
             ));
         }
-        let (capturer, width, height) =
-            build_capturer(self.display_id, self.fps, &self.exclude_windows)?;
+        let (display_id, fps) = (self.display_id, self.fps);
+        let exclude_windows = &self.exclude_windows;
+        // Guard держится до конца функции (на не-macOS -- ZST без Drop).
+        let mut wake_guard = None;
+        let (capturer, width, height) = retry_while_display_missing(
+            || {
+                let res = build_capturer(display_id, fps, exclude_windows);
+                if matches!(&res, Err(e) if is_display_missing(e)) && wake_guard.is_none() {
+                    tracing::warn!("display gone after capture stop, waking and waiting");
+                    wake_guard = Some(crate::platform::display_wake::wake());
+                }
+                res
+            },
+            DISPLAY_RETURN_TIMEOUT,
+            DISPLAY_RETURN_STEP,
+            std::thread::sleep,
+        )?;
         if (width, height) != (self.width, self.height) {
             tracing::error!(
                 old_width = self.width,
@@ -296,6 +344,63 @@ impl Drop for ScapSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn missing() -> CaptureError {
+        CaptureError::Backend("display 3 not found".into())
+    }
+
+    #[test]
+    fn retry_succeeds_when_display_returns_on_third_attempt() {
+        let mut calls = 0;
+        let mut slept = 0;
+        let res = retry_while_display_missing(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(missing())
+                } else {
+                    Ok(calls)
+                }
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(250),
+            |_| slept += 1,
+        );
+        assert_eq!(res.unwrap(), 3);
+        assert_eq!(slept, 2);
+    }
+
+    #[test]
+    fn retry_gives_original_error_after_timeout() {
+        let mut calls = 0;
+        let res: Result<(), _> = retry_while_display_missing(
+            || {
+                calls += 1;
+                Err(missing())
+            },
+            Duration::from_secs(1),
+            Duration::from_millis(250),
+            |_| {},
+        );
+        assert!(matches!(res, Err(ref e) if is_display_missing(e)));
+        assert_eq!(calls, 5);
+    }
+
+    #[test]
+    fn retry_returns_other_errors_immediately() {
+        let mut calls = 0;
+        let res: Result<(), _> = retry_while_display_missing(
+            || {
+                calls += 1;
+                Err(CaptureError::PermissionDenied)
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(250),
+            |_| panic!("must not sleep"),
+        );
+        assert!(matches!(res, Err(CaptureError::PermissionDenied)));
+        assert_eq!(calls, 1);
+    }
 
     #[test]
     fn budget_allows_three_then_denies() {

@@ -983,6 +983,10 @@ struct ActiveSession {
     /// выключена. Передаётся в `build_source` при каждой пересборке
     /// конвейера (смена дисплея не должна выдать шторку в видео).
     curtain_windows: Vec<u32>,
+    /// Guard пробуждения дисплея (слайс I7): держит и продлевает «активность
+    /// пользователя» весь сеанс; отпускается при дропе `ActiveSession`.
+    /// `Mutex` лишь делает поле `Sync` (`ActiveSession` держат через `.await`).
+    _display_wake: std::sync::Mutex<Box<dyn Send>>,
     /// Раскладка хоста (слайс 4.6c), копия `HostContext::input_source`.
     input_source: Option<Arc<dyn InputSourceSwitcher>>,
     /// Фоновый опрос раскладки: шлёт `InputSource` при изменении. `None`
@@ -1731,6 +1735,7 @@ async fn begin_session(
                     quality_preset: QualityPreset::Auto,
                     curtain: ctx.curtain.clone(),
                     curtain_windows: parts.curtain_windows,
+                    _display_wake: parts._display_wake,
                     input_source: ctx.input_source.clone(),
                     input_source_task: ctx.input_source.clone().map(|switcher| {
                         spawn_input_source_poll(
@@ -2666,6 +2671,8 @@ struct SessionParts {
     files_enabled: bool,
     /// See `ActiveSession::curtain_windows`.
     curtain_windows: Vec<u32>,
+    /// See `ActiveSession::_display_wake`.
+    _display_wake: std::sync::Mutex<Box<dyn Send>>,
 }
 
 /// Combines one session's ICE credentials with the extra `--stun` servers
@@ -2800,8 +2807,10 @@ async fn start_session_with_display_wait(
     events: mpsc::Sender<SessionEvent>,
     display_wait_timeout: Duration,
 ) -> anyhow::Result<SessionParts> {
-    // Слайс 4.6a: будим дисплей и ждём, пока он появится в списке; guard
-    // отпускаем сразу после выбора -- дальше его держит `SessionActivity`.
+    // Слайс 4.6a: будим дисплей и ждём, пока он появится в списке. Слайс I7:
+    // guard НЕ отпускаем после выбора -- macOS гасит разбуженный дисплей через
+    // ~10 с, поэтому он продлевает активность весь сеанс (живёт в
+    // `SessionParts` -> `ActiveSession`, дропается вместе с сеансом).
     let wake_guard = (ctx.wake_display)();
     let (displays, start_display) = wait_for_value(
         || {
@@ -2828,7 +2837,6 @@ async fn start_session_with_display_wait(
         DISPLAY_WAIT_STEP,
     )
     .await?;
-    drop(wake_guard);
 
     let keyframe_flag = Arc::new(AtomicBool::new(false));
     let (video_tx, video_rx) = mpsc::channel(4);
@@ -3007,6 +3015,7 @@ async fn start_session_with_display_wait(
         files_task,
         files_enabled,
         curtain_windows,
+        _display_wake: std::sync::Mutex::new(wake_guard),
     })
 }
 
