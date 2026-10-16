@@ -41,6 +41,9 @@ pub fn init_named(log_dir: &Path, file_name: &str) -> io::Result<PathBuf> {
         .append(true)
         .open(&log_path)?;
 
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -48,6 +51,8 @@ pub fn init_named(log_dir: &Path, file_name: &str) -> io::Result<PathBuf> {
         )
         .with_ansi(false)
         .with_writer(Mutex::new(file))
+        .finish()
+        .with(crate::log_throttle::LogThrottle::default())
         .init();
 
     install_panic_hook();

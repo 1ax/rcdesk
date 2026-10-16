@@ -31,6 +31,7 @@ pub mod files;
 mod fsutil;
 pub mod input;
 pub mod input_source;
+pub mod log_throttle;
 pub mod pipeline;
 pub mod platform;
 pub mod service;

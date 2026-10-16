@@ -310,6 +310,9 @@ fn init_logging(command: &Command) {
     #[cfg(not(target_os = "windows"))]
     let _ = command;
 
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     tracing_subscriber::fmt()
         // Slice 3.2 fix: the classic Windows console (cmd.exe on the Win10
         // stand) doesn't interpret ANSI escapes unless VT processing is
@@ -321,6 +324,8 @@ fn init_logging(command: &Command) {
                 tracing_subscriber::EnvFilter::new(rcdesk_host::DEFAULT_LOG_FILTER)
             }),
         )
+        .finish()
+        .with(rcdesk_host::log_throttle::LogThrottle::default())
         .init();
 }
 
