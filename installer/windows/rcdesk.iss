@@ -266,7 +266,8 @@ begin
       RunHostAsUser('autostart off')
     else
     begin
-      RunHostAsUser('autostart on');
+      // restore: не включать, если пользователь выключил автозапуск в меню агента.
+      RunHostAsUser('autostart restore');
       LaunchAgent;
     end;
   end;

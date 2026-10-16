@@ -25,10 +25,12 @@ echo "rcdesk postinstall: пользователь $user (uid $uid)"
 # вызывает), поэтому запускаем его от имени пользователя, а не root. `-H`
 # обязателен: хост берёт домашний каталог из $HOME, а sudo на macOS по
 # умолчанию оставляет HOME вызывающего (root) -- plist лёг бы в /var/root.
-if sudo -H -u "$user" "$APP/Contents/MacOS/rcdesk-host" autostart on; then
-  echo "rcdesk postinstall: автозапуск включён"
+# `restore` включает автозапуск, только если пользователь не выключал его в
+# меню агента (метка autostart-disabled); итог печатает сама команда.
+if autostart_out="$(sudo -H -u "$user" "$APP/Contents/MacOS/rcdesk-host" autostart restore 2>&1)"; then
+  echo "rcdesk postinstall: $autostart_out"
 else
-  echo "rcdesk postinstall: не удалось включить автозапуск (код $?)"
+  echo "rcdesk postinstall: не удалось настроить автозапуск (код $?): $autostart_out"
 fi
 
 # Запуск агента через launchd, а не `open -a` (I9). Агент держит блокировку

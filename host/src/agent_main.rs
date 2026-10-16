@@ -586,8 +586,22 @@ mod imp {
             } else {
                 platform::autostart::disable()
             };
-            if let Err(err) = result {
-                tracing::warn!(error = %err, "failed to change the start-at-login registration");
+            match result {
+                Ok(()) => {
+                    // Remember the user's explicit choice so installer
+                    // updates (`autostart restore`) respect it.
+                    let marker = if want_enabled {
+                        agent::autostart::clear_disabled()
+                    } else {
+                        agent::autostart::mark_disabled()
+                    };
+                    if let Err(err) = marker {
+                        tracing::warn!(error = %err, "failed to update the autostart-disabled marker");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to change the start-at-login registration");
+                }
             }
         }
 

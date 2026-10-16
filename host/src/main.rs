@@ -187,6 +187,9 @@ enum AutostartAction {
     On,
     /// Remove the "start at login" registration.
     Off,
+    /// Turn autostart on unless the user switched it off in the agent menu
+    /// (used by the installers on every install/update).
+    Restore,
     /// Print whether autostart is currently on, and for which path.
     Status,
 }
@@ -359,7 +362,18 @@ fn run_autostart(action: AutostartAction) -> anyhow::Result<()> {
     match action {
         AutostartAction::On => {
             rcdesk_host::platform::autostart::enable(&agent)?;
+            if let Err(err) = rcdesk_host::agent::autostart::clear_disabled() {
+                tracing::warn!(error = %err, "failed to clear the autostart-disabled marker");
+            }
             println!("autostart: on ({})", agent.display());
+        }
+        AutostartAction::Restore => {
+            if rcdesk_host::agent::autostart::is_disabled_by_user() {
+                println!("autostart: off (disabled by user)");
+            } else {
+                rcdesk_host::platform::autostart::enable(&agent)?;
+                println!("autostart: on ({})", agent.display());
+            }
         }
         AutostartAction::Off => {
             rcdesk_host::platform::autostart::disable()?;

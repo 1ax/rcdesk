@@ -11,7 +11,11 @@
 //!
 //! Off by default everywhere: nothing in this module or its platform
 //! counterparts runs at startup -- only `rcdesk-agent`'s "Start at login"
-//! menu item and `rcdesk-host autostart on` call `enable`.
+//! menu item, `rcdesk-host autostart on` and `rcdesk-host autostart restore`
+//! (used by the installers) call `enable`. `restore` skips it when the user
+//! switched autostart off in the agent menu: that choice is remembered as the
+//! `autostart-disabled` marker file in the data directory (see
+//! `mark_disabled`), so an update doesn't silently turn autostart back on.
 
 use std::path::{Path, PathBuf};
 
@@ -99,6 +103,43 @@ pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     } else {
         path.to_path_buf()
     }
+}
+
+// --- "disabled by user" marker -----------------------------------------------
+
+const DISABLED_MARKER_FILE: &str = "autostart-disabled";
+
+fn mark_disabled_in(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join(DISABLED_MARKER_FILE), b"")
+}
+
+fn clear_disabled_in(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(dir.join(DISABLED_MARKER_FILE)) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn is_disabled_in(dir: &Path) -> bool {
+    dir.join(DISABLED_MARKER_FILE).exists()
+}
+
+/// Records that the user turned autostart off on purpose (agent menu), so
+/// installers' `autostart restore` leaves it off after an update.
+pub fn mark_disabled() -> std::io::Result<()> {
+    mark_disabled_in(&super::paths::data_dir())
+}
+
+/// Removes the "disabled by user" marker; a missing marker is not an error.
+pub fn clear_disabled() -> std::io::Result<()> {
+    clear_disabled_in(&super::paths::data_dir())
+}
+
+/// Whether the user turned autostart off on purpose (marker present).
+pub fn is_disabled_by_user() -> bool {
+    is_disabled_in(&super::paths::data_dir())
 }
 
 // --- macOS: LaunchAgent plist XML -------------------------------------------
@@ -207,6 +248,44 @@ pub fn run_value_matches(stored: &str, agent: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rcdesk-autostart-marker-test-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    #[test]
+    fn marker_absent_by_default() {
+        let dir = scratch_dir("absent");
+        assert!(!is_disabled_in(&dir));
+    }
+
+    #[test]
+    fn mark_creates_missing_dir_then_clear_removes() {
+        let dir = scratch_dir("round-trip");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!dir.exists());
+
+        mark_disabled_in(&dir).unwrap();
+        assert!(dir.join(DISABLED_MARKER_FILE).exists());
+        assert!(is_disabled_in(&dir));
+
+        // Marking twice is fine.
+        mark_disabled_in(&dir).unwrap();
+
+        clear_disabled_in(&dir).unwrap();
+        assert!(!is_disabled_in(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_missing_marker_is_ok() {
+        let dir = scratch_dir("clear-missing");
+        clear_disabled_in(&dir).unwrap();
+    }
 
     #[test]
     fn sibling_agent_path_picks_name_by_os() {
