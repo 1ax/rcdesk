@@ -84,7 +84,7 @@ tray-icon = { version = "0.25", default-features = false }
 # (там 8 аргументов). Прямой пин держит lock-файл на совместимой версии даже после
 # `cargo update`. Убрать при переходе на прямой windows-capture 2.x (долг D3/D5).
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-capture = "=1.4.4"
+windows-capture = "=1.5.0"
 # Версия совпадает с той, что уже тянет windows-capture 1.4.4 (см. Cargo.lock) --
 # не добавляет вторую версию `windows` в граф.
 windows = { version = "0.61", features = [
