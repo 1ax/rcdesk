@@ -65,8 +65,10 @@ mod imp {
 
     /// Первая проверка обновлений -- через столько после старта агента (4.3d).
     const UPDATE_FIRST_CHECK_DELAY: Duration = Duration::from_secs(60);
-    /// Дальше -- раз в сутки.
-    const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+    /// Дальше -- раз в час (D70: при раз в сутки пункт меню после релиза
+    /// появлялся только после перезапуска агента). Проверка -- один `HEAD`
+    /// на github.com без API, лимитов нет.
+    const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
     #[derive(Parser)]
     #[command(name = "rcdesk-agent", version = rcdesk_host::build_info::FULL_VERSION, about = "rcdesk tray agent")]
