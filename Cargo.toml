@@ -23,18 +23,18 @@ openh264 = "0.9"
 openh264-sys2 = "0.9"
 scap = "0.0.8"
 clap = { version = "4", features = ["derive"] }
-webrtc = "0.20"
-rtc = "0.20"
+webrtc = "0.21"
+rtc = "0.21"
 bytes = "1"
 async-trait = "0.1"
 enigo = "0.6"
-base64 = "0.22"
+base64 = "0.23"
 rusqlite = { version = "0.40", features = ["bundled"] }
 opaque-ke = { version = "4.0", features = ["argon2"] }
-argon2 = "0.5"
-sha2 = "0.10"
+argon2 = "0.6"
+sha2 = "0.11"
 rpassword = "7"
-hmac = "0.12"
+hmac = "0.13"
 
 [patch.crates-io]
 rtc-sctp = { path = "vendor/rtc-sctp" }

@@ -24,9 +24,9 @@ serde_json = { workspace = true }
 rand = { workspace = true }
 futures-util = "0.3"
 base64 = { workspace = true }
-hmac = "0.12"
-sha1 = "0.10"
-sha2 = "0.10"
+hmac = "0.13"
+sha1 = "0.11"
+sha2 = "0.11"
 rusqlite = { workspace = true }
 argon2 = { workspace = true }
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
