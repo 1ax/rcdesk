@@ -31,14 +31,50 @@ else
   echo "rcdesk postinstall: не удалось включить автозапуск (код $?)"
 fi
 
-# Запуск в GUI-сессии пользователя: `launchctl asuser <uid>` переносит команду
-# в bootstrap-контекст сессии (иначе open из root-скрипта установщика не
-# достучится до WindowServer), `sudo -u` снимает права root, чтобы агент
-# работал от пользователя.
-if launchctl asuser "$uid" sudo -H -u "$user" /usr/bin/open -a "$APP"; then
-  echo "rcdesk postinstall: агент запущен"
-else
-  echo "rcdesk postinstall: не удалось запустить агент (код $?)"
+# Запуск агента через launchd, а не `open -a` (I9). Агент держит блокировку
+# единственного экземпляра и при занятой блокировке выходит с кодом 0, а
+# KeepAlive {SuccessfulExit=false} после успешного выхода не перезапускает.
+# Запущенный в обход launchd экземпляр (open) занимает блокировку; поздно
+# стартовавшая launchd-копия выходит с 0, и задание остаётся без процесса.
+# Агент оказывается вне launchd, и после jetsam его никто не поднимает.
+# Поэтому: bootstrap (при уже загруженном задании -- kickstart -k), а `open -a`
+# оставлен только запасным путём.
+label="app.rcdesk.agent"
+started=0
+
+home="$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p' || true)"
+plist=""
+if [ -n "$home" ]; then
+  plist="$home/Library/LaunchAgents/$label.plist"
 fi
+
+if [ -n "$plist" ] && [ -f "$plist" ]; then
+  if launchctl bootstrap "gui/$uid" "$plist"; then
+    echo "rcdesk postinstall: задание $label загружено через launchctl bootstrap"
+    started=1
+  elif launchctl kickstart -k "gui/$uid/$label"; then
+    echo "rcdesk postinstall: задание $label уже было загружено, перезапущено через kickstart -k"
+    started=1
+  else
+    echo "rcdesk postinstall: bootstrap и kickstart не удались, запасной путь через open"
+  fi
+else
+  echo "rcdesk postinstall: plist '$plist' не найден, запасной путь через open"
+fi
+
+if [ "$started" -eq 0 ]; then
+  # `launchctl asuser <uid>` переносит команду в bootstrap-контекст сессии
+  # (иначе open из root-скрипта установщика не достучится до WindowServer),
+  # `sudo -u` снимает права root, чтобы агент работал от пользователя.
+  if launchctl asuser "$uid" sudo -H -u "$user" /usr/bin/open -a "$APP"; then
+    echo "rcdesk postinstall: агент запущен через open"
+  else
+    echo "rcdesk postinstall: не удалось запустить агент (код $?)"
+  fi
+fi
+
+# Диагностика состояния задания (не валит установку, если задания нет).
+sleep 1
+launchctl print "gui/$uid/$label" 2>/dev/null | grep -E '^[[:space:]]*(state =|pid =|last exit code)' | sed 's/^[[:space:]]*/rcdesk postinstall: /' || echo "rcdesk postinstall: задание $label не загружено"
 
 exit 0

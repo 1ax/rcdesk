@@ -1,4 +1,59 @@
 #!/bin/bash
-# Перед заменой файлов закрываем запущенные агенты (у всех пользователей).
+# Перед заменой файлов останавливаем запущенные агенты (у всех пользователей).
+# Скрипт идёт от root. Сначала выгружаем задание из launchd (I9): иначе голый
+# SIGTERM launchd считает неуспешным выходом, и по KeepAlive {SuccessfulExit=false}
+# он мгновенно перезапускает СТАРЫЙ бинарник до замены payload -- файлы потом
+# ложатся поверх работающего процесса, и TCC отказывает.
+# Ошибки не валят установку.
+
+LABEL="app.rcdesk.agent"
+
+uids=""
+add_uid() {
+  case " $uids " in
+    *" $1 "*) ;;
+    *) uids="$uids $1" ;;
+  esac
+}
+
+# Пользователь консоли.
+console_user="$(stat -f %Su /dev/console 2>/dev/null || true)"
+case "$console_user" in
+  "" | root | loginwindow) ;;
+  *)
+    cuid="$(id -u "$console_user" 2>/dev/null || true)"
+    if [ -n "$cuid" ]; then add_uid "$cuid"; fi
+    ;;
+esac
+
+# Владельцы запущенных процессов rcdesk-agent.
+while read -r puid pcomm; do
+  case "$pcomm" in
+    rcdesk-agent | */rcdesk-agent) add_uid "$puid" ;;
+  esac
+done < <(ps -axo uid=,comm= 2>/dev/null || true)
+
+for uid in $uids; do
+  if launchctl bootout "gui/$uid/$LABEL" >/dev/null 2>&1; then
+    echo "rcdesk preinstall: uid $uid: задание $LABEL выгружено"
+  else
+    echo "rcdesk preinstall: uid $uid: задание $LABEL не было загружено"
+  fi
+done
+
+# Экземпляры, запущенные не через launchd.
 pkill -x rcdesk-agent || true
+
+# Ждём исчезновения процессов: до 5 с с шагом 0.25 с.
+i=0
+while pgrep -x rcdesk-agent >/dev/null 2>&1 && [ "$i" -lt 20 ]; do
+  sleep 0.25
+  i=$((i + 1))
+done
+if pgrep -x rcdesk-agent >/dev/null 2>&1; then
+  echo "rcdesk preinstall: предупреждение: rcdesk-agent всё ещё работает, продолжаем"
+else
+  echo "rcdesk preinstall: агенты остановлены"
+fi
+
 exit 0
