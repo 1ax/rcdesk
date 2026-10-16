@@ -33,6 +33,7 @@ import {
   FileSender,
   chooseChunkSize,
   downloadFailLabel,
+  downloadFileName,
   dragHasFiles,
   failReasonLabel,
   groupByRelativePath,
@@ -1013,7 +1014,7 @@ export function mount(root: Element | null): void {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = name;
+    a.download = downloadFileName(name);
     a.style.display = "none";
     document.body.appendChild(a);
     a.click();

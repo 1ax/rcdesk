@@ -328,6 +328,21 @@ export function downloadFailLabel(reason: DownloadFailReason): string {
   return DOWNLOAD_REASON_LABELS[reason];
 }
 
+/**
+ * File name safe to hand to `a.download` (slice I9a). macOS puts U+202F
+ * (narrow no-break space) into localized dates, and Chrome on Windows aborts
+ * such downloads. Normalizes to NFC, turns every space separator into a plain
+ * space, drops control/format characters, trims; falls back to "file".
+ */
+export function downloadFileName(name: string): string {
+  const cleaned = name
+    .normalize("NFC")
+    .replace(/\p{Zs}/gu, " ")
+    .replace(/[\p{Cc}\p{Cf}]/gu, "")
+    .trim();
+  return cleaned === "" ? "file" : cleaned;
+}
+
 export interface FileReceiverCallbacks {
   /** The host offers `files` (empty with no folders: the offer is gone). */
   onOffer?: (files: OfferedFile[], skippedFolders: number) => void;

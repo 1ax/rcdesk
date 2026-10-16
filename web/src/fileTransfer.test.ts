@@ -8,6 +8,7 @@ import {
   MAX_DOWNLOAD_BYTES,
   chooseChunkSize,
   downloadFailLabel,
+  downloadFileName,
   dragHasFiles,
   failReasonLabel,
   groupByRelativePath,
@@ -701,5 +702,32 @@ describe("downloadFailLabel", () => {
     for (const r of ["cancelled", "disabled", "io", "protocol", "closed", "too_large"] as const) {
       expect(downloadFailLabel(r).length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("downloadFileName", () => {
+  it("replaces U+202F and U+00A0 with a plain space", () => {
+    expect(downloadFileName("Сканирование 16\u202Fокт. 2026\u202Fг..pdf")).toBe("Сканирование 16 окт. 2026 г..pdf");
+    expect(downloadFileName("a\u00A0b.txt")).toBe("a b.txt");
+  });
+
+  it("composes decomposed letters to NFC", () => {
+    const out = downloadFileName("\u0438\u0306.txt");
+    expect(out).toBe("\u0439.txt");
+    expect(out.length).toBe(5);
+  });
+
+  it("drops format and control characters", () => {
+    expect(downloadFileName("a\u200Eb.pdf")).toBe("ab.pdf");
+    expect(downloadFileName("a\u0007b.pdf")).toBe("ab.pdf");
+  });
+
+  it("falls back to file when nothing is left", () => {
+    expect(downloadFileName("")).toBe("file");
+    expect(downloadFileName("\u200E")).toBe("file");
+  });
+
+  it("leaves an ordinary name alone", () => {
+    expect(downloadFileName("report.docx")).toBe("report.docx");
   });
 });
