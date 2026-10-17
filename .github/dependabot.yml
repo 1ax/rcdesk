@@ -11,6 +11,9 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
+      # Закреплён на =1.4.4: scap 0.0.8 ломается на 1.5+ (host/Cargo.toml,
+      # долги D3/D5). Снять вместе с переходом на прямой windows-capture 2.x.
+      - dependency-name: "windows-capture"
     groups:
       cargo:
         patterns: ["*"]
