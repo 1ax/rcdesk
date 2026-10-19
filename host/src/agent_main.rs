@@ -231,6 +231,20 @@ mod imp {
             }
         });
 
+        // D56: остатки прошлого обновления (`<данные>/update`) убираем с задержкой,
+        // когда установщик заведомо отпустил файлы; свежий каталог (обновление
+        // запущено в эти 10 минут) не трогаем.
+        runtime.spawn(async {
+            tokio::time::sleep(updater::LEFTOVER_CLEANUP_DELAY).await;
+            let _ = tokio::task::spawn_blocking(|| {
+                updater::cleanup_leftovers(
+                    &agent::paths::data_dir(),
+                    updater::LEFTOVER_CLEANUP_DELAY,
+                );
+            })
+            .await;
+        });
+
         // macOS only: bring up `NSApplication` on this (main) thread before
         // the first pump -- `tray-icon` requires the event loop already
         // running before a `TrayIcon` is built. Windows' `tray-icon` backend

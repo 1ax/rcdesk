@@ -8,6 +8,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 
@@ -115,6 +116,40 @@ impl RunGuard {
 impl Drop for RunGuard {
     fn drop(&mut self) {
         UPDATE_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Через сколько после старта агента убирать остатки прошлого обновления.
+/// Новый агент запускается из установщика, пока тот ещё может держать файл
+/// (на Windows `.exe` заблокирован), поэтому чистим не сразу, а с запасом.
+pub const LEFTOVER_CLEANUP_DELAY: Duration = Duration::from_secs(10 * 60);
+
+/// Удаляет `<work_dir>/update` (манифест, подпись, ~10 МБ установщика) после
+/// успешного обновления: иначе каталог лежит до следующего обновления.
+/// Вызывать отложенно (`LEFTOVER_CLEANUP_DELAY`) -- сразу после старта установщик
+/// может ещё держать файл. Если обновление идёт (замок `UPDATE_RUNNING`) или каталог
+/// моложе `min_age` (обновление запущено недавно, установщик может ещё работать),
+/// ничего не делает. Best effort: ошибки только логируются.
+pub fn cleanup_leftovers(work_dir: &Path, min_age: Duration) {
+    let Ok(_guard) = RunGuard::acquire() else {
+        tracing::debug!("очистка остатков обновления: обновление идёт, пропуск");
+        return;
+    };
+    let dir = work_dir.join("update");
+    let age = std::fs::metadata(&dir)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok());
+    if age.is_some_and(|age| age < min_age) {
+        tracing::debug!(dir = %dir.display(), "очистка остатков обновления: каталог свежий, пропуск");
+        return;
+    }
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => tracing::info!(dir = %dir.display(), "удалены остатки обновления"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::debug!(dir = %dir.display(), error = %e, "не удалось удалить остатки обновления");
+        }
     }
 }
 
@@ -316,6 +351,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_update_dir() {
+        let _s = SERIAL.lock().await;
+        let work = tmp("cleanup-ok");
+        let up = work.join("update");
+        std::fs::create_dir_all(&up).unwrap();
+        std::fs::write(up.join(ASSET), b"x").unwrap();
+        cleanup_leftovers(&work, Duration::ZERO);
+        assert!(!up.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_a_fresh_update_dir() {
+        let _s = SERIAL.lock().await;
+        let work = tmp("cleanup-fresh");
+        let up = work.join("update");
+        std::fs::create_dir_all(&up).unwrap();
+        std::fs::write(up.join(ASSET), b"x").unwrap();
+        cleanup_leftovers(&work, Duration::from_secs(3600));
+        assert!(up.join(ASSET).exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_without_dir_is_noop() {
+        let _s = SERIAL.lock().await;
+        let work = tmp("cleanup-missing");
+        cleanup_leftovers(&work, Duration::ZERO);
+        assert!(work.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_skips_while_update_running() {
+        let _s = SERIAL.lock().await;
+        let work = tmp("cleanup-busy");
+        let up = work.join("update");
+        std::fs::create_dir_all(&up).unwrap();
+        std::fs::write(up.join(ASSET), b"x").unwrap();
+        {
+            let _g = RunGuard::acquire().unwrap();
+            cleanup_leftovers(&work, Duration::ZERO);
+            assert!(up.join(ASSET).exists());
+        }
+        cleanup_leftovers(&work, Duration::ZERO);
+        assert!(!up.exists());
     }
 
     #[tokio::test]
