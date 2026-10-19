@@ -321,11 +321,41 @@ impl Drop for ActiveReceive {
             // Close the handle first (an open file cannot be removed on
             // Windows).
             self.file.take();
-            // Best effort: nothing useful to do if removal fails.
-            let _ = std::fs::remove_file(&self.part_path);
-            let _ = std::fs::remove_file(&self.final_path);
+            remove_with_retry(vec![self.part_path.clone(), self.final_path.clone()]);
         }
     }
+}
+
+/// How many more times `remove_with_retry` tries a file that could not be
+/// removed right away, and how long it waits before each try (5 s in all).
+const REMOVE_RETRIES: u32 = 20;
+const REMOVE_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Removes `paths`, best effort. A file that cannot be removed right away is
+/// retried for a few seconds on a background thread: on Windows a freshly
+/// created file is often held open by an antivirus scan (Defender on CI),
+/// and `DeleteFile` fails with a sharing violation until it lets go -- the
+/// part file and placeholder would then stay in Downloads forever. A plain
+/// thread, not a tokio task: `Drop` may run during runtime shutdown.
+fn remove_with_retry(paths: Vec<PathBuf>) {
+    let try_remove = |path: &PathBuf| match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    };
+    let mut left: Vec<PathBuf> = paths.into_iter().filter(|p| !try_remove(p)).collect();
+    if left.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        for _ in 0..REMOVE_RETRIES {
+            std::thread::sleep(REMOVE_RETRY_DELAY);
+            left.retain(|p| !try_remove(p));
+            if left.is_empty() {
+                return;
+            }
+        }
+        tracing::warn!(files = ?left, "could not remove files of an aborted transfer");
+    });
 }
 
 /// Receiving side of the `file` channel for one session.
@@ -1639,8 +1669,9 @@ mod tests {
         assert!(dir.join("a.bin.rcdesk-part").exists());
         task.abort();
         let _ = task.await;
-        // The cleanup may finish slightly later on a blocking thread.
-        for _ in 0..200 {
+        // The cleanup may finish later on a blocking thread, or after the
+        // retries of `remove_with_retry` (Windows).
+        for _ in 0..800 {
             if h.files().is_empty() {
                 break;
             }
@@ -1659,7 +1690,7 @@ mod tests {
                 create_unique(&h.dir, "a.bin", 1, 10),
             )
             .await;
-            for _ in 0..200 {
+            for _ in 0..800 {
                 if h.files().is_empty() {
                     break;
                 }
