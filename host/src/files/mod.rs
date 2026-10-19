@@ -197,35 +197,66 @@ fn with_suffix(name: &str, n: u32) -> String {
 }
 
 /// Reserves a free final name in `dir` (`create_new`, race-free) together
-/// with its `.rcdesk-part` file. Returns the part file, its path, the final
-/// path and the final file name.
+/// with its `.rcdesk-part` file, and returns them owned by an
+/// [`ActiveReceive`].
+///
+/// Cancel-safe: all file creation runs inside ONE blocking task that returns
+/// the already-guarding `ActiveReceive`. If the awaiting future is dropped
+/// (task abort, session close), the blocking task still finishes and its
+/// result is dropped, whose `Drop` removes both files. Doing this with several
+/// awaited `tokio::fs` calls would leak files created in between.
 async fn create_unique(
     dir: &Path,
     name: &str,
-) -> std::io::Result<(tokio::fs::File, PathBuf, PathBuf, String)> {
+    id: u32,
+    size: u64,
+) -> std::io::Result<ActiveReceive> {
+    let dir = dir.to_path_buf();
+    let name = name.to_string();
+    tokio::task::spawn_blocking(move || create_unique_blocking(&dir, &name, id, size))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+fn create_unique_blocking(
+    dir: &Path,
+    name: &str,
+    id: u32,
+    size: u64,
+) -> std::io::Result<ActiveReceive> {
+    use std::fs::OpenOptions;
     for n in 0..10_000u32 {
         let candidate = with_suffix(name, n);
         let final_path = dir.join(&candidate);
         let part_path = dir.join(format!("{candidate}{PART_SUFFIX}"));
-        match tokio::fs::OpenOptions::new()
+        match OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&final_path)
-            .await
         {
             Ok(_placeholder) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
-        match tokio::fs::OpenOptions::new()
+        match OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&part_path)
-            .await
         {
-            Ok(file) => return Ok((file, part_path, final_path, candidate)),
+            Ok(file) => {
+                return Ok(ActiveReceive {
+                    id,
+                    size,
+                    written: 0,
+                    file: Some(tokio::fs::File::from_std(file)),
+                    part_path,
+                    final_path,
+                    final_name: candidate,
+                    finished: false,
+                })
+            }
             Err(e) => {
-                let _ = tokio::fs::remove_file(&final_path).await;
+                let _ = std::fs::remove_file(&final_path);
                 if e.kind() == std::io::ErrorKind::AlreadyExists {
                     continue;
                 }
@@ -271,7 +302,8 @@ async fn create_unique_dir(parent: &Path, name: &str) -> std::io::Result<PathBuf
 }
 
 /// One transfer in progress. Dropping it without `finished` removes the
-/// part file and the reserved placeholder (also on task cancellation).
+/// part file and the reserved placeholder (also on task cancellation); see
+/// `create_unique` for why it is built inside the blocking task.
 struct ActiveReceive {
     id: u32,
     size: u64,
@@ -418,24 +450,15 @@ impl Receiver {
         let clean = sanitize_file_name(&name);
         let created = match tokio::fs::create_dir_all(&dir).await {
             Ok(()) => match self.target_dir(&dir, folder, rel_dir.as_deref()).await {
-                Ok(target) => create_unique(&target, &clean).await,
+                Ok(target) => create_unique(&target, &clean, id, size).await,
                 Err(e) => Err(e),
             },
             Err(e) => Err(e),
         };
         match created {
-            Ok((file, part_path, final_path, final_name)) => {
-                tracing::debug!(id, name = %final_name, size, "file receive started");
-                self.active = Some(ActiveReceive {
-                    id,
-                    size,
-                    written: 0,
-                    file: Some(file),
-                    part_path,
-                    final_path,
-                    final_name,
-                    finished: false,
-                });
+            Ok(active) => {
+                tracing::debug!(id, name = %active.final_name, size, "file receive started");
+                self.active = Some(active);
             }
             Err(err) => {
                 tracing::warn!(?err, "cannot create file for incoming transfer");
@@ -1616,7 +1639,34 @@ mod tests {
         assert!(dir.join("a.bin.rcdesk-part").exists());
         task.abort();
         let _ = task.await;
+        // The cleanup may finish slightly later on a blocking thread.
+        for _ in 0..200 {
+            if h.files().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert!(h.files().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_create_unique_midway_leaves_no_files() {
+        let h = Harness::new(true);
+        std::fs::create_dir_all(&h.dir).unwrap();
+        for _ in 0..20 {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_micros(1),
+                create_unique(&h.dir, "a.bin", 1, 10),
+            )
+            .await;
+            for _ in 0..200 {
+                if h.files().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(h.files().is_empty(), "leaked: {:?}", h.files());
+        }
     }
 
     #[tokio::test]
