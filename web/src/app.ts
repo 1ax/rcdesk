@@ -52,6 +52,7 @@ import {
 } from "./fullscreen";
 import type { NavigatorWithKeyboard } from "./fullscreen";
 import { ScreenWakeLock } from "./wakeLock";
+import { VideoResume } from "./videoResume";
 import { inputBlockedLabel } from "./inputBlocked";
 import { hostOutdatedLabel, updateStatusLabel } from "./hostVersion";
 import { hostSupportsText } from "./softKeyboard";
@@ -566,6 +567,11 @@ export function mount(root: Element | null): void {
     wakeLock.enable();
     updateConnectionBanner();
   });
+  // D67a: OS sleep/lock makes the browser pause the remote video while frames
+  // keep arriving; un-pause it for the whole session (also polled from the
+  // stats tick). Attached once -- `video` lives as long as the page.
+  const videoResume = new VideoResume(video, () => session !== null, () => Date.now());
+  videoResume.attach(document);
   const overlay = root.querySelector<HTMLSpanElement>("#stats-overlay")!;
   const connectionBannerEl = root.querySelector<HTMLDivElement>("#connection-banner")!;
   const sessionStatus = root.querySelector<HTMLSpanElement>("#session-status")!;
@@ -2171,6 +2177,7 @@ export function mount(root: Element | null): void {
     statsTimer = setInterval(() => {
       const current = session;
       if (!current) return;
+      videoResume.check("tick");
       current
         .getStats()
         .then((report) => {
