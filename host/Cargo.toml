@@ -51,7 +51,7 @@ futures-util = "0.3"
 # Проверка обновлений (4.3d): ручной HEAD к github.com. Все три крейта уже в графе через
 # tokio-tungstenite; прямыми -- в тех же версиях, провайдер ring (как у rustls выше).
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-webpki-roots = "0.26"
+webpki-roots = "1"
 httparse = "1"
 base64 = { workspace = true }
 opaque-ke = { workspace = true }
