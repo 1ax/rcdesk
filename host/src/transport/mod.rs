@@ -1040,6 +1040,7 @@ impl PeerSession {
             // .. }`), not negotiated, so it is already available before the
             // connection is up; fetched once here rather than per packet.
             let video_ssrc = session.video_track.ssrcs().await.first().copied();
+            let ntp_clock = NtpClock::now();
             while let Some(event) = session.video_track.poll().await {
                 match event {
                     TrackLocalEvent::OnRtcpPacket(packets) => {
@@ -1075,7 +1076,7 @@ impl PeerSession {
                                         );
                                     }
                                     let rtt = rtt_from_report(
-                                        ntp_mid32_now(),
+                                        ntp_clock.mid32(Instant::now()),
                                         report.last_sender_report,
                                         report.delay,
                                     );
@@ -1218,13 +1219,15 @@ fn spawn_data_channel_reader(
 /// wraparound rather than a real RTT).
 ///
 /// A *slightly* negative result (down to `-RTT_SKEW_TOLERANCE`) is reported
-/// as zero rather than rejected: `now` comes from `SystemTime`, while the
-/// SR's NTP stamp comes from `rtc`'s `SystemInstant` (a `SystemTime`/
-/// `Instant` pair captured once per stream, then advanced by `Instant`), and
-/// the two drift apart by fractions of a millisecond as the wall clock is
-/// disciplined. On a real network the RTT dwarfs that; in the in-process
-/// loopback test (true RTT ~0.1 ms) it made the RTT come out as garbage on
-/// roughly one run in eight.
+/// as zero rather than rejected: `now` comes from an `NtpClock` captured by
+/// us, while the SR's NTP stamp comes from `rtc`'s `SystemInstant` (a
+/// `SystemTime`/`Instant` pair captured once per stream, then advanced by
+/// `Instant`). Both are "baseline + monotonic", so they differ only by the
+/// wall-clock drift between the two captures (microseconds) -- unlike a
+/// per-report `SystemTime::now()`, which drifted from the monotonic clock
+/// over the whole session and grew the RTT linearly. On a real network the RTT
+/// dwarfs the residual; in the in-process loopback test (true RTT ~0.1 ms) it
+/// made the RTT come out as garbage on roughly one run in eight.
 fn rtt_from_report(now_ntp_mid32: u32, last_sender_report: u32, delay: u32) -> Option<Duration> {
     if last_sender_report == 0 {
         return None;
@@ -1242,7 +1245,7 @@ fn rtt_from_report(now_ntp_mid32: u32, last_sender_report: u32, delay: u32) -> O
 }
 
 /// Largest negative `now - LSR - DLSR` (in 1/65536 s; 100 ms) still
-/// attributed to clock skew between `SystemTime` and the SR's NTP stamp
+/// attributed to clock skew between our `NtpClock` and the SR's NTP stamp
 /// rather than to a bogus report -- see `rtt_from_report`.
 const RTT_SKEW_TOLERANCE: i32 = 65536 / 10;
 
@@ -1250,16 +1253,40 @@ const RTT_SKEW_TOLERANCE: i32 = 65536 / 10;
 /// round trip -- see `rtt_from_report`.
 const RTT_MAX_PLAUSIBLE: i32 = 65536 * 10;
 
-/// The middle 32 bits of the current 64-bit NTP timestamp (seconds since
-/// 1900-01-01 plus a binary fraction of a second, RFC 3550 §4), as used by
-/// RTCP SR/RR LSR/DLSR fields.
-fn ntp_mid32_now() -> u32 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs() + 2_208_988_800;
-    let nanos_fraction = (u64::from(now.subsec_nanos()) * (1u64 << 32) / 1_000_000_000) as u32;
-    (((secs & 0xFFFF) as u32) << 16) | (nanos_fraction >> 16)
+/// A wall-clock reading built the same way as `rtc`'s `SystemInstant`, which
+/// stamps our RTCP sender reports: a `SystemTime` (as a duration since the
+/// Unix epoch) and an `Instant` captured together once, after which time is
+/// `baseline + (now - baseline_instant)` on the monotonic clock. Reading
+/// `SystemTime::now()` per report instead would let the NTP-disciplined wall
+/// clock and the monotonic clock drift apart by some ppm over a whole
+/// session, making the RTT grow linearly. With our own pair captured shortly
+/// after rtc's, the two baselines differ only by the clock drift over that
+/// gap (seconds, i.e. microseconds), not over the session.
+struct NtpClock {
+    baseline_instant: Instant,
+    baseline_unix: Duration,
+}
+
+impl NtpClock {
+    fn now() -> Self {
+        let baseline_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        Self {
+            baseline_instant: Instant::now(),
+            baseline_unix,
+        }
+    }
+
+    /// The middle 32 bits of the 64-bit NTP timestamp (seconds since
+    /// 1900-01-01 plus a binary fraction of a second, RFC 3550 §4) for the
+    /// monotonic instant `now`, as used by RTCP SR/RR LSR/DLSR fields.
+    fn mid32(&self, now: Instant) -> u32 {
+        let unix = self.baseline_unix + now.saturating_duration_since(self.baseline_instant);
+        let secs = unix.as_secs() + 2_208_988_800;
+        let nanos_fraction = (u64::from(unix.subsec_nanos()) * (1u64 << 32) / 1_000_000_000) as u32;
+        (((secs & 0xFFFF) as u32) << 16) | (nanos_fraction >> 16)
+    }
 }
 
 #[cfg(test)]
@@ -1435,16 +1462,40 @@ mod tests {
         assert!(!sk.should_request(now, false));
     }
 
+    fn test_clock() -> NtpClock {
+        NtpClock {
+            baseline_instant: Instant::now(),
+            baseline_unix: Duration::new(1_700_000_000, 123_456_789),
+        }
+    }
+
     #[test]
-    fn ntp_mid32_now_advances_with_wall_clock() {
-        let first = ntp_mid32_now();
-        std::thread::sleep(Duration::from_millis(10));
-        let second = ntp_mid32_now();
-        let diff = second.wrapping_sub(first);
-        assert_ne!(diff, 0, "ntp_mid32_now should advance after a 10ms sleep");
+    fn ntp_clock_advances_one_second_by_65536_units() {
+        let clock = test_clock();
+        let base = clock.mid32(clock.baseline_instant);
+        let later = clock.mid32(clock.baseline_instant + Duration::from_secs(1));
+        assert_eq!(later.wrapping_sub(base), 65536);
+    }
+
+    #[test]
+    fn ntp_clock_advances_quarter_second_by_16384_units() {
+        let clock = test_clock();
+        let base = clock.mid32(clock.baseline_instant);
+        let later = clock.mid32(clock.baseline_instant + Duration::from_millis(250));
+        let diff = later.wrapping_sub(base);
         assert!(
-            diff < 65536,
-            "10ms should advance the mid32 clock by less than a second's worth of units, got {diff}"
+            (16383..=16385).contains(&diff),
+            "250ms should be ~16384 units, got {diff}"
         );
+    }
+
+    #[test]
+    fn ntp_clock_baseline_matches_direct_conversion() {
+        let clock = test_clock();
+        let unix = clock.baseline_unix;
+        let secs = unix.as_secs() + 2_208_988_800;
+        let fraction = (u64::from(unix.subsec_nanos()) * (1u64 << 32) / 1_000_000_000) as u32;
+        let expected = (((secs & 0xFFFF) as u32) << 16) | (fraction >> 16);
+        assert_eq!(clock.mid32(clock.baseline_instant), expected);
     }
 }
