@@ -17,7 +17,7 @@
 //! (`SessionSlot::run_while_offline`) even while there's no connection to
 //! reconnect on.
 
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -691,12 +691,21 @@ impl VideoPipeline {
     /// `start_session`, not created here): `PeerSession::start_video` is
     /// called once per session, so the flag it was given must keep being the
     /// one this pipeline's encode thread honors even after a display switch.
+    ///
+    /// `generation`/`current_generation` (D24): this pipeline's generation and
+    /// the session-wide "newest generation" counter. The forward task drops
+    /// frames once `current_generation > generation`, i.e. once a newer
+    /// pipeline exists, so late frames of a replaced pipeline can never land
+    /// in `video_tx` after the newer pipeline's first keyframe.
+    #[allow(clippy::too_many_arguments)]
     async fn start(
         ctx: &HostContext,
         display: DisplayInfo,
         peer: Arc<PeerSession>,
         video_tx: mpsc::Sender<EncodedFrame>,
         keyframe_flag: Arc<AtomicBool>,
+        generation: u64,
+        current_generation: Arc<AtomicU64>,
         exclude_windows: &[u32],
     ) -> anyhow::Result<VideoPipeline> {
         let source = (ctx.build_source)(display.id, exclude_windows)?;
@@ -756,6 +765,9 @@ impl VideoPipeline {
         let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
             let mut handle = handle;
+            // Frames skipped because a newer pipeline took over (D24);
+            // reported once on exit instead of per frame.
+            let mut superseded_drops: u64 = 0;
             loop {
                 tokio::select! {
                     frame = handle.frames.recv() => {
@@ -774,6 +786,10 @@ impl VideoPipeline {
                                 .await;
                             break;
                         };
+                        if current_generation.load(Ordering::SeqCst) > generation {
+                            superseded_drops += 1;
+                            continue;
+                        }
                         if let Some(tx) = &frame_feedback_tx {
                             let _ = tx.send(Feedback::Frame {
                                 bytes: frame.data.len(),
@@ -788,6 +804,13 @@ impl VideoPipeline {
                         break;
                     }
                 }
+            }
+            if superseded_drops > 0 {
+                tracing::debug!(
+                    generation,
+                    superseded_drops,
+                    "dropped frames of a superseded video pipeline"
+                );
             }
             // `PipelineHandle::stop` joins the capture/encode threads, and
             // the capture thread may be blocked inside a live source's
@@ -903,6 +926,14 @@ struct ActiveSession {
     /// `switch_display`) shares it (see `Pipeline::start_with_keyframe_flag`'s
     /// doc comment).
     keyframe_flag: Arc<AtomicBool>,
+    /// Newest `VideoPipeline` generation of the session (D24). All pipelines
+    /// share `video_tx`, and `replace_pipeline` starts the new one before
+    /// stopping the old, so for a moment both forward tasks write into the same
+    /// channel. `replace_pipeline` bumps this counter *before* starting the
+    /// new pipeline; a forward task drops frames once the counter exceeds its
+    /// own generation, so nothing from the old pipeline can follow the new
+    /// one's first keyframe. The session's first pipeline is generation 0.
+    pipeline_generation: Arc<AtomicU64>,
     /// The most recently listed set of displays, sent to the client in
     /// `ControlMessage::Displays` (see `displays_message`).
     displays: Vec<DisplayInfo>,
@@ -1722,6 +1753,7 @@ async fn begin_session(
                     video: parts.video,
                     video_tx: parts.video_tx,
                     keyframe_flag: parts.keyframe_flag,
+                    pipeline_generation: parts.pipeline_generation,
                     displays: parts.displays,
                     router: parts.router,
                     cursor_task: parts.cursor_task,
@@ -2559,15 +2591,39 @@ async fn replace_pipeline(
     active: &mut ActiveSession,
     display: DisplayInfo,
 ) -> anyhow::Result<()> {
-    let new = VideoPipeline::start(
+    // D24: both forward tasks write into the shared `video_tx` until `old` is
+    // stopped. Bump the generation first so the old pipeline goes silent
+    // before the new one can emit its first keyframe; otherwise a late old
+    // frame could land after that keyframe and break the client's reference
+    // chain.
+    let previous_generation = active.pipeline_generation.load(Ordering::SeqCst);
+    let new_generation = previous_generation + 1;
+    active
+        .pipeline_generation
+        .store(new_generation, Ordering::SeqCst);
+    let new = match VideoPipeline::start(
         ctx,
         display,
         Arc::clone(&active.peer),
         active.video_tx.clone(),
         Arc::clone(&active.keyframe_flag),
+        new_generation,
+        Arc::clone(&active.pipeline_generation),
         &active.curtain_windows,
     )
-    .await?;
+    .await
+    {
+        Ok(new) => new,
+        Err(err) => {
+            // The old pipeline keeps running: let it send again, and ask for
+            // a keyframe since it may have skipped frames meanwhile.
+            active
+                .pipeline_generation
+                .store(previous_generation, Ordering::SeqCst);
+            active.keyframe_flag.store(true, Ordering::SeqCst);
+            return Err(err);
+        }
+    };
     let old = std::mem::replace(&mut active.video, new);
     old.stop();
     // The new pipeline's `Controller` (if any) always starts fresh
@@ -2653,6 +2709,8 @@ struct SessionParts {
     video: VideoPipeline,
     video_tx: mpsc::Sender<EncodedFrame>,
     keyframe_flag: Arc<AtomicBool>,
+    /// See `ActiveSession::pipeline_generation`.
+    pipeline_generation: Arc<AtomicU64>,
     displays: Vec<DisplayInfo>,
     router: InputRouter,
     cursor_task: tokio::task::JoinHandle<()>,
@@ -2840,6 +2898,7 @@ async fn start_session_with_display_wait(
     .await?;
 
     let keyframe_flag = Arc::new(AtomicBool::new(false));
+    let pipeline_generation = Arc::new(AtomicU64::new(0));
     let (video_tx, video_rx) = mpsc::channel(4);
 
     let session_config = SessionConfig {
@@ -2860,6 +2919,8 @@ async fn start_session_with_display_wait(
         Arc::clone(&peer),
         video_tx.clone(),
         Arc::clone(&keyframe_flag),
+        0,
+        Arc::clone(&pipeline_generation),
         &curtain_windows,
     )
     .await?;
@@ -3005,6 +3066,7 @@ async fn start_session_with_display_wait(
         video,
         video_tx,
         keyframe_flag,
+        pipeline_generation,
         displays,
         router,
         cursor_task,
@@ -3944,6 +4006,7 @@ mod tests {
 
         let (video_tx, mut video_rx) = mpsc::channel(4);
         let keyframe_flag = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(0));
 
         let displays = capture::synthetic::list_displays();
         let display1 = displays.iter().find(|d| d.id == 1).unwrap().clone();
@@ -3955,6 +4018,8 @@ mod tests {
             Arc::clone(&peer),
             video_tx.clone(),
             Arc::clone(&keyframe_flag),
+            0,
+            Arc::clone(&generation),
             &[],
         )
         .await
@@ -3966,12 +4031,15 @@ mod tests {
             "first frame of a fresh pipeline must be a keyframe"
         );
 
+        generation.store(1, Ordering::SeqCst);
         let next = VideoPipeline::start(
             &ctx,
             display2,
             Arc::clone(&peer),
             video_tx.clone(),
             Arc::clone(&keyframe_flag),
+            1,
+            Arc::clone(&generation),
             &[],
         )
         .await
@@ -3989,6 +4057,51 @@ mod tests {
         let _more = collect_frames(&mut video_rx, 5, Duration::from_secs(5)).await;
 
         current.stop();
+    }
+
+    /// D24: once a newer generation is announced, the older pipeline's
+    /// forward task must stop writing into the shared channel (frames already
+    /// in the channel or in flight at that moment may still land).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn superseded_pipeline_stops_sending_frames() {
+        let ctx = test_ctx();
+        let (events_tx, _events_rx) = mpsc::channel(64);
+        let peer = PeerSession::new(ctx.session.clone(), events_tx, Arc::clone(&ctx.runtime))
+            .await
+            .unwrap();
+        let (video_tx, mut video_rx) = mpsc::channel(4);
+        let keyframe_flag = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(0));
+        let display = capture::synthetic::list_displays().remove(0);
+        let pipeline = VideoPipeline::start(
+            &ctx,
+            display,
+            peer,
+            video_tx,
+            keyframe_flag,
+            0,
+            Arc::clone(&generation),
+            &[],
+        )
+        .await
+        .unwrap();
+        collect_frames(&mut video_rx, 3, Duration::from_secs(5)).await;
+
+        generation.store(1, Ordering::SeqCst);
+        // Let the channel fill and the forward task block in `send`, then
+        // drain what was already queued (plus the one in-flight frame).
+        for _ in 0..2 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            while video_rx.try_recv().is_ok() {}
+        }
+        let late = tokio::time::timeout(Duration::from_millis(500), video_rx.recv()).await;
+        assert!(late.is_err(), "superseded pipeline still sent a frame");
+
+        // Without a newer generation the pipeline would have kept sending
+        // (sanity check that the silence above comes from the gate).
+        generation.store(0, Ordering::SeqCst);
+        collect_frames(&mut video_rx, 1, Duration::from_secs(5)).await;
+        pipeline.stop();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4023,6 +4136,8 @@ mod tests {
             Arc::clone(&parts.peer),
             video_tx,
             keyframe_flag,
+            0,
+            Arc::new(AtomicU64::new(0)),
             &[],
         )
         .await
@@ -5695,6 +5810,11 @@ mod tests {
 
         assert_eq!(reply, curtain_status(false, Some("restart failure")));
         assert!(active.curtain_windows.is_empty());
+        assert_eq!(
+            active.pipeline_generation.load(Ordering::SeqCst),
+            0,
+            "failed restart must hand the generation back to the running pipeline"
+        );
         assert_eq!(journal(&log), vec!["show", "hide"]);
 
         active.shutdown().await;
@@ -5794,6 +5914,8 @@ mod tests {
             calls.lock().unwrap().last().cloned(),
             Some((other, vec![101, 102]))
         );
+        // set_curtain + switch_display: two replacements -> generation 2.
+        assert_eq!(active.pipeline_generation.load(Ordering::SeqCst), 2);
         active.shutdown().await;
     }
 
