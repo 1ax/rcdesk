@@ -3033,6 +3033,7 @@ struct StatsSummary {
     overwritten: u64,
     keyframes: u64,
     keyframe_repeats: u64,
+    idle_repeats: u64,
     kbps: u64,
     encode_ms_avg: f64,
     encode_ms_max: f64,
@@ -3080,6 +3081,7 @@ struct StatsWindow {
     overwritten: u64,
     keyframes: u64,
     keyframe_repeats: u64,
+    idle_repeats: u64,
     encode_us_total: u64,
     /// Capture time of the previous frame; deliberately kept across window
     /// boundaries so the first gap of a window is measured from the last
@@ -3106,6 +3108,7 @@ impl StatsWindow {
             overwritten: stats.overwritten.load(Relaxed),
             keyframes: stats.keyframes.load(Relaxed),
             keyframe_repeats: stats.keyframe_repeats.load(Relaxed),
+            idle_repeats: stats.idle_repeats.load(Relaxed),
             encode_us_total: stats.encode_us_total.load(Relaxed),
             prev_captured_at: None,
             gaps_us: Vec::new(),
@@ -3148,6 +3151,7 @@ impl StatsWindow {
         let overwritten = stats.overwritten.load(Relaxed);
         let keyframes = stats.keyframes.load(Relaxed);
         let keyframe_repeats = stats.keyframe_repeats.load(Relaxed);
+        let idle_repeats = stats.idle_repeats.load(Relaxed);
         let encode_us_total = stats.encode_us_total.load(Relaxed);
         let d_encoded = encoded.saturating_sub(self.encoded);
         let d_us = encode_us_total.saturating_sub(self.encode_us_total);
@@ -3163,6 +3167,7 @@ impl StatsWindow {
             overwritten: overwritten.saturating_sub(self.overwritten),
             keyframes: keyframes.saturating_sub(self.keyframes),
             keyframe_repeats: keyframe_repeats.saturating_sub(self.keyframe_repeats),
+            idle_repeats: idle_repeats.saturating_sub(self.idle_repeats),
             kbps: self.bytes * 8 / 1000 / u64::from(seconds),
             encode_ms_avg: if d_encoded == 0 {
                 0.0
@@ -3187,6 +3192,7 @@ impl StatsWindow {
         self.overwritten = overwritten;
         self.keyframes = keyframes;
         self.keyframe_repeats = keyframe_repeats;
+        self.idle_repeats = idle_repeats;
         self.encode_us_total = encode_us_total;
         Some(summary)
     }
@@ -3296,6 +3302,7 @@ async fn run_adapt_task(
                         overwritten = s.overwritten,
                         keyframes = s.keyframes,
                         keyframe_repeats = s.keyframe_repeats,
+                        idle_repeats = s.idle_repeats,
                         kbps = s.kbps,
                         encode_ms_avg = format_args!("{:.1}", s.encode_ms_avg),
                         encode_ms_max = format_args!("{:.1}", s.encode_ms_max),

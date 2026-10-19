@@ -22,6 +22,13 @@ const FRAME_CHANNEL_CAPACITY: usize = 4;
 /// stop flag, so `stop()` doesn't have to wait for a whole frame interval.
 const SLOT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// How often the encode thread re-encodes the last captured frame as a cheap
+/// P-frame while the source is quiet and no keyframe is requested. libwebrtc
+/// asks for a keyframe (PLI) after ~3 s without a decodable frame; an
+/// unchanged-image P-frame once a second keeps the receiver's buffer fed, so
+/// a static screen causes neither PLI nor a (large) IDR in response.
+const IDLE_REPEAT_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Burst capacity of the fps pacer's token bucket (see the encode thread in
 /// `Pipeline::start`): how many frames may pass back to back after a stall
 /// before the target fps applies again. Three is enough to absorb a
@@ -95,6 +102,10 @@ pub struct PipelineStats {
     /// changes. Included in `keyframes` too; this counts the subset that
     /// came from a repeat rather than a freshly captured frame.
     pub keyframe_repeats: AtomicU64,
+    /// Non-key frames produced by re-encoding the last captured frame while
+    /// the source was quiet (see `IDLE_REPEAT_INTERVAL`), so the receiver
+    /// never starves into a PLI on a static screen.
+    pub idle_repeats: AtomicU64,
     /// Sum of wall-clock time spent inside `Encoder::encode` for every call that returned
     /// `Ok(Some(_))`, in microseconds -- read as a delta per window together with `encoded`
     /// to get an average (see `signaling::StatsWindow`).
@@ -254,6 +265,9 @@ impl Pipeline {
                 // below) -- otherwise a client that joins a session with a
                 // static screen never gets a first frame to decode.
                 let mut last_raw: Option<RawFrame> = None;
+                // When an encoded frame (of any kind) was last handed to the
+                // output channel; drives the idle P-frame pulse.
+                let mut last_sent = Instant::now();
 
                 // What the wait for the next slot frame ended with:
                 // distinguishing a real timeout from a frame arriving lets
@@ -316,21 +330,40 @@ impl Pipeline {
                             // channel.
                             if let Some(last) = last_raw.as_mut().filter(|_| tx.capacity() > 0) {
                                 let force_keyframe = request_keyframe.swap(false, Ordering::AcqRel);
-                                if force_keyframe {
+                                // No request: pulse a cheap P-frame once the
+                                // channel has been silent for a whole
+                                // `IDLE_REPEAT_INTERVAL`.
+                                let idle_pulse =
+                                    !force_keyframe && last_sent.elapsed() >= IDLE_REPEAT_INTERVAL;
+                                if force_keyframe || idle_pulse {
                                     last.set_ts(Instant::now());
                                     let started = Instant::now();
-                                    match encoder.encode(last, true) {
+                                    match encoder.encode(last, force_keyframe) {
                                         Ok(Some(encoded)) => {
                                             let us = started.elapsed().as_micros() as u64;
                                             stats.encode_us_total.fetch_add(us, Ordering::Relaxed);
                                             stats.encode_us_max.fetch_max(us, Ordering::Relaxed);
                                             stats.encoded.fetch_add(1, Ordering::Relaxed);
-                                            stats.keyframes.fetch_add(1, Ordering::Relaxed);
-                                            stats.keyframe_repeats.fetch_add(1, Ordering::Relaxed);
-                                            tracing::debug!(
-                                                "keyframe repeat: no new frame within \
-                                                 timeout, re-encoded the last frame"
-                                            );
+                                            if force_keyframe {
+                                                stats.keyframes.fetch_add(1, Ordering::Relaxed);
+                                                stats
+                                                    .keyframe_repeats
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                tracing::debug!(
+                                                    "keyframe repeat: no new frame within \
+                                                     timeout, re-encoded the last frame"
+                                                );
+                                            } else {
+                                                if encoded.keyframe {
+                                                    stats.keyframes.fetch_add(1, Ordering::Relaxed);
+                                                }
+                                                stats.idle_repeats.fetch_add(1, Ordering::Relaxed);
+                                                tracing::trace!(
+                                                    "idle repeat: re-encoded the last frame to \
+                                                     keep the receiver fed"
+                                                );
+                                            }
+                                            last_sent = Instant::now();
                                             if tx.try_send(encoded).is_err() {
                                                 stats.dropped.fetch_add(1, Ordering::Relaxed);
                                                 request_keyframe.store(true, Ordering::Release);
@@ -403,6 +436,7 @@ impl Pipeline {
                             if encoded.keyframe {
                                 stats.keyframes.fetch_add(1, Ordering::Relaxed);
                             }
+                            last_sent = Instant::now();
                             tracing::trace!(
                                 convert_encode_latency_us =
                                     (encoded.ts - captured_at).as_micros() as u64,
@@ -1046,19 +1080,92 @@ mod tests {
         assert_eq!(first.len(), 1, "expected exactly the one served frame");
 
         // No `request_keyframe()` call this time: with the source blocked,
-        // nothing more should arrive over the same window the previous test
-        // used to observe a repeat.
+        // only idle P-frame pulses may arrive, never a keyframe.
         let idle = drain_for(&mut handle, Duration::from_secs(2));
         assert!(
-            idle.is_empty(),
-            "expected no frames without a pending keyframe request, got {}",
-            idle.len()
+            idle.iter().all(|f| !f.keyframe),
+            "expected no keyframes without a pending keyframe request"
         );
         assert_eq!(
             handle.stats.keyframe_repeats.load(Ordering::Relaxed),
             0,
             "expected no keyframe repeats without a request"
         );
+
+        StaticScreenSource::unblock(&stop_signal);
+        handle.stop();
+    }
+
+    #[test]
+    fn idle_pulse_sends_p_frames_on_a_static_screen() {
+        let _guard = serialized();
+        let (source, stop_signal) = StaticScreenSource::new(64, 64);
+        let cfg = EncoderConfig {
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_kbps: 2000,
+            keyframe_interval_frames: 60,
+            max_qp: None,
+        };
+        let (encoder, _kind) =
+            build_encoder(Some(EncoderKind::OpenH264), cfg).expect("encoder init");
+        let mut handle = Pipeline::start(
+            Box::new(source),
+            encoder,
+            RateTarget {
+                bitrate_kbps: 2000,
+                fps: 30,
+            },
+        );
+
+        // First real frame, then silence: a pulse must follow on its own.
+        let frames = drain_until(&mut handle, Duration::from_secs(10), |f| f.len() >= 2);
+        assert!(
+            frames.len() >= 2,
+            "expected an idle pulse, got {}",
+            frames.len()
+        );
+        assert!(frames[0].keyframe, "first frame must be a keyframe");
+        assert!(!frames[1].keyframe, "idle pulse must be a P-frame");
+        assert!(handle.stats.idle_repeats.load(Ordering::Relaxed) >= 1);
+        assert_eq!(handle.stats.keyframe_repeats.load(Ordering::Relaxed), 0);
+
+        StaticScreenSource::unblock(&stop_signal);
+        handle.stop();
+    }
+
+    #[test]
+    fn idle_pulse_waits_for_the_first_frame() {
+        let _guard = serialized();
+        let (mut source, stop_signal) = StaticScreenSource::new(64, 64);
+        // A source that never produces anything.
+        source.served_first = true;
+        let cfg = EncoderConfig {
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_kbps: 2000,
+            keyframe_interval_frames: 60,
+            max_qp: None,
+        };
+        let (encoder, _kind) =
+            build_encoder(Some(EncoderKind::OpenH264), cfg).expect("encoder init");
+        let mut handle = Pipeline::start(
+            Box::new(source),
+            encoder,
+            RateTarget {
+                bitrate_kbps: 2000,
+                fps: 30,
+            },
+        );
+
+        let frames = drain_for(&mut handle, Duration::from_millis(2500));
+        assert!(
+            frames.is_empty(),
+            "no frame may appear before the first capture"
+        );
+        assert_eq!(handle.stats.idle_repeats.load(Ordering::Relaxed), 0);
 
         StaticScreenSource::unblock(&stop_signal);
         handle.stop();
