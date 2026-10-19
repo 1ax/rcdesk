@@ -256,7 +256,7 @@ fn create_unique_blocking(
                 })
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&final_path);
+                remove_with_retry(vec![final_path.clone()]);
                 if e.kind() == std::io::ErrorKind::AlreadyExists {
                     continue;
                 }
@@ -1684,20 +1684,25 @@ mod tests {
     async fn cancelling_create_unique_midway_leaves_no_files() {
         let h = Harness::new(true);
         std::fs::create_dir_all(&h.dir).unwrap();
-        for _ in 0..20 {
+        // A distinct name per attempt: on Windows a removed file may linger
+        // as "delete pending", and reusing its name would make the attempts
+        // interfere with each other rather than test cancellation.
+        for i in 0..20 {
             let _ = tokio::time::timeout(
                 std::time::Duration::from_micros(1),
-                create_unique(&h.dir, "a.bin", 1, 10),
+                create_unique(&h.dir, &format!("a{i}.bin"), 1, 10),
             )
             .await;
-            for _ in 0..800 {
-                if h.files().is_empty() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            assert!(h.files().is_empty(), "leaked: {:?}", h.files());
         }
+        // Cleanup may finish later on a blocking thread, or after the
+        // retries of `remove_with_retry` (Windows).
+        for _ in 0..800 {
+            if h.files().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(h.files().is_empty(), "leaked: {:?}", h.files());
     }
 
     #[tokio::test]
