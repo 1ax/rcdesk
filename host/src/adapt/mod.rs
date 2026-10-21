@@ -34,6 +34,11 @@
 //! - On the second live check (2026-10-14) fps got stuck at 5 for 36 minutes:
 //!   the `min_fps` floor returned by `bitrate_fps_step` is not a rung of the
 //!   fps ladder, and `step_up` could not find it there.
+//! - A REMB at the browser estimator's floor is garbage, not a channel
+//!   measurement (Windows host 0.1.15 live log, 2026-10-21, 2560x1440: REMB
+//!   5-11 kbit/s for ~33 minutes at zero loss while 4.5 Mbit/s flowed fine).
+//!   Values below `REMB_IGNORE_BELOW_KBPS` are treated as "no REMB"; real
+//!   overload is still cut by the loss path (`LOSS_HIGH`).
 
 use std::time::{Duration, Instant};
 
@@ -59,6 +64,14 @@ pub const MIN_FPS: u32 = 5;
 /// large means the RTCP path itself is in trouble, not that bandwidth is
 /// fine) and is ignored rather than acted on.
 pub const REMB_FRESH: Duration = Duration::from_secs(3);
+
+/// A REMB below this (kbit/s) is treated as absent. libwebrtc's estimator
+/// bottoms out at ~5 kbit/s; the live log of Windows host 0.1.15
+/// (2026-10-21) showed REMB 5-11 kbit/s for most of a 33-minute session at
+/// `loss=0.000` with a 4.5 Mbit/s stream flowing. A real channel that narrow
+/// is not a thing for a remote desktop, and genuine overload is still cut by
+/// the `LOSS_HIGH` loss path, so such values are estimator junk, not a signal.
+pub const REMB_IGNORE_BELOW_KBPS: f64 = 50.0;
 
 /// A loss fraction from an RTCP RR older than this counts as zero. Chrome
 /// sends RRs about once a second; when they stop, acting on the last value
@@ -460,7 +473,7 @@ impl Controller {
             .last_remb_at
             .is_some_and(|at| now.saturating_duration_since(at) <= REMB_FRESH);
         let remb_kbps = if remb_fresh {
-            self.last_remb_kbps
+            self.last_remb_kbps.filter(|&r| r >= REMB_IGNORE_BELOW_KBPS)
         } else {
             None
         };
@@ -795,6 +808,86 @@ mod tests {
         let decision = c.tick(now).expect("expected a remb cut");
         assert_eq!(decision.reason, "remb");
         assert_eq!(decision.target.bitrate_kbps, 2400);
+    }
+
+    #[test]
+    fn junk_remb_on_loaded_link_does_not_cut_target() {
+        // Live log 2026-10-21: REMB 5 kbit/s at zero loss on a loaded link.
+        // Treated as no REMB: no "remb" cut, the target stays at max.
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0;
+        for _ in 0..6 {
+            now += TICK;
+            frames(&mut c, now, 750_000);
+            remb(&mut c, now, 5_000);
+            assert_eq!(c.tick(now), None);
+        }
+        assert_eq!(c.target().bitrate_kbps, 6000);
+    }
+
+    #[test]
+    fn junk_remb_on_loaded_link_lets_probe_climb() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        c.target = RateTarget {
+            bitrate_kbps: 2000,
+            fps: 30,
+        };
+        let mut now = t0;
+        for _ in 0..3 {
+            now += TICK;
+            let sent = c.target().bitrate_kbps as usize * 1000 / 8;
+            frames(&mut c, now, sent);
+            remb(&mut c, now, 5_000);
+            if let Some(d) = c.tick(now) {
+                assert_eq!(d.reason, "probe");
+            }
+        }
+        assert!(c.target().bitrate_kbps > 2000, "{:?}", c.target());
+    }
+
+    #[test]
+    fn junk_remb_with_moderate_loss_does_not_arm_loss_cap() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        c.target = RateTarget {
+            bitrate_kbps: 4000,
+            fps: 30,
+        };
+        let mut now = t0;
+        for _ in 0..5 {
+            now += TICK;
+            frames(&mut c, now, 500_000);
+            remb(&mut c, now, 5_000);
+            c.feedback(Feedback::Loss { fraction: 0.05 }, now);
+            c.tick(now);
+            assert!(
+                c.target().bitrate_kbps as f64 > LOSS_CAP_FLOOR_KBPS,
+                "{:?}",
+                c.target()
+            );
+        }
+        assert!(c.target().bitrate_kbps >= 4000, "{:?}", c.target());
+    }
+
+    #[test]
+    fn remb_above_ignore_threshold_on_loaded_link_still_cuts() {
+        // Control for the junk-REMB tests: 2000 kbit/s is a real signal.
+        // (Same scenario as `remb_below_sent_rate_on_loaded_link_caps_...`.)
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0;
+        let mut last = None;
+        for _ in 0..2 {
+            now += TICK;
+            frames(&mut c, now, 750_000);
+            remb(&mut c, now, 2_000_000);
+            last = c.tick(now);
+        }
+        let d = last.expect("expected a remb cut");
+        assert_eq!(d.reason, "remb");
+        assert_eq!(d.target.bitrate_kbps, 2000);
     }
 
     #[test]
