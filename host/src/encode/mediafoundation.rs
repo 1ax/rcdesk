@@ -54,6 +54,12 @@ use super::{EncodeError, EncodedFrame, Encoder, EncoderConfig, RateTarget};
 /// is stuck, and an honest `Err` (the D58 path) beats waiting forever.
 const CREDIT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum time `encode()` waits for the output of the frame it just
+/// submitted, so the returned output belongs to this call and not to the
+/// previous input. Hardware NVENC at 2560x1440 encodes in ~6-15 ms; expiry is
+/// not an error -- the frame surfaces with the next call, as it did before.
+const OUTPUT_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
+
 pub struct MediaFoundationEncoder {
     transform: IMFTransform,
     is_async: bool,
@@ -88,6 +94,12 @@ pub struct MediaFoundationEncoder {
     /// Set once `set_rate` has warned that this MFT has no `ICodecAPI` (see
     /// `configure_codec_api`), so repeated calls don't spam the log.
     rate_warned: bool,
+    /// Async MFTs only: how many inputs handed to `ProcessInput` have not yet
+    /// produced an output (`METransformHaveOutput` drained into a frame).
+    in_flight: u32,
+    /// Set once the async output backlog warning has fired, so a persistent lag
+    /// doesn't spam the log.
+    backlog_warned: bool,
 }
 
 // SAFETY: like `VideoToolboxEncoder`/`OpenH264Encoder`, `MediaFoundationEncoder`
@@ -235,6 +247,8 @@ impl MediaFoundationEncoder {
             credits: 0,
             pending: VecDeque::new(),
             rate_warned: false,
+            in_flight: 0,
+            backlog_warned: false,
         };
 
         if is_async {
@@ -504,8 +518,51 @@ impl MediaFoundationEncoder {
             EncodeError::Backend(format!("MediaFoundation ProcessInput (async): {err}"))
         })?;
         self.credits = self.credits.saturating_sub(1);
-        self.drain_events_no_wait()?;
+        self.in_flight += 1;
+        self.wait_for_output()?;
+        if self.pending.len() > 1 && !self.backlog_warned {
+            tracing::warn!(
+                pending = self.pending.len(),
+                "async MFT output backlog: encoder output lags input"
+            );
+            self.backlog_warned = true;
+        }
         Ok(self.pending.pop_front())
+    }
+
+    /// Waits (bounded by `OUTPUT_WAIT_TIMEOUT`) until every submitted input has
+    /// produced its output, handling every event that arrives meanwhile, so the
+    /// frame returned by `encode()` is the one just submitted rather than its
+    /// predecessor. Expiry is not an error: the output simply surfaces on a
+    /// later call, as it did before this wait existed.
+    fn wait_for_output(&mut self) -> Result<(), EncodeError> {
+        let Some(events) = self.events.clone() else {
+            return Ok(());
+        };
+        let deadline = Instant::now() + OUTPUT_WAIT_TIMEOUT;
+        while self.in_flight > 0 {
+            if Instant::now() >= deadline {
+                // Resync: a `METransformHaveOutput` that yielded no sample
+                // never decrements `in_flight`, and a stale count would make
+                // every later call wait the full timeout.
+                self.in_flight = 0;
+                return Ok(());
+            }
+            // SAFETY: same as `wait_for_credit`; `MF_EVENT_FLAG_NO_WAIT` never
+            // blocks.
+            match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                Ok(event) => self.handle_event(&event)?,
+                Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) => {
+                    return Err(EncodeError::Backend(format!(
+                        "MediaFoundation GetEvent: {err}"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Drains every event currently queued (`MF_EVENT_FLAG_NO_WAIT`) without
@@ -570,6 +627,7 @@ impl MediaFoundationEncoder {
             self.credits += 1;
         } else if event_type == METransformHaveOutput.0 as u32 {
             if let Some(frame) = self.drain_output()? {
+                self.in_flight = self.in_flight.saturating_sub(1);
                 self.pending.push_back(frame);
             }
         }
