@@ -188,6 +188,8 @@ impl TryFrom<AccessRecordFile> for AccessRecord {
 /// "no password set", the default state.
 pub struct AccessStore {
     path: PathBuf,
+    /// Unix mode of the written file: `0o600`, or `0o660` after `shared()`.
+    mode: u32,
 }
 
 impl AccessStore {
@@ -195,7 +197,15 @@ impl AccessStore {
     pub fn new(dir: &Path) -> Self {
         Self {
             path: dir.join("access.json"),
+            mode: 0o600,
         }
+    }
+
+    /// Files of the machine data directory of macOS full mode (D51), shared
+    /// by root and an administrator: mode `0660` instead of `0600`.
+    pub fn shared(mut self) -> Self {
+        self.mode = crate::fullmode::SHARED_FILE_MODE;
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -248,7 +258,7 @@ impl AccessStore {
     pub fn save(&self, record: &AccessRecord) -> anyhow::Result<()> {
         let file = AccessRecordFile::from(record);
         let json = serde_json::to_vec_pretty(&file)?;
-        crate::fsutil::write_private_atomic(&self.path, &json)?;
+        crate::fsutil::write_atomic_mode(&self.path, &json, self.mode)?;
         Ok(())
     }
 
@@ -538,6 +548,25 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_store_writes_the_file_with_mode_0660() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("perms-shared");
+        let store = AccessStore::new(&dir).shared();
+        let record = register("correct horse battery staple").unwrap();
+        store.save(&record).unwrap();
+
+        let mode = std::fs::metadata(store.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o660);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

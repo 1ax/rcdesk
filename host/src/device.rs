@@ -34,6 +34,8 @@ pub const DEFAULT_SERVER: &str = "wss://rcdesk.app/ws";
 /// doc comment for the full path on each platform.
 pub struct DeviceStore {
     path: PathBuf,
+    /// Unix mode of the written file: `0o600`, or `0o660` after `shared()`.
+    mode: u32,
 }
 
 impl DeviceStore {
@@ -41,6 +43,7 @@ impl DeviceStore {
     pub fn new(dir: &Path) -> Self {
         Self {
             path: dir.join("device.json"),
+            mode: 0o600,
         }
     }
 
@@ -71,7 +74,15 @@ impl DeviceStore {
         let slug = slug.trim_end_matches('_');
         Self {
             path: dir.join(format!("device-{slug}.json")),
+            mode: 0o600,
         }
+    }
+
+    /// Files of the machine data directory of macOS full mode (D51), shared
+    /// by root and an administrator: mode `0660` instead of `0600`.
+    pub fn shared(mut self) -> Self {
+        self.mode = crate::fullmode::SHARED_FILE_MODE;
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -114,7 +125,7 @@ impl DeviceStore {
     /// 3.2b) for how.
     pub fn save(&self, credentials: &DeviceCredentials) -> anyhow::Result<()> {
         let json = serde_json::to_vec_pretty(credentials)?;
-        crate::fsutil::write_private_atomic(&self.path, &json)?;
+        crate::fsutil::write_atomic_mode(&self.path, &json, self.mode)?;
         Ok(())
     }
 
@@ -288,6 +299,29 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_store_writes_the_file_with_mode_0660() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("perms-shared");
+        let store = DeviceStore::new(&dir).shared();
+        store
+            .save(&DeviceCredentials {
+                device_id: "dev-1".to_string(),
+                secret: "secret".to_string(),
+            })
+            .unwrap();
+
+        let mode = std::fs::metadata(store.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o660);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

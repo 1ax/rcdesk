@@ -154,6 +154,25 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// macOS, полный режим (D51): системный LaunchAgent, который держит агента
+    /// и на экране входа. install/uninstall требуют sudo.
+    #[cfg(target_os = "macos")]
+    Fullmode {
+        #[command(subcommand)]
+        action: FullmodeAction,
+    },
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Subcommand)]
+enum FullmodeAction {
+    /// Установить системный LaunchAgent, перенести состояние в машинный
+    /// каталог и снять пользовательский автозапуск (нужен sudo).
+    Install,
+    /// Снять системный LaunchAgent; данные и логи не трогаются (нужен sudo).
+    Uninstall,
+    /// Состояние полного режима, каталогов и ролей.
+    Status,
 }
 
 #[cfg(target_os = "windows")]
@@ -278,6 +297,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Password { action } => run_password(action),
         #[cfg(target_os = "windows")]
         Command::Service { action } => run_service(action),
+        #[cfg(target_os = "macos")]
+        Command::Fullmode { action } => run_fullmode(action),
     }
 }
 
@@ -360,11 +381,112 @@ fn run_service(action: ServiceAction) -> anyhow::Result<()> {
     }
 }
 
+/// `rcdesk-host fullmode ...` (macOS, D51).
+#[cfg(target_os = "macos")]
+fn run_fullmode(action: FullmodeAction) -> anyhow::Result<()> {
+    use rcdesk_host::platform::fullmode as fm;
+
+    match action {
+        FullmodeAction::Install => {
+            let agent = rcdesk_host::agent::autostart::agent_path()?;
+            fm::install(&agent)
+        }
+        FullmodeAction::Uninstall => fm::uninstall(),
+        FullmodeAction::Status => {
+            let st = fm::status()?;
+            println!(
+                "Полный режим: {}",
+                if st.installed {
+                    "установлен"
+                } else {
+                    "не установлен"
+                }
+            );
+            println!("Системный plist: {}", st.plist.display());
+            if let Some(agent) = &st.plist_agent {
+                println!("Агент в plist: {agent}");
+            }
+            if !st.data_dir_exists {
+                println!("Каталог данных: {} (нет)", st.data_dir.display());
+            } else {
+                match st.data_dir_owner {
+                    Some((uid, gid, mode)) => println!(
+                        "Каталог данных: {} (uid {uid}, gid {gid}, режим {mode:o}, {})",
+                        st.data_dir.display(),
+                        if st.data_dir_ok {
+                            "годен"
+                        } else {
+                            "НЕ годен: нужен владелец root без симлинка"
+                        }
+                    ),
+                    None => println!("Каталог данных: {}", st.data_dir.display()),
+                }
+            }
+            println!(
+                "Каталог логов: {} ({})",
+                st.log_dir.display(),
+                if st.log_dir_exists {
+                    "есть"
+                } else {
+                    "нет"
+                }
+            );
+            match st.console_uid {
+                Some(uid) => println!("Владелец консоли: uid {uid}"),
+                None => println!("Владелец консоли: не определён"),
+            }
+            println!(
+                "Роль этого процесса: {}",
+                match st.role {
+                    rcdesk_host::fullmode::Role::Session => "сеанс",
+                    rcdesk_host::fullmode::Role::LoginScreen => "экран входа",
+                }
+            );
+            println!(
+                "device.json: {}, access.json: {}",
+                if st.device_json { "есть" } else { "нет" },
+                if st.access_json { "есть" } else { "нет" }
+            );
+            match st.registration_busy {
+                Some(true) => println!("Машинный лок регистрации: занят"),
+                Some(false) => println!("Машинный лок регистрации: свободен"),
+                None => println!("Машинный лок регистрации: проверить не удалось"),
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Resolves `rcdesk-agent`'s path relative to this `rcdesk-host` binary
 /// (`agent::autostart::agent_path`) and applies `action` to it -- see that
 /// function's doc comment for why `rcdesk-host` and `rcdesk-agent` resolve
 /// the same "which path" question differently.
 fn run_autostart(action: AutostartAction) -> anyhow::Result<()> {
+    // macOS, полный режим (D51): автозапуском управляет системный LaunchAgent.
+    // Без гейта `autostart restore` из postinstall при каждом обновлении pkg
+    // снова создал бы пользовательский plist -- второй инстанс.
+    #[cfg(target_os = "macos")]
+    {
+        if rcdesk_host::fullmode::is_installed() {
+            let plist = rcdesk_host::fullmode::plist_path();
+            match action {
+                AutostartAction::On | AutostartAction::Restore => {
+                    println!(
+                        "autostart: управляется системным LaunchAgent полного режима ({}), ничего не меняю",
+                        plist.display()
+                    );
+                    return Ok(());
+                }
+                AutostartAction::Off => anyhow::bail!(
+                    "автозапуск включён полным режимом; чтобы выключить: sudo rcdesk-host fullmode uninstall"
+                ),
+                AutostartAction::Status => {
+                    println!("autostart: on (полный режим, {})", plist.display());
+                    return Ok(());
+                }
+            }
+        }
+    }
     let agent = rcdesk_host::agent::autostart::agent_path()?;
     match action {
         AutostartAction::On => {
@@ -406,9 +528,16 @@ fn run_autostart(action: AutostartAction) -> anyhow::Result<()> {
 fn run_password(action: PasswordAction) -> anyhow::Result<()> {
     let (data_dir, machine) = password_data_dir();
     let store = AccessStore::new(&data_dir);
+    // macOS, полный режим: файлы машинного каталога общие для root и admin.
+    #[cfg(target_os = "macos")]
+    let store = if machine { store.shared() } else { store };
     let admin_hint = |err: anyhow::Error| -> anyhow::Error {
         if machine {
-            err.context("служба установлена, пароль хранится в машинном каталоге: запустите cmd от имени администратора")
+            #[cfg(target_os = "macos")]
+            let hint = "полный режим установлен, пароль хранится в машинном каталоге: запишите его через sudo";
+            #[cfg(not(target_os = "macos"))]
+            let hint = "служба установлена, пароль хранится в машинном каталоге: запустите cmd от имени администратора";
+            err.context(hint)
         } else {
             err
         }
@@ -450,6 +579,12 @@ fn password_data_dir() -> (PathBuf, bool) {
     #[cfg(target_os = "windows")]
     {
         if rcdesk_host::platform::windows::service::is_installed() {
+            return (agent::paths::machine_data_dir(), true);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if rcdesk_host::fullmode::is_installed() {
             return (agent::paths::machine_data_dir(), true);
         }
     }

@@ -33,15 +33,71 @@ macOS 13+, Apple Silicon (arm64). Захват -- ScreenCaptureKit, ввод -- 
 **Обновление.** Открыть новый `rcdesk-macos.pkg` поверх: файлы заменяются,
 агент перезапускается, разрешения остаются.
 
+## Полный режим: доступ к экрану входа
+
+Лёгкий режим (агент в строке меню) на экране входа и блокировки не работает:
+там нет сеанса пользователя. Полный режим поднимает агента и в сеансе
+loginwindow, поэтому к Mac можно подключиться, пока никто не вошёл.
+
+**Требования.**
+
+- администратор (установка идёт через `sudo`);
+- приложению уже выданы «Запись экрана» и «Универсальный доступ» (см. выше);
+- сборка с секцией `__CGPreLoginApp` (без неё ввод на экране входа не проходит).
+
+**Команды** (всё через `sudo`, кроме `status`):
+
+```
+sudo /Applications/rcdesk.app/Contents/MacOS/rcdesk-host fullmode install
+/Applications/rcdesk.app/Contents/MacOS/rcdesk-host fullmode status
+sudo /Applications/rcdesk.app/Contents/MacOS/rcdesk-host fullmode uninstall
+```
+
+**Что делает `install`.**
+
+- создаёт машинные каталоги `/Library/Application Support/rcdesk` (данные) и
+  `/Library/Logs/rcdesk` (логи), владелец root, группа `admin`, режим `2770`;
+- переносит `device.json` и `access.json` пользователя, запустившего `sudo`, в
+  машинный каталог (существующие там файлы не затираются) -- устройство в
+  списке аккаунта остаётся тем же;
+- снимает пользовательский автозапуск (`~/Library/LaunchAgents/app.rcdesk.agent.plist`
+  и задание в `launchd`): метка у системного и пользовательского plist одна;
+- пишет системный LaunchAgent `/Library/LaunchAgents/app.rcdesk.agent.plist`
+  (`LimitLoadToSessionType = Aqua, LoginWindow`) и загружает его в текущий сеанс.
+
+После установки `rcdesk-host autostart on|restore` ничего не меняет (в том числе
+при обновлении pkg), `autostart off` отказывает: автозапуском управляет системный
+LaunchAgent. Пароль доступа (`password set`) пишется в машинный каталог, для этого
+нужен `sudo`.
+
+**Две роли одного бинарника.** В сеансе пользователя агент работает как раньше
+(значок, шторка, обновления). В сеансе loginwindow он работает от root без значка,
+шторки и обновлений и служит, только пока на консоли нет вошедшего пользователя.
+Одновременно подключён ровно один из двух. В сеансе пользователя, не входящего в
+группу `admin`, агент не работает (машинный каталог закрыт группой).
+
+**Логи.** Роль «сеанс» -- `~/Library/Logs/rcdesk/agent.log`, роль «экран входа» --
+`/Library/Logs/rcdesk/loginwindow.log`.
+
+**Как подключиться.** PIN не нужен: выйдите из системы и выберите Mac в списке
+устройств аккаунта с другого устройства.
+
+**Ограничение.** После ПЕРЕЗАГРУЗКИ первым идёт экран разблокировки FileVault: там
+нет ни сети, ни агентов. Доступ с экрана входа появляется только после выхода из
+системы (или если FileVault выключен).
+
 ## Удаление
 
 Вручную:
 
 1. выйти из агента (значок в строке меню → «Выйти из rcdesk»);
-2. `/Applications/rcdesk.app/Contents/MacOS/rcdesk-host autostart off`
+2. если установлен полный режим -- `sudo /Applications/rcdesk.app/Contents/MacOS/rcdesk-host fullmode uninstall`
+   (данные в `/Library/Application Support/rcdesk` и логи в `/Library/Logs/rcdesk`
+   остаются, удалить вручную);
+3. `/Applications/rcdesk.app/Contents/MacOS/rcdesk-host autostart off`
    (или удалить `~/Library/LaunchAgents/app.rcdesk.agent.plist`);
-3. удалить `/Applications/rcdesk.app`;
-4. `sudo pkgutil --forget app.rcdesk.pkg`.
+4. удалить `/Applications/rcdesk.app`;
+5. `sudo pkgutil --forget app.rcdesk.pkg`.
 
 **Данные остаются**: `~/Library/Application Support/rcdesk` (ключ
 устройства, пароль доступа) и `~/Library/Logs/rcdesk` -- при необходимости

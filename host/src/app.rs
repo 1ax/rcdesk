@@ -364,7 +364,15 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
         // (`main.rs`/`agent_main.rs` both build one over
         // `opts.resolved_data_dir()`); `AccessStore::new` doesn't touch the
         // filesystem, so this is safe even before the directory exists.
-        access_store: crate::access::AccessStore::new(&opts.resolved_data_dir()),
+        access_store: {
+            let store = crate::access::AccessStore::new(&opts.resolved_data_dir());
+            // Явный каталог = машинный каталог полного режима: файл общий (0660).
+            if opts.data_dir.is_some() {
+                store.shared()
+            } else {
+                store
+            }
+        },
         // D50d: каталоги обновления проставляет вызывающий (агент, `serve`).
         update_dirs: None,
     })

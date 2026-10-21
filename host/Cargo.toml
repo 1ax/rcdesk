@@ -159,6 +159,9 @@ windows = { version = "0.61", features = [
 arboard = { version = "3.6", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# geteuid() для роли полного режима и отказа `fullmode install` без прав (D51).
+# Уже есть в Cargo.lock транзитивно; больше ничего из libc не используется.
+libc = "0.2"
 # Версии совпадают с теми, что уже тянет `enigo` для macOS (см. Cargo.lock) --
 # не добавляет вторую версию objc2*/ в граф.
 objc2 = { version = "0.6", features = ["relax-void-encoding"] }

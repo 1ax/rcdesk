@@ -37,6 +37,10 @@ pub use macos::autostart;
 /// Шторка (4.2c2): только macOS, только `rcdesk-agent`.
 #[cfg(target_os = "macos")]
 pub use macos::curtain;
+/// Платформенный IO полного режима macOS (D51): установка системного
+/// LaunchAgent, владелец консоли, `euid`. Чистая логика -- `crate::fullmode`.
+#[cfg(target_os = "macos")]
+pub use macos::fullmode;
 /// Переключение раскладки (4.6c): только macOS.
 #[cfg(target_os = "macos")]
 pub use macos::input_source;

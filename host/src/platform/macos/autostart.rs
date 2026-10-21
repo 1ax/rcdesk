@@ -10,6 +10,13 @@
 //! process out from under itself if the click came from its own menu. The
 //! written/removed file only takes effect on the *next* login -- see
 //! docs/dev-run.md's `launchctl print` diagnosis note.
+//!
+//! Full mode (D51): when the system LaunchAgent is installed
+//! (`crate::fullmode::is_installed`), the three public wrappers below are
+//! gated, not just the CLI. The tray menu item "Start at login" is a second
+//! caller (`agent_main::toggle_autostart`) that reaches here directly; a user
+//! plist with the same label `app.rcdesk.agent` would give two launchd jobs in
+//! one domain. The `_in` functions stay ungated so tests can use a temp dir.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,14 +35,29 @@ fn launch_agents_dir() -> PathBuf {
 /// as disabled (see this slice's plan): `enable` below will happily
 /// overwrite it with the current path.
 pub fn is_enabled(agent: &Path) -> anyhow::Result<bool> {
+    if crate::fullmode::is_installed() {
+        // Autostart is really on, via the system plist.
+        return Ok(true);
+    }
     is_enabled_in(&launch_agents_dir(), agent)
 }
 
 pub fn enable(agent: &Path) -> anyhow::Result<()> {
+    if crate::fullmode::is_installed() {
+        tracing::info!(
+            "автозапуском управляет системный LaunchAgent полного режима, пользовательский plist не пишем"
+        );
+        return Ok(());
+    }
     enable_in(&launch_agents_dir(), agent)
 }
 
 pub fn disable() -> anyhow::Result<()> {
+    if crate::fullmode::is_installed() {
+        anyhow::bail!(
+            "автозапуском управляет системный LaunchAgent полного режима; отключить: sudo rcdesk-host fullmode uninstall"
+        );
+    }
     disable_in(&launch_agents_dir())
 }
 

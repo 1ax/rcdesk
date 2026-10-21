@@ -144,7 +144,7 @@ pub fn is_disabled_by_user() -> bool {
 
 // --- macOS: LaunchAgent plist XML -------------------------------------------
 
-const LAUNCH_AGENT_LABEL: &str = "app.rcdesk.agent";
+pub const LAUNCH_AGENT_LABEL: &str = "app.rcdesk.agent";
 
 /// Escapes the five XML predefined entities -- the only untrusted text
 /// `generate_plist` embeds is a filesystem path, so this (not a full XML

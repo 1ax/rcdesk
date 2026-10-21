@@ -24,7 +24,17 @@ pub struct SingleInstance(#[allow(dead_code)] File);
 /// lock file if needed. `Ok(None)` means another instance already holds it
 /// -- the caller should log and exit(0), not treat it as an error (see
 /// `agent_main`).
+///
+/// A second lock exists in macOS full mode (D51): `registration.lock` in the
+/// machine data directory, see [`acquire_named`].
 pub fn acquire(dir: &Path) -> io::Result<Option<SingleInstance>> {
+    acquire_named(dir, "agent.lock")
+}
+
+/// Same as [`acquire`] for an arbitrary lock file name in `dir`. Locks with
+/// different names are independent of each other (the machine registration
+/// lock of macOS full mode is held next to the per-user `agent.lock`).
+pub fn acquire_named(dir: &Path, file_name: &str) -> io::Result<Option<SingleInstance>> {
     std::fs::create_dir_all(dir)?;
     let file = OpenOptions::new()
         .create(true)
@@ -33,7 +43,7 @@ pub fn acquire(dir: &Path) -> io::Result<Option<SingleInstance>> {
         // the OS lock on it matter -- so an existing file is left as-is
         // rather than truncated.
         .truncate(false)
-        .open(dir.join("agent.lock"))?;
+        .open(dir.join(file_name))?;
 
     match file.try_lock() {
         Ok(()) => Ok(Some(SingleInstance(file))),
@@ -68,6 +78,19 @@ mod tests {
         );
 
         drop(first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locks_with_different_names_do_not_conflict() {
+        let dir = scratch_dir("names");
+
+        let first = acquire_named(&dir, "a.lock").unwrap();
+        let second = acquire_named(&dir, "b.lock").unwrap();
+        assert!(first.is_some() && second.is_some());
+        assert!(acquire_named(&dir, "a.lock").unwrap().is_none());
+
+        drop((first, second));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

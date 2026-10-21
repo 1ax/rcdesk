@@ -462,12 +462,12 @@ reason }`, клиент не цепляет ввод и показывает `Т
 
 | | Лёгкий (без админа) | Полный (админ, фаза 4) |
 |---|---|---|
-| Запуск | LaunchAgent (macOS), автозагрузка пользователя (Windows) | LaunchDaemon + агент в контексте LoginWindow (macOS); служба SYSTEM + помощник в консольной сессии (Windows) |
+| Запуск | LaunchAgent (macOS), автозагрузка пользователя (Windows) | один системный LaunchAgent с `LimitLoadToSessionType = [Aqua, LoginWindow]` (macOS, D51); служба SYSTEM + помощник в консольной сессии (Windows) |
 | Разрешения macOS | Запись экрана + Универсальный доступ (даёт пользователь, без админа) | те же + установка демона (админ один раз) |
-| Экран входа / блокировка | блокировка в сеансе — да на macOS (4.2a, T3) | цель; на Windows — долг 4.1b; на macOS экран входа — ввод доходит (D51 решён 2026-10-21: секция `__CGPreLoginApp` + грант TCC), полный режим в работе |
+| Экран входа / блокировка | блокировка в сеансе — да на macOS (4.2a, T3) | цель; на Windows — долг 4.1b; на macOS экран входа — ввод доходит (D51 решён 2026-10-21: секция `__CGPreLoginApp` + грант TCC), полный режим: `rcdesk-host fullmode install` (D51) |
 | Окна с повышенными правами, UAC (Windows) | ввод не проходит (UIPI), клиент предупреждён (`InputBlocked`, 2.6e) | окна администратора — да (4.1a); UAC на secure desktop — долг 4.1b |
 | Ctrl+Alt+Del | нет | цель (SendSAS); на Windows — долг 4.1c |
-| Автостарт до входа | нет | да (Windows, 4.1a) |
+| Автостарт до входа | нет | да (Windows, 4.1a; macOS — системный LaunchAgent, D51) |
 
 Общая логика захвата/транспорта одна; режим определяет только «кто запускает
 процесс и в какой сессии». Полный режим на Windows (слайс 4.1a, решения владельца
@@ -501,6 +501,24 @@ DACL (SYSTEM + Administrators); `service install` переносит туда `d
 `platform::{macos,windows}::autostart`, включается пунктом меню агента «Start
 at login» или `rcdesk-host autostart on`. `launchctl` не вызывается: файл
 только пишется/удаляется, эффект — со следующего входа.
+
+Полный режим macOS (D51, решения владельца 2026-10-21): один системный LaunchAgent
+`/Library/LaunchAgents/app.rcdesk.agent.plist` (`LimitLoadToSessionType = [Aqua, LoginWindow]`,
+`KeepAlive { SuccessfulExit = false }`), ставится только командой `sudo rcdesk-host fullmode install`
+(`platform::macos::fullmode`, чистая логика — `fullmode.rs`). launchd поднимает из него два инстанса
+одного `rcdesk-agent`: роль «сеанс» в GUI-сеансе (трей, шторка, обновления — всё как в лёгком режиме)
+и роль «экран входа» в сеансе loginwindow от root (без трея, шторки и обновлений: `osascript … with
+administrator privileges` установщика там невозможен). Состояние (`device.json`, `access.json`) общее —
+машинный каталог `/Library/Application Support/rcdesk` (root:admin, `02770`, файлы `0660`), иначе у ролей
+разошёлся бы `host_id`, а сервер вытесняет предыдущее соединение того же `host_id` (пинг-понг). Арбитраж —
+одновременно подключён один инстанс: роль «экран входа» служит, только пока владелец `/dev/console`
+— root (вошедшего пользователя нет) и свободен машинный лок регистрации (`registration.lock`); при
+появлении пользователя выходит с кодом 3 (под `KeepAlive{SuccessfulExit=false}` launchd перезапускает
+его в режим ожидания); сеансовая роль при занятом локе ждёт его до 10 с (передача без вытеснения на
+сервере). Обновления — только в сеансовой роли. Пользовательский автозапуск 2.6d при установленном
+полном режиме выключен гейтом (`autostart on|restore` — no-op, иначе `postinstall` pkg создавал бы
+второй plist с той же меткой), `install` его снимает. Ограничение: после перезагрузки первым
+идёт экран разблокировки FileVault (нет сети и агентов) — доступ только после выхода из системы.
 
 **Шторка (слайс 4.2c, только macOS-агент).** Клиент кнопкой «Шторка» шлёт `ControlMessage::SetCurtain { on }`, хост
 отвечает `CurtainStatus { on, reason }`; `HostInfo.curtain_available` — только `rcdesk-agent` на macOS (трейт
@@ -737,6 +755,7 @@ workflow его не видят, прогон ждёт «Review deployments». �
 | opaque-ke 4.0 (argon2), argon2 0.5, sha2 0.10 | host | OPAQUE-пароль доступа к хосту (3.2b): шифронабор как у `@serenity-kit/opaque`, argon2id — KSF, SHA-512 — TripleDH |
 | argon2 0.5 (из workspace) | server | хеш пароля учётки (3.8a), argon2id по умолчанию; соль 16 байт из `rand` 0.10 — `OsRng` крейта требует фичу `getrandom` |
 | lettre 0.11.23 (builder, smtp-transport, tokio1, tokio1-rustls-tls) | server | отправка кода на почту по SMTP (3.8b), Resend `smtp.resend.com:465` implicit TLS; rustls + ring + webpki-roots — без native-tls и системных корней, рантайм-образ не меняется |
+| libc 0.2 | host (macOS) | `geteuid()` — роль инстанса полного режима (root = экран входа) и отказ `fullmode install` без прав (D51); уже в графе транзитивно |
 | rpassword 7 | host | скрытый ввод пароля в терминале для `rcdesk-host password set` (macOS + Windows) |
 | rand_core 0.6 (getrandom) | host | `OsRng` для трейтов `rand_core` 0.6, над которыми обобщён opaque-ke 4.0 (реэкспорт `opaque_ke::rand` без фичи `getrandom` `OsRng` не даёт; воркспейсный `rand` 0.10 — другой мажор трейтов) |
 | @serenity-kit/opaque 1.1 | web | клиентская сторона OPAQUE (3.2d) — `opaque-ke` 4.0 в WASM, первая runtime-зависимость web |

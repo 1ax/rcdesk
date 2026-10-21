@@ -82,8 +82,206 @@ mod imp {
         name: Option<String>,
     }
 
+    /// Полный режим macOS (D51) установлен. На других ОС всегда `false`.
+    fn full_mode_installed() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            rcdesk_host::fullmode::is_installed()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn machine_data_dir_opt() -> Option<std::path::PathBuf> {
+        Some(agent::paths::machine_data_dir())
+    }
+    #[cfg(not(target_os = "macos"))]
+    fn machine_data_dir_opt() -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// Роль «экран входа» (D51): инстанс из системного LaunchAgent в сеансе
+    /// loginwindow от root. Без трея, шторки, обновлений и опроса прав; служит,
+    /// только пока на консоли нет пользователя и свободен машинный лок
+    /// регистрации. Не возвращается.
+    #[cfg(target_os = "macos")]
+    fn run_login_screen(cli: &Cli) -> ! {
+        use rcdesk_host::fullmode::{
+            ConsoleGate, GateDecision, EXIT_CONSOLE_TAKEN, GATE_POLL_INTERVAL,
+            REGISTRATION_LOCK_FILE,
+        };
+
+        let log_dir = agent::paths::machine_log_dir();
+        let log_path = match agent::logging::init_named(&log_dir, "loginwindow.log") {
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!(
+                    "rcdesk-agent: failed to set up logging in {}: {err}",
+                    log_dir.display()
+                );
+                std::process::exit(1);
+            }
+        };
+        let machine_dir = agent::paths::machine_data_dir();
+        tracing::info!(
+            role = "экран входа",
+            version = rcdesk_host::build_info::FULL_VERSION,
+            log_path = %log_path.display(),
+            state_dir = %machine_dir.display(),
+            "rcdesk-agent starting"
+        );
+
+        let _lock = match agent::lock::acquire(&machine_dir) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                tracing::info!("another rcdesk-agent is already running, exiting");
+                std::process::exit(0);
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "failed to acquire the single-instance lock");
+                std::process::exit(1);
+            }
+        };
+
+        let device_store = DeviceStore::for_server(&machine_dir, &cli.server).shared();
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to build the tokio runtime");
+                std::process::exit(1);
+            }
+        };
+        let opts = ServeOptions {
+            server: cli.server.clone(),
+            name: cli.name.clone(),
+            synthetic: false,
+            display: None,
+            fps: 30,
+            bitrate: 6000,
+            max_qp: None,
+            stun: vec![],
+            no_input: false,
+            no_clipboard: false,
+            no_files: false,
+            no_adapt: false,
+            capture: CaptureBackend::Auto,
+            encoder: EncoderBackend::Auto,
+            data_dir: Some(machine_dir.clone()),
+        };
+        let host_name = app::resolve_host_name(cli.name.as_deref());
+        // `update_dirs` остаётся `None`, шторка не создаётся: обновления и
+        // шторка в этой роли невозможны.
+        let ctx = match app::build_host_context(&opts) {
+            Ok(ctx) => Arc::new(ctx),
+            Err(err) => {
+                tracing::error!(error = %err, "failed to build the host context");
+                std::process::exit(1);
+            }
+        };
+
+        // Каналы нужны `run_agent`; UI-потребителя нет, статус пишем в лог.
+        let (status_tx, mut status_rx) = watch::channel(AgentStatus::Connecting);
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel::<AgentCommand>();
+        runtime.spawn(async move {
+            while status_rx.changed().await.is_ok() {
+                let status = status_rx.borrow_and_update().clone();
+                tracing::info!(?status, "статус агента");
+            }
+        });
+        let mut agent_parts = Some((status_tx, cmd_rx, device_store));
+
+        let mut gate = ConsoleGate::new();
+        let mut registration_lock: Option<agent::lock::SingleInstance> = None;
+        let mut lock_error_logged = false;
+        let mut console_warned = false;
+        let mut last_state: Option<(Option<u32>, bool)> = None;
+        loop {
+            if registration_lock.is_none() {
+                match agent::lock::acquire_named(&machine_dir, REGISTRATION_LOCK_FILE) {
+                    Ok(Some(lock)) => registration_lock = Some(lock),
+                    Ok(None) => {}
+                    Err(err) => {
+                        if !lock_error_logged {
+                            tracing::error!(error = %err, "машинный лок регистрации недоступен, считаю занятым");
+                            lock_error_logged = true;
+                        }
+                    }
+                }
+            }
+            let registration_busy = registration_lock.is_none();
+            let console = platform::fullmode::console_uid();
+            let console_for_gate = match console {
+                Some(uid) => uid,
+                None => {
+                    if !console_warned {
+                        tracing::warn!(
+                            "владелец /dev/console не определён, считаю консоль занятой"
+                        );
+                        console_warned = true;
+                    }
+                    u32::MAX
+                }
+            };
+            if last_state != Some((console, registration_busy)) {
+                tracing::info!(?console, registration_busy, "состояние гейта консоли");
+                last_state = Some((console, registration_busy));
+            }
+
+            match gate.tick(Instant::now(), console_for_gate, registration_busy) {
+                GateDecision::Wait | GateDecision::Keep => {}
+                GateDecision::Serve => {
+                    tracing::info!("консоль свободна, начинаю служить");
+                    if let Some((status_tx, cmd_rx, device_store)) = agent_parts.take() {
+                        let agent_ctx = Arc::clone(&ctx);
+                        let server = cli.server.clone();
+                        let host_name = host_name.clone();
+                        runtime.spawn(async move {
+                            let _ = app::run_agent(
+                                &agent_ctx,
+                                &server,
+                                &host_name,
+                                ReconnectPolicy::default(),
+                                Keepalive::default(),
+                                &device_store,
+                                status_tx,
+                                cmd_rx,
+                            )
+                            .await;
+                        });
+                    }
+                }
+                GateDecision::Yield => {
+                    tracing::info!("консоль занята пользователем, выходим");
+                    std::process::exit(EXIT_CONSOLE_TAKEN);
+                }
+            }
+            std::thread::sleep(GATE_POLL_INTERVAL);
+        }
+    }
+
     pub fn run() {
         let cli = Cli::parse();
+
+        // Роль определяется ДО логирования: у ролей разные каталоги логов.
+        // «Экран входа» -- только в полном режиме и только от root.
+        let full_mode = full_mode_installed();
+        #[cfg(target_os = "macos")]
+        {
+            let role = if full_mode {
+                rcdesk_host::fullmode::role_from_uid(platform::fullmode::euid())
+            } else {
+                rcdesk_host::fullmode::Role::Session
+            };
+            if role == rcdesk_host::fullmode::Role::LoginScreen {
+                run_login_screen(&cli);
+            }
+        }
 
         let log_dir = agent::paths::log_dir();
         let log_path = match agent::logging::init(&log_dir) {
@@ -120,7 +318,68 @@ mod imp {
             }
         };
 
-        let device_store = DeviceStore::for_server(&data_dir, &cli.server);
+        // Полный режим macOS: состояние общее для обеих ролей (машинный
+        // каталог), и держим машинный лок регистрации до конца процесса.
+        #[cfg(target_os = "macos")]
+        let state_dir = agent::paths::state_dir_in(full_mode);
+        #[cfg(not(target_os = "macos"))]
+        let state_dir = data_dir.clone();
+        #[cfg(target_os = "macos")]
+        let _registration_lock = if full_mode {
+            let machine_dir = agent::paths::machine_data_dir();
+            match agent::lock::acquire_named(
+                &machine_dir,
+                rcdesk_host::fullmode::REGISTRATION_LOCK_FILE,
+            ) {
+                Ok(Some(lock)) => Some(lock),
+                Ok(None) => {
+                    // Ждём передачи с экрана входа, чтобы на сервере не было
+                    // окна с двумя подключёнными инстансами (вытеснение, ротация
+                    // PIN). Цена: значок в строке меню появится на пару секунд позже.
+                    use rcdesk_host::fullmode::{
+                        REGISTRATION_WAIT_POLL, REGISTRATION_WAIT_TIMEOUT,
+                    };
+                    tracing::info!("машинный лок регистрации занят, ждём передачи с экрана входа");
+                    let started = std::time::Instant::now();
+                    let mut got = None;
+                    while started.elapsed() < REGISTRATION_WAIT_TIMEOUT {
+                        std::thread::sleep(REGISTRATION_WAIT_POLL);
+                        if let Ok(Some(lock)) = agent::lock::acquire_named(
+                            &machine_dir,
+                            rcdesk_host::fullmode::REGISTRATION_LOCK_FILE,
+                        ) {
+                            got = Some(lock);
+                            break;
+                        }
+                    }
+                    match &got {
+                        Some(_) => {
+                            tracing::info!("лок получен за {} мс", started.elapsed().as_millis())
+                        }
+                        None => tracing::warn!("лок так и занят после 10 с, подключаюсь всё равно"),
+                    }
+                    got
+                }
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        dir = %machine_dir.display(),
+                        "полный режим установлен, каталог недоступен этому пользователю — нужны права администратора"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            None
+        };
+
+        let device_store = DeviceStore::for_server(&state_dir, &cli.server);
+        #[cfg(target_os = "macos")]
+        let device_store = if full_mode {
+            device_store.shared()
+        } else {
+            device_store
+        };
 
         tracing::info!(
             version = rcdesk_host::build_info::FULL_VERSION,
@@ -160,7 +419,12 @@ mod imp {
             no_adapt: false,
             capture: CaptureBackend::Auto,
             encoder: EncoderBackend::Auto,
-            data_dir: None,
+            // Полный режим macOS: явный машинный каталог, иначе как раньше.
+            data_dir: if cfg!(target_os = "macos") && full_mode {
+                machine_data_dir_opt()
+            } else {
+                None
+            },
         };
         let host_name = app::resolve_host_name(cli.name.as_deref());
         let ctx = match app::build_host_context(&opts) {

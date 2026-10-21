@@ -16,7 +16,20 @@ use std::path::Path;
 /// meant to protect. On Windows there's no POSIX mode bit to set, but none
 /// is needed either -- see `device.rs`'s module doc comment for why. The
 /// parent directory is created if it doesn't exist yet.
+///
+/// A second mode exists ([`write_atomic_mode`]) for the machine data
+/// directory of macOS full mode (D51), shared by root and an administrator:
+/// there `0660` is needed, otherwise a file written by one of them could not
+/// be read by the other.
 pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_mode(path, bytes, 0o600)
+}
+
+/// Same algorithm as [`write_private_atomic`] with an explicit Unix `mode`
+/// (ignored on other platforms). The mode is applied to the temporary file
+/// with `fchmod` right after creation, before any bytes are written, so a
+/// `umask` cannot strip bits (e.g. group-write of `0660`).
+pub(crate) fn write_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -30,11 +43,18 @@ pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> 
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(mode);
     }
     {
         use std::io::Write as _;
         let mut file = options.open(&tmp_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
