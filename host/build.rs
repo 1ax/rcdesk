@@ -13,6 +13,22 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         embed_windows_resources();
     }
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        embed_cg_prelogin_section();
+    }
+}
+
+/// Секция `__CGPreLoginApp,__cgpreloginapp` в обоих бинарниках пакета: без неё
+/// CoreGraphics не принимает события от процесса в сессии LoginWindow (экран
+/// входа macOS). Содержимое не важно -- достаточно наличия секции (один байт).
+fn embed_cg_prelogin_section() {
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR задаёт cargo");
+    let path = std::path::Path::new(&out_dir).join("cgpreloginapp.bin");
+    std::fs::write(&path, [0u8]).expect("не удалось записать заполнитель cgpreloginapp");
+    let path = path.to_string_lossy();
+    // -Wl,a,b,c передаёт ld аргументы через запятую, путь с запятой её сломает.
+    assert!(!path.contains(','), "OUT_DIR содержит запятую: {path}");
+    println!("cargo:rustc-link-arg-bins=-Wl,-sectcreate,__CGPreLoginApp,__cgpreloginapp,{path}");
 }
 
 /// Иконка и VERSIONINFO для обоих exe пакета (`rcdesk-host`, `rcdesk-agent`).

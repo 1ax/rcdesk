@@ -11,6 +11,12 @@
 # «Универсальный доступ») переживают обновление (долг D28). Без секретов --
 # ad-hoc подпись (DR = cdhash) и предупреждение: форки и PR не падают.
 #
+# Оба бинарника (rcdesk-host и rcdesk-agent) подписываются одним идентификатором
+# app.rcdesk.agent: DR `identifier "app.rcdesk.agent" and certificate leaf =
+# H"<sha1>"` общий, поэтому гранты TCC («Универсальный доступ», «Запись экрана»)
+# действуют для любого из них, в том числе на экране входа. Там же нужна секция
+# __CGPreLoginApp,__cgpreloginapp (её кладёт host/build.rs) -- проверяем ниже.
+#
 # Hardened runtime НЕ включаем: нотаризации нет, а entitlements под захват
 # экрана и ввод не продуманы. .pkg не подписываем: Developer ID Installer нет.
 set -euo pipefail
@@ -27,6 +33,13 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 for f in rcdesk-agent rcdesk-host; do
   [ -f "$release_dir/$f" ] || { echo "нет $release_dir/$f" >&2; exit 1; }
+  # Страховка: секцию кладёт host/build.rs; без неё ввод на экране входа молча
+  # перестанет работать.
+  if ! otool -l "$release_dir/$f" | grep -q cgpreloginapp; then
+    echo "в $release_dir/$f нет секции __CGPreLoginApp,__cgpreloginapp (см. host/build.rs)" >&2
+    exit 1
+  fi
+  echo "секция __cgpreloginapp на месте: $f"
 done
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/rcdesk-pkg.XXXXXX")"
@@ -85,7 +98,7 @@ else
   echo "ПРЕДУПРЕЖДЕНИЕ: MACOS_SIGN_P12 не заданы -- ad-hoc подпись; TCC-разрешения сбросятся при обновлении" >&2
   sign=(codesign --force -s -)
 fi
-"${sign[@]}" --identifier app.rcdesk.host "$app/Contents/MacOS/rcdesk-host"
+"${sign[@]}" --identifier app.rcdesk.agent "$app/Contents/MacOS/rcdesk-host"
 "${sign[@]}" --identifier app.rcdesk.agent "$app"
 
 # 3. Проверка и DR в лог.
