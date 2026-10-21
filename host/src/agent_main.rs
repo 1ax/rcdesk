@@ -338,16 +338,18 @@ mod imp {
             .expect("append separator");
         menu.append(&quit_item).expect("append quit item");
 
-        let is_macos = cfg!(target_os = "macos");
         let icon = Icon::from_rgba(render_icon(model.icon, ICON_SIZE), ICON_SIZE, ICON_SIZE)
             .expect("render_icon always produces a valid-sized RGBA buffer");
-        let tray_icon = TrayIconBuilder::new()
+        let builder = TrayIconBuilder::new()
             .with_menu(Box::new(menu.clone()))
-            .with_tooltip(&model.tooltip)
-            .with_icon(icon)
-            .with_icon_as_template(is_macos)
-            .build()
-            .expect("failed to build the tray icon");
+            .with_tooltip(&model.tooltip);
+        // Шаблонная иконка (перекрашивается под светлую/тёмную строку меню) --
+        // только macOS: `with_icon_templated` в tray-icon 0.26 есть лишь там.
+        #[cfg(target_os = "macos")]
+        let builder = builder.with_icon_templated(icon);
+        #[cfg(not(target_os = "macos"))]
+        let builder = builder.with_icon(icon);
+        let tray_icon = builder.build().expect("failed to build the tray icon");
 
         // Holds the "stay awake" activity for as long as a session is
         // active on macOS (see `platform::activity`'s doc comment); the
@@ -487,17 +489,15 @@ mod imp {
                         ICON_SIZE,
                         ICON_SIZE,
                     ) {
-                        // `set_icon_with_as_template` is macOS-only in
-                        // tray-icon 0.25: on Windows it drops the icon and
-                        // returns `Ok(())`, so the tray icon never changed
-                        // with the session (found on the Win10 stand,
-                        // 2026-09-20). `set_icon` is the cross-platform one.
+                        // `set_icon_templated` is macOS-only in tray-icon
+                        // 0.26 (in 0.25 `set_icon_with_as_template` silently
+                        // dropped the icon on Windows -- found on the Win10
+                        // stand, 2026-09-20). `set_icon` is the cross-platform one.
                         Ok(icon) => {
-                            let result = if is_macos {
-                                tray_icon.set_icon_with_as_template(Some(icon), true)
-                            } else {
-                                tray_icon.set_icon(Some(icon))
-                            };
+                            #[cfg(target_os = "macos")]
+                            let result = tray_icon.set_icon_templated(Some(icon));
+                            #[cfg(not(target_os = "macos"))]
+                            let result = tray_icon.set_icon(Some(icon));
                             if let Err(err) = result {
                                 tracing::warn!(error = %err, "failed to update the tray icon");
                             }

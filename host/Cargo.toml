@@ -78,7 +78,7 @@ winresource = "0.1.31"
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 scap = { workspace = true }
 enigo = { workspace = true }
-tray-icon = { version = "0.25", default-features = false }
+tray-icon = { version = "0.26", default-features = false }
 
 # scap 0.0.8 вызывает пятиаргументный `Settings::new`, который сломан в windows-capture 1.5+
 # (там 8 аргументов). Прямой пин держит lock-файл на совместимой версии даже после
