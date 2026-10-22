@@ -102,6 +102,42 @@ pub fn is_installed_in(dir: &Path) -> bool {
     plist_path_in(dir).exists()
 }
 
+/// Последовательность попыток загрузить задание в GUI-сеанс пользователя `uid`
+/// (аргументы `launchctl` без самого пути к нему, кроме `asuser`-форм).
+///
+/// Почему `asuser`: `install` идёт из root-процесса (`sudo`), а он не находится
+/// в bootstrap-контексте сеанса Aqua. Голый `launchctl bootstrap gui/<uid> ...`
+/// оттуда падает с `Bootstrap failed: 5: Input/output error`, а `kickstart` --
+/// кодом 37, и агент остаётся мёртвым. `launchctl asuser <uid> ...` переносит
+/// команду в контекст сессии пользователя, и она срабатывает. Не «упрощать»
+/// обратно до голых команд. Попытки 1-2 -- боевой путь из root; 3-4 запасные,
+/// на случай когда `install` зовут уже из пользовательского контекста.
+pub fn load_job_attempts(launchctl: &str, uid: &str, plist: &str) -> Vec<Vec<String>> {
+    let domain = format!("gui/{uid}");
+    let target = format!("{domain}/{LAUNCH_AGENT_LABEL}");
+    let v = |parts: &[&str]| parts.iter().map(|p| (*p).to_string()).collect::<Vec<_>>();
+    vec![
+        v(&["asuser", uid, launchctl, "bootstrap", &domain, plist]),
+        v(&["asuser", uid, launchctl, "kickstart", "-k", &target]),
+        v(&["bootstrap", &domain, plist]),
+        v(&["kickstart", "-k", &target]),
+    ]
+}
+
+/// Попытки подтвердить состояние задания после загрузки (`launchctl print`).
+///
+/// `asuser` первым: тот же контекст сеанса, что у сработавшего `bootstrap`; из
+/// root голая форма может быть недоступна. Запасная -- без `asuser`. Это только
+/// чтение: отсутствие результата не признак поломки агента.
+pub fn print_job_attempts(launchctl: &str, uid: &str) -> Vec<Vec<String>> {
+    let target = format!("gui/{uid}/{LAUNCH_AGENT_LABEL}");
+    let v = |parts: &[&str]| parts.iter().map(|p| (*p).to_string()).collect::<Vec<_>>();
+    vec![
+        v(&["asuser", uid, launchctl, "print", &target]),
+        v(&["print", &target]),
+    ]
+}
+
 /// Роль инстанса, поднятого из системного plist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -180,6 +216,49 @@ impl ConsoleGate {
 mod tests {
     use super::*;
     use crate::agent::autostart::parse_program_arguments_path;
+
+    #[test]
+    fn load_job_attempts_order_and_values() {
+        let a = load_job_attempts("/bin/launchctl", "501", "/Library/LaunchAgents/x.plist");
+        let expected: Vec<Vec<&str>> = vec![
+            vec![
+                "asuser",
+                "501",
+                "/bin/launchctl",
+                "bootstrap",
+                "gui/501",
+                "/Library/LaunchAgents/x.plist",
+            ],
+            vec![
+                "asuser",
+                "501",
+                "/bin/launchctl",
+                "kickstart",
+                "-k",
+                "gui/501/app.rcdesk.agent",
+            ],
+            vec!["bootstrap", "gui/501", "/Library/LaunchAgents/x.plist"],
+            vec!["kickstart", "-k", "gui/501/app.rcdesk.agent"],
+        ];
+        assert_eq!(a.len(), 4);
+        assert_eq!(a, expected);
+    }
+
+    #[test]
+    fn print_job_attempts_order_and_values() {
+        let a = print_job_attempts("/bin/launchctl", "501");
+        let expected: Vec<Vec<&str>> = vec![
+            vec![
+                "asuser",
+                "501",
+                "/bin/launchctl",
+                "print",
+                "gui/501/app.rcdesk.agent",
+            ],
+            vec!["print", "gui/501/app.rcdesk.agent"],
+        ];
+        assert_eq!(a, expected);
+    }
 
     #[test]
     fn plist_has_all_keys_and_both_session_types() {

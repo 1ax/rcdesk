@@ -63,7 +63,15 @@ sudo /Applications/rcdesk.app/Contents/MacOS/rcdesk-host fullmode uninstall
 - снимает пользовательский автозапуск (`~/Library/LaunchAgents/app.rcdesk.agent.plist`
   и задание в `launchd`): метка у системного и пользовательского plist одна;
 - пишет системный LaunchAgent `/Library/LaunchAgents/app.rcdesk.agent.plist`
-  (`LimitLoadToSessionType = Aqua, LoginWindow`) и загружает его в текущий сеанс.
+  (`LimitLoadToSessionType = Aqua, LoginWindow`) и загружает его в текущий сеанс
+  через `launchctl asuser <uid>`: из root голый
+  `launchctl bootstrap gui/<uid>` падает с `Input/output error`. После загрузки
+  подтверждает состояние через `launchctl print` (сначала через `asuser`) и печатает
+  `state`/`pid`; если подтвердить не удалось -- предупреждение с готовой командой
+  проверки. Проверено 2026-10-22: `print` из root работает в обеих формах,
+  `asuser` нужен именно изменяющим командам (`bootstrap`, `kickstart`). Ошибкой
+  `install` завершается, только если задание не удалось загрузить (в тексте --
+  команда для ручной загрузки).
 
 После установки `rcdesk-host autostart on|restore` ничего не меняет (в том числе
 при обновлении pkg), `autostart off` отказывает: автозапуском управляет системный

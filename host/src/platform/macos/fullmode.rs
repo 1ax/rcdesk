@@ -16,8 +16,8 @@ use anyhow::{bail, Context};
 use crate::agent::autostart::{parse_program_arguments_path, LAUNCH_AGENT_LABEL};
 use crate::agent::paths;
 use crate::fullmode::{
-    generate_system_plist, plist_path, role_from_uid, Role, ADMIN_GID, DIR_MODE,
-    REGISTRATION_LOCK_FILE, SHARED_FILE_MODE,
+    generate_system_plist, load_job_attempts, plist_path, print_job_attempts, role_from_uid, Role,
+    ADMIN_GID, DIR_MODE, REGISTRATION_LOCK_FILE, SHARED_FILE_MODE,
 };
 
 const LAUNCHCTL: &str = "/bin/launchctl";
@@ -164,6 +164,34 @@ fn launchctl(args: &[&str]) -> anyhow::Result<bool> {
     Ok(output.status.success())
 }
 
+/// `launchctl` со stdout: `Ok(Some(stdout))` при коде выхода 0, иначе `None`.
+fn launchctl_stdout(args: &[&str]) -> anyhow::Result<Option<String>> {
+    let output = Command::new(LAUNCHCTL)
+        .args(args)
+        .output()
+        .with_context(|| format!("запуск {LAUNCHCTL}"))?;
+    tracing::info!(
+        args = ?args,
+        status = %output.status,
+        stdout = %String::from_utf8_lossy(&output.stdout).trim(),
+        stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+        "launchctl"
+    );
+    Ok(output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned()))
+}
+
+/// Строки состояния из вывода `launchctl print` (`state = ...`, `pid = ...`).
+fn job_state_lines(out: &str) -> Vec<String> {
+    out.lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("state =") || l.starts_with("pid ="))
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn install(agent: &Path) -> anyhow::Result<()> {
     if euid() != 0 {
         bail!(
@@ -246,21 +274,52 @@ pub fn install(agent: &Path) -> anyhow::Result<()> {
         agent.display()
     );
 
-    // 6. Загрузить задание в текущий GUI-сеанс. Порядок как в postinstall
-    // пакета: bootstrap падает, если задание уже загружено, тогда kickstart.
+    // 6. Загрузить задание в текущий GUI-сеанс. Из root голый bootstrap падает
+    // (Input/output error), поэтому сначала `launchctl asuser` (см. doc
+    // `load_job_attempts`); потом проверка фактом через `launchctl print`.
     match &uid {
         Some(uid) => {
             let domain = format!("gui/{uid}");
             let target = format!("{domain}/{LAUNCH_AGENT_LABEL}");
             let plist_str = plist.to_string_lossy().into_owned();
-            if launchctl(&["bootstrap", &domain, &plist_str])? {
-                println!("Задание загружено в текущий сеанс ({domain})");
-            } else if launchctl(&["kickstart", "-k", &target])? {
-                println!("Задание уже было загружено, перезапущено ({target})");
-            } else {
-                println!(
-                    "Не удалось загрузить задание в текущий сеанс: оно поднимется при следующем входе"
+            let mut loaded = false;
+            for attempt in load_job_attempts(LAUNCHCTL, uid, &plist_str) {
+                let args: Vec<&str> = attempt.iter().map(String::as_str).collect();
+                if launchctl(&args)? {
+                    if args.contains(&"bootstrap") {
+                        println!("Задание загружено в текущий сеанс ({domain})");
+                    } else {
+                        println!("Задание уже было загружено, перезапущено ({target})");
+                    }
+                    loaded = true;
+                    break;
+                }
+            }
+            if !loaded {
+                bail!(
+                    "системный plist {p} установлен и поднимется при следующем входе, \
+                     но агент сейчас НЕ запущен (пользовательский автозапуск уже снят, \
+                     поэтому удалённый доступ потерян до входа в систему). Поднять вручную \
+                     от имени пользователя: launchctl bootstrap gui/{uid} {p}",
+                    p = plist.display()
                 );
+            }
+            let mut state_lines = Vec::new();
+            for attempt in print_job_attempts(LAUNCHCTL, uid) {
+                let args: Vec<&str> = attempt.iter().map(String::as_str).collect();
+                if let Some(out) = launchctl_stdout(&args)? {
+                    state_lines = job_state_lines(&out);
+                    break;
+                }
+            }
+            if state_lines.is_empty() {
+                println!(
+                    "Предупреждение: задание загружено, но подтвердить состояние не удалось. \
+                     Проверьте сами от имени пользователя: launchctl print {target}"
+                );
+            }
+            for line in state_lines {
+                println!("  {line}");
             }
         }
         None => println!("SUDO_UID не задана: задание поднимется при следующем входе в систему"),
