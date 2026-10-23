@@ -24,13 +24,16 @@ use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication
 use rtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
 use rtc::rtcp::receiver_report::ReceiverReport as RtcpReceiverReport;
 use rtc::rtp::codec::h264::H264Payloader;
+use rtc::rtp::extension::abs_send_time_extension::AbsSendTimeExtension;
+use rtc::rtp::extension::HeaderExtension;
 use rtc::rtp::packetizer::{new_packetizer, Packetizer};
 use rtc::rtp::sequence::new_random_sequencer;
 use rtc::rtp_transceiver::rtp_sender::{
     RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
-    RTCRtpEncodingParameters, RtpCodecKind,
+    RTCRtpEncodingParameters, RTCRtpHeaderExtensionCapability, RtpCodecKind,
 };
 use rtc::sansio::Protocol;
+use rtc::sdp::extmap::ABS_SEND_TIME_URI;
 use rtc::shared::error::Error;
 
 use rtc::statistics::stats::ice_candidate_pair::RTCStatsIceCandidatePairState;
@@ -715,6 +718,18 @@ impl PeerSession {
             payload_type: VIDEO_PAYLOAD_TYPE,
         };
         media_engine.register_codec(video_codec.clone(), RtpCodecKind::Video)?;
+        // D76 (task 010): without abs-send-time the browser's REMB estimator
+        // (libwebrtc, same in Chrome and Firefox) falls back to RTP
+        // timestamps, i.e. capture time, so encoder latency and pacing look
+        // like a growing queue and REMB sits on the floor. Each packet is
+        // stamped with its real send time in `start_video`.
+        media_engine.register_header_extension(
+            RTCRtpHeaderExtensionCapability {
+                uri: ABS_SEND_TIME_URI.to_owned(),
+            },
+            RtpCodecKind::Video,
+            None,
+        )?;
         let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
         // See `RtcpForwarder`'s doc comment: without it, PLI/FIR from the
         // client never reaches `TrackLocalEvent::OnRtcpPacket`.
@@ -930,6 +945,7 @@ impl PeerSession {
             let mut packetizer: Option<Box<dyn Packetizer>> = None;
             let mut prev_captured_at: Option<Instant> = None;
             let mut last_rearm: Option<Instant> = None;
+            let send_clock = NtpClock::now();
             while let Some(frame) = frames.recv().await {
                 // Wait for the connection to actually be up (DTLS/SRTP
                 // ready), not just SDP-negotiated: `get_parameters()` below
@@ -1013,9 +1029,13 @@ impl PeerSession {
                         tokio::time::sleep(gap).await;
                     }
                     pkt.header.payload_type = pt;
+                    // Stamped after the pacing pause, right before the write:
+                    // the receiver's estimator needs the send time, not the
+                    // frame's capture time.
+                    let send_time = abs_send_time(send_clock.ntp64(Instant::now()));
                     if let Err(err) = session
                         .video_track
-                        .write_rtp_with_extensions(pkt, &[])
+                        .write_rtp_with_extensions(pkt, &[send_time])
                         .await
                     {
                         tracing::warn!(?err, "failed to write video packet");
@@ -1287,6 +1307,21 @@ impl NtpClock {
         let nanos_fraction = (u64::from(unix.subsec_nanos()) * (1u64 << 32) / 1_000_000_000) as u32;
         (((secs & 0xFFFF) as u32) << 16) | (nanos_fraction >> 16)
     }
+
+    /// The full 64-bit NTP timestamp (32.32 fixed point) for `now`.
+    fn ntp64(&self, now: Instant) -> u64 {
+        let unix = self.baseline_unix + now.saturating_duration_since(self.baseline_instant);
+        let secs = unix.as_secs() + 2_208_988_800;
+        let fraction = u64::from(unix.subsec_nanos()) * (1u64 << 32) / 1_000_000_000;
+        (secs << 32) | fraction
+    }
+}
+
+/// The abs-send-time header extension for a packet sent at NTP time `ntp`:
+/// 24 bits, 6.18 fixed-point seconds (wraps every 64 s; the receiver only
+/// uses differences).
+fn abs_send_time(ntp: u64) -> HeaderExtension {
+    HeaderExtension::AbsSendTime(AbsSendTimeExtension::new(ntp))
 }
 
 #[cfg(test)]
@@ -1497,5 +1532,49 @@ mod tests {
         let fraction = (u64::from(unix.subsec_nanos()) * (1u64 << 32) / 1_000_000_000) as u32;
         let expected = (((secs & 0xFFFF) as u32) << 16) | (fraction >> 16);
         assert_eq!(clock.mid32(clock.baseline_instant), expected);
+    }
+
+    #[test]
+    fn ntp_clock_ntp64_middle_bits_match_mid32() {
+        let clock = test_clock();
+        for offset in [
+            Duration::ZERO,
+            Duration::from_millis(1234),
+            Duration::from_secs(90),
+        ] {
+            let now = clock.baseline_instant + offset;
+            assert_eq!((clock.ntp64(now) >> 16) as u32, clock.mid32(now));
+        }
+    }
+
+    /// The 24-bit 6.18 value abs-send-time puts on the wire.
+    fn abs_send_time_wire(ntp: u64) -> u32 {
+        let HeaderExtension::AbsSendTime(ext) = abs_send_time(ntp) else {
+            panic!("abs_send_time must build an AbsSendTime extension");
+        };
+        (ext.timestamp & 0xFF_FFFF) as u32
+    }
+
+    #[test]
+    fn abs_send_time_advances_2_pow_18_per_second() {
+        let clock = test_clock();
+        let base = abs_send_time_wire(clock.ntp64(clock.baseline_instant));
+        let later =
+            abs_send_time_wire(clock.ntp64(clock.baseline_instant + Duration::from_millis(1500)));
+        let diff = later.wrapping_sub(base) & 0xFF_FFFF;
+        assert!(
+            ((3 << 17) - 1..=(3 << 17) + 1).contains(&diff),
+            "1.5 s should be ~{} units, got {diff}",
+            3 << 17
+        );
+    }
+
+    #[test]
+    fn abs_send_time_wraps_every_64_seconds() {
+        let clock = test_clock();
+        let base = abs_send_time_wire(clock.ntp64(clock.baseline_instant));
+        let later =
+            abs_send_time_wire(clock.ntp64(clock.baseline_instant + Duration::from_secs(64)));
+        assert_eq!(base, later);
     }
 }

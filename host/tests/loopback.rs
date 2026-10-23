@@ -15,8 +15,9 @@ use rtc::peer_connection::configuration::media_engine::MIME_TYPE_H264;
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
 use rtc::rtp_transceiver::rtp_sender::{
-    RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RtpCodecKind,
+    RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpHeaderExtensionCapability, RtpCodecKind,
 };
+use rtc::sdp::extmap::ABS_SEND_TIME_URI;
 
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
@@ -113,6 +114,16 @@ fn rtp_payload_nal_types(payload: &[u8]) -> Vec<u8> {
     }
 }
 
+/// The `a=extmap` id the SDP assigns to `uri`, if any.
+fn extmap_id(sdp: &str, uri: &str) -> Option<u8> {
+    sdp.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("a=extmap:")?;
+        let (id, rest) = rest.split_once(' ')?;
+        let id = id.split('/').next()?;
+        (rest.split_whitespace().next()? == uri).then(|| id.parse().ok())?
+    })
+}
+
 /// Stand-in for a browser: forwards local ICE candidates over `ice_tx` and
 /// hands the first remote track to whoever is waiting on `track_tx`.
 struct BrowserHandler {
@@ -200,6 +211,14 @@ async fn run() -> anyhow::Result<()> {
     // ---- "Browser" side: a second, plain webrtc-rs PeerConnection. ----
     let mut browser_media_engine = MediaEngine::default();
     browser_media_engine.register_codec(browser_video_codec(), RtpCodecKind::Video)?;
+    // Chrome and Firefox both offer abs-send-time; the host must negotiate it.
+    browser_media_engine.register_header_extension(
+        RTCRtpHeaderExtensionCapability {
+            uri: ABS_SEND_TIME_URI.to_owned(),
+        },
+        RtpCodecKind::Video,
+        None,
+    )?;
     let browser_registry =
         register_default_interceptors(Registry::new(), &mut browser_media_engine)?;
 
@@ -267,12 +286,21 @@ async fn run() -> anyhow::Result<()> {
     // ---- Offer / answer. ----
     let offer_sdp = host_session.create_offer().await?;
     browser_pc
-        .set_remote_description(RTCSessionDescription::offer(offer_sdp)?)
+        .set_remote_description(RTCSessionDescription::offer(offer_sdp.clone())?)
         .await?;
     let answer = browser_pc.create_answer(None).await?;
     let answer_sdp = answer.sdp.clone();
     browser_pc.set_local_description(answer).await?;
-    host_session.set_answer(answer_sdp).await?;
+    host_session.set_answer(answer_sdp.clone()).await?;
+
+    // (g, D76) abs-send-time is in the host's offer and survives into the
+    // answer; its negotiated id is what the packets below must carry.
+    assert!(
+        extmap_id(&offer_sdp, ABS_SEND_TIME_URI).is_some(),
+        "host offer should advertise abs-send-time:\n{offer_sdp}"
+    );
+    let abs_send_time_id = extmap_id(&answer_sdp, ABS_SEND_TIME_URI)
+        .unwrap_or_else(|| panic!("answer should accept abs-send-time:\n{answer_sdp}"));
 
     // (a) on_track fires within 10s.
     let track = timeout(Duration::from_secs(10), track_rx)
@@ -297,7 +325,14 @@ async fn run() -> anyhow::Result<()> {
     // so a long-running test doesn't grow this unboundedly.
     let marker_timestamps = Arc::new(Mutex::new(Vec::<(Instant, u32)>::new()));
     const MAX_MARKER_TIMESTAMPS: usize = 60;
+    // (arrival time, 24-bit abs-send-time) of every packet, and the number
+    // of packets that arrived without the extension; for (g) below.
+    let send_times = Arc::new(Mutex::new(Vec::<(Instant, u32)>::new()));
+    let missing_send_time = Arc::new(AtomicUsize::new(0));
+    const MAX_SEND_TIMES: usize = 2000;
     {
+        let send_times = Arc::clone(&send_times);
+        let missing_send_time = Arc::clone(&missing_send_time);
         let packet_count = Arc::clone(&packet_count);
         let saw_sps = Arc::clone(&saw_sps);
         let marker_timestamps = Arc::clone(&marker_timestamps);
@@ -306,6 +341,20 @@ async fn run() -> anyhow::Result<()> {
             while let Some(event) = track.poll().await {
                 if let TrackRemoteEvent::OnRtpPacket(pkt) = event {
                     packet_count.fetch_add(1, Ordering::Relaxed);
+                    match pkt.header.get_extension(abs_send_time_id) {
+                        Some(ext) if ext.len() == 3 => {
+                            let value = u32::from(ext[0]) << 16
+                                | u32::from(ext[1]) << 8
+                                | u32::from(ext[2]);
+                            let mut send_times = send_times.lock().await;
+                            if send_times.len() < MAX_SEND_TIMES {
+                                send_times.push((Instant::now(), value));
+                            }
+                        }
+                        _ => {
+                            missing_send_time.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     if rtp_payload_nal_types(&pkt.payload).contains(&7) {
                         saw_sps.store(true, Ordering::Relaxed);
                     }
@@ -376,6 +425,40 @@ async fn run() -> anyhow::Result<()> {
         "RTP clock should advance at wall-clock rate: rtp span {rtp_span:?} vs wall span \
          {wall_span:?} over {} frames (drift {drift:?} > tolerance {tolerance:?}); timestamps={timestamps:?}",
         timestamps.len()
+    );
+
+    // (g, D76) every video packet carries abs-send-time; the 24-bit 6.18
+    // value never goes backward (mod 64 s) and advances at wall-clock rate.
+    assert_eq!(
+        missing_send_time.load(Ordering::Relaxed),
+        0,
+        "every RTP packet should carry abs-send-time (id {abs_send_time_id})"
+    );
+    let send_times = send_times.lock().await.clone();
+    assert!(
+        send_times.len() >= 30,
+        "expected >= 30 packets with abs-send-time, got {}",
+        send_times.len()
+    );
+    for w in send_times.windows(2) {
+        let diff = w[1].1.wrapping_sub(w[0].1) & 0xFF_FFFF;
+        assert!(
+            diff < 1 << 22,
+            "abs-send-time went backward or jumped > 16 s between packets: diff {diff}"
+        );
+    }
+    let (first_at, first_send) = send_times[0];
+    let (last_at, last_send) = send_times[send_times.len() - 1];
+    let wall_span = last_at.duration_since(first_at);
+    let send_span = Duration::from_secs_f64(
+        f64::from(last_send.wrapping_sub(first_send) & 0xFF_FFFF) / f64::from(1u32 << 18),
+    );
+    let tolerance = wall_span.mul_f64(0.3) + Duration::from_millis(100);
+    let drift = send_span.abs_diff(wall_span);
+    assert!(
+        drift <= tolerance,
+        "abs-send-time should advance at wall-clock rate: send span {send_span:?} vs wall \
+         span {wall_span:?} (drift {drift:?} > tolerance {tolerance:?})"
     );
 
     // (d) the receiver sends a PLI; the host must notice within 3s
