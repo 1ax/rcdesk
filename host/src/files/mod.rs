@@ -1280,6 +1280,31 @@ mod tests {
         }
     }
 
+    /// Сколько ждать, пока уборка после отмены уберёт файлы.
+    ///
+    /// Уборка живёт в `Drop for ActiveReceive`, а `remove_with_retry` на
+    /// Windows повторяет до `REMOVE_RETRIES` раз по `REMOVE_RETRY_DELAY`.
+    /// Отсчёт начинается не раньше, чем блокирующая задача доберётся до
+    /// очереди пула: отменённый `spawn_blocking` не прекращается, поэтому
+    /// двадцать попыток встают в очередь и последняя стартует позже всех.
+    /// Отсюда запас поверх времени повторов -- иначе бюджет ожидания
+    /// меньше худшего случая уборки, и тест падает на последней попытке
+    /// (`leaked: ["a19.bin", "a19.bin.rcdesk-part"]` в CI 2026-10-23).
+    fn cleanup_wait() -> std::time::Duration {
+        REMOVE_RETRY_DELAY * REMOVE_RETRIES + std::time::Duration::from_secs(15)
+    }
+
+    /// Ждёт, пока каталог не опустеет, но не дольше [`cleanup_wait`].
+    async fn wait_until_empty(h: &Harness) {
+        let deadline = std::time::Instant::now() + cleanup_wait();
+        while std::time::Instant::now() < deadline {
+            if h.files().is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     impl Drop for Harness {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
@@ -1671,13 +1696,8 @@ mod tests {
         let _ = task.await;
         // The cleanup may finish later on a blocking thread, or after the
         // retries of `remove_with_retry` (Windows).
-        for _ in 0..800 {
-            if h.files().is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(h.files().is_empty());
+        wait_until_empty(&h).await;
+        assert!(h.files().is_empty(), "leaked: {:?}", h.files());
     }
 
     #[tokio::test]
@@ -1696,12 +1716,7 @@ mod tests {
         }
         // Cleanup may finish later on a blocking thread, or after the
         // retries of `remove_with_retry` (Windows).
-        for _ in 0..800 {
-            if h.files().is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        wait_until_empty(&h).await;
         assert!(h.files().is_empty(), "leaked: {:?}", h.files());
     }
 
