@@ -3400,8 +3400,6 @@ dependencies = [
 [[package]]
 name = "rtc-turn"
 version = "0.20.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55fd9c23215c3e22ae698b423ae86992a89cb0c24440e3e7e2932dcad75aa3f0"
 dependencies = [
  "bytes",
  "log",
