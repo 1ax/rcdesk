@@ -2914,7 +2914,7 @@ dependencies = [
 
 [[package]]
 name = "rcdesk-host"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2966,7 +2966,7 @@ dependencies = [
 
 [[package]]
 name = "rcdesk-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2975,7 +2975,7 @@ dependencies = [
 
 [[package]]
 name = "rcdesk-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "argon2",
