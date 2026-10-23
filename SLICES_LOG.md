@@ -50,9 +50,18 @@
   proto `82`, server `125` + `60`, loopback `1`, fmt/clippy чисто; web не затронут. Windows — только CI.
   **Проверить в следующем логе:** `reason="encoder"` — единицы, а не сотни; `target_fps` держится 30 при
   движении; `overruns` ≪ `overwritten`.
-- **Открыто (развилки владельцу, в карточке 009):** (1) пауза пробинга после потерь, когда REMB мусорный;
-  (2) реакция на рост RTT (delay-based backoff по `rr_rtt_ms`/`ice_rtt_ms`); (3) вариант C — abs-send-time;
-  (4) CPU-конвертация в MFT-пути. Данные от пользователя: `chrome://webrtc-internals` (или `about:webrtc`),
+- ✅ **`e9719aa` fix: пауза пробинга после потерь без REMB** (решение владельца 2026-10-23 по развилке 1).
+  Потеря ≥ `LOSS_LOW` (свежая, `LOSS_FRESH`) выключает пробинг на `LOSS_PROBE_HOLD` = 10 с независимо от
+  REMB; на загруженном тике (`sent ≥ 0,8·цели`) цель ограничена отправленным (`sent_cap_kbps`, минимум по
+  тикам с потерей, не ниже `LOSS_CAP_FLOOR_KBPS`), причина `loss`. На незагруженном канале потолка нет,
+  только пауза. REMB-потолок (`LOSS_CAP_HOLD`) остался. Меняет поведение на всех платформах. Тесты:
+  4 старых переписаны (пробинг после потерь теперь ждёт паузу), +3 (`loss_with_junk_remb_does_not_saw_back_to_max`,
+  `moderate_loss_on_loaded_link_caps_target_at_sent_rate`, `moderate_loss_on_unloaded_link_only_pauses_probe`).
+  Гейты: host `446 passed; 0 failed; 4 ignored`, proto `82`, server `125` + `60`, loopback `1`, fmt/clippy чисто.
+  **Проверить в следующем логе:** после `reason="loss"` 10+ с без `probe`, нет пилы loss→6000 за 1–3 с.
+- **Открыто (развилки владельцу, в карточке 009):** (2) реакция на рост RTT (delay-based backoff по
+  `rr_rtt_ms`/`ice_rtt_ms`) и (3) вариант C — abs-send-time — владелец отложил до данных; (4) CPU-конвертация
+  в MFT-пути — только со стендом. Данные от пользователя: `chrome://webrtc-internals` (или `about:webrtc`),
   браузер/версия клиента, тип сети клиента, что видел в момент «обрыва».
 
 **Состояние на 2026-10-23 (задача диспетчера 003: остаток D72, спайк D51 и полный режим macOS — без стенда):**
