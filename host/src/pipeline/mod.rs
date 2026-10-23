@@ -92,7 +92,15 @@ pub struct PipelineStats {
     /// thread replaced them in the slot first -- i.e. frames arrived faster
     /// than the encoder consumed them. Distinct from `paced_out` (skipped on
     /// purpose, cheaply) and `dropped` (encoded but not delivered).
+    /// Diagnostic only: a source faster than the encoder overwrites frames
+    /// the pacer would have skipped anyway; the adaptation controller reads
+    /// `overruns` instead.
     pub overwritten: AtomicU64,
+    /// The subset of `overwritten` where the encode thread had not taken a
+    /// frame from the slot for at least one target frame interval (see
+    /// `is_overrun`) -- the honest "encoder can't keep up with the target
+    /// fps" signal `crate::adapt` steps fps down on.
+    pub overruns: AtomicU64,
     /// Keyframes produced by re-encoding the last captured frame after a
     /// `SLOT_WAIT_TIMEOUT` wait found no new frame in the slot and a
     /// keyframe request was pending (see the encode thread in
@@ -155,8 +163,32 @@ impl RateControl {
 /// Single-slot mailbox from the capture thread to the encode thread: only
 /// the most recent unconsumed frame is kept, older ones are overwritten.
 struct FrameSlot {
-    frame: Mutex<Option<RawFrame>>,
+    state: Mutex<SlotState>,
     condvar: Condvar,
+}
+
+#[derive(Default)]
+struct SlotState {
+    frame: Option<RawFrame>,
+    /// Since when the encode thread has been busy with a frame (taken from
+    /// the slot, or an idle/keyframe repeat); `None` while it waits on the
+    /// slot. The capture thread compares it with the target frame interval
+    /// on every overwrite (`is_overrun`).
+    busy_since: Option<Instant>,
+}
+
+/// Whether overwriting a not-yet-taken frame at `now` means the encode
+/// thread can't keep up with `fps`: only if it has been busy with one frame
+/// for a whole target frame interval. A capture source faster than the encoder
+/// (WGC at the monitor's refresh rate) overwrites frames during every
+/// encode, but while one encode is shorter than the frame interval those
+/// frames would have been skipped by the pacer anyway. Windows host 0.2.0
+/// live log (2026-10-23, 2560x1440, NVIDIA MFT, ~28 ms per frame): 3.3
+/// overwrites per 5 s at a 125 ms budget (8 fps) kept fps pinned at 8-15
+/// and flapping 10 <-> 30 (724 `reason="encoder"` decisions in 3 h).
+fn is_overrun(busy_since: Option<Instant>, now: Instant, fps: u32) -> bool {
+    let interval = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
+    busy_since.is_some_and(|at| now.saturating_duration_since(at) >= interval)
 }
 
 pub struct PipelineHandle {
@@ -201,7 +233,7 @@ impl Pipeline {
         let stats = Arc::new(PipelineStats::default());
         let rate_control = Arc::new(RateControl::new(initial));
         let slot = Arc::new(FrameSlot {
-            frame: Mutex::new(None),
+            state: Mutex::new(SlotState::default()),
             condvar: Condvar::new(),
         });
         let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
@@ -210,6 +242,7 @@ impl Pipeline {
             let stop = Arc::clone(&stop);
             let slot = Arc::clone(&slot);
             let stats = Arc::clone(&stats);
+            let rate_control = Arc::clone(&rate_control);
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     match source.next_frame() {
@@ -219,14 +252,19 @@ impl Pipeline {
                             // while holding the lock; there's nothing sound
                             // to recover into, so surface the panic instead
                             // of masking it.
-                            let mut guard = slot.frame.lock().expect("frame slot mutex poisoned");
-                            if guard.replace(frame).is_some() {
+                            let mut guard = slot.state.lock().expect("frame slot mutex poisoned");
+                            if guard.frame.replace(frame).is_some() {
                                 // The encode thread never took the previous
                                 // frame: it is still busy encoding the one
-                                // before -- the "encoder can't keep up"
-                                // signal the adaptation controller reads
-                                // (see `crate::adapt`).
+                                // before. Only an overwrite after a whole
+                                // target frame interval is the "encoder
+                                // can't keep up" signal the adaptation
+                                // controller reads (see `is_overrun`).
                                 stats.overwritten.fetch_add(1, Ordering::Relaxed);
+                                if is_overrun(guard.busy_since, Instant::now(), rate_control.fps())
+                                {
+                                    stats.overruns.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                             slot.condvar.notify_one();
                         }
@@ -286,9 +324,11 @@ impl Pipeline {
                     }
 
                     let outcome = {
-                        let mut guard = slot.frame.lock().expect("frame slot mutex poisoned");
+                        let mut guard = slot.state.lock().expect("frame slot mutex poisoned");
+                        guard.busy_since = None;
                         loop {
-                            if let Some(frame) = guard.take() {
+                            if let Some(frame) = guard.frame.take() {
+                                guard.busy_since = Some(Instant::now());
                                 break SlotWait::Frame(frame);
                             }
                             if stop.load(Ordering::Relaxed) {
@@ -302,7 +342,8 @@ impl Pipeline {
                             if timeout.timed_out() {
                                 // The notify and the timeout can race; if a
                                 // frame is there after all, prefer it.
-                                if let Some(frame) = guard.take() {
+                                if let Some(frame) = guard.frame.take() {
+                                    guard.busy_since = Some(Instant::now());
                                     break SlotWait::Frame(frame);
                                 }
                                 break SlotWait::Timeout;
@@ -336,6 +377,10 @@ impl Pipeline {
                                 let idle_pulse =
                                     !force_keyframe && last_sent.elapsed() >= IDLE_REPEAT_INTERVAL;
                                 if force_keyframe || idle_pulse {
+                                    slot.state
+                                        .lock()
+                                        .expect("frame slot mutex poisoned")
+                                        .busy_since = Some(Instant::now());
                                     last.set_ts(Instant::now());
                                     let started = Instant::now();
                                     match encoder.encode(last, force_keyframe) {
@@ -1169,5 +1214,110 @@ mod tests {
 
         StaticScreenSource::unblock(&stop_signal);
         handle.stop();
+    }
+
+    #[test]
+    fn overrun_needs_a_whole_frame_interval_of_busy_encoder() {
+        let base = Instant::now();
+        // Not busy (waiting on the slot): never an overrun.
+        assert!(!is_overrun(None, at(base, 500), 30));
+        // The 0.2.0 live log: ~28 ms per frame against a 125 ms (8 fps) or
+        // 33 ms (30 fps) budget keeps up.
+        assert!(!is_overrun(Some(base), at(base, 28), 8));
+        assert!(!is_overrun(Some(base), at(base, 28), 30));
+        // Busy past the interval: the encoder can't sustain the target.
+        assert!(is_overrun(Some(base), at(base, 34), 30));
+        assert!(is_overrun(Some(base), at(base, 125), 8));
+        // A zero fps must not divide by zero; it behaves like 1 fps.
+        assert!(!is_overrun(Some(base), at(base, 999), 0));
+        assert!(is_overrun(Some(base), at(base, 1000), 0));
+    }
+
+    /// Hands out a tiny frame every `interval`, much faster than any target
+    /// fps -- the WGC case (frames at the monitor's refresh rate).
+    struct FastSource {
+        interval: Duration,
+    }
+
+    impl FrameSource for FastSource {
+        fn next_frame(&mut self) -> Result<RawFrame, crate::capture::CaptureError> {
+            std::thread::sleep(self.interval);
+            Ok(RawFrame::Bgra {
+                width: 16,
+                height: 16,
+                data: vec![0u8; 16 * 16 * 4],
+                stride: 16 * 4,
+                ts: Instant::now(),
+            })
+        }
+
+        fn size(&self) -> (u32, u32) {
+            (16, 16)
+        }
+    }
+
+    /// An encoder that takes `cost` per frame and produces a few dummy bytes.
+    struct SlowEncoder {
+        cost: Duration,
+    }
+
+    impl Encoder for SlowEncoder {
+        fn encode(
+            &mut self,
+            frame: &RawFrame,
+            force_keyframe: bool,
+        ) -> Result<Option<EncodedFrame>, crate::encode::EncodeError> {
+            std::thread::sleep(self.cost);
+            Ok(Some(EncodedFrame {
+                data: vec![0u8; 8],
+                keyframe: force_keyframe,
+                ts: Instant::now(),
+                captured_at: frame.ts(),
+            }))
+        }
+
+        fn set_rate(&mut self, _target: RateTarget) -> Result<(), crate::encode::EncodeError> {
+            Ok(())
+        }
+    }
+
+    fn run_slow_encoder(cost_ms: u64, fps: u32) -> (u64, u64) {
+        let mut handle = Pipeline::start(
+            Box::new(FastSource {
+                interval: Duration::from_millis(5),
+            }),
+            Box::new(SlowEncoder {
+                cost: Duration::from_millis(cost_ms),
+            }),
+            RateTarget {
+                bitrate_kbps: 1000,
+                fps,
+            },
+        );
+        let _ = drain_for(&mut handle, Duration::from_secs(1));
+        handle.stop();
+        (
+            handle.stats.overwritten.load(Ordering::Relaxed),
+            handle.stats.overruns.load(Ordering::Relaxed),
+        )
+    }
+
+    #[test]
+    fn fast_source_alone_is_not_an_encoder_overrun() {
+        let _guard = serialized();
+        // 40 ms per frame against a 200 ms budget (5 fps): frames get
+        // overwritten during every encode, yet the encoder keeps up.
+        let (overwritten, overruns) = run_slow_encoder(40, 5);
+        assert!(overwritten > 0, "a 200 fps source must overwrite frames");
+        assert_eq!(overruns, 0, "overwritten={overwritten}");
+    }
+
+    #[test]
+    fn encoder_slower_than_the_frame_interval_is_an_overrun() {
+        let _guard = serialized();
+        // 60 ms per frame against a 33 ms budget (30 fps).
+        let (overwritten, overruns) = run_slow_encoder(60, 30);
+        assert!(overruns > 0, "overwritten={overwritten}, overruns=0");
+        assert!(overruns <= overwritten);
     }
 }

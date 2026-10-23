@@ -3093,6 +3093,7 @@ struct StatsSummary {
     dropped: u64,
     paced_out: u64,
     overwritten: u64,
+    overruns: u64,
     keyframes: u64,
     keyframe_repeats: u64,
     idle_repeats: u64,
@@ -3141,6 +3142,7 @@ struct StatsWindow {
     dropped: u64,
     paced_out: u64,
     overwritten: u64,
+    overruns: u64,
     keyframes: u64,
     keyframe_repeats: u64,
     idle_repeats: u64,
@@ -3168,6 +3170,7 @@ impl StatsWindow {
             dropped: stats.dropped.load(Relaxed),
             paced_out: stats.paced_out.load(Relaxed),
             overwritten: stats.overwritten.load(Relaxed),
+            overruns: stats.overruns.load(Relaxed),
             keyframes: stats.keyframes.load(Relaxed),
             keyframe_repeats: stats.keyframe_repeats.load(Relaxed),
             idle_repeats: stats.idle_repeats.load(Relaxed),
@@ -3211,6 +3214,7 @@ impl StatsWindow {
         let dropped = stats.dropped.load(Relaxed);
         let paced_out = stats.paced_out.load(Relaxed);
         let overwritten = stats.overwritten.load(Relaxed);
+        let overruns = stats.overruns.load(Relaxed);
         let keyframes = stats.keyframes.load(Relaxed);
         let keyframe_repeats = stats.keyframe_repeats.load(Relaxed);
         let idle_repeats = stats.idle_repeats.load(Relaxed);
@@ -3227,6 +3231,7 @@ impl StatsWindow {
             dropped: dropped.saturating_sub(self.dropped),
             paced_out: paced_out.saturating_sub(self.paced_out),
             overwritten: overwritten.saturating_sub(self.overwritten),
+            overruns: overruns.saturating_sub(self.overruns),
             keyframes: keyframes.saturating_sub(self.keyframes),
             keyframe_repeats: keyframe_repeats.saturating_sub(self.keyframe_repeats),
             idle_repeats: idle_repeats.saturating_sub(self.idle_repeats),
@@ -3252,6 +3257,7 @@ impl StatsWindow {
         self.dropped = dropped;
         self.paced_out = paced_out;
         self.overwritten = overwritten;
+        self.overruns = overruns;
         self.keyframes = keyframes;
         self.keyframe_repeats = keyframe_repeats;
         self.idle_repeats = idle_repeats;
@@ -3276,10 +3282,11 @@ async fn run_adapt_task(
     let now = Instant::now();
     let mut controller = Controller::new(cfg, now);
     let mut window = StatsWindow::new(&pipeline_stats);
-    // Capture-slot overwrites are read off the pipeline's counter as a delta
-    // per tick (see `Feedback::Overrun`), not pushed per event.
-    let mut overwritten_seen = pipeline_stats
-        .overwritten
+    // Encoder overruns are read off the pipeline's counter as a delta per
+    // tick (see `Feedback::Overrun`), not pushed per event. `overruns`, not
+    // `overwritten`: see `PipelineStats::overruns`.
+    let mut overruns_seen = pipeline_stats
+        .overruns
         .load(std::sync::atomic::Ordering::Relaxed);
     // `interval` would fire immediately; the first tick must wait a full
     // `TICK` so it sees a real window of frames/REMB instead of deciding on
@@ -3322,11 +3329,11 @@ async fn run_adapt_task(
                 }
             }
             _ = ticker.tick() => {
-                let overwritten_now = pipeline_stats
-                    .overwritten
+                let overruns_now = pipeline_stats
+                    .overruns
                     .load(std::sync::atomic::Ordering::Relaxed);
-                let overrun = overwritten_now.saturating_sub(overwritten_seen);
-                overwritten_seen = overwritten_now;
+                let overrun = overruns_now.saturating_sub(overruns_seen);
+                overruns_seen = overruns_now;
                 if overrun > 0 {
                     controller.feedback(Feedback::Overrun { frames: overrun }, Instant::now());
                 }
@@ -3362,6 +3369,7 @@ async fn run_adapt_task(
                         dropped = s.dropped,
                         paced_out = s.paced_out,
                         overwritten = s.overwritten,
+                        overruns = s.overruns,
                         keyframes = s.keyframes,
                         keyframe_repeats = s.keyframe_repeats,
                         idle_repeats = s.idle_repeats,

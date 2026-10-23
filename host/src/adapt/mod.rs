@@ -23,9 +23,12 @@
 //!   signal: Media Foundation on the bench sits at 30-50 ms per frame under
 //!   load and kept up fine at 20 fps, yet a fixed multiple of the target
 //!   frame interval read that as overload. The honest signal is the capture
-//!   thread overwriting a frame the encoder hasn't taken yet
-//!   (`pipeline::PipelineStats::overwritten`): that is exactly "frames arrive
-//!   faster than they are encoded".
+//!   thread overwriting a frame the encoder hasn't taken yet -- but only
+//!   after the encoder has been busy for a whole target frame interval
+//!   (`pipeline::PipelineStats::overruns`). A raw overwrite count also
+//!   fires when the source is merely faster than the encoder (WGC at the
+//!   monitor refresh rate): Windows host 0.2.0 live log, 2026-10-23, fps
+//!   pinned at 8-15 with ~28 ms encodes against a 125 ms budget.
 //! - Ignoring REMB on an unloaded link let the target sit at 3x the real
 //!   capacity (second user's live log, 2026-10-14: ~2 Mbit/s channel, target
 //!   5800, loss up to 42 %): a burst overran the channel, each loss cut the
@@ -217,9 +220,9 @@ pub enum Feedback {
         bytes: usize,
         captured_at: std::time::Instant,
     },
-    /// Captured frames the encoder never got to see because the next one
-    /// overwrote them first (`pipeline::PipelineStats::overwritten`, delta
-    /// since the previous tick) -- the "encoder can't keep up" signal.
+    /// Captured frames overwritten while the encoder had been busy for a
+    /// whole target frame interval (`pipeline::PipelineStats::overruns`,
+    /// delta since the previous tick) -- the "encoder can't keep up" signal.
     Overrun { frames: u64 },
     /// `proto::control::ControlMessage::SetQuality` (slice 3.5e), forwarded
     /// as-is from `signaling::handle_session_event`'s `control` channel
