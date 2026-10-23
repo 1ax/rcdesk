@@ -96,6 +96,14 @@ jobs:
   # Известные уязвимости зависимостей (RustSec). Токен нужен action для отчёта.
   cargo-audit:
     runs-on: ubuntu-latest
+    # `audit-check` публикует находки как check-run. Без `checks: write` он падает
+    # с `Resource not accessible by integration`, едва появляется что сообщать, и
+    # роняет гейт -- хотя уязвимостей нет (инцидент 2026-10-23: отозванный
+    # clipboard-win 5.4.1 уронил релиз 0.2.1). Право нужно и у вызывающих джобов
+    # в deploy.yml/release.yml: reusable-прогон получает права от вызывающего.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0

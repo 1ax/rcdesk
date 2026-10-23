@@ -56,6 +56,9 @@ jobs:
     needs: version
     if: needs.version.outputs.release == 'true'
     uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      checks: write
 
   build-host:
     needs: test
