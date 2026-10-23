@@ -12,6 +12,21 @@
 > чата читает сначала голову, в тело ныряет по ссылке на слайс.
 
 **Состояние на 2026-10-23 (задача диспетчера 010: about:webrtc клиента, Firefox; вариант C; D75 TURN):**
+- 🟡 **Релиз `0.2.3` подготовлен в ветке `task/010`** (решение владельца через диспетчера 2026-10-23).
+  `e93cc23` chore: версия 0.2.3 (`Cargo.toml`, `Cargo.lock`, `web/package.json`, `web/package-lock.json` — тот же
+  набор, что у 0.2.2 `9986ac6`). Везёт D76 `5b43b07` (abs-send-time) и D75 `a4e2613` (TURN 438, вендоринг
+  `rtc-turn`). Гейты: fmt чисто, clippy `-D warnings` чисто, host `449 passed; 0 failed; 4 ignored`, loopback `1`,
+  proto `82`, server `125` + `60`; web check чисто, `Tests 458 passed (458)`, build ок.
+  **D75 проверен только локально** (soak против coturn 4.18 в docker, 1300 с без обрыва, 8×438 обработаны).
+  Живьём — только после релиза, на основном канале владельца: relay-сеанс 15 мин и 45+ мин без `Disconnected`,
+  `no binding found for channel`, 437. D76 живьём тоже не проверен (`remb_kbps` выше пола, `docs/d76-log-summary.py`).
+  **Дальше (не воркер):** зелёный CI ветки → merge в `main` и push (тег ставит job `version`) → проверки артефактов
+  как у 0.2.1 (подпись манифеста боевым ключом, sha256, `CFBundleShortVersionString = 0.2.3`).
+  **Откат:** предыдущий релиз `0.2.2`. Автообновление только вверх (`update_check::is_newer`), поэтому пока 0.2.3
+  остаётся latest-релизом, хосты, откатившиеся на 0.2.2, снова обновятся. Значит, сначала снять с 0.2.3 отметку
+  latest на GitHub (или выпустить 0.2.4 с revert), затем вручную поставить пакет 0.2.2 (Mac pkg / Windows установщик).
+  На Mac с полным режимом `postinstall` сам вызывает `fullmode restore`; если задание не вернулось —
+  `sudo rcdesk-host fullmode restore` и проверить `fullmode status`.
 - 🟡 **Разбор `about:webrtc` клиента (Firefox, Windows, release; версии в файле нет).** Файл — копия DOM
   `#content`: секция RTCPeerConnection пустая (`<div><div></div></div>`), скрытых JSON/блоков нет, кириллица
   испорчена самим сохранением Firefox; есть только журнал соединения (1032 строки без меток). Сеанс 08:58:39Z
