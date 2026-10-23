@@ -171,6 +171,13 @@ enum FullmodeAction {
     Install,
     /// Снять системный LaunchAgent; данные и логи не трогаются (нужен sudo).
     Uninstall,
+    /// Вернуть задание launchd в GUI-сеанс, если полный режим установлен
+    /// (идемпотентно; зовётся из postinstall пакета). Нужен sudo.
+    Restore {
+        /// uid GUI-сеанса, куда грузить задание (из установщика, где нет SUDO_UID).
+        #[arg(long)]
+        uid: Option<String>,
+    },
     /// Состояние полного режима, каталогов и ролей.
     Status,
 }
@@ -392,6 +399,7 @@ fn run_fullmode(action: FullmodeAction) -> anyhow::Result<()> {
             fm::install(&agent)
         }
         FullmodeAction::Uninstall => fm::uninstall(),
+        FullmodeAction::Restore { uid } => fm::restore(uid.as_deref()),
         FullmodeAction::Status => {
             let st = fm::status()?;
             println!(

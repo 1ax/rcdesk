@@ -138,6 +138,47 @@ pub fn print_job_attempts(launchctl: &str, uid: &str) -> Vec<Vec<String>> {
     ]
 }
 
+/// Значение строки `pid = <N>` из вывода `launchctl print` (строка с отступом).
+/// `None`, если у задания нет процесса. Вложенные блоки (`resource coalition`,
+/// `jetsam coalition`) такой строки не содержат.
+pub fn job_pid(print_out: &str) -> Option<u32> {
+    print_out
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("pid = "))
+        .find_map(|v| v.trim().parse().ok())
+}
+
+/// Есть ли в выводе `launchctl print` строка `state = running`. Вложенные
+/// `state = active` (coalition) и `state = not running` не считаются.
+/// Переходные состояния (`xpcproxy`, `spawn scheduled`) -- тоже живое задание,
+/// поэтому для вывода о наличии процесса нужен [`job_pid`], а не эта функция.
+pub fn job_running(print_out: &str) -> bool {
+    print_out.lines().any(|l| l.trim() == "state = running")
+}
+
+/// Задание загружено, но процесса у него нет, а агент в системе есть --
+/// значит он поднят мимо launchd и держит блокировку единственного экземпляра.
+pub fn job_without_process(print_out: &str, agent_running: bool) -> bool {
+    job_pid(print_out).is_none() && agent_running
+}
+
+/// Строки состояния верхнего уровня из вывода `launchctl print` (`state = ...`,
+/// `pid = ...`), в порядке вывода. Вложенные блоки (coalition и др.) пропускаются
+/// по глубине фигурных скобок: прямые поля задания лежат на глубине 1.
+pub fn job_state_lines(out: &str) -> Vec<String> {
+    let mut depth: i32 = 0;
+    let mut lines = Vec::new();
+    for line in out.lines() {
+        let t = line.trim();
+        if depth == 1 && (t.starts_with("state =") || t.starts_with("pid =")) {
+            lines.push(t.to_string());
+        }
+        depth += line.matches('{').count() as i32;
+        depth -= line.matches('}').count() as i32;
+    }
+    lines
+}
+
 /// Роль инстанса, поднятого из системного plist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -242,6 +283,140 @@ mod tests {
         ];
         assert_eq!(a.len(), 4);
         assert_eq!(a, expected);
+    }
+
+    const PRINT_RUNNING: &str = "gui/501/app.rcdesk.agent = {
+\tactive count = 1
+\tpath = /Library/LaunchAgents/app.rcdesk.agent.plist
+\ttype = LaunchAgent
+\tstate = running
+
+\tprogram = /Applications/rcdesk.app/Contents/MacOS/rcdesk-agent
+\tdefault environment = {
+\t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin
+\t}
+
+\truns = 1
+\tpid = 65042
+\timmediate reason = inefficient
+\tresource coalition = {
+\t\tID = 12345
+\t\ttype = resource
+\t\tstate = active
+\t\tactive count = 1
+\t}
+\tjetsam coalition = {
+\t\tID = 12346
+\t\ttype = jetsam
+\t\tstate = active
+\t\tactive count = 1
+\t}
+}
+";
+
+    const PRINT_EMPTY: &str = "gui/501/app.rcdesk.agent = {
+\tactive count = 0
+\tpath = /Library/LaunchAgents/app.rcdesk.agent.plist
+\ttype = LaunchAgent
+\tstate = not running
+
+\tprogram = /Applications/rcdesk.app/Contents/MacOS/rcdesk-agent
+
+\truns = 1
+\tlast exit code = 0
+}
+";
+
+    #[test]
+    fn job_state_running_with_nested_blocks() {
+        assert!(job_running(PRINT_RUNNING));
+        assert_eq!(job_pid(PRINT_RUNNING), Some(65042));
+    }
+
+    #[test]
+    fn job_state_loaded_but_empty() {
+        assert!(!job_running(PRINT_EMPTY));
+        assert_eq!(job_pid(PRINT_EMPTY), None);
+    }
+
+    const PRINT_XPCPROXY: &str = "gui/501/app.rcdesk.agent = {
+    active count = 1
+    path = /Library/LaunchAgents/app.rcdesk.agent.plist
+    type = LaunchAgent
+    state = xpcproxy
+
+    program = /Applications/rcdesk.app/Contents/MacOS/rcdesk-agent
+    arguments = {
+        /Applications/rcdesk.app/Contents/MacOS/rcdesk-agent
+    }
+
+    default environment = {
+        PATH => /usr/bin:/bin:/usr/sbin:/sbin
+    }
+
+    domain = gui/501 [100021]
+    asid = 100021
+    runs = 1
+    pid = 64917
+    immediate reason = speculative
+    last exit code = (never exited)
+
+    semaphores = {
+        successful exit => 0
+    }
+
+    resource coalition = {
+        ID = 78984
+        type = resource
+        state = active
+        active count = 1
+        name = app.rcdesk.agent
+    }
+
+    jetsam coalition = {
+        ID = 78985
+        type = jetsam
+        state = active
+        active count = 1
+        name = app.rcdesk.agent
+    }
+
+    properties = runatload | inferred program | untrusted
+}
+";
+
+    #[test]
+    fn job_state_xpcproxy_has_pid_but_is_not_running() {
+        assert_eq!(job_pid(PRINT_XPCPROXY), Some(64917));
+        assert!(!job_running(PRINT_XPCPROXY));
+    }
+
+    #[test]
+    fn job_without_process_cases() {
+        assert!(!job_without_process(PRINT_XPCPROXY, true));
+        assert!(job_without_process(PRINT_EMPTY, true));
+        assert!(!job_without_process(PRINT_EMPTY, false));
+    }
+
+    #[test]
+    fn job_state_lines_top_level_only() {
+        assert_eq!(
+            job_state_lines(PRINT_XPCPROXY),
+            vec!["state = xpcproxy", "pid = 64917"]
+        );
+        assert_eq!(
+            job_state_lines(PRINT_RUNNING),
+            vec!["state = running", "pid = 65042"]
+        );
+        assert_eq!(job_state_lines(PRINT_EMPTY), vec!["state = not running"]);
+        assert!(job_state_lines("").is_empty());
+    }
+
+    #[test]
+    fn job_state_nested_active_only_is_not_running() {
+        let out = "\tstate = not running\n\tresource coalition = {\n\t\tstate = active\n\t\tactive count = 1\n\t}\n";
+        assert!(!job_running(out));
+        assert_eq!(job_pid(out), None);
     }
 
     #[test]

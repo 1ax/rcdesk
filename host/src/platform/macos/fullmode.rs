@@ -16,8 +16,9 @@ use anyhow::{bail, Context};
 use crate::agent::autostart::{parse_program_arguments_path, LAUNCH_AGENT_LABEL};
 use crate::agent::paths;
 use crate::fullmode::{
-    generate_system_plist, load_job_attempts, plist_path, print_job_attempts, role_from_uid, Role,
-    ADMIN_GID, DIR_MODE, REGISTRATION_LOCK_FILE, SHARED_FILE_MODE,
+    generate_system_plist, job_state_lines, job_without_process, load_job_attempts, plist_path,
+    print_job_attempts, role_from_uid, Role, ADMIN_GID, DIR_MODE, REGISTRATION_LOCK_FILE,
+    SHARED_FILE_MODE,
 };
 
 const LAUNCHCTL: &str = "/bin/launchctl";
@@ -183,13 +184,112 @@ fn launchctl_stdout(args: &[&str]) -> anyhow::Result<Option<String>> {
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned()))
 }
 
-/// Строки состояния из вывода `launchctl print` (`state = ...`, `pid = ...`).
-fn job_state_lines(out: &str) -> Vec<String> {
-    out.lines()
-        .map(str::trim)
-        .filter(|l| l.starts_with("state =") || l.starts_with("pid ="))
+/// Есть ли в системе процесс `rcdesk-agent` (`pgrep -x`, код 0 = есть).
+/// `None` -- запустить `pgrep` не удалось ("не знаю").
+fn agent_process_exists() -> Option<bool> {
+    let status = Command::new("/usr/bin/pgrep")
+        .args(["-x", "rcdesk-agent"])
+        .output()
+        .ok()?
+        .status;
+    match status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+/// Загружает задание в GUI-сеанс `uid` и подтверждает состояние. Общий блок
+/// `install` и `restore`. Из root голый bootstrap падает (Input/output error),
+/// поэтому сначала `launchctl asuser` (см. doc `load_job_attempts`); потом
+/// проверка фактом через `launchctl print`. `Err` -- только когда ни одна
+/// попытка загрузки не удалась.
+fn load_and_confirm(uid: &str, plist: &Path) -> anyhow::Result<()> {
+    let domain = format!("gui/{uid}");
+    let target = format!("{domain}/{LAUNCH_AGENT_LABEL}");
+    let plist_str = plist.to_string_lossy().into_owned();
+    let mut loaded = false;
+    for attempt in load_job_attempts(LAUNCHCTL, uid, &plist_str) {
+        let args: Vec<&str> = attempt.iter().map(String::as_str).collect();
+        if launchctl(&args)? {
+            if args.contains(&"bootstrap") {
+                println!("Задание загружено в текущий сеанс ({domain})");
+            } else {
+                println!("Задание уже было загружено, перезапущено ({target})");
+            }
+            loaded = true;
+            break;
+        }
+    }
+    if !loaded {
+        bail!(
+            "системный plist {p} установлен и поднимется при следующем входе, \
+             но агент сейчас НЕ запущен (пользовательский автозапуск уже снят, \
+             поэтому удалённый доступ потерян до входа в систему). Поднять вручную \
+             от имени пользователя: launchctl bootstrap gui/{uid} {p}",
+            p = plist.display()
+        );
+    }
+    let mut print_out = None;
+    for attempt in print_job_attempts(LAUNCHCTL, uid) {
+        let args: Vec<&str> = attempt.iter().map(String::as_str).collect();
+        if let Some(out) = launchctl_stdout(&args)? {
+            print_out = Some(out);
+            break;
+        }
+    }
+    let state_lines = print_out
+        .as_deref()
+        .map(job_state_lines)
+        .unwrap_or_default();
+    if state_lines.is_empty() {
+        println!(
+            "Предупреждение: задание загружено, но подтвердить состояние не удалось. \
+             Проверьте сами от имени пользователя: launchctl print {target}"
+        );
+    }
+    for line in &state_lines {
+        println!("  {line}");
+    }
+    if let Some(out) = &print_out {
+        if job_without_process(out, agent_process_exists() == Some(true)) {
+            println!(
+                "Предупреждение: задание загружено, но его процесса нет, при этом агент \
+                 работает вне launchd. Такой экземпляр держит блокировку единственного \
+                 экземпляра, поэтому задание пустое. Процесс не завершён. Чтобы перевести \
+                 агент под launchd: pkill -x rcdesk-agent && launchctl kickstart {target}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Возвращает задание launchd в GUI-сеанс, если полный режим установлен
+/// (идемпотентно; зовётся из `postinstall` пакета). Ничего не устанавливает и
+/// не переносит -- это работа `install`.
+pub fn restore(uid: Option<&str>) -> anyhow::Result<()> {
+    if euid() != 0 {
+        bail!(
+            "нужны права администратора: запустите команду через sudo \
+             (sudo /Applications/rcdesk.app/Contents/MacOS/rcdesk-host fullmode restore)"
+        );
+    }
+    if !crate::fullmode::is_installed() {
+        println!("Полный режим не установлен: задание launchd не возвращается");
+        return Ok(());
+    }
+    let uid = uid
+        .filter(|u| !u.is_empty() && u.chars().all(|c| c.is_ascii_digit()))
         .map(str::to_string)
-        .collect()
+        .or_else(sudo_uid)
+        .or_else(|| console_uid().filter(|u| *u != 0).map(|u| u.to_string()));
+    let Some(uid) = uid else {
+        println!(
+            "Некому грузить задание (нет GUI-сеанса): оно поднимется при следующем входе в систему"
+        );
+        return Ok(());
+    };
+    load_and_confirm(&uid, &plist_path())
 }
 
 pub fn install(agent: &Path) -> anyhow::Result<()> {
@@ -274,54 +374,9 @@ pub fn install(agent: &Path) -> anyhow::Result<()> {
         agent.display()
     );
 
-    // 6. Загрузить задание в текущий GUI-сеанс. Из root голый bootstrap падает
-    // (Input/output error), поэтому сначала `launchctl asuser` (см. doc
-    // `load_job_attempts`); потом проверка фактом через `launchctl print`.
+    // 6. Загрузить задание в текущий GUI-сеанс (общий блок с `restore`).
     match &uid {
-        Some(uid) => {
-            let domain = format!("gui/{uid}");
-            let target = format!("{domain}/{LAUNCH_AGENT_LABEL}");
-            let plist_str = plist.to_string_lossy().into_owned();
-            let mut loaded = false;
-            for attempt in load_job_attempts(LAUNCHCTL, uid, &plist_str) {
-                let args: Vec<&str> = attempt.iter().map(String::as_str).collect();
-                if launchctl(&args)? {
-                    if args.contains(&"bootstrap") {
-                        println!("Задание загружено в текущий сеанс ({domain})");
-                    } else {
-                        println!("Задание уже было загружено, перезапущено ({target})");
-                    }
-                    loaded = true;
-                    break;
-                }
-            }
-            if !loaded {
-                bail!(
-                    "системный plist {p} установлен и поднимется при следующем входе, \
-                     но агент сейчас НЕ запущен (пользовательский автозапуск уже снят, \
-                     поэтому удалённый доступ потерян до входа в систему). Поднять вручную \
-                     от имени пользователя: launchctl bootstrap gui/{uid} {p}",
-                    p = plist.display()
-                );
-            }
-            let mut state_lines = Vec::new();
-            for attempt in print_job_attempts(LAUNCHCTL, uid) {
-                let args: Vec<&str> = attempt.iter().map(String::as_str).collect();
-                if let Some(out) = launchctl_stdout(&args)? {
-                    state_lines = job_state_lines(&out);
-                    break;
-                }
-            }
-            if state_lines.is_empty() {
-                println!(
-                    "Предупреждение: задание загружено, но подтвердить состояние не удалось. \
-                     Проверьте сами от имени пользователя: launchctl print {target}"
-                );
-            }
-            for line in state_lines {
-                println!("  {line}");
-            }
-        }
+        Some(uid) => load_and_confirm(uid, &plist)?,
         None => println!("SUDO_UID не задана: задание поднимется при следующем входе в систему"),
     }
 

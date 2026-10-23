@@ -39,29 +39,49 @@ fi
 # Запущенный в обход launchd экземпляр (open) занимает блокировку; поздно
 # стартовавшая launchd-копия выходит с 0, и задание остаётся без процесса.
 # Агент оказывается вне launchd, и после jetsam его никто не поднимает.
-# Поэтому: bootstrap (при уже загруженном задании -- kickstart -k), а `open -a`
-# оставлен только запасным путём.
+# Поэтому `open -a` оставлен только последней страховкой.
 label="app.rcdesk.agent"
 started=0
 
-home="$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p' || true)"
-plist=""
-if [ -n "$home" ]; then
-  plist="$home/Library/LaunchAgents/$label.plist"
-fi
-
-if [ -n "$plist" ] && [ -f "$plist" ]; then
-  if launchctl bootstrap "gui/$uid" "$plist"; then
-    echo "rcdesk postinstall: задание $label загружено через launchctl bootstrap"
-    started=1
-  elif launchctl kickstart -k "gui/$uid/$label"; then
-    echo "rcdesk postinstall: задание $label уже было загружено, перезапущено через kickstart -k"
-    started=1
+if [ -f "/Library/LaunchAgents/$label.plist" ]; then
+  # Полный режим (D51): preinstall выгрузил задание, пользовательского plist нет.
+  # Пакет полный режим сам не включает, только возвращает задание; `restore`
+  # идёт от root (в нём сам `launchctl asuser`) и идемпотентен.
+  if restore_out="$("$APP/Contents/MacOS/rcdesk-host" fullmode restore --uid "$uid" 2>&1)"; then
+    echo "rcdesk postinstall: $restore_out"
   else
-    echo "rcdesk postinstall: bootstrap и kickstart не удались, запасной путь через open"
+    echo "rcdesk postinstall: не удалось вернуть задание полного режима (код $?): $restore_out"
   fi
+  started=1
 else
-  echo "rcdesk postinstall: plist '$plist' не найден, запасной путь через open"
+  home="$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p' || true)"
+  plist=""
+  if [ -n "$home" ]; then
+    plist="$home/Library/LaunchAgents/$label.plist"
+  fi
+
+  if [ -n "$plist" ] && [ -f "$plist" ]; then
+    # Порядок попыток -- как в `load_job_attempts` (host/src/fullmode.rs): из
+    # root голый bootstrap/kickstart падает, поэтому сначала через
+    # `launchctl asuser`, затем те же команды без него.
+    if launchctl asuser "$uid" /bin/launchctl bootstrap "gui/$uid" "$plist"; then
+      echo "rcdesk postinstall: задание $label загружено через launchctl asuser bootstrap"
+      started=1
+    elif launchctl asuser "$uid" /bin/launchctl kickstart -k "gui/$uid/$label"; then
+      echo "rcdesk postinstall: задание $label уже было загружено, перезапущено через asuser kickstart -k"
+      started=1
+    elif launchctl bootstrap "gui/$uid" "$plist"; then
+      echo "rcdesk postinstall: задание $label загружено через launchctl bootstrap"
+      started=1
+    elif launchctl kickstart -k "gui/$uid/$label"; then
+      echo "rcdesk postinstall: задание $label уже было загружено, перезапущено через kickstart -k"
+      started=1
+    else
+      echo "rcdesk postinstall: bootstrap и kickstart не удались, запасной путь через open"
+    fi
+  else
+    echo "rcdesk postinstall: plist '$plist' не найден, запасной путь через open"
+  fi
 fi
 
 if [ "$started" -eq 0 ]; then

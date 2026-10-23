@@ -51,6 +51,7 @@ loginwindow, поэтому к Mac можно подключиться, пока
 sudo /Applications/rcdesk.app/Contents/MacOS/rcdesk-host fullmode install
 /Applications/rcdesk.app/Contents/MacOS/rcdesk-host fullmode status
 sudo /Applications/rcdesk.app/Contents/MacOS/rcdesk-host fullmode uninstall
+sudo /Applications/rcdesk.app/Contents/MacOS/rcdesk-host fullmode restore [--uid <uid>]
 ```
 
 **Что делает `install`.**
@@ -72,6 +73,23 @@ sudo /Applications/rcdesk.app/Contents/MacOS/rcdesk-host fullmode uninstall
   `asuser` нужен именно изменяющим командам (`bootstrap`, `kickstart`). Ошибкой
   `install` завершается, только если задание не удалось загрузить (в тексте --
   команда для ручной загрузки).
+
+**Что делает `restore`.** Возвращает задание launchd в GUI-сеанс, если полный режим
+установлен; если нет -- печатает это и выходит с кодом 0, ничего не меняя. Каталоги не
+создаёт и состояние не переносит (это работа `install`). uid сеанса берётся из
+`--uid`, затем из `SUDO_UID`, затем из владельца `/dev/console` (если это не root).
+Загрузка и подтверждение через `launchctl print` -- те же, что в `install`, поэтому
+команда идемпотентна. Если задание загружено, но пусто, а процесс `rcdesk-agent`
+работает вне launchd (он держит блокировку единственного экземпляра), `restore` его
+НЕ завершает, а печатает диагноз и готовую команду:
+`pkill -x rcdesk-agent && launchctl kickstart gui/<uid>/app.rcdesk.agent`.
+
+**Обновление pkg.** `preinstall` выгружает задание, чтобы `KeepAlive` не поднял старый
+бинарник до замены файлов; `postinstall` его возвращает. Полный режим пакет сам не
+включает, а только сохраняет: при установленном системном plist `postinstall` зовёт
+`fullmode restore --uid <uid>` (запасной `open -a` не используется). В лёгком режиме
+задание грузится из пользовательского plist в том же порядке попыток, что в `install`
+(`launchctl asuser` первым, затем без него), и только потом `open -a`.
 
 После установки `rcdesk-host autostart on|restore` ничего не меняет (в том числе
 при обновлении pkg), `autostart off` отказывает: автозапуском управляет системный
