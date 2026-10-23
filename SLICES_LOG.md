@@ -59,6 +59,12 @@
   `moderate_loss_on_loaded_link_caps_target_at_sent_rate`, `moderate_loss_on_unloaded_link_only_pauses_probe`).
   Гейты: host `446 passed; 0 failed; 4 ignored`, proto `82`, server `125` + `60`, loopback `1`, fmt/clippy чисто.
   **Проверить в следующем логе:** после `reason="loss"` 10+ с без `probe`, нет пилы loss→6000 за 1–3 с.
+- 🟡 **Релиз `0.2.2` подготовлен в ветке `task/009`** (решение владельца 2026-10-23: релиз через `main`).
+  `9986ac6` chore: версия 0.2.2 (`Cargo.toml`, `Cargo.lock`, `web/package.json`, `web/package-lock.json` — тот же
+  набор, что у 0.2.1). Везёт `e4c81a7` и `e9719aa`. Гейты: host `446 passed; 0 failed; 4 ignored`, proto `82`,
+  server `125` + `60`, loopback `1`, fmt/clippy чисто; web check чисто, `Tests 458 passed (458)`, build ок.
+  **Дальше (не воркер):** зелёный CI ветки → merge в `main` и push (тег поставит job `version`) → проверки
+  артефактов как у 0.2.1 (подпись манифеста боевым ключом, sha256, `CFBundleShortVersionString = 0.2.2`).
 - **Открыто (развилки владельцу, в карточке 009):** (2) реакция на рост RTT (delay-based backoff по
   `rr_rtt_ms`/`ice_rtt_ms`) и (3) вариант C — abs-send-time — владелец отложил до данных; (4) CPU-конвертация
   в MFT-пути — только со стендом. Данные от пользователя: `chrome://webrtc-internals` (или `about:webrtc`),
