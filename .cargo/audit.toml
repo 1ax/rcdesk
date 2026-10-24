@@ -1,0 +1,11 @@
+# Конфиг cargo-audit (его читает и rustsec/audit-check в CI).
+[advisories]
+ignore = [
+    # crypto-bigint 0.5.5: утечка по времени в «постоянных по времени»
+    # операциях, исправлено только в 0.7.6 (несовместимо). Приходит через
+    # elliptic-curve 0.13 -> p256 -> rtc-dtls (DTLS webrtc-rs), только хост;
+    # сервер не затронут, OPAQUE на Ristretto255. Эксплуатация требует
+    # замеров времени на самом хосте. Снять, когда webrtc-rs уйдёт на
+    # elliptic-curve 0.14 (вместе с webrtc 0.21 из D72).
+    "RUSTSEC-2026-0387",
+]
