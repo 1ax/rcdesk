@@ -18,12 +18,22 @@ const EMAIL_ERROR_TEXTS: Record<string, string> = {
   "same email": "Это текущая почта аккаунта",
   "wrong password": "Неверный пароль",
   "email taken": "Эта почта уже занята другим аккаунтом",
+  "no such account": "Аккаунта с этой почтой нет. Новый аккаунт — «Назад» → «Создать аккаунт»",
 };
 
 /** Russian text for a server `error.message` during the email flow. */
 export function emailErrorText(message: string): string {
   // Not importing app.ts (cycle): the generic fallback is duplicated here.
   return EMAIL_ERROR_TEXTS[message] ?? `Ошибка: ${message}`;
+}
+
+/** Like `emailErrorText`, but on the "Регистрация" screen a taken address
+ * gets advice (sign in or recover the password). */
+export function emailErrorTextFor(message: string, authLabel: string): string {
+  if (message === "email taken" && authLabel === "Регистрация") {
+    return `${emailErrorText(message)} — войдите или восстановите пароль`;
+  }
+  return emailErrorText(message);
 }
 
 /** Error text for an obviously bad address, or `null` if it looks fine. */
@@ -100,4 +110,16 @@ export function validateCurrentPassword(password: string): string | null {
 /** The `email_change` message for the second step of an email change. */
 export function emailChangeMessage(email: string, code: string, password: string): SignalMessage {
   return { type: "email_change", email, code: normalizeCode(code), password };
+}
+
+/** The `email_code_confirm` message: "Сброс пароля" and "Смена пароля" reset
+ * an existing account, "Регистрация" registers a new one. */
+export function emailCodeConfirmMessage(
+  authLabel: string,
+  email: string,
+  code: string,
+  password: string,
+): SignalMessage {
+  const purpose = authLabel === "Регистрация" ? "register" : "reset";
+  return { type: "email_code_confirm", email, code: normalizeCode(code), password, purpose };
 }

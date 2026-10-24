@@ -2567,15 +2567,34 @@ async fn request_code(ws: &mut WsStream, mailer: &RecordingMailer, email: &str) 
 }
 
 async fn confirm(ws: &mut WsStream, email: &str, code: &str, password: &str) {
+    confirm_with(ws, email, code, password, None).await;
+}
+
+async fn confirm_with(
+    ws: &mut WsStream,
+    email: &str,
+    code: &str,
+    password: &str,
+    purpose: Option<proto::signal::EmailCodePurpose>,
+) {
     send(
         ws,
         &SignalMessage::EmailCodeConfirm {
             email: email.to_string(),
             code: code.to_string(),
             password: password.to_string(),
+            purpose,
         },
     )
     .await;
+}
+
+/// Sends a hand-written JSON frame (an old client's wire shape).
+async fn send_raw_json(ws: &mut WsStream, json: &str) {
+    timeout(TIMEOUT, ws.send(Message::Text(json.to_string().into())))
+        .await
+        .expect("send timed out")
+        .expect("send failed");
 }
 
 async fn password_login(ws: &mut WsStream, email: &str, password: &str) {
@@ -2811,6 +2830,143 @@ async fn registration_without_an_owner_is_not_authenticated_and_get_account_too(
     let code = request_code(&mut ws, &mailer, "bob@example.com").await;
     confirm(&mut ws, "bob@example.com", &code, "long-enough-pass").await;
     expect_not_authenticated(&mut ws).await;
+}
+
+// ---- EmailCodeConfirm purpose ----
+
+#[tokio::test]
+async fn reset_purpose_without_an_account_is_refused_and_creates_nothing() {
+    use proto::signal::EmailCodePurpose;
+    let (url, db, mailer) = spawn_with_recording_mailer().await;
+    let mut ws = client_conn(&url).await;
+    let (token, _) = client_auth(&mut ws, None).await;
+    let owner = owner_of_token(&db, &token).expect("owner");
+
+    let code = request_code(&mut ws, &mailer, "ghost@example.com").await;
+    confirm_with(
+        &mut ws,
+        "ghost@example.com",
+        &code,
+        "long-enough-pass",
+        Some(EmailCodePurpose::Reset),
+    )
+    .await;
+    expect_error(&mut ws, "no such account").await;
+    assert!(db
+        .account_by_email("ghost@example.com")
+        .expect("lookup")
+        .is_none());
+    assert_eq!(db.email_for_owner(&owner).expect("email"), None);
+}
+
+#[tokio::test]
+async fn register_purpose_with_a_taken_email_is_refused_and_keeps_the_other_password() {
+    use proto::signal::EmailCodePurpose;
+    let (url, db, mailer) = spawn_with_recording_mailer().await;
+    let (other_owner, _, _) = rcdesk_server::owners::create_owner(&db, "UA", 1).expect("owner");
+    let other_hash = rcdesk_server::accounts::hash_password("old-password-1").expect("hash");
+    assert!(db
+        .insert_account(&other_owner, "bob@example.com", &other_hash, 1)
+        .expect("account"));
+
+    let mut ws = client_conn(&url).await;
+    let (token, _) = client_auth(&mut ws, None).await;
+    let owner = owner_of_token(&db, &token).expect("owner");
+    let code = request_code(&mut ws, &mailer, "bob@example.com").await;
+    confirm_with(
+        &mut ws,
+        "bob@example.com",
+        &code,
+        "new-password-2",
+        Some(EmailCodePurpose::Register),
+    )
+    .await;
+    expect_error(&mut ws, "email taken").await;
+    assert_eq!(db.email_for_owner(&owner).expect("email"), None);
+
+    // The other account's password is untouched and the new one does not work.
+    let mut login = client_conn(&url).await;
+    password_login(&mut login, "bob@example.com", "new-password-2").await;
+    expect_error(&mut login, "wrong email or password").await;
+    password_login(&mut login, "bob@example.com", "old-password-1").await;
+    let (_, _, email) = expect_signed_in(&mut login).await;
+    assert_eq!(email, "bob@example.com");
+}
+
+#[tokio::test]
+async fn explicit_register_purpose_registers_on_a_free_email() {
+    use proto::signal::EmailCodePurpose;
+    let (url, db, mailer) = spawn_with_recording_mailer().await;
+    let mut ws = client_conn(&url).await;
+    let (token, _) = client_auth(&mut ws, None).await;
+    let owner = owner_of_token(&db, &token).expect("owner");
+    let code = request_code(&mut ws, &mailer, "bob@example.com").await;
+    confirm_with(
+        &mut ws,
+        "bob@example.com",
+        &code,
+        "hunter22-pass",
+        Some(EmailCodePurpose::Register),
+    )
+    .await;
+    let (_, _, email) = expect_signed_in(&mut ws).await;
+    assert_eq!(email, "bob@example.com");
+    assert_eq!(
+        db.email_for_owner(&owner).expect("email").as_deref(),
+        Some("bob@example.com")
+    );
+}
+
+#[tokio::test]
+async fn explicit_reset_purpose_resets_an_existing_account() {
+    use proto::signal::EmailCodePurpose;
+    let (url, db, mailer) = spawn_with_recording_mailer().await;
+    let (acc, _, _) = rcdesk_server::owners::create_owner(&db, "UA", 1).expect("owner");
+    let hash = rcdesk_server::accounts::hash_password("old-password-1").expect("hash");
+    assert!(db
+        .insert_account(&acc, "carol@example.com", &hash, 1)
+        .expect("account"));
+    let mut ws = client_conn(&url).await;
+    client_auth(&mut ws, None).await;
+    let code = request_code(&mut ws, &mailer, "carol@example.com").await;
+    confirm_with(
+        &mut ws,
+        "carol@example.com",
+        &code,
+        "new-password-2",
+        Some(EmailCodePurpose::Reset),
+    )
+    .await;
+    let (_, _, email) = expect_signed_in(&mut ws).await;
+    assert_eq!(email, "carol@example.com");
+    let mut login = client_conn(&url).await;
+    password_login(&mut login, "carol@example.com", "new-password-2").await;
+    expect_signed_in(&mut login).await;
+}
+
+#[tokio::test]
+async fn old_client_without_purpose_still_resets_by_existing_email() {
+    let (url, db, mailer) = spawn_with_recording_mailer().await;
+    let (acc, _, _) = rcdesk_server::owners::create_owner(&db, "UA", 1).expect("owner");
+    let hash = rcdesk_server::accounts::hash_password("old-password-1").expect("hash");
+    assert!(db
+        .insert_account(&acc, "dave@example.com", &hash, 1)
+        .expect("account"));
+    let mut ws = client_conn(&url).await;
+    client_auth(&mut ws, None).await;
+    let code = request_code(&mut ws, &mailer, "dave@example.com").await;
+    send_raw_json(
+        &mut ws,
+        &format!(
+            r#"{{"type":"email_code_confirm","email":"dave@example.com","code":"{code}","password":"new-password-2"}}"#
+        ),
+    )
+    .await;
+    let (_, _, email) = expect_signed_in(&mut ws).await;
+    assert_eq!(email, "dave@example.com");
+    let mut login = client_conn(&url).await;
+    password_login(&mut login, "dave@example.com", "new-password-2").await;
+    expect_signed_in(&mut login).await;
 }
 
 // ---- Email change for a signed-in account ----

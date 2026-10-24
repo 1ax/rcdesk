@@ -28,6 +28,18 @@ pub struct IceServer {
     pub credential: Option<String>,
 }
 
+/// Чего клиент хочет от `EmailCodeConfirm` (сервер сверяет это с наличием
+/// аккаунта с такой почтой).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum EmailCodePurpose {
+    /// Регистрация: почта должна быть свободна.
+    Register,
+    /// Сброс пароля: аккаунт с такой почтой должен существовать.
+    Reset,
+}
+
 /// Причина, по которой хост завершил сеанс `Bye` (слайс 4.6b).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -271,11 +283,17 @@ pub enum SignalMessage {
     /// client -> server: код из письма и новый пароль. Если почта уже
     /// принадлежит аккаунту, это сброс пароля и вход в аккаунт; иначе --
     /// регистрация: почта и пароль привязываются к ТЕКУЩЕМУ владельцу
-    /// соединения. Ответ: `Authenticated`, затем `Account`.
+    /// соединения. `purpose` фиксирует намерение клиента: `Reset` без аккаунта
+    /// -- ошибка `no such account`, `Register` при занятой почте -- `email
+    /// taken` (ничего не меняется). `None` (поле отсутствует) -- прежнее
+    /// поведение по наличию аккаунта, только для вкладки старой версии.
+    /// Ответ: `Authenticated`, затем `Account`.
     EmailCodeConfirm {
         email: String,
         code: String,
         password: String,
+        #[serde(default)]
+        purpose: Option<EmailCodePurpose>,
     },
     /// client -> server: вход по почте и паролю. Ответ: `Authenticated`,
     /// затем `Account`.
@@ -619,6 +637,19 @@ mod tests {
                 email: "a@b.co".to_string(),
                 code: "123456".to_string(),
                 password: "secret-pass".to_string(),
+                purpose: None,
+            },
+            SignalMessage::EmailCodeConfirm {
+                email: "a@b.co".to_string(),
+                code: "123456".to_string(),
+                password: "secret-pass".to_string(),
+                purpose: Some(EmailCodePurpose::Register),
+            },
+            SignalMessage::EmailCodeConfirm {
+                email: "a@b.co".to_string(),
+                code: "123456".to_string(),
+                password: "secret-pass".to_string(),
+                purpose: Some(EmailCodePurpose::Reset),
             },
             SignalMessage::PasswordLogin {
                 email: "a@b.co".to_string(),
@@ -640,6 +671,34 @@ mod tests {
             let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(round_tripped, msg);
         }
+    }
+
+    #[test]
+    fn email_code_confirm_without_purpose_deserializes_to_none() {
+        let msg: SignalMessage = serde_json::from_str(
+            r#"{"type":"email_code_confirm","email":"a@b.co","code":"123456","password":"pw"}"#,
+        )
+        .expect("deserialize");
+        assert_eq!(
+            msg,
+            SignalMessage::EmailCodeConfirm {
+                email: "a@b.co".to_string(),
+                code: "123456".to_string(),
+                password: "pw".to_string(),
+                purpose: None,
+            }
+        );
+        let msg: SignalMessage = serde_json::from_str(
+            r#"{"type":"email_code_confirm","email":"a@b.co","code":"1","password":"pw","purpose":"reset"}"#,
+        )
+        .expect("deserialize");
+        assert!(matches!(
+            msg,
+            SignalMessage::EmailCodeConfirm {
+                purpose: Some(EmailCodePurpose::Reset),
+                ..
+            }
+        ));
     }
 
     #[test]

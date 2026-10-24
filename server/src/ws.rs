@@ -15,7 +15,7 @@ use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
-use proto::signal::{BrowserEntry, DeviceEntry, Role, SignalMessage};
+use proto::signal::{BrowserEntry, DeviceEntry, EmailCodePurpose, Role, SignalMessage};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::time::{interval, timeout, MissedTickBehavior};
@@ -813,6 +813,7 @@ async fn handle_email_code_confirm(
     email: &str,
     code: &str,
     password: String,
+    purpose: Option<EmailCodePurpose>,
 ) {
     let Some(email) = accounts::normalize_email(email) else {
         send_error(tx, "invalid email");
@@ -840,6 +841,18 @@ async fn handle_email_code_confirm(
             return;
         }
     };
+    // Намерение клиента против фактического состояния: до argon2, ничего не меняем.
+    match (purpose, existing.is_some()) {
+        (Some(EmailCodePurpose::Reset), false) => {
+            send_error(tx, "no such account");
+            return;
+        }
+        (Some(EmailCodePurpose::Register), true) => {
+            send_error(tx, "email taken");
+            return;
+        }
+        _ => {}
+    }
     // Владелец проверяется до argon2: без него регистрация невозможна.
     let register_owner = if existing.is_none() {
         match require_owner(db, session, tx) {
@@ -1306,6 +1319,7 @@ async fn run_client(
                 email,
                 code,
                 password,
+                purpose,
             } => {
                 handle_email_code_confirm(
                     account_deps,
@@ -1318,6 +1332,7 @@ async fn run_client(
                     &email,
                     &code,
                     password,
+                    purpose,
                 )
                 .await;
             }

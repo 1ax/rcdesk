@@ -84,8 +84,8 @@ import {
   FIX_ADDRESS_LABEL,
   canChangeEmail,
   emailChangeMessage,
-  emailErrorText,
-  normalizeCode,
+  emailCodeConfirmMessage,
+  emailErrorTextFor,
   resendSecondsLeft,
   validateCode,
   validateCurrentPassword,
@@ -1465,7 +1465,7 @@ export function mount(root: Element | null): void {
   /** A server error while an auth request was in flight. */
   function failAuth(message: string): void {
     authPending = null;
-    setAccountMessage(emailErrorText(message));
+    setAccountMessage(emailErrorTextFor(message, authLabel));
     renderAuth();
   }
 
@@ -1517,12 +1517,9 @@ export function mount(root: Element | null): void {
       signaling.send(emailChangeMessage(authEmail, eaCode.value, eaNewPassword.value));
       return;
     }
-    signaling.send({
-      type: "email_code_confirm",
-      email: authEmail,
-      code: normalizeCode(eaCode.value),
-      password: eaNewPassword.value,
-    });
+    signaling.send(
+      emailCodeConfirmMessage(authLabel, authEmail, eaCode.value, eaNewPassword.value),
+    );
   });
   eaForgotBtn.addEventListener("click", () =>
     openAuth("code", "Сброс пароля", eaLoginEmail.value.trim()),

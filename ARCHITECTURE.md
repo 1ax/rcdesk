@@ -426,6 +426,12 @@ WS (`PasskeyRegister*`, `PasskeyLogin*`, `options`/`credential` — JSON webauth
 на СТАРЫЙ адрес уходит уведомление (`Mailer::send_email_changed`, сбой отправки только в лог и не откатывает смену).
 Токены и сессии не трогаются. Ошибки: `no account`, `same email`, `wrong password`, `wrong code`, `email taken`.
 
+`EmailCodeConfirm` несёт `purpose: Option<EmailCodePurpose { Register, Reset }>` — намерение клиента (экран «Регистрация» /
+«Сброс пароля», «Смена пароля»). Сервер сверяет его с наличием аккаунта после проверки кода и до argon2: `Reset` без
+аккаунта с такой почтой — `no such account` (ничего не создаётся), `Register` при занятой почте — `email taken` (пароль
+чужого аккаунта не трогается, переключения нет). `None` (поле отсутствует, вкладка старой версии) — прежнее поведение:
+решает наличие аккаунта.
+
 ## 7. Ввод
 
 Клиент шлёт `event.code` (например `KeyA`, `MetaLeft`) и состояние модификаторов;

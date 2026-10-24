@@ -3,6 +3,8 @@ import {
   FIX_ADDRESS_LABEL,
   canChangeEmail,
   emailChangeMessage,
+  emailCodeConfirmMessage,
+  emailErrorTextFor,
   emailErrorText,
   normalizeCode,
   resendSecondsLeft,
@@ -32,6 +34,18 @@ describe("emailErrorText", () => {
     expect(emailErrorText("same email")).toBe("Это текущая почта аккаунта");
     expect(emailErrorText("wrong password")).toBe("Неверный пароль");
     expect(emailErrorText("email taken")).toBe("Эта почта уже занята другим аккаунтом");
+  });
+  it("maps no such account and gives registration advice for a taken address", () => {
+    expect(emailErrorText("no such account")).toBe(
+      "Аккаунта с этой почтой нет. Новый аккаунт — «Назад» → «Создать аккаунт»",
+    );
+    expect(emailErrorTextFor("email taken", "Регистрация")).toBe(
+      "Эта почта уже занята другим аккаунтом — войдите или восстановите пароль",
+    );
+    expect(emailErrorTextFor("email taken", "Смена почты")).toBe(
+      "Эта почта уже занята другим аккаунтом",
+    );
+    expect(emailErrorTextFor("wrong code", "Регистрация")).toBe("Неверный или просроченный код");
   });
   it("falls back to a generic text", () => {
     expect(emailErrorText("boom")).toBe("Ошибка: boom");
@@ -116,6 +130,22 @@ describe("email change helpers", () => {
       email: "new@b.co",
       code: "123456",
       password: "pw",
+    });
+  });
+
+  it("sets the email_code_confirm purpose by screen label", () => {
+    const base = { type: "email_code_confirm", email: "a@b.co", code: "123456", password: "pw" };
+    expect(emailCodeConfirmMessage("Регистрация", "a@b.co", "123 456", "pw")).toEqual({
+      ...base,
+      purpose: "register",
+    });
+    expect(emailCodeConfirmMessage("Сброс пароля", "a@b.co", "123456", "pw")).toEqual({
+      ...base,
+      purpose: "reset",
+    });
+    expect(emailCodeConfirmMessage("Смена пароля", "a@b.co", "123456", "pw")).toEqual({
+      ...base,
+      purpose: "reset",
     });
   });
 
