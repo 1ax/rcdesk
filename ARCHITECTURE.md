@@ -421,6 +421,11 @@ WS (`PasskeyRegister*`, `PasskeyLogin*`, `options`/`credential` — JSON webauth
 по умолчанию Resend и `rcdesk <noreply@rcdesk.app>`; без пароля сервер не стартует), пусто — почта выключена
 (`email unavailable`). Ключ Resend `rcdesk-server-smtp` — только отправка, только домен `rcdesk.app`.
 
+Смена почты вошедшего аккаунта — `EmailChange { email, code, password }` (код — обычным `EmailCodeRequest` на НОВЫЙ адрес,
+пароль — ТЕКУЩИЙ; пароль проверяется до кода, чтобы неверный пароль не сжигал код). Ответ — `Account` с новой почтой;
+на СТАРЫЙ адрес уходит уведомление (`Mailer::send_email_changed`, сбой отправки только в лог и не откатывает смену).
+Токены и сессии не трогаются. Ошибки: `no account`, `same email`, `wrong password`, `wrong code`, `email taken`.
+
 ## 7. Ввод
 
 Клиент шлёт `event.code` (например `KeyA`, `MetaLeft`) и состояние модификаторов;

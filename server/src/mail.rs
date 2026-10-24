@@ -13,6 +13,14 @@ use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 pub trait Mailer: Send + Sync {
     /// Отправляет письмо с кодом подтверждения на адрес `to`.
     fn send_code(&self, to: &str, code: &str) -> BoxFuture<'static, anyhow::Result<()>>;
+
+    /// Уведомляет СТАРЫЙ адрес `to` о том, что почта аккаунта изменена на
+    /// `new_email`.
+    fn send_email_changed(
+        &self,
+        to: &str,
+        new_email: &str,
+    ) -> BoxFuture<'static, anyhow::Result<()>>;
 }
 
 pub type SharedMailer = Arc<dyn Mailer>;
@@ -24,6 +32,14 @@ impl Mailer for DisabledMailer {
     fn send_code(&self, _to: &str, _code: &str) -> BoxFuture<'static, anyhow::Result<()>> {
         Box::pin(async { Err(anyhow::anyhow!("mail is not configured")) })
     }
+
+    fn send_email_changed(
+        &self,
+        _to: &str,
+        _new_email: &str,
+    ) -> BoxFuture<'static, anyhow::Result<()>> {
+        Box::pin(async { Err(anyhow::anyhow!("mail is not configured")) })
+    }
 }
 
 /// Пишет адрес и код в лог (`warn`, чтобы был виден при дефолтном фильтре).
@@ -33,6 +49,15 @@ pub struct LogMailer;
 impl Mailer for LogMailer {
     fn send_code(&self, to: &str, code: &str) -> BoxFuture<'static, anyhow::Result<()>> {
         tracing::warn!(%to, %code, "RCDESK_MAIL=log: email code (not sent)");
+        Box::pin(async { Ok(()) })
+    }
+
+    fn send_email_changed(
+        &self,
+        to: &str,
+        new_email: &str,
+    ) -> BoxFuture<'static, anyhow::Result<()>> {
+        tracing::warn!(%to, %new_email, "RCDESK_MAIL=log: email changed notice (not sent)");
         Box::pin(async { Ok(()) })
     }
 }
@@ -56,6 +81,27 @@ pub fn build_code_message(from: &Mailbox, to: &str, code: &str) -> anyhow::Resul
         .to(to)
         .subject(format!("Код rcdesk: {code}"))
         .singlepart(SinglePart::plain(code_body(code)))
+        .context("failed to build email")
+}
+
+fn email_changed_body(new_email: &str) -> String {
+    format!(
+        "Почта аккаунта rcdesk изменена на {new_email}.\n\nЕсли это были не вы, срочно войдите в аккаунт и смените пароль.\n"
+    )
+}
+
+/// Собирает уведомление о смене почты (уходит на старый адрес).
+pub fn build_email_changed_message(
+    from: &Mailbox,
+    to: &str,
+    new_email: &str,
+) -> anyhow::Result<Message> {
+    let to: Mailbox = to.parse().context("invalid recipient address")?;
+    Message::builder()
+        .from(from.clone())
+        .to(to)
+        .subject("Почта аккаунта rcdesk изменена")
+        .singlepart(SinglePart::plain(email_changed_body(new_email)))
         .context("failed to build email")
 }
 
@@ -85,6 +131,20 @@ impl SmtpMailer {
 impl Mailer for SmtpMailer {
     fn send_code(&self, to: &str, code: &str) -> BoxFuture<'static, anyhow::Result<()>> {
         let message = build_code_message(&self.from, to, code);
+        let transport = self.transport.clone();
+        Box::pin(async move {
+            let message = message?;
+            transport.send(message).await.context("SMTP send failed")?;
+            Ok(())
+        })
+    }
+
+    fn send_email_changed(
+        &self,
+        to: &str,
+        new_email: &str,
+    ) -> BoxFuture<'static, anyhow::Result<()>> {
+        let message = build_email_changed_message(&self.from, to, new_email);
         let transport = self.transport.clone();
         Box::pin(async move {
             let message = message?;
@@ -226,6 +286,27 @@ mod tests {
         );
         assert!(code_body("123456").contains("Ваш код для rcdesk: 123456"));
         assert!(code_body("123456").contains("Код действует 10 минут."));
+    }
+
+    #[test]
+    fn email_changed_message_has_subject_from_to_and_plain_utf8() {
+        let from: Mailbox = DEFAULT_MAIL_FROM.parse().unwrap();
+        let msg = build_email_changed_message(&from, "old@example.com", "new@example.com").unwrap();
+        let subject = msg.headers().get::<Subject>().unwrap();
+        assert_eq!(subject.as_ref(), "Почта аккаунта rcdesk изменена");
+        let env = msg.envelope();
+        assert_eq!(env.from().unwrap().to_string(), "noreply@rcdesk.app");
+        assert_eq!(env.to().len(), 1);
+        assert_eq!(env.to()[0].to_string(), "old@example.com");
+        let raw = String::from_utf8_lossy(&msg.formatted()).to_lowercase();
+        assert!(
+            raw.contains("content-type: text/plain; charset=utf-8"),
+            "{raw}"
+        );
+        let body = email_changed_body("new@example.com");
+        assert!(body.contains("изменена на new@example.com"));
+        assert!(body.contains("смените пароль"));
+        assert!(build_email_changed_message(&from, "nope", "new@example.com").is_err());
     }
 
     #[test]

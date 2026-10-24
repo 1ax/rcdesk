@@ -23,7 +23,7 @@ use webauthn_rs::prelude::{DiscoverableAuthentication, PasskeyRegistration};
 
 use crate::accounts::{self, EmailCodes};
 use crate::app::AppState;
-use crate::db::Db;
+use crate::db::{Db, SetEmailOutcome};
 use crate::devices::{self, DeviceAuth};
 use crate::ice::{self, IceConfig};
 use crate::ip_limit::{GlobalLimiter, IpLimiter};
@@ -970,6 +970,96 @@ async fn handle_password_login(
     }
 }
 
+/// `EmailChange`: смена почты аккаунта текущего владельца. Пароль
+/// проверяется до кода, чтобы неверный пароль не сжигал код. Токены и
+/// сессии не трогаются.
+#[allow(clippy::too_many_arguments)]
+async fn handle_email_change(
+    deps: AccountDeps<'_>,
+    db: &Db,
+    session: &mut Option<ClientSession>,
+    ip: IpAddr,
+    tx: &Tx,
+    email: &str,
+    code: &str,
+    password: String,
+) {
+    let Some(email) = accounts::normalize_email(email) else {
+        send_error(tx, "invalid email");
+        return;
+    };
+    if !deps.login_limiter.check(ip) {
+        tracing::warn!(%ip, "email change rate-limited");
+        send_error(tx, "too many attempts");
+        return;
+    }
+    let Some(owner_id) = require_owner(db, session, tx) else {
+        return;
+    };
+    let (old_email, hash) = match db.account_for_owner(&owner_id) {
+        Ok(Some(account)) => account,
+        Ok(None) => {
+            send_error(tx, "no account");
+            return;
+        }
+        Err(err) => {
+            tracing::error!(?err, "failed to load account for owner");
+            send_error(tx, "internal error");
+            return;
+        }
+    };
+    if email == old_email {
+        send_error(tx, "same email");
+        return;
+    }
+    match accounts::verify_password_blocking(Some(hash), password).await {
+        Ok(true) => {}
+        Ok(false) => {
+            deps.login_limiter.spend(ip);
+            send_error(tx, "wrong password");
+            return;
+        }
+        Err(err) => {
+            tracing::error!(?err, "failed to verify password");
+            send_error(tx, "internal error");
+            return;
+        }
+    }
+    if !deps.email_codes.verify(&email, code) {
+        deps.login_limiter.spend(ip);
+        send_error(tx, "wrong code");
+        return;
+    }
+    match db.set_account_email(&owner_id, &email) {
+        Ok(SetEmailOutcome::Updated) => {}
+        Ok(SetEmailOutcome::EmailTaken) => {
+            send_error(tx, "email taken");
+            return;
+        }
+        Ok(SetEmailOutcome::NoAccount) => {
+            send_error(tx, "no account");
+            return;
+        }
+        Err(err) => {
+            tracing::error!(?err, "failed to change account email");
+            send_error(tx, "internal error");
+            return;
+        }
+    }
+    send_account(db, &owner_id, tx);
+    // Уведомление на старый адрес: сбой не откатывает смену и клиенту не виден.
+    match timeout(
+        MAIL_SEND_TIMEOUT,
+        deps.mailer.send_email_changed(&old_email, &email),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => tracing::warn!(?err, "failed to send email changed notice"),
+        Err(_) => tracing::warn!("sending email changed notice timed out"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_client(
     stream: &mut SplitStream<WebSocket>,
@@ -1241,6 +1331,23 @@ async fn run_client(
                     &user_agent,
                     &tx,
                     &email,
+                    password,
+                )
+                .await;
+            }
+            SignalMessage::EmailChange {
+                email,
+                code,
+                password,
+            } => {
+                handle_email_change(
+                    account_deps,
+                    db,
+                    &mut session,
+                    ip,
+                    &tx,
+                    &email,
+                    &code,
                     password,
                 )
                 .await;

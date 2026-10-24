@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
+  FIX_ADDRESS_LABEL,
+  canChangeEmail,
+  emailChangeMessage,
   emailErrorText,
   normalizeCode,
   resendSecondsLeft,
   validateCode,
+  validateCurrentPassword,
   validateEmail,
+  validateNewEmail,
   validatePassword,
 } from "./emailAuth";
 
@@ -21,6 +26,12 @@ describe("emailErrorText", () => {
       "Слишком много попыток — подождите и попробуйте снова",
     );
     expect(emailErrorText("already registered")).toBe("У этого аккаунта уже есть почта");
+  });
+  it("maps the email change errors", () => {
+    expect(emailErrorText("no account")).toBe("У аккаунта нет почты");
+    expect(emailErrorText("same email")).toBe("Это текущая почта аккаунта");
+    expect(emailErrorText("wrong password")).toBe("Неверный пароль");
+    expect(emailErrorText("email taken")).toBe("Эта почта уже занята другим аккаунтом");
   });
   it("falls back to a generic text", () => {
     expect(emailErrorText("boom")).toBe("Ошибка: boom");
@@ -78,5 +89,37 @@ describe("resendSecondsLeft", () => {
     expect(resendSecondsLeft(0, 60_000)).toBe(0);
     expect(resendSecondsLeft(0, 90_000)).toBe(0);
     expect(resendSecondsLeft(10_000, 0)).toBe(60);
+  });
+});
+
+describe("email change helpers", () => {
+  it("shows the change button only for an account with an email", () => {
+    expect(canChangeEmail("a@b.co")).toBe(true);
+    expect(canChangeEmail(null)).toBe(false);
+    expect(canChangeEmail(undefined)).toBe(false);
+  });
+
+  it("rejects a bad new address and the current one (any case)", () => {
+    expect(validateNewEmail("nope", "a@b.co")).toBe("Неверный адрес почты");
+    expect(validateNewEmail(" A@B.co ", "a@b.co")).toBe("Это текущая почта аккаунта");
+    expect(validateNewEmail("new@b.co", "a@b.co")).toBeNull();
+  });
+
+  it("requires a non-empty current password", () => {
+    expect(validateCurrentPassword("")).toBe("Неверный пароль");
+    expect(validateCurrentPassword("x")).toBeNull();
+  });
+
+  it("builds email_change with the code stripped of spaces", () => {
+    expect(emailChangeMessage("new@b.co", "123 456", "pw")).toEqual({
+      type: "email_change",
+      email: "new@b.co",
+      code: "123456",
+      password: "pw",
+    });
+  });
+
+  it("renames the wrong-address link", () => {
+    expect(FIX_ADDRESS_LABEL).toBe("Исправить адрес");
   });
 });

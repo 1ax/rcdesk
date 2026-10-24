@@ -280,6 +280,15 @@ pub enum SignalMessage {
     /// client -> server: вход по почте и паролю. Ответ: `Authenticated`,
     /// затем `Account`.
     PasswordLogin { email: String, password: String },
+    /// client -> server: сменить почту аккаунта текущего владельца на
+    /// `email`. `code` -- код, присланный на НОВЫЙ адрес обычным
+    /// `EmailCodeRequest`; `password` -- ТЕКУЩИЙ пароль аккаунта. Ответ при
+    /// успехе: `Account` с новой почтой (сессии не трогаются).
+    EmailChange {
+        email: String,
+        code: String,
+        password: String,
+    },
     /// client -> server: перечитать аккаунт владельца (нужен владелец).
     /// Сервер отвечает `Account`.
     GetAccount,
@@ -613,6 +622,11 @@ mod tests {
             },
             SignalMessage::PasswordLogin {
                 email: "a@b.co".to_string(),
+                password: "secret-pass".to_string(),
+            },
+            SignalMessage::EmailChange {
+                email: "new@b.co".to_string(),
+                code: "123456".to_string(),
                 password: "secret-pass".to_string(),
             },
             SignalMessage::GetAccount,

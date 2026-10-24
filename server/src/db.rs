@@ -31,6 +31,16 @@ pub const OWNER_IDLE_TTL_SECS: u64 = 30 * 24 * 3600;
 /// прежде чем `prune_unowned_devices` его удалит (B2, аудит S-H2).
 pub const DEVICE_IDLE_TTL_SECS: u64 = 30 * 24 * 3600;
 
+/// Исход `Db::set_account_email`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetEmailOutcome {
+    Updated,
+    /// Почта принадлежит другому аккаунту.
+    EmailTaken,
+    /// У владельца нет аккаунта.
+    NoAccount,
+}
+
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -439,6 +449,42 @@ impl Db {
             )
             .optional()?;
         Ok(found)
+    }
+
+    /// Почта и хеш пароля аккаунта владельца: `(email, password_hash)`.
+    pub fn account_for_owner(&self, owner_id: &str) -> anyhow::Result<Option<(String, String)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let found = conn
+            .query_row(
+                "SELECT email, password_hash FROM accounts WHERE owner_id = ?1",
+                [owner_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    /// Меняет почту аккаунта владельца. `email` уже нормализована.
+    pub fn set_account_email(
+        &self,
+        owner_id: &str,
+        email: &str,
+    ) -> anyhow::Result<SetEmailOutcome> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let result = conn.execute(
+            "UPDATE accounts SET email = ?1 WHERE owner_id = ?2",
+            (email, owner_id),
+        );
+        match result {
+            Ok(0) => Ok(SetEmailOutcome::NoAccount),
+            Ok(_) => Ok(SetEmailOutcome::Updated),
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Ok(SetEmailOutcome::EmailTaken)
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// Почта аккаунта владельца, если он завёл учётную запись.
@@ -1353,6 +1399,73 @@ mod tests {
             )
             .expect("timestamps");
         assert_eq!((created, changed), (10, 20));
+    }
+
+    #[test]
+    fn account_for_owner_returns_email_and_hash() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("a", 1).expect("owner");
+        db.insert_owner("b", 1).expect("owner");
+        db.insert_account("a", "a@b.co", "h1", 10).expect("insert");
+        assert_eq!(
+            db.account_for_owner("a").expect("find"),
+            Some(("a@b.co".to_string(), "h1".to_string()))
+        );
+        assert_eq!(db.account_for_owner("b").expect("none"), None);
+    }
+
+    #[test]
+    fn set_account_email_changes_email_keeps_hash() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("a", 1).expect("owner");
+        db.insert_account("a", "a@b.co", "h1", 10).expect("insert");
+
+        assert_eq!(
+            db.set_account_email("a", "new@b.co").expect("set"),
+            SetEmailOutcome::Updated
+        );
+        assert_eq!(db.account_by_email("a@b.co").expect("old"), None);
+        assert_eq!(
+            db.account_by_email("new@b.co").expect("new"),
+            Some(("a".to_string(), "h1".to_string()))
+        );
+        assert_eq!(
+            db.email_for_owner("a").expect("email"),
+            Some("new@b.co".to_string())
+        );
+    }
+
+    #[test]
+    fn set_account_email_refuses_a_taken_email_and_changes_nothing() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("a", 1).expect("owner");
+        db.insert_owner("b", 1).expect("owner");
+        db.insert_account("a", "a@b.co", "h1", 10).expect("insert");
+        db.insert_account("b", "b@b.co", "h2", 10).expect("insert");
+
+        assert_eq!(
+            db.set_account_email("a", "b@b.co").expect("set"),
+            SetEmailOutcome::EmailTaken
+        );
+        assert_eq!(
+            db.account_by_email("a@b.co").expect("a"),
+            Some(("a".to_string(), "h1".to_string()))
+        );
+        assert_eq!(
+            db.account_by_email("b@b.co").expect("b"),
+            Some(("b".to_string(), "h2".to_string()))
+        );
+    }
+
+    #[test]
+    fn set_account_email_without_account_reports_no_account() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("a", 1).expect("owner");
+        assert_eq!(
+            db.set_account_email("a", "new@b.co").expect("set"),
+            SetEmailOutcome::NoAccount
+        );
+        assert_eq!(db.account_by_email("new@b.co").expect("none"), None);
     }
 
     #[test]

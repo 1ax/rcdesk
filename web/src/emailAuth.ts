@@ -1,6 +1,8 @@
 // Pure helpers for the "email + password" account UI (slice 3.8c): server
 // error texts, client-side input checks and the resend timer. No DOM access.
 
+import type { SignalMessage } from "./generated/SignalMessage";
+
 /** Minimum wait between two `email_code_request`s for one address (server rule). */
 export const RESEND_COOLDOWN_SECS = 60;
 
@@ -12,6 +14,10 @@ const EMAIL_ERROR_TEXTS: Record<string, string> = {
   "email unavailable": "Не удалось отправить письмо — попробуйте позже",
   "too many attempts": "Слишком много попыток — подождите и попробуйте снова",
   "already registered": "У этого аккаунта уже есть почта",
+  "no account": "У аккаунта нет почты",
+  "same email": "Это текущая почта аккаунта",
+  "wrong password": "Неверный пароль",
+  "email taken": "Эта почта уже занята другим аккаунтом",
 };
 
 /** Russian text for a server `error.message` during the email flow. */
@@ -62,4 +68,36 @@ export function resendSecondsLeft(
   if (lastSentMs === null) return 0;
   const left = Math.ceil((lastSentMs + cooldownSecs * 1000 - nowMs) / 1000);
   return Math.min(Math.max(left, 0), cooldownSecs);
+}
+
+/** Label of the "wrong address, go back to the first step" link. */
+export const FIX_ADDRESS_LABEL = "Исправить адрес";
+
+/** The cabinet's "Сменить почту" button exists only for an account with an email. */
+export function canChangeEmail(accountEmail: string | null | undefined): boolean {
+  return typeof accountEmail === "string";
+}
+
+/** Error text for the NEW address of an email change: a bad address or the
+ * account's current one (compared case-insensitively), else `null`. */
+export function validateNewEmail(
+  email: string,
+  currentEmail: string | null | undefined,
+): string | null {
+  const invalid = validateEmail(email);
+  if (invalid !== null) return invalid;
+  if (typeof currentEmail === "string" && email.trim().toLowerCase() === currentEmail.toLowerCase()) {
+    return emailErrorText("same email");
+  }
+  return null;
+}
+
+/** Error text for an empty current password (the server checks the rest). */
+export function validateCurrentPassword(password: string): string | null {
+  return password === "" ? emailErrorText("wrong password") : null;
+}
+
+/** The `email_change` message for the second step of an email change. */
+export function emailChangeMessage(email: string, code: string, password: string): SignalMessage {
+  return { type: "email_change", email, code: normalizeCode(code), password };
 }

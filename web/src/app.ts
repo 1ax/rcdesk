@@ -81,11 +81,16 @@ import {
   requestOptionsFromServer,
 } from "./passkey";
 import {
+  FIX_ADDRESS_LABEL,
+  canChangeEmail,
+  emailChangeMessage,
   emailErrorText,
   normalizeCode,
   resendSecondsLeft,
   validateCode,
+  validateCurrentPassword,
   validateEmail,
+  validateNewEmail,
   validatePassword,
 } from "./emailAuth";
 import {
@@ -367,6 +372,7 @@ export function mount(root: Element | null): void {
           <h2>Почта и пароль</h2>
           <p id="email-current" class="hint email-current"></p>
           <button id="email-action-btn" class="btn btn-secondary">Добавить почту и пароль</button>
+          <button id="email-change-btn" class="btn btn-secondary" hidden>Сменить почту</button>
         </div>
         <div class="devices" id="passkey-block">
           <h2>Passkey</h2>
@@ -409,7 +415,7 @@ export function mount(root: Element | null): void {
             autocomplete="new-password" placeholder="Новый пароль (8–128 символов)" />
           <button id="ea-confirm-submit" type="submit" class="btn">Готово</button>
           <button id="ea-resend-btn" type="button" class="link-btn">Отправить код ещё раз</button>
-          <button id="ea-change-email-btn" type="button" class="link-btn">Изменить почту</button>
+          <button id="ea-change-email-btn" type="button" class="link-btn">${FIX_ADDRESS_LABEL}</button>
         </form>
         <p id="ea-status" class="hint account-status"></p>
         <button id="ea-back-btn" class="btn btn-secondary">Назад</button>
@@ -725,6 +731,7 @@ export function mount(root: Element | null): void {
   const emailBlock = root.querySelector<HTMLDivElement>("#email-block")!;
   const emailCurrentEl = root.querySelector<HTMLParagraphElement>("#email-current")!;
   const emailActionBtn = root.querySelector<HTMLButtonElement>("#email-action-btn")!;
+  const emailChangeBtn = root.querySelector<HTMLButtonElement>("#email-change-btn")!;
   const passkeyBlock = root.querySelector<HTMLDivElement>("#passkey-block")!;
   const authCard = root.querySelector<HTMLDivElement>("#auth-card")!;
   const eaTitle = root.querySelector<HTMLHeadingElement>("#ea-title")!;
@@ -895,14 +902,15 @@ export function mount(root: Element | null): void {
   // answers the `get_account` sent after every `authenticated`; `null` = none).
   let accountEmail: string | null | undefined = undefined;
   // The email auth card: "login" form or the "code" flow (registration /
-  // password reset / password change, told apart by `authLabel`), its step,
+  // password reset / password change, told apart by `authLabel`; "change" is
+  // the email change of a signed-in account), its step,
   // the address the code went to, the request in flight (buttons disabled
   // while set; server errors go to the card while set) and the resend timer.
-  let authMode: "login" | "code" = "login";
+  let authMode: "login" | "code" | "change" = "login";
   let authLabel = "Вход";
   let authStep: 1 | 2 = 1;
   let authEmail = "";
-  let authPending: "request" | "confirm" | "login" | null = null;
+  let authPending: "request" | "confirm" | "login" | "change" | null = null;
   let authLastSentMs: number | null = null;
   let authTimer: ReturnType<typeof setInterval> | undefined;
   const passkeySupported =
@@ -1363,6 +1371,7 @@ export function mount(root: Element | null): void {
     loginOpenBtn.disabled = connectionLost;
     signupOpenBtn.disabled = connectionLost;
     emailActionBtn.disabled = connectionLost || authPending !== null;
+    emailChangeBtn.disabled = connectionLost || authPending !== null;
     renderAuth();
   }
 
@@ -1379,8 +1388,13 @@ export function mount(root: Element | null): void {
     const registering = authMode === "code" && authLabel === "Регистрация";
     eaTitle.textContent = authLabel;
     eaLoginForm.hidden = authMode !== "login";
-    eaRequestForm.hidden = !(authMode === "code" && authStep === 1);
-    eaConfirmForm.hidden = !(authMode === "code" && authStep === 2);
+    eaRequestForm.hidden = !(authMode !== "login" && authStep === 1);
+    eaConfirmForm.hidden = !(authMode !== "login" && authStep === 2);
+    // Email change: the second field is the CURRENT password, not a new one.
+    const changing = authMode === "change";
+    eaRequestEmail.placeholder = changing ? "Новая почта" : "Почта";
+    eaNewPassword.placeholder = changing ? "Текущий пароль" : "Новый пароль (8–128 символов)";
+    eaNewPassword.autocomplete = changing ? "current-password" : "new-password";
     eaLoginSubmit.disabled = busy;
     eaRequestSubmit.disabled = busy;
     eaConfirmSubmit.disabled = busy;
@@ -1401,7 +1415,7 @@ export function mount(root: Element | null): void {
     if (left === 0) stopAuthTimer();
   }
 
-  function openAuth(mode: "login" | "code", label: string, email: string): void {
+  function openAuth(mode: "login" | "code" | "change", label: string, email: string): void {
     stopAuthTimer();
     authMode = mode;
     authLabel = label;
@@ -1420,6 +1434,12 @@ export function mount(root: Element | null): void {
     accountCard.hidden = true;
     authCard.hidden = false;
     renderAuth();
+  }
+
+  /** Back from the auth card to the cabinet (email change started there). */
+  function showCabinet(): void {
+    mainCard.hidden = true;
+    accountCard.hidden = false;
   }
 
   function closeAuth(): void {
@@ -1467,7 +1487,10 @@ export function mount(root: Element | null): void {
   eaRequestForm.addEventListener("submit", (event) => {
     event.preventDefault();
     if (authPending !== null || connectionLost) return;
-    const invalid = validateEmail(eaRequestEmail.value);
+    const invalid =
+      authMode === "change"
+        ? validateNewEmail(eaRequestEmail.value, accountEmail)
+        : validateEmail(eaRequestEmail.value);
     if (invalid !== null) {
       setAccountMessage(invalid);
       return;
@@ -1477,14 +1500,23 @@ export function mount(root: Element | null): void {
   eaConfirmForm.addEventListener("submit", (event) => {
     event.preventDefault();
     if (authPending !== null || connectionLost) return;
-    const invalid = validateCode(eaCode.value) ?? validatePassword(eaNewPassword.value);
+    const changing = authMode === "change";
+    const invalid =
+      validateCode(eaCode.value) ??
+      (changing
+        ? validateCurrentPassword(eaNewPassword.value)
+        : validatePassword(eaNewPassword.value));
     if (invalid !== null) {
       setAccountMessage(invalid);
       return;
     }
-    authPending = "confirm";
+    authPending = changing ? "change" : "confirm";
     setAccountMessage("");
     renderAuth();
+    if (changing) {
+      signaling.send(emailChangeMessage(authEmail, eaCode.value, eaNewPassword.value));
+      return;
+    }
     signaling.send({
       type: "email_code_confirm",
       email: authEmail,
@@ -1513,7 +1545,9 @@ export function mount(root: Element | null): void {
     renderAuth();
   });
   eaBackBtn.addEventListener("click", () => {
+    const toCabinet = authMode === "change";
     closeAuth();
+    if (toCabinet) showCabinet();
     setAccountMessage("");
   });
   loginOpenBtn.addEventListener("click", () => openAuth("login", "Вход", ""));
@@ -1523,6 +1557,9 @@ export function mount(root: Element | null): void {
   emailActionBtn.addEventListener("click", () => {
     if (typeof accountEmail === "string") openAuth("code", "Смена пароля", accountEmail);
     else openAuth("code", "Регистрация", "");
+  });
+  emailChangeBtn.addEventListener("click", () => {
+    if (canChangeEmail(accountEmail)) openAuth("change", "Смена почты", "");
   });
 
   signaling.on("email_code_sent", () => {
@@ -1539,6 +1576,14 @@ export function mount(root: Element | null): void {
 
   signaling.on("account", (msg) => {
     accountEmail = msg.email;
+    if (authPending === "change" && msg.email !== null) {
+      // Email changed: back to the cabinet with a note.
+      closeAuth();
+      showCabinet();
+      setAccountMessage("Почта изменена");
+      renderAccount();
+      return;
+    }
     const finishing = authPending === "confirm" || authPending === "login";
     if (finishing && msg.email !== null) {
       // Registration / reset / login done: back to the first screen.
@@ -1634,6 +1679,7 @@ export function mount(root: Element | null): void {
     emailCurrentEl.hidden = typeof accountEmail !== "string";
     emailActionBtn.textContent =
       typeof accountEmail === "string" ? "Сменить пароль" : "Добавить почту и пароль";
+    emailChangeBtn.hidden = !canChangeEmail(accountEmail);
     const needConfirm = (passkeys ?? []).length === 0 && typeof accountEmail !== "string";
     const confirmingSignOut = confirmingAccountKey === "sign-out";
     signOutBtn.dataset.confirmKey = "sign-out";

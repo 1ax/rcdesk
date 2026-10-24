@@ -2478,6 +2478,8 @@ async fn global_pin_bucket_limits_distributed_guessing() {
 #[derive(Clone, Default)]
 struct RecordingMailer {
     sent: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// `(old address, new email)` of every email-changed notice.
+    changed: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
 
 impl rcdesk_server::mail::Mailer for RecordingMailer {
@@ -2490,6 +2492,18 @@ impl rcdesk_server::mail::Mailer for RecordingMailer {
             .lock()
             .expect("mailer mutex")
             .push((to.to_string(), code.to_string()));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn send_email_changed(
+        &self,
+        to: &str,
+        new_email: &str,
+    ) -> futures_util::future::BoxFuture<'static, anyhow::Result<()>> {
+        self.changed
+            .lock()
+            .expect("mailer mutex")
+            .push((to.to_string(), new_email.to_string()));
         Box::pin(async { Ok(()) })
     }
 }
@@ -2797,4 +2811,170 @@ async fn registration_without_an_owner_is_not_authenticated_and_get_account_too(
     let code = request_code(&mut ws, &mailer, "bob@example.com").await;
     confirm(&mut ws, "bob@example.com", &code, "long-enough-pass").await;
     expect_not_authenticated(&mut ws).await;
+}
+
+// ---- Email change for a signed-in account ----
+
+async fn email_change(ws: &mut WsStream, email: &str, code: &str, password: &str) {
+    send(
+        ws,
+        &SignalMessage::EmailChange {
+            email: email.to_string(),
+            code: code.to_string(),
+            password: password.to_string(),
+        },
+    )
+    .await;
+}
+
+/// Registers `email` / `password` on a fresh connection; returns the
+/// connection and its owner.
+async fn registered_conn(
+    url: &str,
+    db: &Db,
+    mailer: &RecordingMailer,
+    email: &str,
+    password: &str,
+) -> (WsStream, String) {
+    let mut ws = client_conn(url).await;
+    let (token, _) = client_auth(&mut ws, None).await;
+    let owner = owner_of_token(db, &token).expect("owner");
+    let code = request_code(&mut ws, mailer, email).await;
+    confirm(&mut ws, email, &code, password).await;
+    expect_signed_in(&mut ws).await;
+    (ws, owner)
+}
+
+#[tokio::test]
+async fn email_change_moves_the_account_and_notifies_the_old_address() {
+    let (url, db, mailer) = spawn_with_recording_mailer().await;
+    let (mut ws, owner) =
+        registered_conn(&url, &db, &mailer, "old@example.com", "hunter22-pass").await;
+
+    let code = request_code(&mut ws, &mailer, "new@example.com").await;
+    email_change(&mut ws, " New@Example.com ", &code, "hunter22-pass").await;
+    assert_eq!(
+        recv(&mut ws).await,
+        SignalMessage::Account {
+            email: Some("new@example.com".to_string())
+        }
+    );
+    assert_eq!(
+        db.email_for_owner(&owner).expect("email").as_deref(),
+        Some("new@example.com")
+    );
+    // The notice goes out right after the reply; give the server a moment.
+    for _ in 0..50 {
+        if !mailer.changed.lock().expect("mailer mutex").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        *mailer.changed.lock().expect("mailer mutex"),
+        vec![("old@example.com".to_string(), "new@example.com".to_string())]
+    );
+
+    // The old address no longer logs in; the new one does with the same password.
+    let mut login = client_conn(&url).await;
+    password_login(&mut login, "old@example.com", "hunter22-pass").await;
+    expect_error(&mut login, "wrong email or password").await;
+    password_login(&mut login, "new@example.com", "hunter22-pass").await;
+    let (_, _, email) = expect_signed_in(&mut login).await;
+    assert_eq!(email, "new@example.com");
+}
+
+#[tokio::test]
+async fn email_change_with_wrong_password_keeps_the_code_valid() {
+    let (url, db, mailer) = spawn_with_recording_mailer().await;
+    let (mut ws, owner) =
+        registered_conn(&url, &db, &mailer, "old@example.com", "hunter22-pass").await;
+
+    let code = request_code(&mut ws, &mailer, "new@example.com").await;
+    email_change(&mut ws, "new@example.com", &code, "not-the-password").await;
+    expect_error(&mut ws, "wrong password").await;
+    assert_eq!(
+        db.email_for_owner(&owner).expect("email").as_deref(),
+        Some("old@example.com")
+    );
+
+    email_change(&mut ws, "new@example.com", &code, "hunter22-pass").await;
+    assert_eq!(
+        recv(&mut ws).await,
+        SignalMessage::Account {
+            email: Some("new@example.com".to_string())
+        }
+    );
+}
+
+#[tokio::test]
+async fn email_change_with_wrong_code_is_rejected() {
+    let (url, db, mailer) = spawn_with_recording_mailer().await;
+    let (mut ws, owner) =
+        registered_conn(&url, &db, &mailer, "old@example.com", "hunter22-pass").await;
+
+    let code = request_code(&mut ws, &mailer, "new@example.com").await;
+    let wrong = if code == "000000" { "111111" } else { "000000" };
+    email_change(&mut ws, "new@example.com", wrong, "hunter22-pass").await;
+    expect_error(&mut ws, "wrong code").await;
+    assert_eq!(
+        db.email_for_owner(&owner).expect("email").as_deref(),
+        Some("old@example.com")
+    );
+    assert!(mailer.changed.lock().expect("mailer mutex").is_empty());
+}
+
+#[tokio::test]
+async fn email_change_to_a_taken_email_is_rejected() {
+    let (url, db, mailer) = spawn_with_recording_mailer().await;
+    // Another account is set up directly: the per-IP code limiter is small.
+    let (other_owner, _, _) = rcdesk_server::owners::create_owner(&db, "UA", 1).expect("owner");
+    let other_hash = rcdesk_server::accounts::hash_password("other-pass-1").expect("hash");
+    assert!(db
+        .insert_account(&other_owner, "taken@example.com", &other_hash, 1)
+        .expect("account"));
+    let (mut ws, owner) =
+        registered_conn(&url, &db, &mailer, "old@example.com", "hunter22-pass").await;
+
+    let code = request_code(&mut ws, &mailer, "taken@example.com").await;
+    email_change(&mut ws, "taken@example.com", &code, "hunter22-pass").await;
+    expect_error(&mut ws, "email taken").await;
+    assert_eq!(
+        db.email_for_owner(&owner).expect("email").as_deref(),
+        Some("old@example.com")
+    );
+    assert_eq!(
+        db.email_for_owner(&other_owner).expect("email").as_deref(),
+        Some("taken@example.com")
+    );
+}
+
+#[tokio::test]
+async fn email_change_to_the_current_email_is_rejected() {
+    let (url, db, mailer) = spawn_with_recording_mailer().await;
+    let (mut ws, _owner) =
+        registered_conn(&url, &db, &mailer, "old@example.com", "hunter22-pass").await;
+
+    email_change(&mut ws, "OLD@example.com", "123456", "hunter22-pass").await;
+    expect_error(&mut ws, "same email").await;
+}
+
+#[tokio::test]
+async fn email_change_requires_an_account_and_an_owner() {
+    let (url, _db, _mailer) = spawn_with_recording_mailer().await;
+
+    // Owner without an account.
+    let mut ws = client_conn(&url).await;
+    client_auth(&mut ws, None).await;
+    email_change(&mut ws, "new@example.com", "123456", "hunter22-pass").await;
+    expect_error(&mut ws, "no account").await;
+
+    // Connection without an owner.
+    let mut anon = client_conn(&url).await;
+    email_change(&mut anon, "new@example.com", "123456", "hunter22-pass").await;
+    expect_error(&mut anon, "not authenticated").await;
+
+    // Invalid new address.
+    email_change(&mut anon, "nope", "123456", "hunter22-pass").await;
+    expect_error(&mut anon, "invalid email").await;
 }
