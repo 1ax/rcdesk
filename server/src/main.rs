@@ -58,18 +58,55 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("rcdesk-server listening on {addr}");
 
-    axum::serve(
-        listener,
-        app(
-            registry,
-            IceConfig::from_env(),
-            db,
-            webauthn,
-            mailer_from_env()?,
-        )
-        .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    let shutdown_db = db.clone();
+    let service = app(
+        registry,
+        IceConfig::from_env(),
+        db,
+        webauthn,
+        mailer_from_env()?,
     )
-    .await?;
+    .into_make_service_with_connect_info::<std::net::SocketAddr>();
+
+    // Без with_graceful_shutdown: он ждал бы закрытия долгоживущих WebSocket.
+    // Клиенты и хосты переподключаются сами, поэтому по сигналу просто выходим.
+    tokio::select! {
+        result = axum::serve(listener, service) => result?,
+        () = shutdown_signal() => {
+            tracing::info!("shutdown signal received");
+            match shutdown_db.checkpoint() {
+                Ok((0, _, _)) => {}
+                Ok((busy, log, done)) => tracing::warn!(
+                    "wal checkpoint incomplete: busy={busy} log={log} checkpointed={done}"
+                ),
+                Err(err) => tracing::warn!("wal checkpoint failed: {err:#}"),
+            }
+        }
+    }
 
     Ok(())
+}
+
+/// Ждёт SIGTERM (docker stop, PID 1) или Ctrl+C; на не-unix — только Ctrl+C.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            Err(err) => {
+                tracing::warn!("failed to install SIGTERM handler: {err}");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

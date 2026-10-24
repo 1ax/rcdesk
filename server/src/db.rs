@@ -114,6 +114,18 @@ impl Db {
         })
     }
 
+    /// Переносит WAL в основной файл и обнуляет `-wal` (`wal_checkpoint(TRUNCATE)`).
+    /// Зовётся при штатной остановке. Возвращает `(busy, log, checkpointed)`
+    /// как есть: `busy != 0` значит, что чекпоинт не дошёл до конца (другой
+    /// читатель/писатель держит БД) — логирует вызывающий.
+    pub fn checkpoint(&self) -> anyhow::Result<(i64, i64, i64)> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let row = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(row)
+    }
+
     pub fn insert_device(
         &self,
         device_id: &str,
@@ -899,6 +911,41 @@ mod tests {
             |r| r.get(0),
         )
         .expect("count tokens")
+    }
+
+    #[test]
+    fn checkpoint_truncates_wal_and_keeps_data() {
+        let dir = std::env::temp_dir().join(format!(
+            "rcdesk-checkpoint-test-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        let path = dir.join("rcdesk.db");
+        let wal = dir.join("rcdesk.db-wal");
+        {
+            let db = Db::open(&path).expect("open file db");
+            for i in 0..20 {
+                db.insert_owner(&format!("o{i}"), 100).expect("owner");
+            }
+            let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+            assert!(wal_len > 0, "WAL должен быть непустым до чекпоинта");
+
+            let (busy, _log, _done) = db.checkpoint().expect("checkpoint");
+            assert_eq!(busy, 0);
+            let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+            assert_eq!(wal_len, 0, "WAL должен быть обнулён после чекпоинта");
+        }
+        let reopened = Db::open(&path).expect("reopen db");
+        assert_eq!(owner_count(&reopened), 20);
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn now_nanos() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos()
     }
 
     #[test]
