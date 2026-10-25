@@ -404,6 +404,17 @@ export function attachInput(
       case "scroll": {
         const lines = wheelAcc.add(action.dx, action.dy);
         if (lines.dx === 0 && lines.dy === 0) break;
+        // macOS scrolls the window under the pointer (H5-13): in direct mode
+        // the pointer goes under the fingers first.
+        if (touch?.mode() === "direct") {
+          const p = pointFromClient(action.cx, action.cy);
+          if (p) {
+            virtualCursor.x = p.x;
+            virtualCursor.y = p.y;
+            pendingMove = null;
+            send(channels.pointer, { type: "pointer_move", x: p.x, y: p.y });
+          }
+        }
         // Finger up = content up = wheel down (as on a phone).
         send(channels.input, {
           type: "wheel",

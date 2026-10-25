@@ -33,7 +33,7 @@ export interface TouchEvent {
 export type TouchAction =
   | { kind: "move"; dx: number; dy: number }
   | { kind: "button"; button: "left" | "right"; pressed: boolean }
-  | { kind: "scroll"; dx: number; dy: number }
+  | { kind: "scroll"; dx: number; dy: number; cx: number; cy: number }
   | { kind: "drag"; pressed: boolean }
   // Slice H3: pinch (centroid in client px), view pan and direct-mode click.
   | { kind: "pinch"; factor: number; cx: number; cy: number }
@@ -43,6 +43,7 @@ export type TouchAction =
 export const TAP_MAX_MS = 300;
 export const LONG_PRESS_MS = 500;
 export const SLOP_PX = 10;
+export const DOUBLE_TAP_MS = 350;
 
 type Phase =
   | "idle"
@@ -63,6 +64,12 @@ export class TouchRecognizer {
   private downAt = 0;
   private startX = 0;
   private startY = 0;
+  private tapX = 0;
+  private tapY = 0;
+  // Last recognized one-finger tap (for the double-tap point snap).
+  private lastTapAt = Number.NEGATIVE_INFINITY;
+  private lastTapX = 0;
+  private lastTapY = 0;
   // Two-finger state.
   private twoAt = 0;
   private twoStartCx = 0;
@@ -133,6 +140,17 @@ export class TouchRecognizer {
       this.downAt = now;
       this.startX = ev.x;
       this.startY = ev.y;
+      // A second tap close to the first one in space and time lands on the
+      // exact same point, so the host assembles a double click.
+      this.tapX = ev.x;
+      this.tapY = ev.y;
+      if (
+        now - this.lastTapAt <= DOUBLE_TAP_MS &&
+        Math.hypot(ev.x - this.lastTapX, ev.y - this.lastTapY) < SLOP_PX
+      ) {
+        this.tapX = this.lastTapX;
+        this.tapY = this.lastTapY;
+      }
       return [];
     }
     if ((this.phase === "pending" || this.phase === "moving") && this.fingers.size === 1) {
@@ -165,10 +183,12 @@ export class TouchRecognizer {
           const pdy = ev.y - this.startY;
           return [{ kind: "pan", dx: pdx, dy: pdy }];
         }
-        if (Math.hypot(ev.x - this.startX, ev.y - this.startY) >= SLOP_PX) {
-          this.phase = "moving";
-        }
-        return dx === 0 && dy === 0 ? [] : [{ kind: "move", dx, dy }];
+        // Trackpad: accumulate below the slop, then hand over the shift
+        // from the start point in one move (a jittery tap must not move
+        // the host cursor).
+        if (Math.hypot(ev.x - this.startX, ev.y - this.startY) < SLOP_PX) return [];
+        this.phase = "moving";
+        return [{ kind: "move", dx: ev.x - this.startX, dy: ev.y - this.startY }];
       case "moving":
       case "drag":
         if (this.mode === "direct") {
@@ -189,7 +209,7 @@ export class TouchRecognizer {
           this.twoKind = spread > shift ? "pinch" : "scroll";
         }
         if (this.twoKind === "scroll") {
-          return sdx === 0 && sdy === 0 ? [] : [{ kind: "scroll", dx: sdx, dy: sdy }];
+          return sdx === 0 && sdy === 0 ? [] : [{ kind: "scroll", dx: sdx, dy: sdy, cx, cy }];
         }
         const prev = this.dPrev;
         this.dPrev = d;
@@ -210,8 +230,11 @@ export class TouchRecognizer {
         const tap = now - this.downAt <= TAP_MAX_MS;
         this.reset();
         if (!tap) return [];
+        this.lastTapAt = now;
+        this.lastTapX = this.tapX;
+        this.lastTapY = this.tapY;
         if (this.mode === "direct") {
-          return [{ kind: "click", button: "left", x: this.startX, y: this.startY }];
+          return [{ kind: "click", button: "left", x: this.tapX, y: this.tapY }];
         }
         return [
           { kind: "button", button: "left", pressed: true },
@@ -253,6 +276,7 @@ export class TouchRecognizer {
   private onCancel(ev: TouchEvent): TouchAction[] {
     if (!this.fingers.has(ev.id)) return [];
     const wasDrag = this.phase === "drag";
+    this.lastTapAt = Number.NEGATIVE_INFINITY;
     this.reset();
     return wasDrag ? [{ kind: "drag", pressed: false }] : [];
   }

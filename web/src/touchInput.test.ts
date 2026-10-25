@@ -69,10 +69,63 @@ describe("TouchRecognizer", () => {
     const r = new TouchRecognizer();
     r.handle(ev("down", 1, 100, 100), 0);
     r.handle(ev("down", 2, 160, 100), 10);
-    expect(r.handle(ev("move", 1, 100, 130), 30)).toEqual([{ kind: "scroll", dx: 0, dy: 15 }]);
-    expect(r.handle(ev("move", 2, 160, 130), 40)).toEqual([{ kind: "scroll", dx: 0, dy: 15 }]);
+    expect(r.handle(ev("move", 1, 100, 130), 30)).toEqual([
+      { kind: "scroll", dx: 0, dy: 15, cx: 130, cy: 115 },
+    ]);
+    expect(r.handle(ev("move", 2, 160, 130), 40)).toEqual([
+      { kind: "scroll", dx: 0, dy: 15, cx: 130, cy: 130 },
+    ]);
     expect(r.handle(ev("up", 1), 60)).toEqual([]);
     expect(r.handle(ev("up", 2), 70)).toEqual([]);
+  });
+
+  it("trackpad jitter below slop does not move", () => {
+    const r = new TouchRecognizer();
+    const actions: TouchAction[] = [];
+    actions.push(...r.handle(ev("down", 1, 50, 50), 0));
+    actions.push(...r.handle(ev("move", 1, 52, 51), 20));
+    actions.push(...r.handle(ev("move", 1, 53, 52), 40));
+    actions.push(...r.handle(ev("up", 1, 53, 52), 100));
+    expect(actions.some((a) => a.kind === "move")).toBe(false);
+    expect(actions).toEqual(click("left"));
+  });
+
+  it("trackpad first move carries the accumulated delta", () => {
+    const r = new TouchRecognizer();
+    r.handle(ev("down", 1, 0, 0), 0);
+    expect(r.handle(ev("move", 1, 3, 0), 10)).toEqual([]);
+    expect(r.handle(ev("move", 1, 12, 0), 20)).toEqual([{ kind: "move", dx: 12, dy: 0 }]);
+    expect(r.handle(ev("move", 1, 15, 0), 30)).toEqual([{ kind: "move", dx: 3, dy: 0 }]);
+  });
+
+  it("double tap in direct mode reuses the first point", () => {
+    const r = new TouchRecognizer(() => "direct");
+    r.handle(ev("down", 1, 100, 100), 0);
+    const first = r.handle(ev("up", 1, 100, 100), 50);
+    r.handle(ev("down", 1, 104, 100), 250);
+    const second = r.handle(ev("up", 1, 104, 100), 300);
+    expect(first).toEqual([{ kind: "click", button: "left", x: 100, y: 100 }]);
+    expect(second).toEqual(first);
+    r.handle(ev("down", 1, 104, 100), 800);
+    expect(r.handle(ev("up", 1, 104, 100), 850)).toEqual([
+      { kind: "click", button: "left", x: 104, y: 100 },
+    ]);
+  });
+
+  it("scroll carries the centroid", () => {
+    const r = new TouchRecognizer(() => "direct");
+    r.handle(ev("down", 1, 100, 100), 0);
+    r.handle(ev("down", 2, 120, 100), 10);
+    // Both fingers move by (0, -50); the gesture locks in as a scroll once
+    // the centroid shift passes the slop.
+    expect(r.handle(ev("move", 1, 100, 90), 20)).toEqual([]);
+    expect(r.handle(ev("move", 2, 120, 90), 30)).toEqual([
+      { kind: "scroll", dx: 0, dy: -5, cx: 110, cy: 90 },
+    ]);
+    r.handle(ev("move", 1, 100, 50), 40);
+    expect(r.handle(ev("move", 2, 120, 50), 50)).toEqual([
+      { kind: "scroll", dx: 0, dy: -20, cx: 110, cy: 50 },
+    ]);
   });
 
   it("ignores a third finger", () => {
