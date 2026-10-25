@@ -370,6 +370,32 @@ describe("ClipboardBridge.syncBeforePaste", () => {
   });
 });
 
+describe("ClipboardBridge.syncFromClient", () => {
+  it("syncFromClient sends new text and notes it", async () => {
+    const deps = makeDeps({ readText: vi.fn().mockResolvedValue("hello") });
+    const bridge = new ClipboardBridge(deps);
+
+    await bridge.syncFromClient();
+    expect(deps.send).toHaveBeenCalledWith({ type: "clipboard_text", text: "hello" });
+    expect(deps.notify).toHaveBeenCalledWith("Буфер телефона отправлен на хост");
+
+    await bridge.syncFromClient();
+    expect(deps.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("syncFromClient is silent when the read is refused or empty", async () => {
+    const refused = makeDeps({ readText: vi.fn().mockRejectedValue(new Error("denied")) });
+    await expect(new ClipboardBridge(refused).syncFromClient()).resolves.toBeUndefined();
+    expect(refused.send).not.toHaveBeenCalled();
+    expect(refused.notify).not.toHaveBeenCalled();
+
+    const empty = makeDeps({ readText: vi.fn().mockResolvedValue("") });
+    await new ClipboardBridge(empty).syncFromClient();
+    expect(empty.send).not.toHaveBeenCalled();
+    expect(empty.notify).not.toHaveBeenCalled();
+  });
+});
+
 describe("ClipboardBridge.onLocalClipboardChange", () => {
   it("sends new clipboard text, same checks as syncBeforePaste", async () => {
     const deps = makeDeps({ readText: vi.fn().mockResolvedValue("changed") });

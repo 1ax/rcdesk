@@ -75,6 +75,7 @@ const DEFERRED_COPY_TIMEOUT_MS = 3_000;
 /** Note shown when the host's text lands in the local clipboard (slice E4);
  * not shown for a Safari deferred copy, where the user pressed copy. */
 const HOST_CLIPBOARD_NOTE = "Буфер обновлён с хоста";
+const CLIENT_CLIPBOARD_NOTE = "Буфер телефона отправлен на хост";
 
 /** localStorage key of the clipboard-sync opt-in (slice E4). */
 export const CLIPBOARD_SYNC_STORAGE_KEY = "rcdesk.clipboardSync";
@@ -240,7 +241,7 @@ export class ClipboardBridge {
    * within-limit text, sends it to the host -- used both before forwarding
    * a paste shortcut (decision 2a) and on `clipboardchange` (decision 2b,
    * via `onLocalClipboardChange`). Never rejects. */
-  private trySyncClipboardText(): Promise<void> {
+  private trySyncClipboardText(noteOnSend = false): Promise<void> {
     return this.deps.readText().then((text) => {
       if (text.length === 0) return;
       if (exceedsLimit(text)) {
@@ -250,7 +251,17 @@ export class ClipboardBridge {
       if (text === this.lastText) return;
       this.deps.send({ type: "clipboard_text", text });
       this.lastText = text;
+      if (noteOnSend) this.deps.notify(CLIENT_CLIPBOARD_NOTE);
     });
+  }
+
+  /** client -> host on the user's explicit or implicit request (slice H5-9:
+   * the phone has no `clipboardchange` and no paste shortcut): reads the local
+   * clipboard inside a user gesture -- iOS shows its own "Paste" prompt -- and
+   * sends new text to the host, telling the user when it did. Never rejects;
+   * a refused read is silent. */
+  syncFromClient(): Promise<void> {
+    return this.trySyncClipboardText(true).catch(() => undefined);
   }
 
   /** client -> host, before forwarding a Cmd/Ctrl+V keydown (decision 2a):

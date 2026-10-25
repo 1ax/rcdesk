@@ -435,6 +435,7 @@ export function mount(root: Element | null): void {
             <input type="checkbox" id="clipboard-sync-checkbox" />
             Буфер обмена
           </label>
+          <button id="clipboard-push-btn" class="btn btn-secondary" title="Отправить буфер телефона на хост" hidden>Буфер →</button>
           <span class="overlay" id="stats-overlay" hidden></span>
         </div>
         <div class="controls">
@@ -869,6 +870,29 @@ export function mount(root: Element | null): void {
   const clipboardSyncCheckbox = root.querySelector<HTMLInputElement>("#clipboard-sync-checkbox")!;
   let clipboardSyncEnabled = initialStorage ? loadClipboardSyncSetting(initialStorage) : false;
   clipboardSyncCheckbox.checked = clipboardSyncEnabled;
+  const coarsePointer = matchMedia("(pointer: coarse)").matches;
+  const clipboardPushBtn = root.querySelector<HTMLButtonElement>("#clipboard-push-btn")!;
+  function renderClipboardPushBtn(): void {
+    clipboardPushBtn.hidden = !(coarsePointer && clipboardSyncEnabled);
+  }
+  renderClipboardPushBtn();
+  clipboardPushBtn.addEventListener("click", () => {
+    void clipboardBridge?.syncFromClient();
+  });
+  // A phone cannot report clipboard changes, so after returning to the tab
+  // (or at session start) the first click sends the phone clipboard to the
+  // host; iOS asks "Paste" (H5-9).
+  let returnSyncArmed = false;
+  function onClipboardReturnClick(): void {
+    if (!returnSyncArmed) return;
+    returnSyncArmed = false;
+    void clipboardBridge?.syncFromClient();
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && coarsePointer && clipboardBridge !== null) {
+      returnSyncArmed = true;
+    }
+  });
   let statsVisible = initialStorage ? loadStatsVisible(initialStorage) : false;
   statsCheckbox.checked = statsVisible;
   overlay.hidden = !statsVisible;
@@ -1254,6 +1278,8 @@ export function mount(root: Element | null): void {
         setTimeout: (handler, ms) => setTimeout(handler, ms),
         clearTimeout: (handle) => clearTimeout(handle),
       });
+      returnSyncArmed = coarsePointer;
+      document.addEventListener("click", onClipboardReturnClick, true);
       window.addEventListener("focus", onClipboardFocusOrGesture);
       document.addEventListener("pointerdown", onClipboardFocusOrGesture, true);
       document.addEventListener("keydown", onClipboardFocusOrGesture, true);
@@ -1270,6 +1296,8 @@ export function mount(root: Element | null): void {
    * `clipboardBridge?.…` call is a no-op (slice E4). */
   function detachClipboardBridge(): void {
     if (clipboardBridge) {
+      document.removeEventListener("click", onClipboardReturnClick, true);
+      returnSyncArmed = false;
       window.removeEventListener("focus", onClipboardFocusOrGesture);
       document.removeEventListener("pointerdown", onClipboardFocusOrGesture, true);
       document.removeEventListener("keydown", onClipboardFocusOrGesture, true);
@@ -3287,6 +3315,7 @@ export function mount(root: Element | null): void {
 
   clipboardSyncCheckbox.addEventListener("change", () => {
     clipboardSyncEnabled = clipboardSyncCheckbox.checked;
+    renderClipboardPushBtn();
     const storage = ownerStorage();
     if (storage) saveClipboardSyncSetting(storage, clipboardSyncEnabled);
     if (session !== null) {
