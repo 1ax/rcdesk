@@ -191,11 +191,15 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
 
   // iOS animates the keyboard away for ~250 ms; the zoom is restored only once
   // the viewport is full again, not on blur (H5-4).
-  const beginClosing = (): void => {
+  // H5-15: on a blur the strip stays visible until the close finishes -- iOS
+  // blurs the field before the `click` of the very strip button being tapped,
+  // and a `display: none` strip would swallow that click (no refocus, keyboard
+  // gone). An explicit hide (`⌄`) hides it at once.
+  const beginClosing = (hideStrip: boolean): void => {
     if (closing) return;
     closing = true;
     visible = false;
-    strip.hidden = true;
+    if (hideStrip) strip.hidden = true;
     repeat.stop();
     closeTimer = setTimeout(finishClosing, CLOSE_TIMEOUT_MS);
   };
@@ -207,13 +211,14 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
       closeTimer = null;
     }
     closing = false;
+    strip.hidden = true;
     stopTracking();
     window.scrollTo(0, 0);
     onHide?.();
   }
 
   const hide = (): void => {
-    beginClosing();
+    beginClosing(true);
     field.blur();
   };
 
@@ -261,7 +266,7 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
   };
 
   const onBlur = (): void => {
-    beginClosing();
+    beginClosing(false);
   };
 
   // Удержание = автоповтор (H5-3), короткий тап по-прежнему уходит через click.

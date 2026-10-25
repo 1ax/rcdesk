@@ -560,14 +560,21 @@ export function mount(root: Element | null): void {
   // Slice H2b: while the phone keyboard is up (`#soft-keys` shown), focus
   // stays in the hidden text field -- moving it to the video would dismiss
   // the keyboard on every tap.
-  video.addEventListener("click", () => {
-    // H5-5: iOS blurs the hidden field on a tap on the video even with
-    // `pointerdown.preventDefault()` (iOS 27: a <div> blurs it too, only
-    // <button>s don't), which closed the keyboard and undid the zoom; the
-    // keyboard is brought back inside the click gesture.
-    if (softKeyboard.resume()) return;
-    focusVideoUnlessTyping();
-  });
+  // H5-5/H5-15: iOS blurs the hidden field on a tap anywhere outside it --
+  // video, letterbox bars, a gap in the session bar, a panel button -- which
+  // closed the keyboard and undid the zoom. Capture on the whole session
+  // screen: bring the keyboard back inside the click gesture, then let the
+  // tapped button do its job. The key strip refocuses itself (`onStripClick`).
+  root.querySelector<HTMLDivElement>("#session-screen")!.addEventListener(
+    "click",
+    (e) => {
+      const t = e.target as HTMLElement | null;
+      if (t?.closest("#soft-keys")) return;
+      const resumed = softKeyboard.resume();
+      if (!resumed && t?.closest(".session-video")) focusVideoUnlessTyping();
+    },
+    true,
+  );
   // D32: the first real frame of a (re)started session -- `playing` rather
   // than `loadeddata` since it only fires once decoding/rendering actually
   // resumes (`loadeddata` can fire for a frame that's then immediately
@@ -709,15 +716,13 @@ export function mount(root: Element | null): void {
   }
   // Slice H2b: версия хоста из `host_info` (null -- поле не пришло).
   let hostVersion: string | null = null;
-  // H5-12: collapse the bar in landscape while the keyboard is up; re-checked on rotation.
+  // H5-12/H5-15: collapse the bar while the keyboard is up. Measured in the
+  // simulator (iPhone 17 Pro, portrait): with the keyboard open the wrapped bar
+  // left the frame 80 px of height -- in portrait too, not only in landscape.
   function syncBarForKeyboard(): void {
-    const landscape = matchMedia("(orientation: landscape)").matches;
-    if (landscape && !barAutoCollapsed && !sessionScreen.classList.contains("is-collapsed")) {
+    if (!barAutoCollapsed && !sessionScreen.classList.contains("is-collapsed")) {
       barAutoCollapsed = true;
       applyBarCollapsed(true, false);
-    } else if (!landscape && barAutoCollapsed) {
-      barAutoCollapsed = false;
-      applyBarCollapsed(false, false);
     }
   }
   const softKeyboard: SoftKeyboardController = mountSoftKeyboard({
@@ -735,6 +740,10 @@ export function mount(root: Element | null): void {
     // возвращается при скрытии (H5-2). В альбоме панель сеанса сворачивается
     // на время клавиатуры, иначе она съедает остаток экрана (H5-4).
     onShow: () => {
+      // H5-15: a focusable video takes the focus on the tap's default action
+      // (after `click`), undoing the refocus of `resume()` -- not focusable
+      // while the phone keyboard owns the input.
+      video.removeAttribute("tabindex");
       zoomBeforeKeyboard = zoom.scale < KEYBOARD_ZOOM ? zoom : null;
       keyboardZoomApplied = false;
       heightBeforeKeyboard = sessionVideoEl.clientHeight;
@@ -770,6 +779,7 @@ export function mount(root: Element | null): void {
       placeTouchCursor();
     },
     onHide: () => {
+      video.tabIndex = 0;
       if (session === null) {
         zoomBeforeKeyboard = null;
         barAutoCollapsed = false;
@@ -923,7 +933,7 @@ export function mount(root: Element | null): void {
     // closed -- a tap on the key strip or any button would get iOS's "Paste"
     // prompt in the way of the keyboard.
     const t = e.target as HTMLElement | null;
-    if (!t || !t.closest("#video, #zoom-layer") || softKeyboard.isOpen()) return;
+    if (!t || !t.closest(".session-video") || softKeyboard.isOpen()) return;
     returnSyncArmed = false;
     void clipboardBridge?.syncFromClient();
   }
