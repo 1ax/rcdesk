@@ -42,7 +42,7 @@
   отпечаток в `hub-pin-<slug>.txt` рядом с `device-*.json` (режим как у него), пишется только после `Registered`;
   несовпадение — отказ с обоими отпечатками и путём файла. Служба Windows (`service install/run`) не тронута — D47-5.
   Гейты: host `476 passed; 0 failed; 4 ignored`, hub `2`, loopback `1`, proto `85`, server `131` + `73`, fmt/clippy
-  чистые. Windows-CI на `04539dd` ещё не гонялся (нужен push `wip/d47`).
+  чистые. CI `wip/d47` зелёный (run `40197686699`, на `b0b2b04`): Windows host `450 passed; 0 failed; 1 ignored`, hub `2`.
 - **Дальше:** D47-5 — служба Windows: хаб в процессе службы (SIGTERM/стоп службы), помощник
   на `ws://127.0.0.1:8444/ws`, DACL ключа, установщик (режимы «Облако / Этот компьютер — хаб / Подключаться к хабу»,
   `netsh advfirewall`, тихие `/HUB`, `/SERVER=`); D47-6 — живая проверка стенд Win10 (хаб) + Mac. Windows-код — через
