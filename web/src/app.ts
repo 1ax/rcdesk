@@ -1327,7 +1327,10 @@ export function mount(root: Element | null): void {
         setTimeout: (handler, ms) => setTimeout(handler, ms),
         clearTimeout: (handle) => clearTimeout(handle),
       });
-      returnSyncArmed = coarsePointer;
+      // H5-16: armed only after coming back from another app (see the
+      // `visibilitychange` listener), not at session start -- otherwise the very
+      // first tap on the remote screen pops iOS's "Paste" prompt every session.
+      returnSyncArmed = false;
       document.addEventListener("click", onClipboardReturnClick, true);
       window.addEventListener("focus", onClipboardFocusOrGesture);
       document.addEventListener("pointerdown", onClipboardFocusOrGesture, true);
