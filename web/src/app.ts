@@ -675,6 +675,7 @@ export function mount(root: Element | null): void {
   function applyZoom(next: Zoom): void {
     zoom = clampZoom(next, sessionVideoEl.clientWidth, sessionVideoEl.clientHeight);
     zoomLayer.style.transform = zoomCss(zoom);
+    placeTouchCursor();
   }
   // H5-6: places the virtual-cursor overlay from its frame position in
   // unscaled-layer coordinates (the layer at 1x is the container), so it
@@ -691,7 +692,8 @@ export function mount(root: Element | null): void {
     if (!p) return;
     const hx = Number(touchCursorEl.dataset.hx ?? 0) || 0;
     const hy = Number(touchCursorEl.dataset.hy ?? 0) || 0;
-    touchCursorEl.style.transform = `translate(${p.clientX - hx}px, ${p.clientY - hy}px)`;
+    const s = zoom.scale;
+    touchCursorEl.style.transform = `translate(${p.clientX - hx / s}px, ${p.clientY - hy / s}px) scale(${1 / s})`;
   }
   window.addEventListener("resize", () => {
     applyZoom(zoom);
@@ -885,8 +887,13 @@ export function mount(root: Element | null): void {
   // (or at session start) the first click sends the phone clipboard to the
   // host; iOS asks "Paste" (H5-9).
   let returnSyncArmed = false;
-  function onClipboardReturnClick(): void {
+  function onClipboardReturnClick(e: Event): void {
     if (!returnSyncArmed) return;
+    // H5-11: only a tap on the remote screen itself, with the phone keyboard
+    // closed -- a tap on the key strip or any button would get iOS's "Paste"
+    // prompt in the way of the keyboard.
+    const t = e.target as HTMLElement | null;
+    if (!t || !t.closest("#video, #zoom-layer") || !softKeysEl.hidden) return;
     returnSyncArmed = false;
     void clipboardBridge?.syncFromClient();
   }

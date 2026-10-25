@@ -355,7 +355,10 @@ export function attachInput(
         if (!point) return;
         virtualCursor.x = point.x;
         virtualCursor.y = point.y;
-        queuePointerMove(point);
+        // H5-11: the move must reach the host before the click (menus pick the
+        // item by hover), so it goes out now, not on the next animation frame.
+        pendingMove = null;
+        send(channels.pointer, { type: "pointer_move", x: point.x, y: point.y });
         showTouchCursor();
         for (const pressed of [true, false]) {
           send(channels.input, {

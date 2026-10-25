@@ -450,6 +450,7 @@ body {
 /* Slice H1: virtual cursor drawn over the video in touch "trackpad" mode
    (a sensor has no hover, so the CSS cursor is invisible). */
 .touch-cursor {
+  transform-origin: 0 0;
   position: absolute;
   left: 0;
   top: 0;
