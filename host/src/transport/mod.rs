@@ -46,13 +46,29 @@ use webrtc::media_stream::Track;
 use webrtc::peer_connection::{
     register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder,
     PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceServer,
-    RTCPeerConnectionIceEvent, RTCPeerConnectionState, RTCSessionDescription, RTCStatsReport,
-    RTCStatsReportEntry, Registry, StatsSelector,
+    RTCIceTransportPolicy, RTCPeerConnectionIceEvent, RTCPeerConnectionState,
+    RTCSessionDescription, RTCStatsReport, RTCStatsReportEntry, Registry, StatsSelector,
 };
 use webrtc::rtp_transceiver::RtpSender;
 use webrtc::runtime::Runtime;
 
 use crate::encode::EncodedFrame;
+
+/// Debug switch: when set to a truthy value (`1`, `true`, `yes`), the host
+/// gathers and uses only TURN relay candidates (`RTCIceTransportPolicy::Relay`).
+/// Meant for live checks of the host's TURN client (debt D75: ICE rarely
+/// selects relay on its own). Without a TURN server in `ice_servers`,
+/// `PeerSession::new` fails with a configuration validation error. Never set
+/// this in production.
+pub const RELAY_ONLY_ENV: &str = "RCDESK_ICE_RELAY_ONLY";
+
+/// Whether a `RELAY_ONLY_ENV` value enables relay-only mode.
+fn relay_only_from_env_value(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes")
+    )
+}
 
 /// Payload type for the (only) negotiated video codec. Fixed rather than
 /// negotiated because the media engine registers exactly one video codec.
@@ -747,9 +763,13 @@ impl PeerSession {
                 credential: server.credential.clone().unwrap_or_default(),
             })
             .collect();
-        let configuration = RTCConfigurationBuilder::new()
-            .with_ice_servers(ice_servers)
-            .build();
+        let mut builder = RTCConfigurationBuilder::new().with_ice_servers(ice_servers);
+        let relay_only = std::env::var(RELAY_ONLY_ENV).ok();
+        if relay_only_from_env_value(relay_only.as_deref()) {
+            tracing::warn!("ICE relay-only mode ({RELAY_ONLY_ENV}): only TURN candidates");
+            builder = builder.with_ice_transport_policy(RTCIceTransportPolicy::Relay);
+        }
+        let configuration = builder.build();
 
         let tag = next_session_tag();
         let connected = Arc::new(AtomicBool::new(false));
@@ -1327,6 +1347,25 @@ fn abs_send_time(ntp: u64) -> HeaderExtension {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_only_env_value_table() {
+        for v in ["1", "true", "yes", "TRUE", "Yes", " 1 ", "\ttrue\n"] {
+            assert!(relay_only_from_env_value(Some(v)), "{v:?}");
+        }
+        for v in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("on"),
+            Some("garbage"),
+            Some("  "),
+        ] {
+            assert!(!relay_only_from_env_value(v), "{v:?}");
+        }
+    }
 
     fn cand(typ: &str, addr: &str) -> CandidateInfo {
         CandidateInfo {
