@@ -37,12 +37,29 @@ jobs:
             binary: target/release/rcdesk-host
             agent_binary: target/release/rcdesk-agent
     runs-on: ${{ matrix.os }}
+    # Без web/dist сборка хоста падает, а не отдаёт заглушку хаба. На уровне job,
+    # чтобы дымовые `cargo run --release` ниже не пересобирали хост из-за смены
+    # переменной окружения (build.rs следит за ней).
+    env:
+      RCDESK_REQUIRE_WEB: "1"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: release
+      # Веб-клиент вшивается в хост (LAN-хаб, D47-3): build.rs берёт web/dist.
+      # Версия Node и действие -- как в job `web` из ci.yml.
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Собрать веб-клиент
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
       # Собирает оба [[bin]] пакета rcdesk-host (rcdesk-host и rcdesk-agent) --
       # `cargo build -p <pkg>` без `--bin` строит все бинарники пакета, так
       # что `autostart status` ниже находит rcdesk-agent уже рядом (слайс 2.6d).

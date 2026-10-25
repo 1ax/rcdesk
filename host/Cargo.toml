@@ -70,6 +70,12 @@ hmac = { workspace = true }
 # actually satisfies opaque-ke's trait bounds. Not in slice 3.2b's planned
 # dependency list -- see the sub-step report for why it's needed anyway.
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+# LAN-хаб (D47-3): сигнальный сервер библиотекой, без OpenSSL (passkeys/smtp
+# выключены), раздача веб-клиента через axum и самоподписанный сертификат rcgen
+# (провайдер ring, без aws-lc-rs). Оба крейта уже в графе (server / rtc).
+rcdesk-server = { path = "../server", default-features = false }
+axum = { workspace = true }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 
 # Иконка и VERSIONINFO exe (4.3b). Только для сборки под Windows: на Mac крейта нет в графе.
 [target.'cfg(windows)'.build-dependencies]

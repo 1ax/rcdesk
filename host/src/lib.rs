@@ -30,6 +30,7 @@ pub mod encode;
 pub mod files;
 mod fsutil;
 pub mod fullmode;
+pub mod hub;
 pub mod input;
 pub mod input_source;
 pub mod log_throttle;

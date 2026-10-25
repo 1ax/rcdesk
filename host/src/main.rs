@@ -146,6 +146,20 @@ enum Command {
         #[command(subcommand)]
         action: PasswordAction,
     },
+    /// LAN-хаб (D47): сигнальный сервер и веб-клиент в одном процессе, HTTPS с
+    /// самоподписанным сертификатом -- для сети без интернета и `rcdesk.app`.
+    /// Хост на самом хабе подключается к `ws://127.0.0.1:<local-port>/ws`.
+    Hub {
+        /// Порт HTTPS (на всех интерфейсах).
+        #[arg(long, default_value_t = rcdesk_host::hub::DEFAULT_PORT)]
+        port: u16,
+        /// Порт локального слушателя без TLS (только 127.0.0.1) для хоста на хабе.
+        #[arg(long, default_value_t = rcdesk_host::hub::DEFAULT_LOCAL_PORT)]
+        local_port: u16,
+        /// Каталог данных хаба (БД и ключ); по умолчанию `<данные хоста>/hub`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
     /// Windows, полный режим (слайс 4.1a): служба SYSTEM `rcdesk` + помощник
     /// в консольной сессии. install/uninstall/start/stop требуют cmd от имени
     /// администратора.
@@ -302,6 +316,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Autostart { action } => run_autostart(action),
         Command::Password { action } => run_password(action),
+        Command::Hub {
+            port,
+            local_port,
+            data_dir,
+        } => run_hub(port, local_port, data_dir).await,
         #[cfg(target_os = "windows")]
         Command::Service { action } => run_service(action),
         #[cfg(target_os = "macos")]
@@ -525,6 +544,26 @@ fn run_autostart(action: AutostartAction) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `hub`: поднимает LAN-хаб и печатает адреса и отпечаток ключа (D47-3).
+async fn run_hub(port: u16, local_port: u16, data_dir: Option<PathBuf>) -> anyhow::Result<()> {
+    use rcdesk_host::hub;
+    let cfg = hub::HubConfig {
+        data_dir: data_dir.unwrap_or_else(hub::default_data_dir),
+        port,
+        local_port,
+    };
+    let data_dir = cfg.data_dir.clone();
+    let hub = hub::start(cfg).await?;
+    println!("rcdesk hub: данные {}", data_dir.display());
+    println!(
+        "rcdesk hub: HTTPS https://<адрес этого компьютера>:{}/",
+        hub.tls_addr.port()
+    );
+    println!("rcdesk hub: локально ws://{}/ws", hub.local_addr);
+    println!("rcdesk hub: отпечаток ключа sha256:{}", hub.fingerprint);
+    hub.run_until(hub::shutdown_signal()).await
 }
 
 /// `rcdesk-host password set|clear|status` -- see `rcdesk_host::access`'s

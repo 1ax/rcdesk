@@ -5,6 +5,7 @@ pub mod devices;
 pub mod ice;
 pub mod ip_limit;
 pub mod mail;
+pub mod maintenance;
 pub mod owners;
 pub mod passkeys;
 pub mod registry;
