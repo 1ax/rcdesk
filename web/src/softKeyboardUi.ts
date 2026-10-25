@@ -254,8 +254,8 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
     const b = (e.target as HTMLElement).closest("button");
     if (!b) return;
     e.preventDefault();
+    swallowClick = false;
     if (b.dataset.code) {
-      swallowClick = false;
       let mods: string[] | null = null;
       repeat.start(() => {
         if (mods === null) {
@@ -272,12 +272,16 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
   };
 
   const onStripClick = (e: Event): void => {
+    const b = (e.target as HTMLElement).closest("button");
+    if (!b) return;
+    // H5-7: iOS 27 blurs the field on the tap (even on a <button>), which has
+    // already started closing the keyboard by the time `click` arrives; bring
+    // it back inside the gesture -- unless this is the hide button itself.
+    if (closing && b.dataset.action !== "hide") show();
     if (swallowClick) {
       swallowClick = false;
       return;
     }
-    const b = (e.target as HTMLElement).closest("button");
-    if (!b) return;
     if (b.dataset.code) {
       sendAll(keystrokes(b.dataset.code, false, sticky.consume()));
       renderMods();
