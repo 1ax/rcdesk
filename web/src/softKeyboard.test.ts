@@ -6,6 +6,7 @@ import {
   composeTyped,
   diffTyped,
   hostSupportsText,
+  isPasteCombo,
   keystrokes,
 } from "./softKeyboard";
 
@@ -161,5 +162,23 @@ describe("KeyRepeat", () => {
     expect(fn).not.toHaveBeenCalled();
     vi.advanceTimersByTime(100);
     expect(fn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("isPasteCombo", () => {
+  it("true for Cmd/Ctrl + v in both layouts", () => {
+    expect(isPasteCombo("v", ["MetaLeft"])).toBe(true);
+    expect(isPasteCombo("V", ["ControlLeft"])).toBe(true);
+    expect(isPasteCombo("м", ["MetaLeft"])).toBe(true);
+  });
+
+  it("false without a modifier or for other keys", () => {
+    expect(isPasteCombo("v", [])).toBe(false);
+    expect(isPasteCombo("c", ["MetaLeft"])).toBe(false);
+    expect(isPasteCombo("v", ["ShiftLeft"])).toBe(false);
+  });
+
+  it("false for multi-character input", () => {
+    expect(isPasteCombo("vv", ["MetaLeft"])).toBe(false);
   });
 });

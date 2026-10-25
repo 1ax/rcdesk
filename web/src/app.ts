@@ -704,6 +704,7 @@ export function mount(root: Element | null): void {
       if (inputChannel?.readyState === "open") inputChannel.send(JSON.stringify(msg));
     },
     isTextSupported: () => hostSupportsText(hostVersion),
+    beforePaste: () => clipboardBridge?.syncBeforePaste() ?? Promise.resolve(),
     fit: sessionScreen,
     // Клавиатура телефона закрывает большую часть экрана, поэтому картинка
     // подтягивается к 2x вокруг последнего места касания (там поле ввода) и

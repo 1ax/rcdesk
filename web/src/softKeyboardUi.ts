@@ -7,6 +7,7 @@ import {
   StickyModifiers,
   composeTyped,
   diffTyped,
+  isPasteCombo,
   keystrokes,
 } from "./softKeyboard";
 
@@ -22,6 +23,9 @@ export interface SoftKeyboardOptions {
   onShow?: () => void;
   /** Called when the fitted height changed (keyboard animation, rotation). */
   onLayout?: () => void;
+  /** Called before Cmd/Ctrl+V is sent, so the client clipboard reaches the host
+   * first. Must never reject, but the wiring continues even if it does. */
+  beforePaste?: () => Promise<void>;
   /** Called after the keyboard is hidden (button, blur, reset). */
   onHide?: () => void;
 }
@@ -63,7 +67,7 @@ const MOD_KEYS: Array<[string, string]> = [
 const CLOSE_TIMEOUT_MS = 400;
 
 export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardController {
-  const { button, strip, field, send, isTextSupported, fit, onShow, onLayout, onHide } = opts;
+  const { button, strip, field, send, isTextSupported, fit, onShow, onLayout, onHide, beforePaste } = opts;
   let lastFit = "";
   const sticky = new StickyModifiers();
   const repeat = new KeyRepeat();
@@ -76,8 +80,16 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
   let metaBtn: HTMLButtonElement | null = null;
   const vv = window.visualViewport;
 
+  // All outgoing input goes through one promise chain, so a paste that waits
+  // for `beforePaste` keeps its place in front of whatever is typed next (H5-8).
+  let chain: Promise<void> = Promise.resolve();
+  const enqueue = (step: () => void | Promise<void>): void => {
+    chain = chain.then(step, step).catch(() => undefined);
+  };
   const sendAll = (msgs: InputMessage[]): void => {
-    for (const m of msgs) send(m);
+    enqueue(() => {
+      for (const m of msgs) send(m);
+    });
   };
 
   const makeBtn = (label: string): HTMLButtonElement => {
@@ -218,6 +230,7 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
     const { backspaces, inserted } = diffTyped(prev, next);
     if (backspaces > 0 || inserted.length > 0) {
       const mods = sticky.consume();
+      if (beforePaste && isPasteCombo(inserted, mods)) enqueue(() => beforePaste());
       sendAll(composeTyped(inserted, backspaces, mods, isTextSupported()));
       renderMods();
     }

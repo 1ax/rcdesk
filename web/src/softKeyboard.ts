@@ -94,6 +94,16 @@ export function composeTyped(
   return out;
 }
 
+/** `true` when the typed character with these sticky modifiers is a paste
+ * shortcut (Cmd/Ctrl + the physical V key, in either layout) -- the client
+ * clipboard must reach the host first (slice H5-8, see `ClipboardBridge`). */
+export function isPasteCombo(inserted: string, mods: readonly string[]): boolean {
+  if (!mods.includes("MetaLeft") && !mods.includes("ControlLeft")) return false;
+  const chars = Array.from(inserted);
+  if (chars.length !== 1) return false;
+  return charToKey(chars[0]!)?.code === "KeyV";
+}
+
 export const REPEAT_DELAY_MS = 500;
 export const REPEAT_INTERVAL_MS = 50;
 
