@@ -13,8 +13,10 @@ import { SignalingClient } from "./signaling";
 import { PeerSession, toRtcIceServers } from "./session";
 import { summarizeStats, takeSnapshot } from "./stats";
 import type { Snapshot, StatsSummary } from "./stats";
-import { attachInput } from "./input";
+import { attachInput, unmapPointer } from "./input";
 import {
+  KEYBOARD_ZOOM,
+  centerOn,
   clampZoom,
   followPoint,
   identityZoom,
@@ -656,6 +658,10 @@ export function mount(root: Element | null): void {
     video.focus();
   });
   let zoom: Zoom = identityZoom();
+  // Slice H5-2: last virtual-cursor frame position and the zoom to restore
+  // once the phone keyboard goes away (`null` -- the keyboard didn't zoom).
+  let lastTouchCursor: { x: number; y: number } | null = null;
+  let zoomBeforeKeyboard: Zoom | null = null;
   function applyZoom(next: Zoom): void {
     zoom = clampZoom(next, sessionVideoEl.clientWidth, sessionVideoEl.clientHeight);
     zoomLayer.style.transform = zoomCss(zoom);
@@ -672,6 +678,39 @@ export function mount(root: Element | null): void {
     },
     isTextSupported: () => hostSupportsText(hostVersion),
     fit: sessionScreen,
+    // Клавиатура телефона закрывает большую часть экрана, поэтому картинка
+    // подтягивается к 2x вокруг последнего места касания (там поле ввода) и
+    // возвращается при скрытии (H5-2).
+    onShow: () => {
+      zoomBeforeKeyboard = zoom.scale < KEYBOARD_ZOOM ? zoom : null;
+    },
+    onLayout: () => {
+      const w = sessionVideoEl.clientWidth;
+      const h = sessionVideoEl.clientHeight;
+      if (zoomBeforeKeyboard === null) {
+        applyZoom(zoom); // re-clamp to the resized container
+        return;
+      }
+      const anchor = lastTouchCursor
+        ? unmapPointer(
+            lastTouchCursor.x,
+            lastTouchCursor.y,
+            { left: 0, top: 0, width: w, height: h },
+            video.videoWidth,
+            video.videoHeight,
+          )
+        : null;
+      applyZoom(
+        anchor
+          ? centerOn(KEYBOARD_ZOOM, anchor.clientX, anchor.clientY, w, h)
+          : centerOn(KEYBOARD_ZOOM, w / 2, h / 2, w, h),
+      );
+    },
+    onHide: () => {
+      const restore = zoomBeforeKeyboard;
+      zoomBeforeKeyboard = null;
+      applyZoom(restore ?? zoom);
+    },
   });
   const curtainBtn = root.querySelector<HTMLButtonElement>("#curtain-btn")!;
   const curtainStatusEl = root.querySelector<HTMLSpanElement>("#curtain-status")!;
@@ -1916,6 +1955,7 @@ export function mount(root: Element | null): void {
             touchCursorEl.hidden = true;
             return;
           }
+          lastTouchCursor = { x: pos.x, y: pos.y };
           keyboardBtn.hidden = false;
           touchModeBtn.hidden = false;
           const layerRect = zoomLayer.getBoundingClientRect();

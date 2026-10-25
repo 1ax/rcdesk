@@ -254,8 +254,9 @@ export class KeyMessageGate {
 /** Slices H1/H3: touch-mode callbacks supplied by the app. */
 export interface TouchHooks {
   mode: () => TouchMode;
-  /** Virtual cursor client position (to draw it) or `null` (hide it). */
-  onCursor: (pos: { clientX: number; clientY: number } | null) => void;
+  /** Virtual cursor: client position (to draw it) plus the normalized `[0,1]`
+   * frame position (slice H5-2 zooms around it), or `null` (hide it). */
+  onCursor: (pos: { clientX: number; clientY: number; x: number; y: number } | null) => void;
   onPinch: (factor: number, clientX: number, clientY: number) => void;
   onPan: (dx: number, dy: number) => void;
 }
@@ -331,9 +332,14 @@ export function attachInput(
   function showTouchCursor(): void {
     if (!touch) return;
     const rect = video.getBoundingClientRect();
-    touch.onCursor(
-      unmapPointer(virtualCursor.x, virtualCursor.y, rect, video.videoWidth, video.videoHeight),
+    const pos = unmapPointer(
+      virtualCursor.x,
+      virtualCursor.y,
+      rect,
+      video.videoWidth,
+      video.videoHeight,
     );
+    touch.onCursor(pos ? { ...pos, x: virtualCursor.x, y: virtualCursor.y } : null);
   }
 
   function runTouchAction(action: TouchAction): void {

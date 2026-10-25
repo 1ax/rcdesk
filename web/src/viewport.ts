@@ -16,6 +16,9 @@ export function identityZoom(): Zoom {
   return { scale: 1, tx: 0, ty: 0 };
 }
 
+/** Zoom the phone keyboard brings in (slice H5-2). */
+export const KEYBOARD_ZOOM = 2;
+
 /** Keeps `scale` in `[ZOOM_MIN, ZOOM_MAX]` and the container fully covered. */
 export function clampZoom(z: Zoom, w: number, h: number): Zoom {
   const scale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z.scale));
@@ -92,4 +95,11 @@ export function saveTouchMode(storage: Pick<Storage, "setItem"> | null, mode: To
 
 export function touchModeLabel(mode: TouchMode): string {
   return mode === "direct" ? "Касание" : "Трекпад";
+}
+
+/** Zoom to `scale` with the unscaled-layer point `(lx, ly)` at the centre of a
+ * `w`x`h` container (clamped so the layer still covers it). */
+export function centerOn(scale: number, lx: number, ly: number, w: number, h: number): Zoom {
+  const s = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, scale));
+  return clampZoom({ scale: s, tx: w / 2 - lx * s, ty: h / 2 - ly * s }, w, h);
 }

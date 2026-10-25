@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   TOUCH_MODE_STORAGE_KEY,
+  centerOn,
   clampZoom,
   followPoint,
   identityZoom,
@@ -46,6 +47,20 @@ describe("zoom", () => {
     expect(followPoint(z, 10, 150, 400, 300, 24)).toEqual({ scale: 2, tx: -186, ty: -100 });
     expect(followPoint(z, 390, 290, 400, 300, 24)).toEqual({ scale: 2, tx: -214, ty: -114 });
     expect(followPoint(identityZoom(), 0, 0, 400, 300, 24)).toEqual(identityZoom());
+  });
+
+  it("centerOn puts the anchor at the centre", () => {
+    expect(centerOn(2, 100, 75, 400, 300)).toEqual({ scale: 2, tx: 0, ty: 0 });
+  });
+
+  it("centerOn clamps at the edges", () => {
+    expect(centerOn(2, 10, 10, 400, 300)).toEqual({ scale: 2, tx: 0, ty: 0 });
+    expect(centerOn(2, 390, 290, 400, 300)).toEqual({ scale: 2, tx: -400, ty: -300 });
+  });
+
+  it("centerOn clamps the scale", () => {
+    expect(centerOn(8, 200, 150, 400, 300).scale).toBe(4);
+    expect(centerOn(0.5, 100, 75, 400, 300)).toEqual({ scale: 1, tx: 0, ty: 0 });
   });
 
   it("zoomCss is empty for identity", () => {

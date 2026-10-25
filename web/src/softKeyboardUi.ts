@@ -11,6 +11,12 @@ export interface SoftKeyboardOptions {
   isTextSupported: () => boolean;
   /** Element whose height follows the visual viewport while the keyboard is up. */
   fit?: HTMLElement;
+  /** Called first in `show()`, before anything changes. */
+  onShow?: () => void;
+  /** Called when the fitted height changed (keyboard animation, rotation). */
+  onLayout?: () => void;
+  /** Called after the keyboard is hidden (button, blur, reset). */
+  onHide?: () => void;
 }
 
 export interface SoftKeyboardController {
@@ -42,7 +48,8 @@ const MOD_KEYS: Array<[string, string]> = [
 ];
 
 export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardController {
-  const { button, strip, field, send, isTextSupported, fit } = opts;
+  const { button, strip, field, send, isTextSupported, fit, onShow, onLayout, onHide } = opts;
+  let lastFit = "";
   const sticky = new StickyModifiers();
   let prev = SENTINEL;
   let visible = false;
@@ -96,7 +103,13 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
     strip.style.bottom = `${window.innerHeight - vv.offsetTop - vv.height}px`;
     // iOS does not shrink the layout viewport for the keyboard.
     // Строка вычитается из высоты экрана сеанса, чтобы не закрывать картинку (H5-1).
-    if (fit) fit.style.height = `${Math.max(0, vv.height - strip.offsetHeight)}px`;
+    if (fit) {
+      const height = `${Math.max(0, vv.height - strip.offsetHeight)}px`;
+      const changed = height !== lastFit;
+      fit.style.height = height;
+      lastFit = height;
+      if (changed) onLayout?.();
+    }
   };
   const startTracking = (): void => {
     if (!vv) return;
@@ -110,6 +123,7 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
     vv.removeEventListener("scroll", updateBottom);
     strip.style.bottom = "";
     if (fit) fit.style.height = "";
+    lastFit = "";
   };
 
   const resetField = (): void => {
@@ -118,6 +132,7 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
   };
 
   const show = (): void => {
+    onShow?.();
     visible = true;
     resetField();
     field.focus();
@@ -136,6 +151,7 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
     strip.hidden = true;
     field.blur();
     stopTracking();
+    onHide?.();
   };
 
   const sendEnter = (): void => {
@@ -184,6 +200,7 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
     visible = false;
     strip.hidden = true;
     stopTracking();
+    onHide?.();
   };
 
   const onStripPointerDown = (e: Event): void => {
