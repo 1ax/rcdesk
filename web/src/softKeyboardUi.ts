@@ -37,6 +37,8 @@ export interface SoftKeyboardController {
    * on the video, slice H5-5). Must be called inside a user gesture (`click`),
    * or iOS ignores the focus. `true` if there was a close to cancel. */
   resume(): boolean;
+  /** Visible, or still closing (iOS blurs the field before `click`, H5-12). */
+  isOpen(): boolean;
   setHostOs(os: "macos" | "windows" | null): void;
   reset(): void;
   dispose(): void;
@@ -324,6 +326,9 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
       if (!closing) return false;
       show();
       return true;
+    },
+    isOpen() {
+      return visible || closing;
     },
     setHostOs(os) {
       hostOs = os;

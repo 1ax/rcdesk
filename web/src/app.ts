@@ -566,7 +566,7 @@ export function mount(root: Element | null): void {
     // <button>s don't), which closed the keyboard and undid the zoom; the
     // keyboard is brought back inside the click gesture.
     if (softKeyboard.resume()) return;
-    if (softKeysEl.hidden) video.focus();
+    focusVideoUnlessTyping();
   });
   // D32: the first real frame of a (re)started session -- `playing` rather
   // than `loadeddata` since it only fires once decoding/rendering actually
@@ -661,7 +661,7 @@ export function mount(root: Element | null): void {
     touchMode = touchMode === "direct" ? "trackpad" : "direct";
     saveTouchMode(ownerStorage(), touchMode);
     touchModeBtn.textContent = touchModeLabel(touchMode);
-    video.focus();
+    focusVideoUnlessTyping();
   });
   let zoom: Zoom = identityZoom();
   // Slice H5-2: last virtual-cursor frame position and the zoom to restore
@@ -670,6 +670,9 @@ export function mount(root: Element | null): void {
   // H5-10: a touch is active, so the overlay must show as soon as it has an image.
   let touchCursorWanted = false;
   let zoomBeforeKeyboard: Zoom | null = null;
+  // H5-12: the keyboard zoom is applied once per show; later layout changes keep manual pinch/pan.
+  let keyboardZoomApplied = false;
+  let heightBeforeKeyboard = 0;
   // H5-4: the session bar was collapsed automatically for the keyboard in landscape.
   let barAutoCollapsed = false;
   function applyZoom(next: Zoom): void {
@@ -699,8 +702,24 @@ export function mount(root: Element | null): void {
     applyZoom(zoom);
     placeTouchCursor();
   });
+  // H5-12: the container changes height without a window resize too (session
+  // bar wrapping, collapse); keep the layer clamped and the cursor overlay placed.
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(() => applyZoom(zoom)).observe(sessionVideoEl);
+  }
   // Slice H2b: версия хоста из `host_info` (null -- поле не пришло).
   let hostVersion: string | null = null;
+  // H5-12: collapse the bar in landscape while the keyboard is up; re-checked on rotation.
+  function syncBarForKeyboard(): void {
+    const landscape = matchMedia("(orientation: landscape)").matches;
+    if (landscape && !barAutoCollapsed && !sessionScreen.classList.contains("is-collapsed")) {
+      barAutoCollapsed = true;
+      applyBarCollapsed(true, false);
+    } else if (!landscape && barAutoCollapsed) {
+      barAutoCollapsed = false;
+      applyBarCollapsed(false, false);
+    }
+  }
   const softKeyboard: SoftKeyboardController = mountSoftKeyboard({
     button: keyboardBtn,
     strip: softKeysEl,
@@ -717,20 +736,22 @@ export function mount(root: Element | null): void {
     // на время клавиатуры, иначе она съедает остаток экрана (H5-4).
     onShow: () => {
       zoomBeforeKeyboard = zoom.scale < KEYBOARD_ZOOM ? zoom : null;
-      if (
-        matchMedia("(orientation: landscape)").matches &&
-        !sessionScreen.classList.contains("is-collapsed")
-      ) {
-        barAutoCollapsed = true;
-        applyBarCollapsed(true, false);
-      }
+      keyboardZoomApplied = false;
+      heightBeforeKeyboard = sessionVideoEl.clientHeight;
+      syncBarForKeyboard();
     },
     onLayout: () => {
+      syncBarForKeyboard();
       const w = sessionVideoEl.clientWidth;
       const h = sessionVideoEl.clientHeight;
-      if (zoomBeforeKeyboard === null) {
+      if (
+        zoomBeforeKeyboard === null ||
+        keyboardZoomApplied ||
+        h >= heightBeforeKeyboard * 0.85
+      ) {
         applyZoom(zoom); // re-clamp to the resized container
       } else {
+        keyboardZoomApplied = true;
         const anchor = lastTouchCursor
           ? unmapPointer(
               lastTouchCursor.x,
@@ -749,6 +770,11 @@ export function mount(root: Element | null): void {
       placeTouchCursor();
     },
     onHide: () => {
+      if (session === null) {
+        zoomBeforeKeyboard = null;
+        barAutoCollapsed = false;
+        return;
+      }
       if (barAutoCollapsed) {
         barAutoCollapsed = false;
         applyBarCollapsed(false, false);
@@ -759,6 +785,10 @@ export function mount(root: Element | null): void {
       placeTouchCursor();
     },
   });
+  /** H5-12: focus the video for key events, unless the phone keyboard owns focus. */
+  function focusVideoUnlessTyping(): void {
+    if (!softKeyboard.isOpen()) video.focus();
+  }
   const curtainBtn = root.querySelector<HTMLButtonElement>("#curtain-btn")!;
   const curtainStatusEl = root.querySelector<HTMLSpanElement>("#curtain-status")!;
   // Slice 4.2c3: reset in `stopSessionResources`; see `curtain.ts`.
@@ -801,7 +831,7 @@ export function mount(root: Element | null): void {
     sendSwitchInputSource();
     // The button is clicked mid-typing: give the keyboard back to the video
     // so the next keys reach the host (and Space/Enter don't re-press it).
-    video.focus();
+    focusVideoUnlessTyping();
   });
   // `document.fullscreenEnabled` doesn't change over a tab's lifetime, so
   // this is decided once, here, rather than on every render (slice 3.5c).
@@ -893,7 +923,7 @@ export function mount(root: Element | null): void {
     // closed -- a tap on the key strip or any button would get iOS's "Paste"
     // prompt in the way of the keyboard.
     const t = e.target as HTMLElement | null;
-    if (!t || !t.closest("#video, #zoom-layer") || !softKeysEl.hidden) return;
+    if (!t || !t.closest("#video, #zoom-layer") || softKeyboard.isOpen()) return;
     returnSyncArmed = false;
     void clipboardBridge?.syncFromClient();
   }
@@ -2591,6 +2621,9 @@ export function mount(root: Element | null): void {
     touchCursorEl.style.width = "";
     touchCursorEl.style.height = "";
     touchCursorWanted = false;
+    zoomBeforeKeyboard = null;
+    barAutoCollapsed = false;
+    lastTouchCursor = null;
     applyZoom(identityZoom());
     overlay.textContent = "";
     firstFrameShown = false;
@@ -3316,7 +3349,7 @@ export function mount(root: Element | null): void {
     // Give focus back to the video so keyboard input keeps going to the
     // session (see the `click` listener above, which does the same after a
     // user gesture on the video itself).
-    video.focus();
+    focusVideoUnlessTyping();
   });
 
   qualitySelect.addEventListener("change", () => {
@@ -3329,7 +3362,7 @@ export function mount(root: Element | null): void {
     if (controlChannel) sendQualityPreset(controlChannel, preset);
     // Give focus back to the video, same reasoning as `displaySelect`'s
     // change listener above.
-    video.focus();
+    focusVideoUnlessTyping();
   });
 
   clipboardSyncCheckbox.addEventListener("change", () => {
@@ -3341,7 +3374,7 @@ export function mount(root: Element | null): void {
       if (clipboardSyncEnabled) attachClipboardBridge();
       else detachClipboardBridge();
     }
-    video.focus();
+    focusVideoUnlessTyping();
   });
 
   cmdAsCtrlCheckbox.addEventListener("change", () => {
@@ -3353,7 +3386,7 @@ export function mount(root: Element | null): void {
     releaseAllKeys();
     // Give focus back to the video, same reasoning as `displaySelect`'s/
     // `qualitySelect`'s change listeners above.
-    video.focus();
+    focusVideoUnlessTyping();
   });
 
   // Slice 3.5g: collapses the session bar to its thin handle strip, which
@@ -3361,12 +3394,12 @@ export function mount(root: Element | null): void {
   // the remote screen is covered either way.
   barCollapseBtn.addEventListener("click", () => {
     applyBarCollapsed(true);
-    video.focus();
+    focusVideoUnlessTyping();
   });
 
   sessionBarHandle.addEventListener("click", () => {
     applyBarCollapsed(false);
-    video.focus();
+    focusVideoUnlessTyping();
   });
 
   statsCheckbox.addEventListener("change", () => {
@@ -3376,7 +3409,7 @@ export function mount(root: Element | null): void {
     if (storage) saveStatsVisible(storage, statsVisible);
     // Give focus back to the video, same reasoning as `displaySelect`'s/
     // `qualitySelect`'s change listeners above.
-    video.focus();
+    focusVideoUnlessTyping();
   });
 
   showPinScreen();
