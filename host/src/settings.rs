@@ -1,6 +1,7 @@
 //! Настройки хоста, которые пишет человек, а не хост (D47-4): файл
-//! `settings.json` в каталоге данных. Сейчас в нём одно поле -- адрес
-//! сигнального сервера (например, LAN-хаба). Хост этот файл никогда не пишет.
+//! `settings.json` в каталоге данных. Поля: адрес сигнального сервера
+//! (например, LAN-хаба) и признак «служба поднимает LAN-хаб у себя» (D47-5).
+//! Хост этот файл никогда не пишет.
 
 use std::path::Path;
 
@@ -17,6 +18,9 @@ pub const DEV_SERVER: &str = "ws://127.0.0.1:8080/ws";
 #[derive(Debug, Deserialize, Default)]
 struct Settings {
     server: Option<String>,
+    /// `true` -- служба Windows запускает LAN-хаб внутри себя.
+    #[serde(default)]
+    hub: Option<bool>,
 }
 
 /// Адрес сигнального сервера по приоритету: флаг `--server` > поле `server`
@@ -39,28 +43,40 @@ pub fn resolve_server(flag: Option<String>, dir: &Path, default: &str) -> String
     default.to_string()
 }
 
-/// Поле `server` из файла настроек; `None`, если файла нет, он не читается
-/// или не разбирается (с предупреждением), либо поле пустое.
-fn server_from_file(dir: &Path) -> Option<String> {
+/// Читает и разбирает `dir/settings.json`; `None`, если файла нет, он не
+/// читается или не разбирается (последние два случая -- с предупреждением).
+fn load(dir: &Path) -> Option<Settings> {
     let path = dir.join(SETTINGS_FILE);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
         Err(err) => {
-            tracing::warn!(path = %path.display(), error = %err, "не удалось прочитать settings.json, беру адрес по умолчанию");
+            tracing::warn!(path = %path.display(), error = %err, "не удалось прочитать settings.json, беру значения по умолчанию");
             return None;
         }
     };
     match serde_json::from_slice::<Settings>(&bytes) {
-        Ok(settings) => settings
-            .server
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty()),
+        Ok(settings) => Some(settings),
         Err(err) => {
-            tracing::warn!(path = %path.display(), error = %err, "settings.json не разобрался, беру адрес по умолчанию");
+            tracing::warn!(path = %path.display(), error = %err, "settings.json не разобрался, беру значения по умолчанию");
             None
         }
     }
+}
+
+/// Поле `server` из файла настроек; `None`, если файла нет, он не читается
+/// или не разбирается, либо поле пустое.
+fn server_from_file(dir: &Path) -> Option<String> {
+    load(dir)?
+        .server
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Включён ли режим LAN-хаба (`"hub": true`); любая ошибка чтения или
+/// разбора -- `false`.
+pub fn hub_enabled(dir: &Path) -> bool {
+    load(dir).and_then(|s| s.hub) == Some(true)
 }
 
 #[cfg(test)]
@@ -131,6 +147,27 @@ mod tests {
         let dir = scratch_dir("empty");
         write(&dir, r#"{"server":"   "}"#);
         assert_eq!(resolve_server(None, &dir, DEFAULT_SERVER), DEFAULT_SERVER);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hub_true_enables_hub() {
+        let dir = scratch_dir("hub-true");
+        write(&dir, r#"{"hub":true}"#);
+        assert!(hub_enabled(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hub_off_missing_or_broken_is_disabled() {
+        let dir = scratch_dir("hub-off");
+        assert!(!hub_enabled(&dir), "нет файла");
+        write(&dir, r#"{"server":"wss://h:1/ws"}"#);
+        assert!(!hub_enabled(&dir), "нет поля");
+        write(&dir, r#"{"hub":false}"#);
+        assert!(!hub_enabled(&dir), "false");
+        write(&dir, "{ not json");
+        assert!(!hub_enabled(&dir), "битый");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

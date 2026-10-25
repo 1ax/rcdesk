@@ -19,7 +19,9 @@ pub mod web;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::serve::ListenerExt as _;
@@ -182,10 +184,64 @@ pub async fn run(cfg: HubConfig, shutdown: impl Future<Output = ()>) -> Result<(
     start(cfg).await?.run_until(shutdown).await
 }
 
-/// Ctrl+C (SIGINT). SIGTERM для запуска под службой добавит под-шаг службы.
+/// Ctrl+C (SIGINT) или, на unix, SIGTERM (остановка под systemd/launchd).
+/// Под службой Windows остановку даёт [`stop_flag_signal`].
 pub async fn shutdown_signal() {
-    if let Err(err) = tokio::signal::ctrl_c().await {
-        tracing::warn!("hub: не удалось подписаться на Ctrl+C: {err}");
-        std::future::pending::<()>().await;
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    res = tokio::signal::ctrl_c() => {
+                        if let Err(err) = res {
+                            tracing::warn!("hub: не удалось подписаться на Ctrl+C: {err}");
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!("hub: не удалось подписаться на SIGTERM: {err}");
+                if let Err(err) = tokio::signal::ctrl_c().await {
+                    tracing::warn!("hub: не удалось подписаться на Ctrl+C: {err}");
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::warn!("hub: не удалось подписаться на Ctrl+C: {err}");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Завершается, когда `flag` становится `true` (опрос раз в 200 мс). Для
+/// службы Windows: флаг -- `STOP_REQUESTED`, выставляемый обработчиком SCM.
+pub async fn stop_flag_signal(flag: &'static AtomicBool) {
+    while !flag.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stop_flag_signal_completes_after_the_flag_is_set() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        let setter = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            FLAG.store(true, Ordering::SeqCst);
+        });
+        tokio::time::timeout(Duration::from_secs(2), stop_flag_signal(&FLAG))
+            .await
+            .expect("future должна завершиться после установки флага");
+        setter.await.unwrap();
     }
 }

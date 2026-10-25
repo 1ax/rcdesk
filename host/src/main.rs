@@ -202,9 +202,10 @@ enum FullmodeAction {
 enum ServiceAction {
     /// Установить службу (автозапуск, перезапуск при сбое) и запустить её.
     Install {
-        /// Signaling server WebSocket URL.
-        #[arg(long, default_value = "wss://rcdesk.app/ws")]
-        server: String,
+        /// Signaling server WebSocket URL. Без флага службу настраивает
+        /// `settings.json` в %ProgramData%\rcdesk (поля `server`, `hub`).
+        #[arg(long)]
+        server: Option<String>,
     },
     /// Остановить и удалить службу; данные в %ProgramData%\rcdesk не трогаются.
     Uninstall,
@@ -217,8 +218,8 @@ enum ServiceAction {
     /// Точка входа SCM (binpath службы); руками не запускается.
     #[command(hide = true)]
     Run {
-        #[arg(long, default_value = "wss://rcdesk.app/ws")]
-        server: String,
+        #[arg(long)]
+        server: Option<String>,
     },
 }
 
@@ -394,11 +395,11 @@ fn run_service(action: ServiceAction) -> anyhow::Result<()> {
     use rcdesk_host::service as common;
 
     match action {
-        ServiceAction::Install { server } => svc::install(&server),
+        ServiceAction::Install { server } => svc::install(server.as_deref()),
         ServiceAction::Uninstall => svc::uninstall(),
         ServiceAction::Start => svc::start(),
         ServiceAction::Stop => svc::stop(),
-        ServiceAction::Run { server } => svc::run(&server),
+        ServiceAction::Run { server } => svc::run(server),
         ServiceAction::Status => {
             let state = svc::status()?;
             println!("Служба {}: {}", common::SERVICE_NAME, state.label());
@@ -408,6 +409,31 @@ fn run_service(action: ServiceAction) -> anyhow::Result<()> {
                 None => println!(
                     "PIN: нет (помощник ещё не зарегистрирован, либо нужны права администратора)"
                 ),
+            }
+            if rcdesk_host::settings::hub_enabled(&data) {
+                println!(
+                    "Режим: LAN-хаб, порт {} (адрес — IPv4 этого компьютера, см. ipconfig)",
+                    rcdesk_host::hub::DEFAULT_PORT
+                );
+                let key_path = data.join("hub").join(rcdesk_host::hub::cert::KEY_FILE);
+                match rcdesk_host::hub::cert::read_key_fingerprint(&key_path) {
+                    Ok(Some(fp)) => println!("Отпечаток ключа хаба: sha256:{fp}"),
+                    Ok(None) => println!("Отпечаток ключа хаба: ключа ещё нет"),
+                    Err(err) => {
+                        let denied = err.chain().any(|c| {
+                            c.downcast_ref::<std::io::Error>().map(|e| e.kind())
+                                == Some(std::io::ErrorKind::PermissionDenied)
+                        });
+                        if denied {
+                            println!("Отпечаток ключа хаба: нужны права администратора");
+                        } else {
+                            println!("Отпечаток ключа хаба: не удалось прочитать ({err:#})");
+                        }
+                    }
+                }
+            } else {
+                let (server, _) = common::helper_server(None, &data);
+                println!("Сервер: {server}");
             }
             println!("Данные: {}", data.display());
             println!("Логи: {}", agent::paths::machine_log_dir().display());

@@ -60,6 +60,21 @@ pub fn load_identity(data_dir: &Path, computer_name: &str) -> Result<HubIdentity
     })
 }
 
+/// Отпечаток ключа из файла без его создания: `None`, если файла нет.
+/// Ошибка чтения (например, нет прав) или разбора -- `Err`.
+pub fn read_key_fingerprint(path: &Path) -> Result<Option<String>> {
+    let pem = match std::fs::read_to_string(path) {
+        Ok(pem) => pem,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("не удалось прочитать {}", path.display()))
+        }
+    };
+    let key = KeyPair::from_pem(&pem)
+        .with_context(|| format!("не удалось разобрать ключ хаба {}", path.display()))?;
+    Ok(Some(key_fingerprint(&key)))
+}
+
 /// Ключ из файла; если файла нет -- создаёт (на unix с правами 0600).
 /// DACL для Windows появится в под-шаге службы.
 pub fn load_or_create_key(path: &Path) -> Result<KeyPair> {
@@ -241,6 +256,20 @@ mod tests {
             std::env::temp_dir().join(format!("rcdesk-hubcert-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn read_key_fingerprint_does_not_create_the_key() {
+        let dir = temp_dir("read-fp");
+        let path = dir.join(KEY_FILE);
+        assert_eq!(read_key_fingerprint(&path).unwrap(), None);
+        assert!(!path.exists());
+        let key = load_or_create_key(&path).unwrap();
+        assert_eq!(
+            read_key_fingerprint(&path).unwrap(),
+            Some(key_fingerprint(&key))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

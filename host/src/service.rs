@@ -48,9 +48,33 @@ pub fn validate_server(server: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `"<exe>" service run --server <server>` -- binpath службы.
-pub fn service_command_line(exe: &Path, server: &str) -> String {
-    format!("\"{}\" service run --server {server}", exe.display())
+/// `"<exe>" service run [--server <server>]` -- binpath службы. Без явного
+/// адреса флага нет: службу настраивает `settings.json` (D47-5).
+pub fn service_command_line(exe: &Path, server: Option<&str>) -> String {
+    match server {
+        Some(server) => format!("\"{}\" service run --server {server}", exe.display()),
+        None => format!("\"{}\" service run", exe.display()),
+    }
+}
+
+/// Адрес сервера для помощника внутри службы и признак режима хаба. Если в
+/// `dir/settings.json` включён хаб -- помощник ходит на локальный слушатель
+/// хаба, а флаг и поле `server` игнорируются; иначе флаг > settings >
+/// [`crate::device::DEFAULT_SERVER`].
+pub fn helper_server(flag: Option<String>, dir: &Path) -> (String, bool) {
+    if crate::settings::hub_enabled(dir) {
+        if flag.is_some() {
+            tracing::warn!("включён режим хаба: --server игнорируется");
+        }
+        let server = format!("ws://127.0.0.1:{}/ws", crate::hub::DEFAULT_LOCAL_PORT);
+        tracing::info!(%server, source = "hub", "адрес сигнального сервера");
+        (server, true)
+    } else {
+        (
+            crate::settings::resolve_server(flag, dir, crate::device::DEFAULT_SERVER),
+            false,
+        )
+    }
 }
 
 /// `"<exe>" serve --machine --server <server>` -- команда помощника.
@@ -266,13 +290,54 @@ mod tests {
     fn command_lines_quote_the_exe() {
         let exe = Path::new(r"C:\Program Files\rcdesk\rcdesk-host.exe");
         assert_eq!(
-            service_command_line(exe, "wss://rcdesk.app/ws"),
+            service_command_line(exe, Some("wss://rcdesk.app/ws")),
             r#""C:\Program Files\rcdesk\rcdesk-host.exe" service run --server wss://rcdesk.app/ws"#
+        );
+        assert_eq!(
+            service_command_line(exe, None),
+            r#""C:\Program Files\rcdesk\rcdesk-host.exe" service run"#
         );
         assert_eq!(
             helper_command_line(exe, "wss://rcdesk.app/ws"),
             r#""C:\Program Files\rcdesk\rcdesk-host.exe" serve --machine --server wss://rcdesk.app/ws"#
         );
+    }
+
+    #[test]
+    fn helper_server_in_hub_mode_ignores_the_flag_and_the_file_server() {
+        let dir = scratch_dir("hub-mode");
+        std::fs::write(
+            dir.join(crate::settings::SETTINGS_FILE),
+            r#"{"hub":true,"server":"wss://other/ws"}"#,
+        )
+        .unwrap();
+        let want = ("ws://127.0.0.1:8444/ws".to_string(), true);
+        assert_eq!(helper_server(None, &dir), want);
+        assert_eq!(helper_server(Some("ws://x:1/ws".into()), &dir), want);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn helper_server_without_hub_prefers_flag_then_settings_then_default() {
+        let dir = scratch_dir("no-hub");
+        assert_eq!(
+            helper_server(None, &dir),
+            ("wss://rcdesk.app/ws".to_string(), false)
+        );
+        std::fs::write(
+            dir.join(crate::settings::SETTINGS_FILE),
+            r#"{"server":"wss://hub.lan:8443/ws"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            helper_server(None, &dir),
+            ("wss://hub.lan:8443/ws".to_string(), false)
+        );
+        assert_eq!(
+            helper_server(Some("ws://x:1/ws".into()), &dir),
+            ("ws://x:1/ws".to_string(), false)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

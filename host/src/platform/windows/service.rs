@@ -132,10 +132,11 @@ use windows::Win32::System::Threading::{
 
 use crate::agent::logging;
 use crate::agent::paths::{data_dir, machine_data_dir, machine_log_dir};
+use crate::hub::{self, HubConfig};
 use crate::service::{
-    active_session_from_raw, helper_command_line, migrate_files, service_command_line,
-    validate_server, Action, HelperState, ServiceState, Supervisor, MIGRATED_FILES, SERVICE_LOG,
-    SERVICE_NAME,
+    active_session_from_raw, helper_command_line, helper_server, migrate_files,
+    service_command_line, validate_server, Action, HelperState, ServiceState, Supervisor,
+    MIGRATED_FILES, SERVICE_LOG, SERVICE_NAME,
 };
 
 /// Имя в services.msc.
@@ -406,8 +407,10 @@ fn set_dacl_from_descriptor(dir: &Path, descriptor: PSECURITY_DESCRIPTOR) -> any
 /// Установка службы: каталог данных + DACL, перенос `device.json` /
 /// `access.json` из каталога установщика, `CreateServiceW`, описание,
 /// перезапуск при сбое, старт. Нужны права администратора.
-pub fn install(server: &str) -> anyhow::Result<()> {
-    validate_server(server).map_err(|m| anyhow::anyhow!(m))?;
+pub fn install(server: Option<&str>) -> anyhow::Result<()> {
+    if let Some(server) = server {
+        validate_server(server).map_err(|m| anyhow::anyhow!(m))?;
+    }
     if is_installed() {
         anyhow::bail!(
             "служба {SERVICE_NAME} уже установлена; сначала `rcdesk-host service uninstall`"
@@ -598,8 +601,11 @@ pub fn stop() -> anyhow::Result<()> {
 // Работа внутри службы (`service run`).
 // ---------------------------------------------------------------------------
 
-/// Адрес сервера для помощника; задаётся в `run` до диспетчера.
+/// Итоговый адрес сервера для помощника (флаг, `settings.json` или локальный
+/// слушатель хаба); задаётся в `run` до диспетчера.
 static SERVER: OnceLock<String> = OnceLock::new();
+/// Режим хаба: служба поднимает LAN-хаб у себя (`settings.json`, D47-5).
+static HUB_MODE: AtomicBool = AtomicBool::new(false);
 /// `SERVICE_STATUS_HANDLE.0` для `report` (обработчик управления зовётся из
 /// другого потока).
 static STATUS_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
@@ -610,17 +616,22 @@ static FINISHED: AtomicBool = AtomicBool::new(false);
 
 /// Точка входа `service run`: логи в `service.log`, диспетчер SCM. Возвращает
 /// управление, когда служба остановилась.
-pub fn run(server: &str) -> anyhow::Result<()> {
-    validate_server(server).map_err(|m| anyhow::anyhow!(m))?;
+pub fn run(server: Option<String>) -> anyhow::Result<()> {
+    if let Some(server) = &server {
+        validate_server(server).map_err(|m| anyhow::anyhow!(m))?;
+    }
     let log_dir = machine_log_dir();
     logging::init_named(&log_dir, SERVICE_LOG)
         .with_context(|| format!("лог службы в {}", log_dir.display()))?;
+    let (server, hub) = helper_server(server, &machine_data_dir());
     tracing::info!(
         version = crate::build_info::FULL_VERSION,
         server,
+        hub,
         "rcdesk service starting"
     );
-    let _ = SERVER.set(server.to_string());
+    HUB_MODE.store(hub, Ordering::SeqCst);
+    let _ = SERVER.set(server);
 
     let mut name = wide_null(SERVICE_NAME);
     let table = [
@@ -727,7 +738,22 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     );
     tracing::info!("rcdesk service running");
 
-    let exit_code = match supervise() {
+    // Хаб стартует до первого тика супервизора; помощник и так
+    // переподключается с backoff, ждать готовности хаба не нужно.
+    let hub = if HUB_MODE.load(Ordering::SeqCst) {
+        match spawn_hub() {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                tracing::error!(error = %format!("{err:#}"), "не удалось запустить хаб");
+                report(SERVICE_STOPPED, 0, 1, 0, 0);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let exit_code = match supervise(hub) {
         Ok(()) => 0,
         Err(err) => {
             tracing::error!(error = %format!("{err:#}"), "supervisor failed");
@@ -737,9 +763,32 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     report(SERVICE_STOPPED, 0, exit_code, 0, 0);
 }
 
+/// Поток хаба со своим tokio-рантаймом; завершается по `STOP_REQUESTED` или
+/// при падении хаба (порт занят и т.п.).
+fn spawn_hub() -> anyhow::Result<std::thread::JoinHandle<anyhow::Result<()>>> {
+    let cfg = HubConfig {
+        data_dir: machine_data_dir().join("hub"),
+        port: hub::DEFAULT_PORT,
+        local_port: hub::DEFAULT_LOCAL_PORT,
+    };
+    std::thread::Builder::new()
+        .name("rcdesk-hub".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("tokio-рантайм хаба")?;
+            runtime.block_on(hub::run(cfg, hub::stop_flag_signal(&STOP_REQUESTED)))
+        })
+        .context("поток хаба")
+}
+
 /// Цикл надзора: раз в секунду смотрит активную консольную сессию и
-/// состояние помощника, исполняет решение `Supervisor::tick`.
-fn supervise() -> anyhow::Result<()> {
+/// состояние помощника, исполняет решение `Supervisor::tick`. В режиме хаба
+/// выходит ещё и когда поток хаба завершился сам (ошибка -- SCM
+/// перезапустит службу по failure actions); при штатной остановке ждёт
+/// поток хаба.
+fn supervise(hub: Option<std::thread::JoinHandle<anyhow::Result<()>>>) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("путь к rcdesk-host.exe")?;
     let server = SERVER.get().cloned().unwrap_or_default();
     let mut supervisor = Supervisor::new();
@@ -747,6 +796,9 @@ fn supervise() -> anyhow::Result<()> {
     let mut next_tick = Instant::now();
 
     while !STOP_REQUESTED.load(Ordering::SeqCst) {
+        if hub.as_ref().is_some_and(|h| h.is_finished()) {
+            break;
+        }
         let now = Instant::now();
         if now >= next_tick {
             next_tick = now + TICK_INTERVAL;
@@ -762,6 +814,24 @@ fn supervise() -> anyhow::Result<()> {
             "stopping helper"
         );
         helper.kill();
+    }
+
+    if let Some(hub) = hub {
+        let finished_early = !STOP_REQUESTED.load(Ordering::SeqCst);
+        let result = match hub.join() {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("поток хаба паниковал")),
+        };
+        if finished_early {
+            // Хаб упал сам: служба останавливается с кодом 1.
+            return match result {
+                Ok(()) => Err(anyhow::anyhow!("хаб завершился неожиданно")),
+                Err(err) => Err(err.context("хаб остановился")),
+            };
+        }
+        if let Err(err) = result {
+            tracing::warn!(error = %format!("{err:#}"), "хаб завершился с ошибкой при остановке");
+        }
     }
     Ok(())
 }
