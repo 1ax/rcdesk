@@ -93,3 +93,37 @@ export function composeTyped(
   }
   return out;
 }
+
+export const REPEAT_DELAY_MS = 500;
+export const REPEAT_INTERVAL_MS = 50;
+
+/** Autorepeat for a held strip key (slice H5-3): `fire` runs once after
+ * `REPEAT_DELAY_MS`, then every `REPEAT_INTERVAL_MS`, until `stop()`.
+ * `stop()` reports whether anything fired -- the release's `click` must then
+ * be swallowed, or the key would go out one extra time. */
+export class KeyRepeat {
+  private delay: ReturnType<typeof setTimeout> | null = null;
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private fired = false;
+
+  start(fire: () => void): void {
+    this.stop();
+    this.delay = setTimeout(() => {
+      this.delay = null;
+      this.fired = true;
+      fire();
+      this.timer = setInterval(fire, REPEAT_INTERVAL_MS);
+    }, REPEAT_DELAY_MS);
+  }
+
+  /** Cancels the repeat; `true` if at least one repeat fired. */
+  stop(): boolean {
+    if (this.delay !== null) clearTimeout(this.delay);
+    if (this.timer !== null) clearInterval(this.timer);
+    this.delay = null;
+    this.timer = null;
+    const fired = this.fired;
+    this.fired = false;
+    return fired;
+  }
+}

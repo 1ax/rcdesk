@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  KeyRepeat,
   SENTINEL,
   StickyModifiers,
   composeTyped,
@@ -117,5 +118,48 @@ describe("composeTyped", () => {
       k("Backspace", false),
       { type: "text", text: "x" },
     ]);
+  });
+});
+
+describe("KeyRepeat", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("does not fire before the delay", () => {
+    const fn = vi.fn();
+    const r = new KeyRepeat();
+    r.start(fn);
+    vi.advanceTimersByTime(499);
+    expect(fn).not.toHaveBeenCalled();
+    expect(r.stop()).toBe(false);
+  });
+
+  it("fires after the delay and then every interval", () => {
+    const fn = vi.fn();
+    const r = new KeyRepeat();
+    r.start(fn);
+    vi.advanceTimersByTime(500);
+    expect(fn).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(100);
+    expect(fn).toHaveBeenCalledTimes(3);
+    expect(r.stop()).toBe(true);
+    vi.advanceTimersByTime(200);
+    expect(fn).toHaveBeenCalledTimes(3);
+  });
+
+  it("start restarts the delay", () => {
+    const fn = vi.fn();
+    const r = new KeyRepeat();
+    r.start(fn);
+    vi.advanceTimersByTime(400);
+    r.start(fn);
+    vi.advanceTimersByTime(400);
+    expect(fn).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(100);
+    expect(fn).toHaveBeenCalledTimes(1);
   });
 });

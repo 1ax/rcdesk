@@ -1,7 +1,14 @@
 // DOM-обвязка экранной клавиатуры телефона (слайс H2b). Логика -- в softKeyboard.ts.
 
 import type { InputMessage } from "./generated/InputMessage";
-import { SENTINEL, StickyModifiers, composeTyped, diffTyped, keystrokes } from "./softKeyboard";
+import {
+  KeyRepeat,
+  SENTINEL,
+  StickyModifiers,
+  composeTyped,
+  diffTyped,
+  keystrokes,
+} from "./softKeyboard";
 
 export interface SoftKeyboardOptions {
   button: HTMLButtonElement;
@@ -51,6 +58,8 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
   const { button, strip, field, send, isTextSupported, fit, onShow, onLayout, onHide } = opts;
   let lastFit = "";
   const sticky = new StickyModifiers();
+  const repeat = new KeyRepeat();
+  let swallowClick = false;
   let prev = SENTINEL;
   let visible = false;
   let hostOs: "macos" | "windows" | null = null;
@@ -147,6 +156,7 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
   };
 
   const hide = (): void => {
+    repeat.stop();
     visible = false;
     strip.hidden = true;
     field.blur();
@@ -203,11 +213,33 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
     onHide?.();
   };
 
+  // Удержание = автоповтор (H5-3), короткий тап по-прежнему уходит через click.
   const onStripPointerDown = (e: Event): void => {
-    if ((e.target as HTMLElement).closest("button")) e.preventDefault();
+    const b = (e.target as HTMLElement).closest("button");
+    if (!b) return;
+    e.preventDefault();
+    if (b.dataset.code) {
+      swallowClick = false;
+      let mods: string[] | null = null;
+      repeat.start(() => {
+        if (mods === null) {
+          mods = sticky.consume();
+          renderMods();
+        }
+        sendAll(keystrokes(b.dataset.code!, false, mods));
+      });
+    }
+  };
+
+  const onStripPointerUp = (): void => {
+    if (repeat.stop()) swallowClick = true;
   };
 
   const onStripClick = (e: Event): void => {
+    if (swallowClick) {
+      swallowClick = false;
+      return;
+    }
     const b = (e.target as HTMLElement).closest("button");
     if (!b) return;
     if (b.dataset.code) {
@@ -227,6 +259,9 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
   field.addEventListener("beforeinput", onBeforeInput);
   field.addEventListener("blur", onBlur);
   strip.addEventListener("pointerdown", onStripPointerDown);
+  strip.addEventListener("pointerup", onStripPointerUp);
+  strip.addEventListener("pointercancel", onStripPointerUp);
+  strip.addEventListener("pointerleave", onStripPointerUp);
   strip.addEventListener("click", onStripClick);
 
   return {
@@ -248,7 +283,11 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
       field.removeEventListener("beforeinput", onBeforeInput);
       field.removeEventListener("blur", onBlur);
       strip.removeEventListener("pointerdown", onStripPointerDown);
+      strip.removeEventListener("pointerup", onStripPointerUp);
+      strip.removeEventListener("pointercancel", onStripPointerUp);
+      strip.removeEventListener("pointerleave", onStripPointerUp);
       strip.removeEventListener("click", onStripClick);
+      repeat.stop();
       stopTracking();
     },
   };
