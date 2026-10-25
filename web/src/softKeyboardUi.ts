@@ -21,9 +21,12 @@ export interface SoftKeyboardController {
   dispose(): void;
 }
 
-const CODE_KEYS: Array<[string, string]> = [
+const LEAD_KEYS: Array<[string, string]> = [
   ["Escape", "Esc"],
   ["Tab", "Tab"],
+];
+
+const NAV_KEYS: Array<[string, string]> = [
   ["ArrowLeft", "←"],
   ["ArrowUp", "↑"],
   ["ArrowDown", "↓"],
@@ -59,18 +62,24 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
     return b;
   };
 
-  for (const [code, label] of CODE_KEYS) {
-    const b = makeBtn(label);
-    b.dataset.code = code;
-    strip.appendChild(b);
-  }
+  const addCodeKeys = (keys: Array<[string, string]>): void => {
+    for (const [code, label] of keys) {
+      const b = makeBtn(label);
+      b.dataset.code = code;
+      strip.appendChild(b);
+    }
+  };
+  addCodeKeys(LEAD_KEYS);
   for (const [code, label] of MOD_KEYS) {
     const b = makeBtn(label);
     b.dataset.mod = code;
     if (code === "MetaLeft") metaBtn = b;
     strip.appendChild(b);
   }
-  const hideBtn = makeBtn("Скрыть");
+  addCodeKeys(NAV_KEYS);
+  const hideBtn = makeBtn("\u2304");
+  hideBtn.setAttribute("aria-label", "Скрыть клавиатуру");
+  hideBtn.title = "Скрыть клавиатуру";
   hideBtn.dataset.action = "hide";
   strip.appendChild(hideBtn);
 
@@ -86,7 +95,8 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
     if (!vv) return;
     strip.style.bottom = `${window.innerHeight - vv.offsetTop - vv.height}px`;
     // iOS does not shrink the layout viewport for the keyboard.
-    if (fit) fit.style.height = `${vv.height}px`;
+    // Строка вычитается из высоты экрана сеанса, чтобы не закрывать картинку (H5-1).
+    if (fit) fit.style.height = `${Math.max(0, vv.height - strip.offsetHeight)}px`;
   };
   const startTracking = (): void => {
     if (!vv) return;
