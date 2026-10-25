@@ -1334,6 +1334,10 @@ export function mount(root: Element | null): void {
       document.addEventListener("click", onClipboardReturnClick, true);
       window.addEventListener("focus", onClipboardFocusOrGesture);
       document.addEventListener("pointerdown", onClipboardFocusOrGesture, true);
+      // H5-17: a touch `pointerdown` carries no user activation on iOS
+      // (`writeText` -> NotAllowedError; measured in the simulator), `click` does
+      // -- without it the host's clipboard never reached the phone.
+      document.addEventListener("click", onClipboardFocusOrGesture, true);
       document.addEventListener("keydown", onClipboardFocusOrGesture, true);
       if ("onclipboardchange" in clipboard) {
         clipboard.addEventListener("clipboardchange", onClipboardChange);
@@ -1352,6 +1356,7 @@ export function mount(root: Element | null): void {
       returnSyncArmed = false;
       window.removeEventListener("focus", onClipboardFocusOrGesture);
       document.removeEventListener("pointerdown", onClipboardFocusOrGesture, true);
+      document.removeEventListener("click", onClipboardFocusOrGesture, true);
       document.removeEventListener("keydown", onClipboardFocusOrGesture, true);
       if (clipboardChangeAttached) {
         navigator.clipboard.removeEventListener("clipboardchange", onClipboardChange);
