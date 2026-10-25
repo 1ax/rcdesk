@@ -10,7 +10,7 @@ export interface Zoom {
 }
 
 export const ZOOM_MIN = 1;
-export const ZOOM_MAX = 4;
+export const ZOOM_MAX = 8;
 
 export function identityZoom(): Zoom {
   return { scale: 1, tx: 0, ty: 0 };

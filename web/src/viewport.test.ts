@@ -20,8 +20,8 @@ describe("zoom", () => {
     expect(z.tx + 100 * 2).toBe(100);
   });
 
-  it("caps at 4x and returns to identity below 1x", () => {
-    expect(zoomAt(identityZoom(), 10, 0, 0, 400, 300).scale).toBe(4);
+  it("caps at 8x and returns to identity below 1x", () => {
+    expect(zoomAt(identityZoom(), 10, 0, 0, 400, 300).scale).toBe(8);
     const z = zoomAt(zoomAt(identityZoom(), 2, 100, 50, 400, 300), 0.1, 100, 50, 400, 300);
     expect(z).toEqual(identityZoom());
   });
@@ -59,7 +59,7 @@ describe("zoom", () => {
   });
 
   it("centerOn clamps the scale", () => {
-    expect(centerOn(8, 200, 150, 400, 300).scale).toBe(4);
+    expect(centerOn(16, 200, 150, 400, 300).scale).toBe(8);
     expect(centerOn(0.5, 100, 75, 400, 300)).toEqual({ scale: 1, tx: 0, ty: 0 });
   });
 

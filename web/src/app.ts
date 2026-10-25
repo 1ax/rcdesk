@@ -667,6 +667,8 @@ export function mount(root: Element | null): void {
   // Slice H5-2: last virtual-cursor frame position and the zoom to restore
   // once the phone keyboard goes away (`null` -- the keyboard didn't zoom).
   let lastTouchCursor: { x: number; y: number } | null = null;
+  // H5-10: a touch is active, so the overlay must show as soon as it has an image.
+  let touchCursorWanted = false;
   let zoomBeforeKeyboard: Zoom | null = null;
   // H5-4: the session bar was collapsed automatically for the keyboard in landscape.
   let barAutoCollapsed = false;
@@ -2023,13 +2025,15 @@ export function mount(root: Element | null): void {
         mode: () => touchMode,
         onCursor: (pos) => {
           if (!pos) {
+            touchCursorWanted = false;
             touchCursorEl.hidden = true;
             return;
           }
           lastTouchCursor = { x: pos.x, y: pos.y };
           keyboardBtn.hidden = false;
           touchModeBtn.hidden = false;
-          touchCursorEl.hidden = false;
+          touchCursorWanted = true;
+          touchCursorEl.hidden = !touchCursorEl.getAttribute("src");
           placeTouchCursor();
           if (touchMode === "trackpad") {
             const c = sessionVideoEl.getBoundingClientRect();
@@ -2244,6 +2248,11 @@ export function mount(root: Element | null): void {
         return;
       }
       applyCursor(video, msg, touchCursorEl);
+      // H5-10: the overlay stayed hidden while it had no image; show it now.
+      if (touchCursorWanted && touchCursorEl.getAttribute("src")) {
+        touchCursorEl.hidden = false;
+        placeTouchCursor();
+      }
     });
   }
 
@@ -2572,6 +2581,9 @@ export function mount(root: Element | null): void {
     touchCursorEl.removeAttribute("src");
     touchCursorEl.style.visibility = "";
     touchCursorEl.style.transform = "";
+    touchCursorEl.style.width = "";
+    touchCursorEl.style.height = "";
+    touchCursorWanted = false;
     applyZoom(identityZoom());
     overlay.textContent = "";
     firstFrameShown = false;
