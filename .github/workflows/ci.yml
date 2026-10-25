@@ -37,14 +37,29 @@ jobs:
       - name: cargo test --workspace
         if: matrix.os != 'windows-latest'
         run: cargo test --workspace
-      # rcdesk-server тянет OpenSSL (webauthn-rs) и работает только на Linux:
-      # на Windows-раннере OpenSSL нет, поэтому сервер там не собираем.
+      # rcdesk-server с фичами по умолчанию тянет OpenSSL (webauthn-rs) и
+      # работает только на Linux: на Windows-раннере OpenSSL нет, поэтому
+      # целиком сервер там не собираем. Без фич (`--no-default-features`, без
+      # passkey и SMTP) он OpenSSL не тянет и собирается на Windows: так его
+      # подключит хост (LAN-хаб). Эту же конфигурацию гоняем и на Linux.
       - name: cargo clippy --workspace --exclude rcdesk-server (windows)
         if: matrix.os == 'windows-latest'
         run: cargo clippy --workspace --exclude rcdesk-server --all-targets -- -D warnings
       - name: cargo test --workspace --exclude rcdesk-server (windows)
         if: matrix.os == 'windows-latest'
         run: cargo test --workspace --exclude rcdesk-server
+      - name: cargo clippy -p rcdesk-server --no-default-features (windows)
+        if: matrix.os == 'windows-latest'
+        run: cargo clippy -p rcdesk-server --no-default-features --all-targets -- -D warnings
+      - name: cargo test -p rcdesk-server --no-default-features (windows)
+        if: matrix.os == 'windows-latest'
+        run: cargo test -p rcdesk-server --no-default-features
+      - name: cargo clippy -p rcdesk-server --no-default-features
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy -p rcdesk-server --no-default-features --all-targets -- -D warnings
+      - name: cargo test -p rcdesk-server --no-default-features
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p rcdesk-server --no-default-features
 
   proto-ts-sync:
     runs-on: ubuntu-latest

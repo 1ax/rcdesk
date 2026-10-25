@@ -4,10 +4,14 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "smtp")]
 use anyhow::Context;
 use futures_util::future::BoxFuture;
+#[cfg(feature = "smtp")]
 use lettre::message::{Mailbox, Message, SinglePart};
+#[cfg(feature = "smtp")]
 use lettre::transport::smtp::authentication::Credentials;
+#[cfg(feature = "smtp")]
 use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 
 pub trait Mailer: Send + Sync {
@@ -62,18 +66,25 @@ impl Mailer for LogMailer {
     }
 }
 
+#[cfg(feature = "smtp")]
 const DEFAULT_SMTP_HOST: &str = "smtp.resend.com";
+#[cfg(feature = "smtp")]
 const DEFAULT_SMTP_PORT: u16 = 465;
+#[cfg(feature = "smtp")]
 const DEFAULT_SMTP_USER: &str = "resend";
+#[cfg(feature = "smtp")]
 const DEFAULT_MAIL_FROM: &str = "rcdesk <noreply@rcdesk.app>";
 
+#[cfg(feature = "smtp")]
 fn code_body(code: &str) -> String {
     format!(
         "Ваш код для rcdesk: {code}\n\nКод действует 10 минут. Если вы не запрашивали код, просто проигнорируйте это письмо.\n"
     )
 }
 
+#[cfg(feature = "smtp")]
 /// Собирает письмо с кодом. Отдельно от отправки, чтобы проверять без сети.
+#[cfg(feature = "smtp")]
 pub fn build_code_message(from: &Mailbox, to: &str, code: &str) -> anyhow::Result<Message> {
     let to: Mailbox = to.parse().context("invalid recipient address")?;
     Message::builder()
@@ -84,13 +95,16 @@ pub fn build_code_message(from: &Mailbox, to: &str, code: &str) -> anyhow::Resul
         .context("failed to build email")
 }
 
+#[cfg(feature = "smtp")]
 fn email_changed_body(new_email: &str) -> String {
     format!(
         "Почта аккаунта rcdesk изменена на {new_email}.\n\nЕсли это были не вы, срочно войдите в аккаунт и смените пароль.\n"
     )
 }
 
+#[cfg(feature = "smtp")]
 /// Собирает уведомление о смене почты (уходит на старый адрес).
+#[cfg(feature = "smtp")]
 pub fn build_email_changed_message(
     from: &Mailbox,
     to: &str,
@@ -105,12 +119,15 @@ pub fn build_email_changed_message(
         .context("failed to build email")
 }
 
+#[cfg(feature = "smtp")]
 /// Отправка через SMTP (implicit TLS, rustls + webpki-roots).
+#[cfg(feature = "smtp")]
 pub struct SmtpMailer {
     transport: AsyncSmtpTransport<Tokio1Executor>,
     from: Mailbox,
 }
 
+#[cfg(feature = "smtp")]
 impl SmtpMailer {
     pub fn new(
         host: &str,
@@ -128,6 +145,7 @@ impl SmtpMailer {
     }
 }
 
+#[cfg(feature = "smtp")]
 impl Mailer for SmtpMailer {
     fn send_code(&self, to: &str, code: &str) -> BoxFuture<'static, anyhow::Result<()>> {
         let message = build_code_message(&self.from, to, code);
@@ -173,6 +191,11 @@ pub fn mailer_from_vars(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<
             tracing::info!("mail mode: log");
             Ok(Arc::new(LogMailer))
         }
+        #[cfg(not(feature = "smtp"))]
+        "smtp" => {
+            anyhow::bail!("RCDESK_MAIL=smtp: server built without smtp feature")
+        }
+        #[cfg(feature = "smtp")]
         "smtp" => {
             let host = nonempty("RCDESK_SMTP_HOST").unwrap_or_else(|| DEFAULT_SMTP_HOST.into());
             let port = match nonempty("RCDESK_SMTP_PORT") {
@@ -201,7 +224,6 @@ pub fn mailer_from_vars(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lettre::message::header::Subject;
     use std::collections::HashMap;
 
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -223,6 +245,45 @@ mod tests {
     fn empty_and_log_modes_ok() {
         assert!(mailer_from_vars(vars(&[])).is_ok());
         assert!(mailer_from_vars(vars(&[("RCDESK_MAIL", "log")])).is_ok());
+    }
+
+    #[test]
+    fn unknown_mode_is_error() {
+        let e = err_text(mailer_from_vars(vars(&[("RCDESK_MAIL", "smtps")])));
+        assert!(e.contains("RCDESK_MAIL"), "{e}");
+    }
+
+    #[cfg(not(feature = "smtp"))]
+    #[test]
+    fn smtp_without_feature_is_config_error() {
+        let e = err_text(mailer_from_vars(vars(&[
+            ("RCDESK_MAIL", "smtp"),
+            ("RCDESK_SMTP_PASSWORD", "re_secret"),
+        ])));
+        assert!(e.contains("built without smtp feature"), "{e}");
+        assert!(!e.contains("re_secret"));
+    }
+}
+
+#[cfg(all(test, feature = "smtp"))]
+mod smtp_tests {
+    use super::*;
+    use lettre::message::header::Subject;
+    use std::collections::HashMap;
+
+    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let m: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| m.get(k).cloned()
+    }
+
+    fn err_text(r: anyhow::Result<SharedMailer>) -> String {
+        match r {
+            Ok(_) => panic!("expected error"),
+            Err(e) => format!("{e:#}"),
+        }
     }
 
     #[tokio::test]
@@ -261,12 +322,6 @@ mod tests {
             ])));
             assert!(e.contains("RCDESK_SMTP_PORT"), "{e}");
         }
-    }
-
-    #[test]
-    fn unknown_mode_is_error() {
-        let e = err_text(mailer_from_vars(vars(&[("RCDESK_MAIL", "smtps")])));
-        assert!(e.contains("RCDESK_MAIL"), "{e}");
     }
 
     #[test]

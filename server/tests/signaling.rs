@@ -1685,6 +1685,7 @@ async fn passkey_management_without_client_auth_returns_not_authenticated() {
 
 // (3.7b-b) an authenticated owner with no passkeys gets an empty list, and
 // RegisterStart returns options that parse as JSON and demand a resident key.
+#[cfg(feature = "passkeys")]
 #[tokio::test]
 async fn list_passkeys_is_empty_and_register_start_returns_options() {
     let url = spawn_server().await;
@@ -1713,6 +1714,7 @@ async fn list_passkeys_is_empty_and_register_start_returns_options() {
 
 // (3.7b-c) Finish without Start, a second Finish and garbage are all
 // "passkey failed"; login needs no owner.
+#[cfg(feature = "passkeys")]
 #[tokio::test]
 async fn passkey_finish_without_start_or_with_garbage_fails() {
     let url = spawn_server().await;
@@ -1754,6 +1756,32 @@ async fn passkey_finish_without_start_or_with_garbage_fails() {
     expect_error(&mut stranger, "passkey failed").await;
     // The state was consumed by the failed finish.
     send(&mut stranger, &login_finish).await;
+    expect_error(&mut stranger, "passkey failed").await;
+}
+
+// (D47-1) Без фичи `passkeys` список читается из SQLite, а любая церемония
+// (старт регистрации и входа) отвечает "passkey failed" (причина --
+// "passkeys disabled" -- только в логе).
+#[cfg(not(feature = "passkeys"))]
+#[tokio::test]
+async fn passkey_ceremonies_are_disabled_without_the_feature() {
+    let url = spawn_server().await;
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    client_auth(&mut client, None).await;
+
+    send(&mut client, &SignalMessage::ListPasskeys).await;
+    match recv(&mut client).await {
+        SignalMessage::Passkeys { passkeys } => assert!(passkeys.is_empty()),
+        other => panic!("expected passkeys, got {other:?}"),
+    }
+
+    send(&mut client, &SignalMessage::PasskeyRegisterStart).await;
+    expect_error(&mut client, "passkey failed").await;
+
+    let mut stranger = connect(&url).await;
+    hello(&mut stranger, Role::Client).await;
+    send(&mut stranger, &SignalMessage::PasskeyLoginStart).await;
     expect_error(&mut stranger, "passkey failed").await;
 }
 

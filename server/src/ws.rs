@@ -19,7 +19,6 @@ use proto::signal::{BrowserEntry, DeviceEntry, EmailCodePurpose, Role, SignalMes
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::time::{interval, timeout, MissedTickBehavior};
-use webauthn_rs::prelude::{DiscoverableAuthentication, PasskeyRegistration};
 
 use crate::accounts::{self, EmailCodes};
 use crate::app::AppState;
@@ -29,7 +28,9 @@ use crate::ice::{self, IceConfig};
 use crate::ip_limit::{GlobalLimiter, IpLimiter};
 use crate::mail::SharedMailer;
 use crate::owners;
-use crate::passkeys::{self, PasskeyError, SharedWebauthn};
+use crate::passkeys::{
+    self, DiscoverableAuthentication, PasskeyError, PasskeyRegistration, SharedWebauthn,
+};
 use crate::registry::{Registry, Tx};
 
 /// Максимальный размер входящего WebSocket-сообщения/кадра. Самый большой

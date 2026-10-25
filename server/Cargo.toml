@@ -12,6 +12,12 @@ path = "src/lib.rs"
 name = "rcdesk-server"
 path = "src/main.rs"
 
+[features]
+default = ["passkeys", "smtp"]
+# Без фич крейт собирается без OpenSSL (LAN-хаб в хосте на Windows).
+passkeys = ["dep:webauthn-rs"]
+smtp = ["dep:lettre"]
+
 [dependencies]
 axum = { workspace = true }
 tokio = { workspace = true }
@@ -29,8 +35,8 @@ sha1 = "0.10"
 sha2 = "0.10"
 rusqlite = { workspace = true }
 argon2 = { workspace = true }
-lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
-webauthn-rs = { version = "0.5.5", features = ["conditional-ui"] }
+lettre = { version = "0.11.23", optional = true, default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
+webauthn-rs = { version = "0.5.5", optional = true, features = ["conditional-ui"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
