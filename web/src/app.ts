@@ -673,7 +673,27 @@ export function mount(root: Element | null): void {
     zoom = clampZoom(next, sessionVideoEl.clientWidth, sessionVideoEl.clientHeight);
     zoomLayer.style.transform = zoomCss(zoom);
   }
-  window.addEventListener("resize", () => applyZoom(zoom));
+  // H5-6: places the virtual-cursor overlay from its frame position in
+  // unscaled-layer coordinates (the layer at 1x is the container), so it
+  // stays on the frame when the container's height changes (keyboard, bar).
+  function placeTouchCursor(): void {
+    if (!lastTouchCursor || touchCursorEl.hidden) return;
+    const p = unmapPointer(
+      lastTouchCursor.x,
+      lastTouchCursor.y,
+      { left: 0, top: 0, width: sessionVideoEl.clientWidth, height: sessionVideoEl.clientHeight },
+      video.videoWidth,
+      video.videoHeight,
+    );
+    if (!p) return;
+    const hx = Number(touchCursorEl.dataset.hx ?? 0) || 0;
+    const hy = Number(touchCursorEl.dataset.hy ?? 0) || 0;
+    touchCursorEl.style.transform = `translate(${p.clientX - hx}px, ${p.clientY - hy}px)`;
+  }
+  window.addEventListener("resize", () => {
+    applyZoom(zoom);
+    placeTouchCursor();
+  });
   // Slice H2b: версия хоста из `host_info` (null -- поле не пришло).
   let hostVersion: string | null = null;
   const softKeyboard: SoftKeyboardController = mountSoftKeyboard({
@@ -704,22 +724,23 @@ export function mount(root: Element | null): void {
       const h = sessionVideoEl.clientHeight;
       if (zoomBeforeKeyboard === null) {
         applyZoom(zoom); // re-clamp to the resized container
-        return;
+      } else {
+        const anchor = lastTouchCursor
+          ? unmapPointer(
+              lastTouchCursor.x,
+              lastTouchCursor.y,
+              { left: 0, top: 0, width: w, height: h },
+              video.videoWidth,
+              video.videoHeight,
+            )
+          : null;
+        applyZoom(
+          anchor
+            ? centerOn(KEYBOARD_ZOOM, anchor.clientX, anchor.clientY, w, h)
+            : centerOn(KEYBOARD_ZOOM, w / 2, h / 2, w, h),
+        );
       }
-      const anchor = lastTouchCursor
-        ? unmapPointer(
-            lastTouchCursor.x,
-            lastTouchCursor.y,
-            { left: 0, top: 0, width: w, height: h },
-            video.videoWidth,
-            video.videoHeight,
-          )
-        : null;
-      applyZoom(
-        anchor
-          ? centerOn(KEYBOARD_ZOOM, anchor.clientX, anchor.clientY, w, h)
-          : centerOn(KEYBOARD_ZOOM, w / 2, h / 2, w, h),
-      );
+      placeTouchCursor();
     },
     onHide: () => {
       if (barAutoCollapsed) {
@@ -729,6 +750,7 @@ export function mount(root: Element | null): void {
       const restore = zoomBeforeKeyboard;
       zoomBeforeKeyboard = null;
       applyZoom(restore ?? zoom);
+      placeTouchCursor();
     },
   });
   const curtainBtn = root.querySelector<HTMLButtonElement>("#curtain-btn")!;
@@ -1978,11 +2000,8 @@ export function mount(root: Element | null): void {
           lastTouchCursor = { x: pos.x, y: pos.y };
           keyboardBtn.hidden = false;
           touchModeBtn.hidden = false;
-          const layerRect = zoomLayer.getBoundingClientRect();
-          const hx = Number(touchCursorEl.dataset.hx ?? 0) || 0;
-          const hy = Number(touchCursorEl.dataset.hy ?? 0) || 0;
           touchCursorEl.hidden = false;
-          touchCursorEl.style.transform = `translate(${(pos.clientX - layerRect.left) / zoom.scale - hx}px, ${(pos.clientY - layerRect.top) / zoom.scale - hy}px)`;
+          placeTouchCursor();
           if (touchMode === "trackpad") {
             const c = sessionVideoEl.getBoundingClientRect();
             applyZoom(
