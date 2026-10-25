@@ -310,6 +310,33 @@ export function attachInput(
     pendingMove = null;
   }
 
+  // H5-16: a tap goes out like a finger would -- hover, press, release -- and
+  // taps are serialized, so a quick second tap never overtakes the first one's
+  // release. macOS menus drop a zero-length click (measured: 3 of 5 menu taps
+  // landed; with these delays 6 of 6).
+  const TAP_HOVER_MS = 20;
+  const TAP_HOLD_MS = 60;
+  // A right tap stays instantaneous: macOS opens the context menu on the
+  // right button's press, and a release 60 ms later would land on that menu
+  // (measured: the menu never stayed open, 0 of 6 pastes).
+  const RIGHT_TAP_HOLD_MS = 0;
+  let tapChain: Promise<void> = Promise.resolve();
+  const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+  function sendTap(button: PointerButton, point: { x: number; y: number }): void {
+    pendingMove = null;
+    send(channels.pointer, { type: "pointer_move", x: point.x, y: point.y });
+    tapChain = tapChain
+      .then(() => wait(TAP_HOVER_MS))
+      .then(() =>
+        send(channels.input, { type: "pointer_button", button, pressed: true, x: point.x, y: point.y }),
+      )
+      .then(() => wait(button === "right" ? RIGHT_TAP_HOLD_MS : TAP_HOLD_MS))
+      .then(() =>
+        send(channels.input, { type: "pointer_button", button, pressed: false, x: point.x, y: point.y }),
+      )
+      .catch(() => undefined);
+  }
+
   function queuePointerMove(point: { x: number; y: number }): void {
     pendingMove = point;
     if (rafHandle === null) {
@@ -355,22 +382,13 @@ export function attachInput(
         if (!point) return;
         virtualCursor.x = point.x;
         virtualCursor.y = point.y;
-        // H5-11: the move must reach the host before the click (menus pick the
-        // item by hover), so it goes out now, not on the next animation frame.
-        pendingMove = null;
-        send(channels.pointer, { type: "pointer_move", x: point.x, y: point.y });
         showTouchCursor();
-        for (const pressed of [true, false]) {
-          send(channels.input, {
-            type: "pointer_button",
-            button: action.button,
-            pressed,
-            x: point.x,
-            y: point.y,
-          });
-        }
+        sendTap(action.button, point);
         return;
       }
+      case "tap":
+        sendTap(action.button, { x: virtualCursor.x, y: virtualCursor.y });
+        return;
       default:
         break;
     }

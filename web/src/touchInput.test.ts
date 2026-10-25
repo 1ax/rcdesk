@@ -11,10 +11,7 @@ function ev(kind: TouchEventKind, id: number, x = 0, y = 0) {
   return { kind, id, x, y };
 }
 
-const click = (button: "left" | "right"): TouchAction[] => [
-  { kind: "button", button, pressed: true },
-  { kind: "button", button, pressed: false },
-];
+const click = (button: "left" | "right"): TouchAction[] => [{ kind: "tap", button }];
 
 describe("TouchRecognizer", () => {
   it("turns a quick tap into a left click", () => {

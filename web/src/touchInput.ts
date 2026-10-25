@@ -33,6 +33,8 @@ export interface TouchEvent {
 export type TouchAction =
   | { kind: "move"; dx: number; dy: number }
   | { kind: "button"; button: "left" | "right"; pressed: boolean }
+  // H5-16: a whole tap (press + release) at the virtual cursor.
+  | { kind: "tap"; button: "left" | "right" }
   | { kind: "scroll"; dx: number; dy: number; cx: number; cy: number }
   | { kind: "drag"; pressed: boolean }
   // Slice H3: pinch (centroid in client px), view pan and direct-mode click.
@@ -236,10 +238,7 @@ export class TouchRecognizer {
         if (this.mode === "direct") {
           return [{ kind: "click", button: "left", x: this.tapX, y: this.tapY }];
         }
-        return [
-          { kind: "button", button: "left", pressed: true },
-          { kind: "button", button: "left", pressed: false },
-        ];
+        return [{ kind: "tap", button: "left" }];
       }
       case "moving":
         this.reset();
@@ -261,12 +260,7 @@ export class TouchRecognizer {
         if (tapLike && this.mode === "direct") {
           return [{ kind: "click", button: "right", x: this.twoStartCx, y: this.twoStartCy }];
         }
-        return tapLike
-          ? [
-              { kind: "button", button: "right", pressed: true },
-              { kind: "button", button: "right", pressed: false },
-            ]
-          : [];
+        return tapLike ? [{ kind: "tap", button: "right" }] : [];
       }
       default:
         return [];
