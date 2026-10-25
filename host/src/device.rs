@@ -30,6 +30,32 @@ use proto::signal::DeviceCredentials;
 /// [`DeviceStore::for_server`]).
 pub const DEFAULT_SERVER: &str = "wss://rcdesk.app/ws";
 
+/// Слаг сервера для имён файлов (D60, D47-4): `None` для [`DEFAULT_SERVER`]
+/// (trailing `/` игнорируется), иначе адрес без схемы, где каждый символ вне
+/// `[A-Za-z0-9.-]` заменён на `_`, а хвостовые `_` обрезаны
+/// (`ws://127.0.0.1:8100/ws` -> `127.0.0.1_8100_ws`).
+pub fn server_slug(server: &str) -> Option<String> {
+    let server = server.trim_end_matches('/');
+    if server == DEFAULT_SERVER {
+        return None;
+    }
+    let rest = ["wss://", "ws://", "https://", "http://"]
+        .iter()
+        .find_map(|scheme| server.strip_prefix(scheme))
+        .unwrap_or(server);
+    let slug: String = rest
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Some(slug.trim_end_matches('_').to_string())
+}
+
 /// The `device.json` file in the agent's data directory. See this module's
 /// doc comment for the full path on each platform.
 pub struct DeviceStore {
@@ -53,29 +79,24 @@ impl DeviceStore {
     /// with every char outside `[A-Za-z0-9.-]` replaced by `_` and trailing
     /// `_` trimmed (`ws://127.0.0.1:8100/ws` -> `device-127.0.0.1_8100_ws.json`).
     pub fn for_server(dir: &Path, server: &str) -> Self {
-        let server = server.trim_end_matches('/');
-        if server == DEFAULT_SERVER {
-            return Self::new(dir);
+        match server_slug(server) {
+            None => Self::new(dir),
+            Some(slug) => Self {
+                path: dir.join(format!("device-{slug}.json")),
+                mode: 0o600,
+            },
         }
-        let rest = ["wss://", "ws://", "https://", "http://"]
-            .iter()
-            .find_map(|scheme| server.strip_prefix(scheme))
-            .unwrap_or(server);
-        let slug: String = rest
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let slug = slug.trim_end_matches('_');
-        Self {
-            path: dir.join(format!("device-{slug}.json")),
-            mode: 0o600,
-        }
+    }
+
+    /// Каталог, в котором лежит файл учётных данных (D47-4: рядом с ним
+    /// хранится закреплённый ключ хаба).
+    pub(crate) fn dir(&self) -> &Path {
+        self.path.parent().unwrap_or(Path::new("."))
+    }
+
+    /// Unix-режим записываемых файлов этого каталога.
+    pub(crate) fn file_mode(&self) -> u32 {
+        self.mode
     }
 
     /// Files of the machine data directory of macOS full mode (D51), shared
@@ -159,6 +180,16 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ))
+    }
+
+    #[test]
+    fn server_slug_none_for_default_and_slug_otherwise() {
+        assert_eq!(server_slug(DEFAULT_SERVER), None);
+        assert_eq!(server_slug("wss://rcdesk.app/ws/"), None);
+        assert_eq!(
+            server_slug("ws://127.0.0.1:8100/ws").as_deref(),
+            Some("127.0.0.1_8100_ws")
+        );
     }
 
     #[test]

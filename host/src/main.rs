@@ -65,9 +65,10 @@ enum Command {
     /// incoming WebRTC sessions. Reconnects with backoff if the connection
     /// is lost or never comes up -- see `docs/dev-run.md`.
     Serve {
-        /// Signaling server WebSocket URL.
-        #[arg(long, default_value = "ws://127.0.0.1:8080/ws")]
-        server: String,
+        /// Signaling server WebSocket URL. Без флага: поле `server` файла
+        /// `settings.json` в каталоге данных, иначе `ws://127.0.0.1:8080/ws`.
+        #[arg(long)]
+        server: Option<String>,
         /// Host name shown to clients. Defaults to this computer's own name,
         /// then $HOSTNAME, then "rcdesk-host" -- see `docs/dev-run.md`.
         #[arg(long)]
@@ -295,6 +296,14 @@ async fn main() -> anyhow::Result<()> {
             let data_dir = machine.then(agent::paths::machine_data_dir);
             #[cfg(not(target_os = "windows"))]
             let data_dir = None;
+            // Адрес сервера: флаг > settings.json каталога данных > локальный (D47-4).
+            let server = rcdesk_host::settings::resolve_server(
+                server,
+                &data_dir
+                    .clone()
+                    .unwrap_or_else(rcdesk_host::agent::paths::data_dir),
+                rcdesk_host::settings::DEV_SERVER,
+            );
             let opts = ServeOptions {
                 server,
                 name,

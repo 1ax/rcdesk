@@ -315,6 +315,171 @@ pub enum AgentCommand {
     EndSession,
 }
 
+/// Файл закреплённого ключа LAN-хаба (D47-4): `<dir>/hub-pin-<slug>.txt`,
+/// внутри hex SHA-256 от SubjectPublicKeyInfo сертификата хаба и перевод
+/// строки. Для боевого сервера ([`crate::device::DEFAULT_SERVER`]) файла нет:
+/// там работает обычная проверка по корням webpki.
+#[derive(Debug, Clone)]
+pub struct PinStore {
+    path: std::path::PathBuf,
+    /// Unix-режим записываемого файла (`0600`, для общего каталога macOS --
+    /// `fullmode::SHARED_FILE_MODE`).
+    mode: u32,
+}
+
+impl PinStore {
+    /// Хранилище для `server` в каталоге `dir`; `None` для боевого сервера.
+    pub fn new(dir: &std::path::Path, server: &str, mode: u32) -> Option<Self> {
+        let slug = crate::device::server_slug(server)?;
+        Some(Self {
+            path: dir.join(format!("hub-pin-{slug}.txt")),
+            mode,
+        })
+    }
+
+    /// Хранилище рядом с файлом учётных данных `device_store` (тот же каталог
+    /// и тот же режим файла).
+    pub fn for_device_store(
+        device_store: &crate::device::DeviceStore,
+        server: &str,
+    ) -> Option<Self> {
+        Self::new(device_store.dir(), server, device_store.file_mode())
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Сохранённый отпечаток; `None`, если файла нет, он не читается или пуст.
+    pub fn load(&self) -> Option<String> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(text) => Some(text.trim().to_string()).filter(|t| !t.is_empty()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                tracing::warn!(path = %self.path.display(), error = %err, "не удалось прочитать закреплённый ключ хаба");
+                None
+            }
+        }
+    }
+
+    pub fn save(&self, fingerprint: &str) -> std::io::Result<()> {
+        let text = format!("{fingerprint}\n");
+        crate::fsutil::write_atomic_mode(&self.path, text.as_bytes(), self.mode)
+    }
+}
+
+/// Что верификатор увидел за рукопожатие.
+#[derive(Debug, Default)]
+struct PinState {
+    /// Отпечаток, предъявленный при первом знакомстве (закрепить после
+    /// успешной регистрации).
+    first_seen: Option<String>,
+    /// (закреплённый, предъявленный) при несовпадении.
+    mismatch: Option<(String, String)>,
+}
+
+/// Проверка сертификата сервера: сначала обычная (корни webpki), для
+/// самоподписанного сертификата LAN-хаба -- закрепление ключа по первому
+/// знакомству (TOFU). Подпись рукопожатия проверяется всегда.
+#[derive(Debug)]
+struct PinVerifier {
+    webpki: Arc<rustls::client::WebPkiServerVerifier>,
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
+    /// Закрепление включено (сервер не боевой).
+    tofu: bool,
+    /// Отпечаток, сохранённый раньше.
+    pinned: Option<String>,
+    state: Arc<Mutex<PinState>>,
+}
+
+impl PinVerifier {
+    fn new(tofu: bool, pinned: Option<String>) -> anyhow::Result<Self> {
+        let roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        };
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let algs = provider.signature_verification_algorithms;
+        let webpki =
+            rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .map_err(|err| {
+                    anyhow::anyhow!("не удалось собрать проверку сертификатов: {err}")
+                })?;
+        Ok(Self {
+            webpki,
+            algs,
+            tofu,
+            pinned,
+            state: Arc::new(Mutex::new(PinState::default())),
+        })
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let webpki_err = match self.webpki.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Ok(ok) => return Ok(ok),
+            Err(err) => err,
+        };
+        if !self.tofu {
+            return Err(webpki_err);
+        }
+        // Самоподписанный сертификат хаба: имя не проверяем (IP нет в SAN),
+        // решает отпечаток открытого ключа.
+        let seen =
+            crate::hub::cert::cert_spki_sha256_hex(end_entity.as_ref()).ok_or_else(|| {
+                rustls::Error::General("не удалось разобрать сертификат сервера".to_string())
+            })?;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match &self.pinned {
+            Some(pinned) if *pinned == seen => {}
+            Some(pinned) => {
+                state.mismatch = Some((pinned.clone(), seen.clone()));
+                return Err(rustls::Error::General(format!(
+                    "ключ сервера не совпал с закреплённым: закреплён {pinned}, предъявлен {seen}"
+                )));
+            }
+            None => state.first_seen = Some(seen),
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+}
+
 /// Why `SignalingClient::connect` failed. Distinguishes the one case
 /// `app::run_agent` must react to specially -- the server not recognizing a
 /// saved device (slice 3.1c) -- from every other failure.
@@ -355,8 +520,9 @@ impl SignalingClient {
         name: &str,
         device: Option<DeviceCredentials>,
         session_id: Option<String>,
+        pin: Option<PinStore>,
     ) -> Result<Self, ConnectError> {
-        Self::connect_with_timeout(url, name, device, session_id, CONNECT_TIMEOUT).await
+        Self::connect_with_timeout(url, name, device, session_id, pin, CONNECT_TIMEOUT).await
     }
 
     /// Same as [`Self::connect`], but the whole handshake is bounded by
@@ -366,9 +532,12 @@ impl SignalingClient {
         name: &str,
         device: Option<DeviceCredentials>,
         session_id: Option<String>,
+        pin: Option<PinStore>,
         timeout: Duration,
     ) -> Result<Self, ConnectError> {
-        match tokio::time::timeout(timeout, Self::handshake(url, name, device, session_id)).await {
+        match tokio::time::timeout(timeout, Self::handshake(url, name, device, session_id, pin))
+            .await
+        {
             Ok(result) => result,
             Err(_elapsed) => Err(ConnectError::Other(anyhow::anyhow!(
                 "signaling connect timed out after {timeout:?}"
@@ -381,10 +550,58 @@ impl SignalingClient {
         name: &str,
         device: Option<DeviceCredentials>,
         session_id: Option<String>,
+        pin_store: Option<PinStore>,
     ) -> Result<Self, ConnectError> {
-        let (ws_stream, _response) = tokio_tungstenite::connect_async(url)
-            .await
-            .map_err(anyhow::Error::from)?;
+        // `wss://`: своя проверка сертификата с закреплением ключа хаба (D47-4);
+        // `ws://` -- как раньше, без TLS.
+        let mut pin_state = None;
+        let (ws_stream, _response) = if url.starts_with("wss://") {
+            let verifier = PinVerifier::new(
+                pin_store.is_some(),
+                pin_store.as_ref().and_then(PinStore::load),
+            )?;
+            let state = Arc::clone(&verifier.state);
+            let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .map_err(anyhow::Error::from)?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth();
+            let connected = tokio_tungstenite::connect_async_tls_with_config(
+                url,
+                None,
+                false,
+                Some(tokio_tungstenite::Connector::Rustls(Arc::new(config))),
+            )
+            .await;
+            match connected {
+                Ok(connected) => {
+                    pin_state = Some(state);
+                    connected
+                }
+                Err(err) => {
+                    let mismatch = state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .mismatch
+                        .take();
+                    if let (Some((pinned, seen)), Some(store)) = (mismatch, &pin_store) {
+                        return Err(ConnectError::Other(anyhow::anyhow!(
+                            "ключ хаба не совпал с закреплённым: закреплён {pinned}, предъявлен {seen}; \
+                             если хаб переустановлен, удалите файл {}",
+                            store.path().display()
+                        )));
+                    }
+                    return Err(ConnectError::Other(err.into()));
+                }
+            }
+        } else {
+            tokio_tungstenite::connect_async(url)
+                .await
+                .map_err(anyhow::Error::from)?
+        };
         let (mut write, mut read) = ws_stream.split();
 
         send(
@@ -433,6 +650,26 @@ impl SignalingClient {
                 )))
             }
         };
+
+        // Регистрация прошла -- ключ хаба можно закрепить (только теперь, чтобы
+        // чужой сервер без нашего протокола ничего не записал).
+        if let (Some(store), Some(state)) = (&pin_store, &pin_state) {
+            let first_seen = state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .first_seen
+                .take();
+            if let Some(fingerprint) = first_seen {
+                match store.save(&fingerprint) {
+                    Ok(()) => tracing::info!("закреплён ключ хаба {fingerprint} для {url}"),
+                    Err(err) => tracing::warn!(
+                        path = %store.path().display(),
+                        error = %err,
+                        "не удалось сохранить закреплённый ключ хаба"
+                    ),
+                }
+            }
+        }
 
         Ok(Self {
             host_id,
@@ -6106,6 +6343,7 @@ mod tests {
             "test-host",
             None,
             None,
+            None,
             Duration::from_millis(300),
         )
         .await;
@@ -6181,7 +6419,7 @@ mod tests {
             drop(ws);
         });
 
-        let client = SignalingClient::connect(&url, "test-host", None, None)
+        let client = SignalingClient::connect(&url, "test-host", None, None, None)
             .await
             .expect("connect");
         let ctx = test_ctx();
@@ -6298,7 +6536,7 @@ mod tests {
             while ws.next().await.is_some() {}
         });
 
-        let client = SignalingClient::connect(&url, "test-host", None, None)
+        let client = SignalingClient::connect(&url, "test-host", None, None, None)
             .await
             .expect("connect");
         let ctx = test_ctx();
@@ -6381,16 +6619,17 @@ mod tests {
             listener,
             Some("s-1".to_string()),
         ));
-        let _client = SignalingClient::connect(&url, "test-host", None, Some("s-1".to_string()))
-            .await
-            .expect("connect");
+        let _client =
+            SignalingClient::connect(&url, "test-host", None, Some("s-1".to_string()), None)
+                .await
+                .expect("connect");
         server.await.expect("server task");
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("ws://{addr}/ws");
         let server = tokio::spawn(fake_server_expecting_session_id(listener, None));
-        let _client = SignalingClient::connect(&url, "test-host", None, None)
+        let _client = SignalingClient::connect(&url, "test-host", None, None, None)
             .await
             .expect("connect");
         server.await.expect("server task");
@@ -7237,5 +7476,108 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
         task.abort();
+    }
+
+    // ---- Закрепление ключа хаба (D47-4) ----
+
+    fn pin_scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rcdesk-host-pin-test-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn pin_store_path_and_round_trip_with_trim() {
+        let dir = pin_scratch_dir("store");
+        let store = PinStore::new(&dir, "ws://127.0.0.1:8100/ws", 0o600).unwrap();
+        assert_eq!(store.path(), dir.join("hub-pin-127.0.0.1_8100_ws.txt"));
+        assert_eq!(store.load(), None);
+        store.save(&"ab".repeat(32)).unwrap();
+        assert_eq!(store.load(), Some("ab".repeat(32)));
+        std::fs::write(store.path(), "  cd  \n\n").unwrap();
+        assert_eq!(store.load().as_deref(), Some("cd"));
+        assert!(PinStore::new(&dir, crate::device::DEFAULT_SERVER, 0o600).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pin_store_file_has_mode_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = pin_scratch_dir("mode");
+        let store = PinStore::new(&dir, "wss://hub.lan:8443/ws", 0o600).unwrap();
+        store.save("00").unwrap();
+        let mode = std::fs::metadata(store.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn self_signed() -> (rustls::pki_types::CertificateDer<'static>, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let der = crate::hub::cert::generate_cert(&key, "test-pc").unwrap();
+        let fp = crate::hub::cert::key_fingerprint(&key);
+        (rustls::pki_types::CertificateDer::from(der), fp)
+    }
+
+    fn verify(
+        verifier: &PinVerifier,
+        cert: &rustls::pki_types::CertificateDer<'static>,
+    ) -> Result<(), rustls::Error> {
+        use rustls::client::danger::ServerCertVerifier as _;
+        verifier
+            .verify_server_cert(
+                cert,
+                &[],
+                &rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap(),
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .map(|_| ())
+    }
+
+    #[test]
+    fn verifier_without_saved_fingerprint_accepts_and_reports_it() {
+        let (cert, fp) = self_signed();
+        let verifier = PinVerifier::new(true, None).unwrap();
+        verify(&verifier, &cert).unwrap();
+        let state = verifier.state.lock().unwrap();
+        assert_eq!(state.first_seen.as_deref(), Some(fp.as_str()));
+        assert!(state.mismatch.is_none());
+    }
+
+    #[test]
+    fn verifier_accepts_matching_fingerprint_without_touching_the_slot() {
+        let (cert, fp) = self_signed();
+        let verifier = PinVerifier::new(true, Some(fp)).unwrap();
+        verify(&verifier, &cert).unwrap();
+        assert!(verifier.state.lock().unwrap().first_seen.is_none());
+    }
+
+    #[test]
+    fn verifier_rejects_a_different_fingerprint() {
+        let (cert, fp) = self_signed();
+        let verifier = PinVerifier::new(true, Some("0".repeat(64))).unwrap();
+        let err = verify(&verifier, &cert).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains(&fp) && text.contains(&"0".repeat(64)),
+            "{text}"
+        );
+        assert!(verifier.state.lock().unwrap().mismatch.is_some());
+    }
+
+    #[test]
+    fn verifier_for_the_production_server_rejects_self_signed() {
+        let (cert, _) = self_signed();
+        let verifier = PinVerifier::new(false, None).unwrap();
+        assert!(verify(&verifier, &cert).is_err());
+        assert!(verifier.state.lock().unwrap().first_seen.is_none());
     }
 }

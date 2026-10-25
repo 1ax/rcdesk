@@ -511,6 +511,8 @@ pub async fn run_agent(
     status: watch::Sender<AgentStatus>,
     mut commands: mpsc::UnboundedReceiver<AgentCommand>,
 ) -> anyhow::Result<std::convert::Infallible> {
+    // D47-4: закреплённый ключ хаба лежит рядом с `device-*.json`.
+    let pin_store = crate::signaling::PinStore::for_device_store(device_store, server);
     let mut backoff = Backoff::new(policy);
     let mut slot = SessionSlot::new();
     loop {
@@ -526,7 +528,7 @@ pub async fn run_agent(
             .run_while_offline(
                 ctx,
                 &mut commands,
-                SignalingClient::connect(server, name, device, live_session_id),
+                SignalingClient::connect(server, name, device, live_session_id, pin_store.clone()),
             )
             .await;
         match connect_result {

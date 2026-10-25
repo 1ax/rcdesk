@@ -189,3 +189,54 @@ async fn hub_serves_https_and_signaling_over_tls_and_locally() {
     hub.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn host_pins_the_hub_key_on_first_connect_and_rejects_another() {
+    use rcdesk_host::signaling::{PinStore, SignalingClient};
+
+    let base = std::env::temp_dir().join(format!("rcdesk-hub-pin-it-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let hub_dir = base.join("hub");
+    let host_dir = base.join("host");
+    let hub = hub::start(HubConfig {
+        data_dir: hub_dir,
+        port: 0,
+        local_port: 0,
+    })
+    .await
+    .expect("start hub");
+
+    let url = format!("wss://127.0.0.1:{}/ws", hub.tls_addr.port());
+    let store = PinStore::new(&host_dir, &url, 0o600).expect("pin store");
+    let connect = || SignalingClient::connect(&url, "pin-test", None, None, Some(store.clone()));
+
+    // Первое знакомство: подключились, ключ закреплён.
+    connect().await.map(|_| ()).expect("первое подключение");
+    let saved = std::fs::read_to_string(store.path()).expect("файл закрепления");
+    assert!(
+        store
+            .path()
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("hub-pin-")),
+        "{:?}",
+        store.path()
+    );
+    assert_eq!(saved, format!("{}\n", hub.fingerprint));
+
+    // Второе подключение с тем же ключом проходит.
+    connect().await.map(|_| ()).expect("второе подключение");
+
+    // Чужой закреплённый ключ: отказ, файл не перезаписан.
+    let foreign = format!("{}\n", "0".repeat(64));
+    std::fs::write(store.path(), &foreign).expect("write");
+    let err = match connect().await {
+        Ok(_) => panic!("подключение с чужим ключом должно провалиться"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains(&hub.fingerprint), "{err}");
+    assert!(err.contains("hub-pin-"), "{err}");
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), foreign);
+
+    hub.stop();
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -73,9 +73,10 @@ mod imp {
     #[derive(Parser)]
     #[command(name = "rcdesk-agent", version = rcdesk_host::build_info::FULL_VERSION, about = "rcdesk tray agent")]
     struct Cli {
-        /// Signaling server WebSocket URL.
-        #[arg(long, default_value = "wss://rcdesk.app/ws")]
-        server: String,
+        /// Signaling server WebSocket URL. Без флага: поле `server` файла
+        /// `settings.json` в каталоге данных, иначе `wss://rcdesk.app/ws`.
+        #[arg(long)]
+        server: Option<String>,
         /// Host name shown to clients. Defaults the same way `rcdesk-host
         /// serve` does -- see `app::resolve_host_name`.
         #[arg(long)]
@@ -146,7 +147,12 @@ mod imp {
             }
         };
 
-        let device_store = DeviceStore::for_server(&machine_dir, &cli.server).shared();
+        let server = rcdesk_host::settings::resolve_server(
+            cli.server.clone(),
+            &machine_dir,
+            rcdesk_host::device::DEFAULT_SERVER,
+        );
+        let device_store = DeviceStore::for_server(&machine_dir, &server).shared();
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -158,7 +164,7 @@ mod imp {
             }
         };
         let opts = ServeOptions {
-            server: cli.server.clone(),
+            server: server.clone(),
             name: cli.name.clone(),
             synthetic: false,
             display: None,
@@ -239,7 +245,7 @@ mod imp {
                     tracing::info!("консоль свободна, начинаю служить");
                     if let Some((status_tx, cmd_rx, device_store)) = agent_parts.take() {
                         let agent_ctx = Arc::clone(&ctx);
-                        let server = cli.server.clone();
+                        let server = server.clone();
                         let host_name = host_name.clone();
                         runtime.spawn(async move {
                             let _ = app::run_agent(
@@ -373,7 +379,12 @@ mod imp {
             None
         };
 
-        let device_store = DeviceStore::for_server(&state_dir, &cli.server);
+        let server = rcdesk_host::settings::resolve_server(
+            cli.server.clone(),
+            &state_dir,
+            rcdesk_host::device::DEFAULT_SERVER,
+        );
+        let device_store = DeviceStore::for_server(&state_dir, &server);
         #[cfg(target_os = "macos")]
         let device_store = if full_mode {
             device_store.shared()
@@ -405,7 +416,7 @@ mod imp {
         };
 
         let opts = ServeOptions {
-            server: cli.server.clone(),
+            server: server.clone(),
             name: cli.name.clone(),
             synthetic: false,
             display: None,
@@ -458,7 +469,7 @@ mod imp {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<AgentCommand>();
 
         let agent_ctx = Arc::clone(&ctx);
-        let server = cli.server.clone();
+        let server = server.clone();
         runtime.spawn(async move {
             let _ = app::run_agent(
                 &agent_ctx,

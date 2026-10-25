@@ -37,6 +37,7 @@ pub mod log_throttle;
 pub mod pipeline;
 pub mod platform;
 pub mod service;
+pub mod settings;
 pub mod signaling;
 pub mod transport;
 pub mod update_check;
