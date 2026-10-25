@@ -281,6 +281,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn key_file_is_private_on_unix() {
         use std::os::unix::fs::PermissionsExt as _;
