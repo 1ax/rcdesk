@@ -242,11 +242,11 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
       prev = next;
     }
     const composing = (e as InputEvent).isComposing === true;
-    if (!composing && (next.endsWith(" ") || next.length > 64)) resetField();
+    if (!composing && next.length > 64) resetField();
   };
 
   const onKeydown = (e: KeyboardEvent): void => {
-    if (e.key === "Enter") {
+    if (e.key === "Enter" && !e.isComposing) {
       e.preventDefault();
       sendEnter();
     }

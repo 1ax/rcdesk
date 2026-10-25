@@ -7,9 +7,23 @@ import type { InputMessage } from "./generated/InputMessage";
 /** Страж в начале скрытого поля: Backspace на «пустом» поле виден как удаление. */
 export const SENTINEL = " ";
 
+const segmenter: Intl.Segmenter | null =
+  typeof Intl !== "undefined" && "Segmenter" in Intl ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
+
+/** Grapheme clusters of `s` (a phone's Backspace deletes one of these). */
+export function graphemes(s: string): string[] {
+  if (!segmenter) return Array.from(s);
+  return Array.from(segmenter.segment(s), (x) => x.segment);
+}
+
+/** iOS "smart punctuation" back to the ASCII the user typed (H5-14). */
+export function plainPunctuation(s: string): string {
+  return s.replace(/[‘’‚′]/g, "'").replace(/[“”„″]/g, '"').replace(/—/g, "--").replace(/…/g, "...");
+}
+
 export function diffTyped(prev: string, next: string): { backspaces: number; inserted: string } {
-  const a = Array.from(prev);
-  const b = Array.from(next);
+  const a = graphemes(prev);
+  const b = graphemes(next);
   let i = 0;
   while (i < a.length && i < b.length && a[i] === b[i]) i++;
   return { backspaces: a.length - i, inserted: b.slice(i).join("") };
@@ -71,11 +85,12 @@ export function keystrokes(code: string, shift: boolean, mods: readonly string[]
 }
 
 export function composeTyped(
-  inserted: string,
+  insertedRaw: string,
   backspaces: number,
   mods: readonly string[],
   textSupported: boolean,
 ): InputMessage[] {
+  const inserted = plainPunctuation(insertedRaw);
   const out: InputMessage[] = [];
   for (let i = 0; i < backspaces; i++) out.push(...keystrokes("Backspace", false, []));
   const viaKeys = (m: readonly string[]): void => {

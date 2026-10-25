@@ -7,8 +7,28 @@ import {
   diffTyped,
   hostSupportsText,
   isPasteCombo,
+  graphemes,
   keystrokes,
+  plainPunctuation,
 } from "./softKeyboard";
+
+describe("H5-14", () => {
+  it("diffTyped deletes one grapheme per phone Backspace", () => {
+    expect(diffTyped(" a❤️", " a")).toEqual({ backspaces: 1, inserted: "" });
+    expect(diffTyped(" 👍🏽x", " ")).toEqual({ backspaces: 2, inserted: "" });
+    expect(diffTyped(" e\u0301", " ")).toEqual({ backspaces: 1, inserted: "" });
+  });
+  it("graphemes falls back sanely", () => {
+    expect(graphemes("ab")).toEqual(["a", "b"]);
+  });
+  it("plainPunctuation", () => {
+    expect(plainPunctuation("‘a’ “b” — c…")).toBe("'a' \"b\" -- c...");
+    expect(plainPunctuation("plain 'x' \"y\"")).toBe("plain 'x' \"y\"");
+  });
+  it("composeTyped sends plain punctuation as text", () => {
+    expect(composeTyped("’", 0, [], true)).toEqual([{ type: "text", text: "'" }]);
+  });
+});
 
 const k = (code: string, pressed: boolean) => ({ type: "key", code, pressed });
 
