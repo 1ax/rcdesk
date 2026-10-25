@@ -560,6 +560,11 @@ export function mount(root: Element | null): void {
   // stays in the hidden text field -- moving it to the video would dismiss
   // the keyboard on every tap.
   video.addEventListener("click", () => {
+    // H5-5: iOS blurs the hidden field on a tap on the video even with
+    // `pointerdown.preventDefault()` (iOS 27: a <div> blurs it too, only
+    // <button>s don't), which closed the keyboard and undid the zoom; the
+    // keyboard is brought back inside the click gesture.
+    if (softKeyboard.resume()) return;
     if (softKeysEl.hidden) video.focus();
   });
   // D32: the first real frame of a (re)started session -- `playing` rather

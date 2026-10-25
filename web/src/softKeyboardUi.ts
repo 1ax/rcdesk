@@ -29,6 +29,10 @@ export interface SoftKeyboardOptions {
 export interface SoftKeyboardController {
   show(): void;
   hide(): void;
+  /** Brings the keyboard back if it is closing (iOS blurs the field on a tap
+   * on the video, slice H5-5). Must be called inside a user gesture (`click`),
+   * or iOS ignores the focus. `true` if there was a close to cancel. */
+  resume(): boolean;
   setHostOs(os: "macos" | "windows" | null): void;
   reset(): void;
   dispose(): void;
@@ -299,6 +303,11 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
   return {
     show,
     hide,
+    resume() {
+      if (!closing) return false;
+      show();
+      return true;
+    },
     setHostOs(os) {
       hostOs = os;
       if (metaBtn) metaBtn.textContent = hostOs === "macos" ? "Cmd" : "Win";
