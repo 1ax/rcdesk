@@ -810,7 +810,8 @@ body {
 .soft-input {
   position: fixed;
   left: 0;
-  bottom: 0;
+  /* iOS scrolls the page to the focused field; there is nothing above to scroll (H5-4). */
+  top: 0;
   width: 1px;
   height: 1px;
   opacity: 0.01;

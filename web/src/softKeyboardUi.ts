@@ -54,6 +54,10 @@ const MOD_KEYS: Array<[string, string]> = [
   ["ShiftLeft", "Shift"],
 ];
 
+// Safety net if `visualViewport` never returns to full height (Android,
+// desktop, no `visualViewport`): finish closing anyway after this delay.
+const CLOSE_TIMEOUT_MS = 400;
+
 export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardController {
   const { button, strip, field, send, isTextSupported, fit, onShow, onLayout, onHide } = opts;
   let lastFit = "";
@@ -62,6 +66,8 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
   let swallowClick = false;
   let prev = SENTINEL;
   let visible = false;
+  let closing = false;
+  let closeTimer: ReturnType<typeof setTimeout> | null = null;
   let hostOs: "macos" | "windows" | null = null;
   let metaBtn: HTMLButtonElement | null = null;
   const vv = window.visualViewport;
@@ -119,9 +125,13 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
       lastFit = height;
       if (changed) onLayout?.();
     }
+    // iOS scrolls the page to the field; the session screen sits at the top of the document.
+    if (window.scrollY !== 0) window.scrollTo(0, 0);
+    if (closing && vv.height >= window.innerHeight - 1) finishClosing();
   };
   const startTracking = (): void => {
     if (!vv) return;
+    // addEventListener with the same function is idempotent, no duplicates on resume.
     vv.addEventListener("resize", updateBottom);
     vv.addEventListener("scroll", updateBottom);
     updateBottom();
@@ -141,7 +151,13 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
   };
 
   const show = (): void => {
-    onShow?.();
+    const resumed = closing;
+    if (closeTimer !== null) {
+      clearTimeout(closeTimer);
+      closeTimer = null;
+    }
+    closing = false;
+    if (!resumed) onShow?.();
     visible = true;
     resetField();
     field.focus();
@@ -155,13 +171,32 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
     startTracking();
   };
 
-  const hide = (): void => {
-    repeat.stop();
+  // iOS animates the keyboard away for ~250 ms; the zoom is restored only once
+  // the viewport is full again, not on blur (H5-4).
+  const beginClosing = (): void => {
+    if (closing) return;
+    closing = true;
     visible = false;
     strip.hidden = true;
-    field.blur();
+    repeat.stop();
+    closeTimer = setTimeout(finishClosing, CLOSE_TIMEOUT_MS);
+  };
+
+  function finishClosing(): void {
+    if (!closing) return;
+    if (closeTimer !== null) {
+      clearTimeout(closeTimer);
+      closeTimer = null;
+    }
+    closing = false;
     stopTracking();
+    window.scrollTo(0, 0);
     onHide?.();
+  }
+
+  const hide = (): void => {
+    beginClosing();
+    field.blur();
   };
 
   const sendEnter = (): void => {
@@ -207,10 +242,7 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
   };
 
   const onBlur = (): void => {
-    visible = false;
-    strip.hidden = true;
-    stopTracking();
-    onHide?.();
+    beginClosing();
   };
 
   // Удержание = автоповтор (H5-3), короткий тап по-прежнему уходит через click.
@@ -288,6 +320,11 @@ export function mountSoftKeyboard(opts: SoftKeyboardOptions): SoftKeyboardContro
       strip.removeEventListener("pointerleave", onStripPointerUp);
       strip.removeEventListener("click", onStripClick);
       repeat.stop();
+      if (closeTimer !== null) {
+        clearTimeout(closeTimer);
+        closeTimer = null;
+      }
+      closing = false;
       stopTracking();
     },
   };

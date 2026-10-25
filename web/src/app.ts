@@ -662,6 +662,8 @@ export function mount(root: Element | null): void {
   // once the phone keyboard goes away (`null` -- the keyboard didn't zoom).
   let lastTouchCursor: { x: number; y: number } | null = null;
   let zoomBeforeKeyboard: Zoom | null = null;
+  // H5-4: the session bar was collapsed automatically for the keyboard in landscape.
+  let barAutoCollapsed = false;
   function applyZoom(next: Zoom): void {
     zoom = clampZoom(next, sessionVideoEl.clientWidth, sessionVideoEl.clientHeight);
     zoomLayer.style.transform = zoomCss(zoom);
@@ -680,9 +682,17 @@ export function mount(root: Element | null): void {
     fit: sessionScreen,
     // Клавиатура телефона закрывает большую часть экрана, поэтому картинка
     // подтягивается к 2x вокруг последнего места касания (там поле ввода) и
-    // возвращается при скрытии (H5-2).
+    // возвращается при скрытии (H5-2). В альбоме панель сеанса сворачивается
+    // на время клавиатуры, иначе она съедает остаток экрана (H5-4).
     onShow: () => {
       zoomBeforeKeyboard = zoom.scale < KEYBOARD_ZOOM ? zoom : null;
+      if (
+        matchMedia("(orientation: landscape)").matches &&
+        !sessionScreen.classList.contains("is-collapsed")
+      ) {
+        barAutoCollapsed = true;
+        applyBarCollapsed(true, false);
+      }
     },
     onLayout: () => {
       const w = sessionVideoEl.clientWidth;
@@ -707,6 +717,10 @@ export function mount(root: Element | null): void {
       );
     },
     onHide: () => {
+      if (barAutoCollapsed) {
+        barAutoCollapsed = false;
+        applyBarCollapsed(false, false);
+      }
       const restore = zoomBeforeKeyboard;
       zoomBeforeKeyboard = null;
       applyZoom(restore ?? zoom);
@@ -835,8 +849,9 @@ export function mount(root: Element | null): void {
    * aria-label) and saves the choice (slice 3.5g) -- used both to apply the
    * setting loaded from storage at mount, and by `#bar-collapse-btn`'s and
    * `#session-bar-handle`'s click listeners below. The `is-collapsed` class
-   * on `#session-screen` is read by the fullscreen CSS rules (slice 3.5h). */
-  function applyBarCollapsed(collapsed: boolean): void {
+   * on `#session-screen` is read by the fullscreen CSS rules (slice 3.5h).
+   * `persist = false` skips saving (temporary auto-collapse, H5-4). */
+  function applyBarCollapsed(collapsed: boolean, persist = true): void {
     sessionScreen.classList.toggle("is-collapsed", collapsed);
     sessionBarEl.hidden = collapsed;
     sessionBarHandle.hidden = !collapsed;
@@ -846,7 +861,7 @@ export function mount(root: Element | null): void {
     sessionBarHandle.title = title;
     sessionBarHandle.setAttribute("aria-label", title);
     const storage = ownerStorage();
-    if (storage) saveSessionBarCollapsed(storage, collapsed);
+    if (storage && persist) saveSessionBarCollapsed(storage, collapsed);
   }
 
   applyBarCollapsed(initialStorage ? loadSessionBarCollapsed(initialStorage) : false);
