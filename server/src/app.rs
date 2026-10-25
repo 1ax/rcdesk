@@ -89,6 +89,9 @@ pub struct AppState {
     pub email_code_limiter: IpLimiter,
     /// Per-IP limit on wrong passwords / email codes; spent by failures.
     pub login_limiter: IpLimiter,
+    /// Режим «LAN-хаб» (D47): аккаунтов, passkey и почты нет; клиент узнаёт
+    /// об этом из `Authenticated.lan_hub` и прячет их UI.
+    pub lan_hub: bool,
 }
 
 pub fn app(
@@ -129,6 +132,43 @@ pub fn app_with_limits(
     liveness: Liveness,
     pin_global: GlobalLimiter,
 ) -> Router {
+    build_app(
+        registry, ice, db, webauthn, mailer, liveness, pin_global, false,
+    )
+}
+
+/// Как [`app`] (лимиты и liveness по умолчанию), но сервер объявляет клиентам
+/// режим «LAN-хаб» (D47): `Authenticated.lan_hub == true`.
+pub fn lan_hub_app(
+    registry: Registry,
+    ice: IceConfig,
+    db: Db,
+    webauthn: SharedWebauthn,
+    mailer: SharedMailer,
+) -> Router {
+    build_app(
+        registry,
+        ice,
+        db,
+        webauthn,
+        mailer,
+        Liveness::default(),
+        GlobalLimiter::new(PIN_GLOBAL_BURST, PIN_GLOBAL_REFILL),
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_app(
+    registry: Registry,
+    ice: IceConfig,
+    db: Db,
+    webauthn: SharedWebauthn,
+    mailer: SharedMailer,
+    liveness: Liveness,
+    pin_global: GlobalLimiter,
+    lan_hub: bool,
+) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/ws", get(ws_handler))
@@ -146,6 +186,7 @@ pub fn app_with_limits(
             email_codes: EmailCodes::new(),
             email_code_limiter: IpLimiter::new(EMAIL_CODE_BURST, EMAIL_CODE_REFILL),
             login_limiter: IpLimiter::new(LOGIN_BURST, LOGIN_REFILL),
+            lan_hub,
         })
 }
 

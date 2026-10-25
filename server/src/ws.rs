@@ -147,6 +147,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
             email_codes: &state.email_codes,
             email_code_limiter: &state.email_code_limiter,
             login_limiter: &state.login_limiter,
+            lan_hub: state.lan_hub,
         },
         info,
         read_timeout,
@@ -593,6 +594,8 @@ struct AccountDeps<'a> {
     email_codes: &'a EmailCodes,
     email_code_limiter: &'a IpLimiter,
     login_limiter: &'a IpLimiter,
+    /// Режим «LAN-хаб» (D47): шлётся клиенту в `Authenticated`.
+    lan_hub: bool,
 }
 
 /// Сколько ждём отправки письма с кодом.
@@ -744,7 +747,14 @@ fn send_error(tx: &Tx, message: &str) {
 
 /// `Authenticated` с устройствами владельца (ошибка загрузки устройств --
 /// в лог и пустой список, как в соседних ветках).
-fn send_authenticated(db: &Db, registry: &Registry, owner_id: &str, token: String, tx: &Tx) {
+fn send_authenticated(
+    db: &Db,
+    registry: &Registry,
+    owner_id: &str,
+    token: String,
+    lan_hub: bool,
+    tx: &Tx,
+) {
     let devices = match device_entries_for_owner(db, registry, owner_id) {
         Ok(devices) => devices,
         Err(err) => {
@@ -752,7 +762,11 @@ fn send_authenticated(db: &Db, registry: &Registry, owner_id: &str, token: Strin
             Vec::new()
         }
     };
-    let _ = tx.send(SignalMessage::Authenticated { token, devices });
+    let _ = tx.send(SignalMessage::Authenticated {
+        token,
+        devices,
+        lan_hub,
+    });
 }
 
 /// `Account` с почтой владельца.
@@ -881,7 +895,7 @@ async fn handle_email_code_confirm(
             .and_then(|_| switch_to_account(db, session, &account_id, user_agent, now));
         match result {
             Ok(token) => {
-                send_authenticated(db, registry, &account_id, token, tx);
+                send_authenticated(db, registry, &account_id, token, deps.lan_hub, tx);
                 send_account(db, &account_id, tx);
             }
             Err(err) => {
@@ -913,7 +927,7 @@ async fn handle_email_code_confirm(
                 .as_ref()
                 .map(|s| s.token.clone())
                 .unwrap_or_default();
-            send_authenticated(db, registry, &owner_id, token, tx);
+            send_authenticated(db, registry, &owner_id, token, deps.lan_hub, tx);
             send_account(db, &owner_id, tx);
         }
         // Гонка: почту заняли между проверкой и вставкой.
@@ -974,7 +988,7 @@ async fn handle_password_login(
     let now = ice::now_unix() as i64;
     match switch_to_account(db, session, &account_id, user_agent, now) {
         Ok(token) => {
-            send_authenticated(db, registry, &account_id, token, tx);
+            send_authenticated(db, registry, &account_id, token, deps.lan_hub, tx);
             send_account(db, &account_id, tx);
         }
         Err(err) => {
@@ -1143,7 +1157,11 @@ async fn run_client(
                             token_id,
                             token: token.clone(),
                         });
-                        let _ = tx.send(SignalMessage::Authenticated { token, devices });
+                        let _ = tx.send(SignalMessage::Authenticated {
+                            token,
+                            devices,
+                            lan_hub: account_deps.lan_hub,
+                        });
                     }
                     Err(err) => {
                         tracing::error!(?err, "owner authentication failed");
@@ -1303,7 +1321,11 @@ async fn run_client(
                                 Vec::new()
                             }
                         };
-                        let _ = tx.send(SignalMessage::Authenticated { token, devices });
+                        let _ = tx.send(SignalMessage::Authenticated {
+                            token,
+                            devices,
+                            lan_hub: account_deps.lan_hub,
+                        });
                     }
                     Err(err) => {
                         tracing::error!(?err, "failed to sign in with passkey");

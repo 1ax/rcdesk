@@ -151,6 +151,7 @@ import {
 import type { ControlMessage } from "./generated/ControlMessage";
 import type { DisplayEntry } from "./generated/DisplayEntry";
 import type { BrowserEntry } from "./generated/BrowserEntry";
+import { lanHubUi } from "./lanHub";
 import type { PasskeyEntry } from "./generated/PasskeyEntry";
 import type { DeviceEntry } from "./generated/DeviceEntry";
 import type { HostOs } from "./generated/HostOs";
@@ -901,6 +902,9 @@ export function mount(root: Element | null): void {
   // Slice 3.8c: the owner's account email (`undefined` until `account`
   // answers the `get_account` sent after every `authenticated`; `null` = none).
   let accountEmail: string | null | undefined = undefined;
+  // D47: the server is a LAN hub (`authenticated.lan_hub`) -- no accounts,
+  // passkeys, mail or agent download; their UI is hidden (`applyLanHub`).
+  let lanHub = false;
   // The email auth card: "login" form or the "code" flow (registration /
   // password reset / password change, told apart by `authLabel`; "change" is
   // the email change of a signed-in account), its step,
@@ -1357,6 +1361,24 @@ export function mount(root: Element | null): void {
     eaStatus.textContent = text;
   }
 
+  /** D47: in LAN-hub mode forces the account/passkey/email/download UI
+   * hidden (`hidden` attribute, like the rest of the client). Idempotent;
+   * a no-op for a regular server, so their own rendering stays as is. */
+  function applyLanHub(): void {
+    const ui = lanHubUi(lanHub);
+    if (!ui.showAccountUi) {
+      accountEl.hidden = true;
+      passkeyLoginBtn.hidden = true;
+      emailBlock.hidden = true;
+      passkeyBlock.hidden = true;
+      authCard.hidden = true;
+    }
+    if (!ui.showDownload) {
+      const downloadEl = root!.querySelector<HTMLElement>("#download");
+      if (downloadEl) downloadEl.hidden = true;
+    }
+  }
+
   /** Shows the first-screen account row for the current `passkeys`. */
   function renderAccountRow(): void {
     const mode = accountRowMode(passkeySupported, passkeys, accountEmail);
@@ -1365,6 +1387,7 @@ export function mount(root: Element | null): void {
     accountOpenBtn.hidden = mode !== "account";
     passkeyLoginBtn.hidden = !passkeySupported;
     passkeyBlock.hidden = !passkeySupported;
+    applyLanHub();
     const busy = passkeyFlow !== null || connectionLost;
     passkeyLoginBtn.disabled = busy;
     passkeyAddBtn.disabled = busy;
@@ -2596,6 +2619,8 @@ export function mount(root: Element | null): void {
     const storage = ownerStorage();
     if (storage) saveOwnerToken(storage, msg.token);
     devices = msg.devices;
+    lanHub = msg.lan_hub === true;
+    applyLanHub();
     renderDeviceList();
     // Slice 3.7c: a passkey login finished (or an ordinary (re)auth): learn
     // whether this owner has passkeys, which drives the account row.
@@ -2603,8 +2628,10 @@ export function mount(root: Element | null): void {
       passkeyFlow = null;
       if (!authCard.hidden) closeAuth();
     }
-    signaling.send({ type: "list_passkeys" });
-    signaling.send({ type: "get_account" });
+    if (lanHubUi(lanHub).requestAccountData) {
+      signaling.send({ type: "list_passkeys" });
+      signaling.send({ type: "get_account" });
+    }
     if (!accountCard.hidden) signaling.send({ type: "list_browsers" });
     // Confirms a reconnect (slice 3.5a) succeeded, if that's what this is --
     // a no-op the rest of the time, since `connectionLost` starts `false`.

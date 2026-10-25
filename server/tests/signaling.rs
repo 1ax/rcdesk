@@ -160,9 +160,56 @@ async fn client_auth(
 ) -> (String, Vec<proto::signal::DeviceEntry>) {
     send(ws, &SignalMessage::ClientAuth { token }).await;
     match recv(ws).await {
-        SignalMessage::Authenticated { token, devices } => (token, devices),
+        SignalMessage::Authenticated { token, devices, .. } => (token, devices),
         other => panic!("expected authenticated, got {other:?}"),
     }
+}
+
+/// Boots the LAN-hub variant of the app (D47) and returns its ws:// URL.
+async fn spawn_lan_hub_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let registry = Registry::new();
+    let db = Db::in_memory().expect("open in-memory db");
+    let webauthn = rcdesk_server::passkeys::build_webauthn("localhost", "http://localhost:5173")
+        .expect("build webauthn");
+    let mailer: rcdesk_server::mail::SharedMailer =
+        std::sync::Arc::new(rcdesk_server::mail::DisabledMailer);
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            rcdesk_server::app::lan_hub_app(registry, IceConfig::from_env(), db, webauthn, mailer)
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("serve");
+    });
+    format!("ws://{addr}/ws")
+}
+
+/// Sends `ClientAuth` and returns `Authenticated.lan_hub`.
+async fn client_auth_lan_hub_flag(url: &str) -> bool {
+    let mut client = connect(url).await;
+    hello(&mut client, Role::Client).await;
+    send(&mut client, &SignalMessage::ClientAuth { token: None }).await;
+    match recv(&mut client).await {
+        SignalMessage::Authenticated { lan_hub, .. } => lan_hub,
+        other => panic!("expected authenticated, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn regular_server_authenticated_has_lan_hub_false() {
+    let url = spawn_server().await;
+    assert!(!client_auth_lan_hub_flag(&url).await);
+}
+
+#[tokio::test]
+async fn lan_hub_server_authenticated_has_lan_hub_true() {
+    let url = spawn_lan_hub_server().await;
+    assert!(client_auth_lan_hub_flag(&url).await);
 }
 
 /// Registers a host and joins it with one client. Returns the connections,
@@ -2639,7 +2686,7 @@ async fn password_login(ws: &mut WsStream, email: &str, password: &str) {
 /// Reads `Authenticated` + `Account`, returns the token, devices and email.
 async fn expect_signed_in(ws: &mut WsStream) -> (String, Vec<proto::signal::DeviceEntry>, String) {
     let (token, devices) = match recv(ws).await {
-        SignalMessage::Authenticated { token, devices } => (token, devices),
+        SignalMessage::Authenticated { token, devices, .. } => (token, devices),
         other => panic!("expected authenticated, got {other:?}"),
     };
     let email = match recv(ws).await {

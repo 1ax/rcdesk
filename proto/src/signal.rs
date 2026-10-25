@@ -226,6 +226,11 @@ pub enum SignalMessage {
     Authenticated {
         token: String,
         devices: Vec<DeviceEntry>,
+        /// server -> client (D47): сервер — LAN-хаб: аккаунтов, passkey и
+        /// почты нет, клиент прячет их UI. `#[serde(default)]`: старый сервер
+        /// поле не шлёт -> `false`.
+        #[serde(default)]
+        lan_hub: bool,
     },
     /// client -> server: перечитать список устройств.
     ListDevices,
@@ -541,11 +546,27 @@ mod tests {
                 busy: false,
                 last_seen_at: 1234,
             }],
+            lan_hub: true,
         };
 
         let json = serde_json::to_string(&authenticated).expect("serialize");
         let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, authenticated);
+    }
+
+    #[test]
+    fn authenticated_without_lan_hub_field_deserializes_to_false() {
+        let json = r#"{"type":"authenticated","token":"t","devices":[]}"#;
+
+        let msg: SignalMessage = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            msg,
+            SignalMessage::Authenticated {
+                token: "t".to_string(),
+                devices: Vec::new(),
+                lan_hub: false,
+            }
+        );
     }
 
     #[test]
