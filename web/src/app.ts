@@ -1266,6 +1266,8 @@ export function mount(root: Element | null): void {
     fileReceiver?.dispose();
     fileReceiver = new FileReceiver(dc, {
       onOffer: (files, skippedFolders) => {
+        // Files on the host clipboard replaced the last synced text.
+        if (files.length > 0 || skippedFolders > 0) clipboardBridge?.forgetLastText();
         offeredFiles = files;
         offeredFolders = skippedFolders;
         if (files.length === 0 && skippedFolders > 0) {
