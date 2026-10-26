@@ -241,14 +241,14 @@ export class ClipboardBridge {
    * within-limit text, sends it to the host -- used both before forwarding
    * a paste shortcut (decision 2a) and on `clipboardchange` (decision 2b,
    * via `onLocalClipboardChange`). Never rejects. */
-  private trySyncClipboardText(noteOnSend = false): Promise<void> {
+  private trySyncClipboardText(noteOnSend = false, force = false): Promise<void> {
     return this.deps.readText().then((text) => {
       if (text.length === 0) return;
       if (exceedsLimit(text)) {
         warnTooLarge(this.deps, text);
         return;
       }
-      if (text === this.lastText) return;
+      if (!force && text === this.lastText) return;
       this.deps.send({ type: "clipboard_text", text });
       this.lastText = text;
       if (noteOnSend) this.deps.notify(CLIENT_CLIPBOARD_NOTE);
@@ -279,13 +279,23 @@ export class ClipboardBridge {
         resolve();
       };
       const timeoutHandle = this.deps.setTimeout(finish, PASTE_READ_TIMEOUT_MS);
-      this.trySyncClipboardText()
+      // Sent even when equal to `lastText`: the host clipboard may have
+      // changed since without telling us (files or an image copied there),
+      // and the host itself skips a write that would change nothing.
+      this.trySyncClipboardText(false, true)
         .catch(() => {
           // readText() rejected (e.g. no permission) -- proceed without a
           // clipboard_text, same as a timeout.
         })
         .then(finish);
     });
+  }
+
+  /** The host clipboard now holds something other than the last text
+   * (e.g. files copied there, announced as a download offer): the same
+   * local text must be sent again on the next sync. */
+  forgetLastText(): void {
+    this.lastText = null;
   }
 
   /** client -> host, on the browser's `clipboardchange` event (decision 2b,

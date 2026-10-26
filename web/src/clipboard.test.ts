@@ -311,16 +311,15 @@ describe("ClipboardBridge.syncBeforePaste", () => {
     expect(deps.send).toHaveBeenCalledWith({ type: "clipboard_text", text: "clipboard contents" } satisfies InputMessage);
   });
 
-  it("does not send when the text matches lastText (echo after a host write)", async () => {
+  it("sends even when the text matches lastText (host clipboard may have changed since)", async () => {
     const deps = makeDeps({ readText: vi.fn().mockResolvedValue("same text") });
     const bridge = new ClipboardBridge(deps);
 
-    bridge.onHostText("same text");
-    await vi.waitFor(() => expect(deps.writeText).toHaveBeenCalled());
-
+    await bridge.syncBeforePaste();
     await bridge.syncBeforePaste();
 
-    expect(deps.send).not.toHaveBeenCalled();
+    expect(deps.send).toHaveBeenCalledTimes(2);
+    expect(deps.send).toHaveBeenLastCalledWith({ type: "clipboard_text", text: "same text" } satisfies InputMessage);
   });
 
   it("does not send an empty clipboard", async () => {
@@ -417,6 +416,17 @@ describe("ClipboardBridge.onLocalClipboardChange", () => {
 
     await bridge.onLocalClipboardChange();
     expect(deps.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends the same text again after forgetLastText (files copied on the host)", async () => {
+    const deps = makeDeps({ readText: vi.fn().mockResolvedValue("123") });
+    const bridge = new ClipboardBridge(deps);
+
+    await bridge.onLocalClipboardChange();
+    bridge.forgetLastText();
+    await bridge.onLocalClipboardChange();
+
+    expect(deps.send).toHaveBeenCalledTimes(2);
   });
 
   it("resolves without throwing when readText rejects", async () => {

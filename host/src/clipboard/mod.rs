@@ -151,9 +151,17 @@ impl ClipboardSync {
         }
 
         let Some(text) = self.backend.get_text() else {
+            // Something without text (an image, an empty clipboard) replaced
+            // the known text, so the same text arriving later from the
+            // client is a real change, not a duplicate.
+            self.last_text = None;
             return events;
         };
-        if text.is_empty() || Some(&text) == self.last_text.as_ref() {
+        if Some(&text) == self.last_text.as_ref() {
+            return events;
+        }
+        if text.is_empty() {
+            self.last_text = None;
             return events;
         }
         if text.len() > MAX_CLIPBOARD_BYTES {
@@ -161,6 +169,7 @@ impl ClipboardSync {
                 len = text.len(),
                 "clipboard text too large to sync, skipping"
             );
+            self.last_text = None;
             return events;
         }
 
@@ -179,7 +188,12 @@ impl ClipboardSync {
             );
             return;
         }
-        if Some(text) == self.last_text.as_deref() {
+        // A duplicate only while the clipboard still holds it: if anything
+        // was copied on the host since (files in Finder, an image), even a
+        // change `poll` has not seen yet, the client's text must replace it.
+        if Some(text) == self.last_text.as_deref() && self.backend.change_count() == self.last_count
+        {
+            tracing::info!(len = text.len(), "clipboard text from client unchanged");
             return;
         }
         if let Err(err) = self.backend.set_text(text) {
@@ -194,6 +208,7 @@ impl ClipboardSync {
         // (an echo) -- writing the clipboard bumps the OS's change counter
         // too, same as any other write to it.
         self.last_count = self.backend.change_count();
+        tracing::info!(len = text.len(), "clipboard text from client applied");
     }
 }
 
@@ -454,6 +469,57 @@ mod tests {
         sync.apply_remote(&huge);
 
         assert_eq!(calls_handle.set_calls(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn apply_remote_replaces_files_copied_after_the_same_text() {
+        let backend = FakeClipboardBackend::new();
+        let mut sync = files_sync(backend.clone());
+        sync.apply_remote("123");
+        backend.set_remote_files(&["/tmp/a.pdf"], Some("a.pdf"));
+        assert_eq!(sync.poll().len(), 1);
+
+        sync.apply_remote("123");
+
+        assert_eq!(
+            backend.set_calls(),
+            vec!["123".to_string(), "123".to_string()]
+        );
+        assert_eq!(backend.clone().get_file_list(), None);
+    }
+
+    #[test]
+    fn apply_remote_replaces_a_change_poll_has_not_seen_yet() {
+        let backend = FakeClipboardBackend::new();
+        let mut sync = files_sync(backend.clone());
+        sync.apply_remote("123");
+        // Files copied on the host, the watcher has not polled yet.
+        backend.set_remote_files(&["/tmp/a.pdf"], Some("a.pdf"));
+
+        sync.apply_remote("123");
+
+        assert_eq!(
+            backend.set_calls(),
+            vec!["123".to_string(), "123".to_string()]
+        );
+        assert_eq!(backend.clone().get_file_list(), None);
+        assert_eq!(sync.poll(), vec![]);
+    }
+
+    #[test]
+    fn apply_remote_replaces_non_text_copied_after_the_same_text() {
+        let backend = FakeClipboardBackend::new();
+        let mut sync = sync_with(backend.clone());
+        sync.apply_remote("123");
+        backend.set_remote_change(None);
+        assert_eq!(sync.poll(), vec![]);
+
+        sync.apply_remote("123");
+
+        assert_eq!(
+            backend.set_calls(),
+            vec!["123".to_string(), "123".to_string()]
+        );
     }
 
     fn files_sync(backend: FakeClipboardBackend) -> ClipboardSync {
