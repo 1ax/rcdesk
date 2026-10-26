@@ -2462,6 +2462,7 @@ async fn handle_session_event(
         }
         SessionEvent::ReceiverReport {
             fraction_lost,
+            total_lost,
             rtt,
             jitter,
             ..
@@ -2471,6 +2472,7 @@ async fn handle_session_event(
                 if let Some(adapt_tx) = &active.video.adapt_tx {
                     let _ = adapt_tx.send(Feedback::Loss {
                         fraction: fraction_lost,
+                        total_lost,
                     });
                     let _ = adapt_tx.send(Feedback::ReceiverStats {
                         rtt,
@@ -3338,6 +3340,7 @@ struct StatsSummary {
     encode_ms_avg: f64,
     encode_ms_max: f64,
     loss: f32,
+    lost_packets: u32,
     remb_kbps: Option<u32>,
     rr_rtt_ms: Option<f64>,
     rr_jitter_ms: Option<f32>,
@@ -3371,6 +3374,13 @@ struct StatsWindow {
     ticks: u32,
     bytes: u64,
     last_loss: f32,
+    /// Lost packets accumulated in this window (delta of the receiver
+    /// report's cumulative counter).
+    lost_packets: u32,
+    /// Cumulative counter of the previous report. The first report only
+    /// seeds it (counts as 0 for the window) so the session's earlier
+    /// history isn't dumped into one window.
+    prev_total_lost: Option<u32>,
     last_remb_kbps: Option<u32>,
     last_rr_rtt_ms: Option<f64>,
     last_rr_jitter_ms: Option<f32>,
@@ -3399,6 +3409,8 @@ impl StatsWindow {
             ticks: 0,
             bytes: 0,
             last_loss: 0.0,
+            lost_packets: 0,
+            prev_total_lost: None,
             last_remb_kbps: None,
             last_rr_rtt_ms: None,
             last_rr_jitter_ms: None,
@@ -3426,8 +3438,14 @@ impl StatsWindow {
         self.prev_captured_at = Some(captured_at);
     }
 
-    fn loss(&mut self, fraction: f32) {
+    fn loss(&mut self, fraction: f32, total_lost: u32) {
         self.last_loss = fraction;
+        if let Some(prev) = self.prev_total_lost {
+            self.lost_packets = self
+                .lost_packets
+                .saturating_add(total_lost.saturating_sub(prev));
+        }
+        self.prev_total_lost = Some(total_lost);
     }
 
     fn remb(&mut self, kbps: u32) {
@@ -3480,6 +3498,7 @@ impl StatsWindow {
             },
             encode_ms_max: stats.encode_us_max.swap(0, Relaxed) as f64 / 1000.0,
             loss: self.last_loss,
+            lost_packets: self.lost_packets,
             remb_kbps: self.last_remb_kbps,
             rr_rtt_ms: self.last_rr_rtt_ms,
             rr_jitter_ms: self.last_rr_jitter_ms,
@@ -3489,6 +3508,7 @@ impl StatsWindow {
         };
         self.ticks = 0;
         self.bytes = 0;
+        self.lost_packets = 0;
         self.captured = captured;
         self.encoded = encoded;
         self.dropped = dropped;
@@ -3553,7 +3573,10 @@ async fn run_adapt_task(
                             Feedback::Frame { bytes, captured_at } => {
                                 window.frame(*bytes, *captured_at)
                             }
-                            Feedback::Loss { fraction } => window.loss(*fraction),
+                            Feedback::Loss {
+                                fraction,
+                                total_lost,
+                            } => window.loss(*fraction, *total_lost),
                             Feedback::Remb { bitrate_bps } => window.remb((bitrate_bps / 1000) as u32),
                             Feedback::ReceiverStats { rtt, jitter_ms } => {
                                 window.receiver_stats(*rtt, *jitter_ms)
@@ -3614,6 +3637,7 @@ async fn run_adapt_task(
                         encode_ms_avg = format_args!("{:.1}", s.encode_ms_avg),
                         encode_ms_max = format_args!("{:.1}", s.encode_ms_max),
                         loss = format_args!("{:.3}", s.loss),
+                        lost_packets = s.lost_packets,
                         remb_kbps = ?s.remb_kbps,
                         target_kbps = target.bitrate_kbps,
                         target_fps = target.fps,
@@ -3765,7 +3789,8 @@ mod tests {
         for _ in 0..140 {
             w.frame(5000, Instant::now());
         }
-        w.loss(0.02);
+        w.loss(0.02, 100);
+        w.loss(0.02, 107);
         w.receiver_stats(Some(Duration::from_millis(12)), 3.5);
         let s = w.tick(&stats).expect("fifth tick yields a summary");
         assert_eq!(s.rr_rtt_ms.map(|r| r.round()), Some(12.0));
@@ -3776,6 +3801,8 @@ mod tests {
         assert!((s.encode_ms_avg - 3.0).abs() < 0.01);
         assert!((s.encode_ms_max - 12.0).abs() < 0.01);
         assert_eq!(s.loss, 0.02);
+        // The first report only seeds the counter; the second adds 7.
+        assert_eq!(s.lost_packets, 7);
         assert_eq!(stats.encode_us_max.load(Relaxed), 0);
     }
 

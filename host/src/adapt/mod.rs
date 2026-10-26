@@ -48,6 +48,10 @@
 //!   08:00:45-08:00:53). Loss itself therefore pauses probing for
 //!   `LOSS_PROBE_HOLD` and, on a loaded link, caps the target at what was
 //!   actually sent, independent of REMB.
+//! - `fraction_lost` of a report covering a few packets is noise: Mac host
+//!   0.2.3 live log, 2026-10-26, 1 lost of 2 sent (0.496) on a static screen
+//!   cut the target every 30-60 s for hours. A report counts as loss only if
+//!   the cumulative lost counter grew by `MIN_LOST_PACKETS` or more.
 
 use std::time::{Duration, Instant};
 
@@ -130,6 +134,14 @@ pub const LOSS_PROBE_HOLD: Duration = Duration::from_secs(10);
 /// of the fresh REMB (second user's live log, 2026-10-14: channel ~2 Mbit/s,
 /// REMB 1986, target 5800, loss up to 42 %).
 pub const LOSS_CAP_RATIO: f64 = 0.9;
+
+/// A receiver report counts as loss only if at least this many packets were
+/// lost since the previous report. `fraction_lost` of a report covering a
+/// handful of packets is sampling noise: Mac host 0.2.3 live log, 2026-10-26,
+/// 05:49-09:03Z, static screen sent 19-31 kbit/s (3-15 packets/s) and 211
+/// `loss` cuts followed, e.g. loss=0.496 from 1 lost packet out of 2, each
+/// cutting the target to 1000/8 then 834/5 for hours.
+pub const MIN_LOST_PACKETS: u32 = 3;
 
 /// The loss ceiling never drops below this (kbps). On a static screen the
 /// browser's REMB is "hungry" (capped at ~1.5x of what it received) and says
@@ -215,8 +227,10 @@ pub struct AdaptConfig {
 pub enum Feedback {
     /// `transport::SessionEvent::Remb`.
     Remb { bitrate_bps: u64 },
-    /// Derived from `transport::SessionEvent::ReceiverReport::fraction_lost`.
-    Loss { fraction: f32 },
+    /// Derived from `transport::SessionEvent::ReceiverReport`: `fraction_lost`
+    /// plus `total_lost`, the report's cumulative count of lost packets (the
+    /// controller works with its delta between reports, see `MIN_LOST_PACKETS`).
+    Loss { fraction: f32, total_lost: u32 },
     /// RTT and jitter from the same RTCP receiver report as `Loss`. Pure
     /// diagnostics for the `video: 5s summary` line; the controller ignores it.
     ReceiverStats {
@@ -333,6 +347,9 @@ pub struct Controller {
     prev_tick_remb_kbps: Option<f64>,
     last_loss: f32,
     last_loss_at: Option<Instant>,
+    /// Cumulative lost-packet counter of the previous receiver report, to
+    /// turn it into a per-report delta (see `MIN_LOST_PACKETS`).
+    prev_total_lost: Option<u32>,
     /// Until when REMB acts as a bitrate ceiling after observed loss (see
     /// `LOSS_CAP_HOLD`); re-armed by every tick that sees fresh loss
     /// >= `LOSS_LOW` together with a fresh REMB.
@@ -374,6 +391,7 @@ impl Controller {
             prev_tick_remb_kbps: None,
             last_loss: 0.0,
             last_loss_at: None,
+            prev_total_lost: None,
             loss_cap_until: None,
             probe_hold_until: None,
             sent_cap_kbps: None,
@@ -402,8 +420,18 @@ impl Controller {
                 self.last_remb_kbps = Some(bitrate_bps as f64 / 1000.0);
                 self.last_remb_at = Some(now);
             }
-            Feedback::Loss { fraction } => {
-                self.last_loss = fraction;
+            Feedback::Loss {
+                fraction,
+                total_lost,
+            } => {
+                let lost = total_lost.saturating_sub(self.prev_total_lost.unwrap_or(0));
+                self.prev_total_lost = Some(total_lost);
+                // An insignificant report is still a fresh "no loss" sample.
+                self.last_loss = if lost >= MIN_LOST_PACKETS {
+                    fraction
+                } else {
+                    0.0
+                };
                 self.last_loss_at = Some(now);
             }
             Feedback::ReceiverStats { .. } => {}
@@ -723,6 +751,19 @@ mod tests {
         }
     }
 
+    /// Feeds a receiver report with `fraction` whose cumulative lost counter
+    /// grows by a large step, so it always counts as significant loss.
+    fn loss(c: &mut Controller, now: Instant, fraction: f32) {
+        let total_lost = c.prev_total_lost.unwrap_or(0) + 100;
+        c.feedback(
+            Feedback::Loss {
+                fraction,
+                total_lost,
+            },
+            now,
+        );
+    }
+
     /// One tick's worth of encoded frames totalling `bytes` -- fed as a
     /// single `Frame` since only the byte sum and "any frames at all" matter
     /// to the controller.
@@ -909,7 +950,7 @@ mod tests {
             now += TICK;
             frames(&mut c, now, 500_000);
             remb(&mut c, now, 5_000);
-            c.feedback(Feedback::Loss { fraction: 0.05 }, now);
+            loss(&mut c, now, 0.05);
             c.tick(now);
             assert!(
                 c.target().bitrate_kbps as f64 > LOSS_CAP_FLOOR_KBPS,
@@ -1025,7 +1066,7 @@ mod tests {
         let mut c = Controller::new(cfg(), t0);
         let now = t0 + TICK;
 
-        c.feedback(Feedback::Loss { fraction: 0.2 }, now);
+        loss(&mut c, now, 0.2);
         let decision = c.tick(now).expect("expected a decision");
         assert_eq!(decision.reason, "loss");
         assert_eq!(decision.target.bitrate_kbps, 5400);
@@ -1044,7 +1085,7 @@ mod tests {
 
         frames(&mut c, now, 375_000);
         remb(&mut c, now, 1_986_000);
-        c.feedback(Feedback::Loss { fraction: 0.42 }, now);
+        loss(&mut c, now, 0.42);
         let d = c.tick(now).expect("expected a loss decision");
         assert_eq!(d.reason, "loss");
         assert_eq!(d.target.bitrate_kbps, 1787);
@@ -1086,7 +1127,7 @@ mod tests {
         let mut c = Controller::new(cfg(), t0);
         let mut now = t0 + TICK;
 
-        c.feedback(Feedback::Loss { fraction: 0.2 }, now);
+        loss(&mut c, now, 0.2);
         let d = c.tick(now).expect("expected a decision");
         assert_eq!(d.reason, "loss");
         assert_eq!(d.target.bitrate_kbps, 5400);
@@ -1121,7 +1162,7 @@ mod tests {
 
         frames(&mut c, now, 125_000);
         remb(&mut c, now, 2_000_000);
-        c.feedback(Feedback::Loss { fraction: 0.01 }, now);
+        loss(&mut c, now, 0.01);
         let d = c.tick(now).expect("expected a probe");
         assert_eq!(d.reason, "probe");
         assert_eq!(d.target.bitrate_kbps, 3300);
@@ -1139,7 +1180,7 @@ mod tests {
 
         frames(&mut c, now, 375_000);
         remb(&mut c, now, 1_986_000);
-        c.feedback(Feedback::Loss { fraction: 0.42 }, now);
+        loss(&mut c, now, 0.42);
         let d = c.tick(now).expect("expected a loss decision");
         assert_eq!(d.target.bitrate_kbps, 1787);
         let armed_at = now;
@@ -1169,7 +1210,7 @@ mod tests {
         let mut c = Controller::new(cfg(), t0);
         let mut now = t0 + TICK;
 
-        c.feedback(Feedback::Loss { fraction: 0.2 }, now);
+        loss(&mut c, now, 0.2);
         let decision = c.tick(now).expect("expected a decision");
         assert_eq!(decision.reason, "loss");
         assert_eq!(decision.target.bitrate_kbps, 5400);
@@ -1269,7 +1310,7 @@ mod tests {
         for _ in 0..5 {
             now += TICK;
             frames(&mut c, now, 1_000);
-            c.feedback(Feedback::Loss { fraction: 0.9 }, now);
+            loss(&mut c, now, 0.9);
             c.tick(now);
         }
         assert_eq!(c.target().fps, MIN_FPS);
@@ -1299,7 +1340,7 @@ mod tests {
         let mut now = t0 + TICK;
         frames(&mut c, now, 750_000);
         remb(&mut c, now, 9_000);
-        c.feedback(Feedback::Loss { fraction: 0.3 }, now);
+        loss(&mut c, now, 0.3);
         let d = c.tick(now).expect("expected a loss cut");
         assert_eq!(d.reason, "loss");
         assert_eq!(d.target.bitrate_kbps, 5100);
@@ -1313,7 +1354,7 @@ mod tests {
             let sent = c.target().bitrate_kbps as usize * 1000 / 8;
             frames(&mut c, now, sent);
             remb(&mut c, now, 9_000);
-            c.feedback(Feedback::Loss { fraction: 0.0 }, now);
+            loss(&mut c, now, 0.0);
             c.tick(now);
             assert!(c.target().bitrate_kbps <= floor, "{:?}", c.target());
             floor = c.target().bitrate_kbps;
@@ -1323,7 +1364,7 @@ mod tests {
         now += TICK;
         frames(&mut c, now, 637_500);
         remb(&mut c, now, 9_000);
-        c.feedback(Feedback::Loss { fraction: 0.0 }, now);
+        loss(&mut c, now, 0.0);
         let d = c.tick(now).expect("expected a probe after the hold");
         assert_eq!(d.reason, "probe");
         assert_eq!(d.target.bitrate_kbps, 5610);
@@ -1342,7 +1383,7 @@ mod tests {
         };
         let mut now = t0 + TICK;
         frames(&mut c, now, 525_000);
-        c.feedback(Feedback::Loss { fraction: 0.05 }, now);
+        loss(&mut c, now, 0.05);
         let d = c.tick(now).expect("expected a cut to the sent rate");
         assert_eq!(d.reason, "loss");
         assert_eq!(d.target.bitrate_kbps, 4200);
@@ -1375,7 +1416,7 @@ mod tests {
         };
         let mut now = t0 + TICK;
         frames(&mut c, now, 125_000);
-        c.feedback(Feedback::Loss { fraction: 0.05 }, now);
+        loss(&mut c, now, 0.05);
         assert_eq!(c.tick(now), None);
         let loss_at = now;
         while now + TICK < loss_at + LOSS_FRESH + LOSS_PROBE_HOLD {
@@ -1401,7 +1442,7 @@ mod tests {
         let now = t0 + TICK;
         frames(&mut c, now, 1_000);
         remb(&mut c, now, 115_000);
-        c.feedback(Feedback::Loss { fraction: 0.05 }, now);
+        loss(&mut c, now, 0.05);
         let decision = c.tick(now).expect("expected a decision");
         assert_eq!(decision.target.bitrate_kbps, 1000);
         assert_eq!(decision.target.fps, 30);
@@ -1503,7 +1544,7 @@ mod tests {
 
         for _ in 0..10 {
             now += TICK;
-            c.feedback(Feedback::Loss { fraction: 0.9 }, now);
+            loss(&mut c, now, 0.9);
             c.tick(now);
             assert!(
                 c.target().bitrate_kbps >= MIN_BITRATE_KBPS,
@@ -1688,5 +1729,72 @@ mod tests {
         let steps = c.ladder();
         assert_eq!(steps, vec![30, 24, 20, 15, 12, 10, 8]);
         assert_eq!(c.bitrate_fps_step(&steps, 6000.0), 30);
+    }
+
+    /// Feeds a receiver report with an explicit cumulative lost counter.
+    fn loss_total(c: &mut Controller, now: Instant, fraction: f32, total_lost: u32) {
+        c.feedback(
+            Feedback::Loss {
+                fraction,
+                total_lost,
+            },
+            now,
+        );
+    }
+
+    #[test]
+    fn loss_report_with_too_few_lost_packets_is_ignored() {
+        // Mac host 0.2.3 live log: 1 lost of 2 packets (0.496) on a static
+        // screen. Unloaded link (1000 kbps sent vs 6000 target), fresh REMB
+        // ~500 kbps, one lost packet per report: no cut of any kind.
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0;
+        for i in 0..8u32 {
+            now += TICK;
+            frames(&mut c, now, 125_000);
+            remb(&mut c, now, 500_000);
+            loss_total(&mut c, now, 0.496, 1 + i);
+            assert_eq!(c.tick(now), None, "tick {i}");
+        }
+        assert_eq!(c.target().bitrate_kbps, 6000);
+        assert_eq!(c.target().fps, 30);
+    }
+
+    #[test]
+    fn loss_report_with_enough_lost_packets_still_cuts() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let now = t0 + TICK;
+        frames(&mut c, now, 125_000);
+        remb(&mut c, now, 500_000);
+        loss_total(&mut c, now, 0.2, MIN_LOST_PACKETS);
+        let d = c.tick(now).expect("expected a loss cut");
+        assert_eq!(d.reason, "loss");
+        assert!(d.target.bitrate_kbps < 6000, "{d:?}");
+    }
+
+    #[test]
+    fn first_report_uses_cumulative_total_and_decreasing_counter_is_zero() {
+        // First report: the delta is the cumulative total itself.
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let now = t0 + TICK;
+        frames(&mut c, now, 125_000);
+        loss_total(&mut c, now, 0.2, MIN_LOST_PACKETS);
+        let d = c.tick(now).expect("first report counts its whole total");
+        assert_eq!(d.reason, "loss");
+
+        // A counter going backwards (reset) saturates to 0 lost: ignored.
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0 + TICK;
+        frames(&mut c, now, 125_000);
+        loss_total(&mut c, now, 0.0, 500);
+        c.tick(now);
+        now += TICK;
+        frames(&mut c, now, 125_000);
+        loss_total(&mut c, now, 0.5, 10);
+        assert_eq!(c.tick(now), None);
+        assert_eq!(c.target().bitrate_kbps, 6000);
     }
 }
