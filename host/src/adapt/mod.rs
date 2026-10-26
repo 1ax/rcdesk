@@ -189,6 +189,14 @@ pub const MIN_BITS_PER_PIXEL_PER_FRAME: f64 = 0.02;
 /// motion smoothness.
 pub const SHARP_BPP_MULTIPLIER: f64 = 3.0;
 
+/// `QualityPreset::Sharp`'s per-frame QP ceiling (H.264 QP, lower = sharper).
+/// Measured on VideoToolbox (1920x1080 synthetic text page, openh264 decode,
+/// luma PSNR; docs/task017-quality-analysis.md §2): a page appearing at
+/// 1000 kbps / 8 fps stays at 28-33 dB and is never refined; with QP <= 28
+/// it is 36 dB rising to 40.6 dB at +30% bytes. Scrolling text stays within
+/// budget (98 KB vs 74 KB over 11 frames).
+pub const SHARP_MAX_QP: u8 = 28;
+
 /// `QualityPreset::Smooth` (slice 3.5e, "Плавность"): shrinks the bit budget
 /// so the controller tolerates a much softer frame in exchange for keeping
 /// fps up -- meant for video/animation-heavy sessions.
@@ -279,6 +287,8 @@ struct QualityPolicy {
     max_fps: u32,
     min_fps: u32,
     bpp_budget: f64,
+    /// Per-frame encoder QP ceiling (`None` = the encoder's own default).
+    max_qp: Option<u8>,
 }
 
 impl QualityPolicy {
@@ -294,16 +304,19 @@ impl QualityPolicy {
                 max_fps: cfg.max_fps,
                 min_fps: cfg.min_fps,
                 bpp_budget: MIN_BITS_PER_PIXEL_PER_FRAME,
+                max_qp: None,
             },
             QualityPreset::Sharp => QualityPolicy {
                 max_fps: cfg.max_fps.min(SHARP_FPS_CEILING),
                 min_fps: cfg.min_fps,
                 bpp_budget: MIN_BITS_PER_PIXEL_PER_FRAME * SHARP_BPP_MULTIPLIER,
+                max_qp: Some(SHARP_MAX_QP),
             },
             QualityPreset::Smooth => QualityPolicy {
                 max_fps: cfg.max_fps,
                 min_fps: cfg.min_fps.max(SMOOTH_FPS_FLOOR).min(cfg.max_fps),
                 bpp_budget: MIN_BITS_PER_PIXEL_PER_FRAME * SMOOTH_BPP_MULTIPLIER,
+                max_qp: None,
             },
         }
     }
@@ -412,6 +425,11 @@ impl Controller {
     /// `Auto` and changed only by `set_preset`.
     pub fn preset(&self) -> QualityPreset {
         self.preset
+    }
+
+    /// The current preset's encoder QP ceiling (`None` = no preset cap).
+    pub fn max_qp(&self) -> Option<u8> {
+        self.policy.max_qp
     }
 
     pub fn feedback(&mut self, fb: Feedback, now: Instant) {
@@ -1556,6 +1574,18 @@ mod tests {
     }
 
     // --- Slice 3.5e: quality presets ---------------------------------
+
+    #[test]
+    fn max_qp_follows_the_preset() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        assert_eq!(c.max_qp(), None);
+        c.set_preset(QualityPreset::Sharp, t0 + TICK);
+        assert_eq!(c.max_qp(), Some(SHARP_MAX_QP));
+        assert_eq!(SHARP_MAX_QP, 28);
+        c.set_preset(QualityPreset::Smooth, t0 + TICK);
+        assert_eq!(c.max_qp(), None);
+    }
 
     #[test]
     fn set_preset_sharp_clamps_fps_ceiling_and_announces_next_tick() {

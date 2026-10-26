@@ -132,6 +132,9 @@ pub struct PipelineStats {
 #[derive(Debug, Default)]
 pub struct RateControl {
     pending: Mutex<Option<RateTarget>>,
+    /// Staged preset QP ceiling: outer `Some` = a change is waiting to be
+    /// applied, inner value is what to apply (`None` = no preset cap).
+    pending_max_qp: Mutex<Option<Option<u8>>>,
     fps: AtomicU32,
 }
 
@@ -139,6 +142,7 @@ impl RateControl {
     fn new(initial: RateTarget) -> Self {
         Self {
             pending: Mutex::new(None),
+            pending_max_qp: Mutex::new(None),
             fps: AtomicU32::new(initial.fps),
         }
     }
@@ -152,6 +156,15 @@ impl RateControl {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(target);
         self.fps.store(target.fps, Ordering::Release);
+    }
+
+    /// Stages a preset QP ceiling (`None` = no preset cap) for the encode
+    /// thread to apply via `Encoder::set_max_qp` before its next frame.
+    pub fn set_max_qp(&self, max_qp: Option<u8>) {
+        *self
+            .pending_max_qp
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(max_qp);
     }
 
     /// The fps the pacer is currently budgeting frames at.
@@ -445,6 +458,21 @@ impl Pipeline {
                                 bitrate_kbps = target.bitrate_kbps,
                                 fps = target.fps,
                                 "failed to apply rate target, continuing at previous rate"
+                            );
+                        }
+                    }
+
+                    let pending_max_qp = rate_control
+                        .pending_max_qp
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some(max_qp) = pending_max_qp {
+                        if let Err(err) = encoder.set_max_qp(max_qp) {
+                            tracing::warn!(
+                                error = %err,
+                                max_qp = ?max_qp,
+                                "failed to apply qp ceiling, continuing with previous one"
                             );
                         }
                     }
@@ -1254,6 +1282,61 @@ mod tests {
         fn size(&self) -> (u32, u32) {
             (16, 16)
         }
+    }
+
+    /// Records `set_max_qp` calls into a shared log; encodes dummy frames.
+    struct QpRecordingEncoder {
+        calls: Arc<Mutex<Vec<Option<u8>>>>,
+    }
+
+    impl Encoder for QpRecordingEncoder {
+        fn encode(
+            &mut self,
+            frame: &RawFrame,
+            force_keyframe: bool,
+        ) -> Result<Option<EncodedFrame>, crate::encode::EncodeError> {
+            Ok(Some(EncodedFrame {
+                data: vec![0u8; 8],
+                keyframe: force_keyframe,
+                ts: Instant::now(),
+                captured_at: frame.ts(),
+            }))
+        }
+
+        fn set_rate(&mut self, _target: RateTarget) -> Result<(), crate::encode::EncodeError> {
+            Ok(())
+        }
+
+        fn set_max_qp(&mut self, max_qp: Option<u8>) -> Result<(), crate::encode::EncodeError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(max_qp);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn rate_control_staged_max_qp_reaches_the_encoder() {
+        let _guard = serialized();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut handle = Pipeline::start(
+            Box::new(SyntheticSource::new(64, 64, 30)),
+            Box::new(QpRecordingEncoder {
+                calls: Arc::clone(&calls),
+            }),
+            RateTarget {
+                bitrate_kbps: 1000,
+                fps: 30,
+            },
+        );
+        handle.rate_control().set_max_qp(Some(28));
+        let _ = drain_for(&mut handle, Duration::from_secs(1));
+        handle.stop();
+        assert_eq!(
+            *calls.lock().unwrap_or_else(|p| p.into_inner()),
+            vec![Some(28)]
+        );
     }
 
     /// An encoder that takes `cost` per frame and produces a few dummy bytes.

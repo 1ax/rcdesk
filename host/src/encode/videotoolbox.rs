@@ -497,6 +497,29 @@ impl Encoder for VideoToolboxEncoder {
         // `new()` and stays valid until `Drop::drop` invalidates it.
         unsafe { apply_rate(&self.session, target.bitrate_kbps, target.fps) }
     }
+
+    fn set_max_qp(&mut self, max_qp: Option<u8>) -> Result<(), EncodeError> {
+        // Effective ceiling: the stricter of the preset cap and the
+        // configured one; 51 (H.264 maximum) means "no cap".
+        let effective = match (max_qp, self.cfg.max_qp) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => 51,
+        };
+        // SAFETY: `self.session` was successfully created and configured in
+        // `new()` and stays valid until `Drop::drop` invalidates it; the key
+        // is a documented `&'static CFString`. Soft: older macOS may lack
+        // the key, which must never fail the session.
+        unsafe {
+            soft_set_property(
+                &self.session,
+                "MaxAllowedFrameQP",
+                kVTCompressionPropertyKey_MaxAllowedFrameQP,
+                CFNumber::new_i32(effective as i32).as_ref(),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Drop for VideoToolboxEncoder {
@@ -1144,5 +1167,48 @@ mod tests {
             !outputs[0].keyframe,
             "set_rate must not force a new keyframe"
         );
+    }
+
+    #[test]
+    fn set_max_qp_mid_stream_keeps_encoding() {
+        let mut cfg = test_cfg();
+        cfg.width = 64;
+        cfg.height = 64;
+
+        let mut source = SyntheticSource::new(64, 64, 1000);
+        let mut encoder = VideoToolboxEncoder::new(cfg).expect("encoder init");
+
+        for _ in 0..20u32 {
+            let raw = source.next_frame().expect("frame");
+            encoder.encode(&raw, false).expect("encode");
+        }
+
+        encoder.set_max_qp(Some(28)).expect("set_max_qp");
+
+        let mut outputs = Vec::new();
+        for _ in 0..20u32 {
+            let raw = source.next_frame().expect("frame");
+            if let Some(encoded) = encoder.encode(&raw, false).expect("encode") {
+                outputs.push(encoded);
+            }
+        }
+        assert!(
+            !outputs.is_empty(),
+            "expected at least one output after set_max_qp"
+        );
+        assert!(
+            !outputs[0].keyframe,
+            "set_max_qp must not force a new keyframe"
+        );
+
+        encoder.set_max_qp(None).expect("set_max_qp(None)");
+        let mut after_reset = 0;
+        for _ in 0..20u32 {
+            let raw = source.next_frame().expect("frame");
+            if encoder.encode(&raw, false).expect("encode").is_some() {
+                after_reset += 1;
+            }
+        }
+        assert!(after_reset > 0, "expected output after set_max_qp(None)");
     }
 }

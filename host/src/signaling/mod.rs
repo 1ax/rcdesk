@@ -3563,6 +3563,8 @@ async fn run_adapt_task(
     // previous summary (for the per-window delta).
     let mut logged_path: Option<crate::transport::PathInfo> = None;
     let mut discarded_seen: u32 = 0;
+    // The preset QP ceiling the encoder currently has (it starts with none).
+    let mut applied_max_qp: Option<u8> = None;
 
     loop {
         tokio::select! {
@@ -3584,6 +3586,11 @@ async fn run_adapt_task(
                             _ => {}
                         }
                         controller.feedback(fb, Instant::now());
+                        if controller.max_qp() != applied_max_qp {
+                            applied_max_qp = controller.max_qp();
+                            rate_control.set_max_qp(applied_max_qp);
+                            tracing::info!(max_qp = ?applied_max_qp, "adapt: preset qp ceiling");
+                        }
                     }
                     None => break,
                 }

@@ -39,6 +39,16 @@ pub trait Encoder: Send {
     /// keyframe, no SPS/PPS change). Backends that can't change a field
     /// ignore it and say so in their doc comment.
     fn set_rate(&mut self, target: RateTarget) -> Result<(), EncodeError>;
+
+    /// Runtime QP ceiling from the quality preset (`Sharp` caps it so small
+    /// text stays legible when the bitrate is cut). `None` = back to the
+    /// encoder's configured `EncoderConfig::max_qp`. Backends that can't
+    /// change it live ignore it (this default): openh264 and Media
+    /// Foundation keep the default for now.
+    fn set_max_qp(&mut self, max_qp: Option<u8>) -> Result<(), EncodeError> {
+        let _ = max_qp;
+        Ok(())
+    }
 }
 
 /// Runtime rate target the adaptation controller (slice 2.3) pushes into a
