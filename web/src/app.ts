@@ -24,9 +24,12 @@ import {
   panBy,
   saveTouchMode,
   touchModeLabel,
+  anchorOf,
   zoomAt,
+  zoomAtAnchor,
   zoomCss,
   type TouchMode,
+  type ViewAnchor,
   type Zoom,
 } from "./viewport";
 import { ClipboardBridge, isSafari, loadClipboardSyncSetting, saveClipboardSyncSetting } from "./clipboard";
@@ -671,12 +674,15 @@ export function mount(root: Element | null): void {
     focusVideoUnlessTyping();
   });
   let zoom: Zoom = identityZoom();
+  // H5-18: frame point at the container centre, to keep it when the container resizes.
+  let viewAnchor: ViewAnchor | null = null;
   // Slice H5-2: last virtual-cursor frame position and the zoom to restore
   // once the phone keyboard goes away (`null` -- the keyboard didn't zoom).
   let lastTouchCursor: { x: number; y: number } | null = null;
   // H5-10: a touch is active, so the overlay must show as soon as it has an image.
   let touchCursorWanted = false;
-  let zoomBeforeKeyboard: Zoom | null = null;
+  // Zoom scale and centre frame point before the keyboard zoomed (H5-18).
+  let zoomBeforeKeyboard: { scale: number; anchor: ViewAnchor | null } | null = null;
   // H5-12: the keyboard zoom is applied once per show; later layout changes keep manual pinch/pan.
   let keyboardZoomApplied = false;
   let heightBeforeKeyboard = 0;
@@ -685,7 +691,26 @@ export function mount(root: Element | null): void {
   function applyZoom(next: Zoom): void {
     zoom = clampZoom(next, sessionVideoEl.clientWidth, sessionVideoEl.clientHeight);
     zoomLayer.style.transform = zoomCss(zoom);
+    viewAnchor = anchorOf(
+      zoom,
+      sessionVideoEl.clientWidth,
+      sessionVideoEl.clientHeight,
+      video.videoWidth,
+      video.videoHeight,
+    );
     placeTouchCursor();
+  }
+  // H5-18: the container changed size (keyboard, bar, rotation) -- keep the
+  // frame point that was at the centre there, instead of re-clamping the
+  // box-relative offset (the letterbox moved the frame under it).
+  function refitZoom(): void {
+    const w = sessionVideoEl.clientWidth;
+    const h = sessionVideoEl.clientHeight;
+    if (zoom.scale === 1 || !viewAnchor) {
+      applyZoom(zoom);
+      return;
+    }
+    applyZoom(zoomAtAnchor(zoom.scale, viewAnchor, w, h, video.videoWidth, video.videoHeight));
   }
   // H5-6: places the virtual-cursor overlay from its frame position in
   // unscaled-layer coordinates (the layer at 1x is the container), so it
@@ -706,13 +731,13 @@ export function mount(root: Element | null): void {
     touchCursorEl.style.transform = `translate(${p.clientX - hx / s}px, ${p.clientY - hy / s}px) scale(${1 / s})`;
   }
   window.addEventListener("resize", () => {
-    applyZoom(zoom);
+    refitZoom();
     placeTouchCursor();
   });
   // H5-12: the container changes height without a window resize too (session
   // bar wrapping, collapse); keep the layer clamped and the cursor overlay placed.
   if (typeof ResizeObserver !== "undefined") {
-    new ResizeObserver(() => applyZoom(zoom)).observe(sessionVideoEl);
+    new ResizeObserver(() => refitZoom()).observe(sessionVideoEl);
   }
   // Slice H2b: версия хоста из `host_info` (null -- поле не пришло).
   let hostVersion: string | null = null;
@@ -744,7 +769,7 @@ export function mount(root: Element | null): void {
       // (after `click`), undoing the refocus of `resume()` -- not focusable
       // while the phone keyboard owns the input.
       video.removeAttribute("tabindex");
-      zoomBeforeKeyboard = zoom.scale < KEYBOARD_ZOOM ? zoom : null;
+      zoomBeforeKeyboard = zoom.scale < KEYBOARD_ZOOM ? { scale: zoom.scale, anchor: viewAnchor } : null;
       keyboardZoomApplied = false;
       heightBeforeKeyboard = sessionVideoEl.clientHeight;
       syncBarForKeyboard();
@@ -758,7 +783,7 @@ export function mount(root: Element | null): void {
         keyboardZoomApplied ||
         h >= heightBeforeKeyboard * 0.85
       ) {
-        applyZoom(zoom); // re-clamp to the resized container
+        refitZoom(); // keep the centre frame point in the resized container
       } else {
         keyboardZoomApplied = true;
         const anchor = lastTouchCursor
@@ -791,7 +816,20 @@ export function mount(root: Element | null): void {
       }
       const restore = zoomBeforeKeyboard;
       zoomBeforeKeyboard = null;
-      applyZoom(restore ?? zoom);
+      if (restore === null) refitZoom();
+      else if (restore.scale === 1 || !restore.anchor) applyZoom({ scale: restore.scale, tx: 0, ty: 0 });
+      else {
+        applyZoom(
+          zoomAtAnchor(
+            restore.scale,
+            restore.anchor,
+            sessionVideoEl.clientWidth,
+            sessionVideoEl.clientHeight,
+            video.videoWidth,
+            video.videoHeight,
+          ),
+        );
+      }
       placeTouchCursor();
     },
   });
@@ -2642,6 +2680,7 @@ export function mount(root: Element | null): void {
     zoomBeforeKeyboard = null;
     barAutoCollapsed = false;
     lastTouchCursor = null;
+    viewAnchor = null;
     applyZoom(identityZoom());
     overlay.textContent = "";
     firstFrameShown = false;

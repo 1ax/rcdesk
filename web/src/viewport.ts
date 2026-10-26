@@ -3,6 +3,8 @@
 // shown with `transform: translate(tx px, ty px) scale(scale)` and
 // `transform-origin: 0 0`.
 
+import { frameLayout } from "./input";
+
 export interface Zoom {
   scale: number;
   tx: number;
@@ -102,4 +104,47 @@ export function touchModeLabel(mode: TouchMode): string {
 export function centerOn(scale: number, lx: number, ly: number, w: number, h: number): Zoom {
   const s = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, scale));
   return clampZoom({ scale: s, tx: w / 2 - lx * s, ty: h / 2 - ly * s }, w, h);
+}
+
+/** Normalized frame point shown at the centre of the container (H5-18). */
+export interface ViewAnchor {
+  x: number;
+  y: number;
+}
+
+/** Frame point at the container centre for `z`; `null` when no frame geometry.
+ * Not clipped to [0,1]: the centre may sit in a letterbox bar, and restoring
+ * must be exact. */
+export function anchorOf(
+  z: Zoom,
+  w: number,
+  h: number,
+  videoWidth: number,
+  videoHeight: number,
+): ViewAnchor | null {
+  const f = frameLayout({ left: 0, top: 0, width: w, height: h }, videoWidth, videoHeight);
+  if (!f) return null;
+  const lx = (w / 2 - z.tx) / z.scale;
+  const ly = (h / 2 - z.ty) / z.scale;
+  return { x: (lx - f.offsetX) / f.displayWidth, y: (ly - f.offsetY) / f.displayHeight };
+}
+
+/** Zoom to `scale` with the frame point `anchor` at the container centre (clamped). */
+export function zoomAtAnchor(
+  scale: number,
+  anchor: ViewAnchor,
+  w: number,
+  h: number,
+  videoWidth: number,
+  videoHeight: number,
+): Zoom {
+  const f = frameLayout({ left: 0, top: 0, width: w, height: h }, videoWidth, videoHeight);
+  if (!f) return centerOn(scale, w / 2, h / 2, w, h);
+  return centerOn(
+    scale,
+    f.offsetX + anchor.x * f.displayWidth,
+    f.offsetY + anchor.y * f.displayHeight,
+    w,
+    h,
+  );
 }

@@ -35,7 +35,7 @@ export interface InputChannels {
  * plain object instead of constructing a real one (this file's tests run
  * under vitest's `node` environment, with no DOM -- see `session.test.ts`
  * for the same pattern applied to `RTCPeerConnection`). */
-type RectLike = Pick<DOMRect, "left" | "top" | "width" | "height">;
+export type RectLike = Pick<DOMRect, "left" | "top" | "width" | "height">;
 
 /**
  * Maps a client-space point (e.g. `PointerEvent.clientX/Y`) to a normalized
@@ -89,7 +89,7 @@ export function unmapPointer(
 
 /** Size and offset of the displayed frame inside `rect` under `object-fit:
  * contain`, or `null` when nothing is rendered yet. */
-function frameLayout(
+export function frameLayout(
   rect: RectLike,
   videoWidth: number,
   videoHeight: number,

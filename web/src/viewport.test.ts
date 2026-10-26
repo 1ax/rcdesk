@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   TOUCH_MODE_STORAGE_KEY,
+  anchorOf,
   centerOn,
   clampZoom,
   followPoint,
@@ -10,6 +11,7 @@ import {
   saveTouchMode,
   touchModeLabel,
   zoomAt,
+  zoomAtAnchor,
   zoomCss,
 } from "./viewport";
 
@@ -101,5 +103,43 @@ describe("touch mode storage", () => {
   it("labels", () => {
     expect(touchModeLabel("trackpad")).toBe("Трекпад");
     expect(touchModeLabel("direct")).toBe("Касание");
+  });
+});
+
+describe("view anchor", () => {
+  const VW = 1920;
+  const VH = 1080;
+  const W = 402;
+  const dispH = (W * VH) / VW; // 226.125
+  const lyOf = (h: number, y: number) => (h - dispH) / 2 + y * dispH;
+
+  it("identity zoom anchors at the frame centre", () => {
+    const a = anchorOf(identityZoom(), W, 566, VW, VH);
+    expect(a?.x).toBeCloseTo(0.5);
+    expect(a?.y).toBeCloseTo(0.5);
+  });
+
+  it("keeps the centre frame point when the height changes", () => {
+    const z = centerOn(2, 0.4 * W, lyOf(566, 0.35), W, 566);
+    const a = anchorOf(z, W, 566, VW, VH);
+    expect(a?.x).toBeCloseTo(0.4);
+    expect(a?.y).toBeCloseTo(0.35);
+    const z2 = zoomAtAnchor(2, a!, W, 367, VW, VH);
+    const a2 = anchorOf(z2, W, 367, VW, VH);
+    expect(a2?.x).toBeCloseTo(0.4);
+    expect(a2?.y).toBeCloseTo(0.35);
+  });
+
+  it("scale 1 at the centre anchor is identity", () => {
+    const z = zoomAtAnchor(1, { x: 0.5, y: 0.5 }, W, 566, VW, VH);
+    expect(z.scale).toBe(1);
+    expect(z.tx).toBeCloseTo(0);
+    expect(z.ty).toBeCloseTo(0);
+  });
+
+  it("without video: null anchor and centred zoom", () => {
+    const z = centerOn(2, 201, 283, W, 566);
+    expect(anchorOf(z, W, 566, 0, 0)).toBeNull();
+    expect(zoomAtAnchor(2, { x: 0.4, y: 0.35 }, W, 566, 0, 0)).toEqual(z);
   });
 });
