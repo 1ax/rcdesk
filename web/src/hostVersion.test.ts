@@ -72,6 +72,14 @@ describe("updateStatusLabel", () => {
       ),
     ).toBe("Скачиваю rcdesk 0.3.3… 4,2 МБ");
   });
+  it("downloading with zero bytes so far shows no numbers", () => {
+    expect(
+      updateStatusLabel(
+        { ...base, state: "downloading", version: "0.3.3", received: 0, total: null },
+        null,
+      ),
+    ).toBe("Скачиваю rcdesk 0.3.3…");
+  });
   it("installing on windows", () => {
     expect(updateStatusLabel({ ...base, state: "installing", version: "0.2.0" }, "windows")).toBe(
       "Устанавливаю rcdesk 0.2.0 — сеанс прервётся",

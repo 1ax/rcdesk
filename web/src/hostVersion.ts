@@ -63,7 +63,10 @@ export function updateStatusLabel(
     case "downloading":
     {
       const { received, total } = msg;
-      if (received === null || received === undefined) return `Скачиваю rcdesk ${v}…`;
+      // 0 байт -- загрузка ещё не началась (размер ещё не узнан): без цифр.
+      if (received === null || received === undefined || received <= 0) {
+        return `Скачиваю rcdesk ${v}…`;
+      }
       if (total === null || total === undefined || total <= 0) {
         return `Скачиваю rcdesk ${v}… ${formatMb(received)} МБ`;
       }
