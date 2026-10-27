@@ -95,6 +95,11 @@ pub struct ClipboardSync {
     /// Whether the last reported file list is still on the clipboard as far
     /// as we know (so a following change reports `NoFiles`).
     had_files: bool,
+    /// Set when `apply_remote` overwrote a file list that was on the
+    /// clipboard: the offer is withdrawn, but `NoFiles` has not been
+    /// reported yet (the write is re-synced into `last_count`, so `poll`
+    /// would never see it as a change).
+    files_revoked: bool,
 }
 
 impl ClipboardSync {
@@ -110,6 +115,7 @@ impl ClipboardSync {
             last_text: None,
             files_enabled: false,
             had_files: false,
+            files_revoked: false,
         }
     }
 
@@ -126,13 +132,17 @@ impl ClipboardSync {
     /// read failure, empty, over `MAX_CLIPBOARD_BYTES`, or identical to what
     /// was last seen). A file list replaces the text of the same change.
     pub fn poll(&mut self) -> Vec<ClipboardEvent> {
+        let mut events = Vec::new();
+        if self.files_revoked {
+            self.files_revoked = false;
+            events.push(ClipboardEvent::NoFiles);
+        }
         let count = self.backend.change_count();
         if count == self.last_count {
-            return Vec::new();
+            return events;
         }
         self.last_count = count;
 
-        let mut events = Vec::new();
         if self.files_enabled {
             match self.backend.get_file_list() {
                 Some(list) => {
@@ -203,6 +213,12 @@ impl ClipboardSync {
             return;
         }
         self.last_text = Some(text.to_string());
+        if self.had_files {
+            // The write replaced the copied files; tell the client at the
+            // next `poll`, which will not see this as a change.
+            self.had_files = false;
+            self.files_revoked = true;
+        }
         // Re-read the counter *after* writing so this session's own write
         // doesn't come back around as a "remote change" on the next `poll`
         // (an echo) -- writing the clipboard bumps the OS's change counter
@@ -600,5 +616,45 @@ mod tests {
                 ClipboardEvent::Text("a.txt".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn apply_remote_after_files_reports_no_files_once() {
+        let backend = FakeClipboardBackend::new();
+        let mut sync = files_sync(backend.clone());
+        backend.set_remote_files(&["/tmp/a.txt"], None);
+        assert_eq!(sync.poll().len(), 1);
+
+        sync.apply_remote("x");
+        assert_eq!(sync.poll(), vec![ClipboardEvent::NoFiles]);
+        assert_eq!(sync.poll(), vec![]);
+    }
+
+    #[test]
+    fn apply_remote_without_files_reports_nothing() {
+        let backend = FakeClipboardBackend::new();
+        let mut sync = files_sync(backend.clone());
+
+        sync.apply_remote("x");
+        assert_eq!(sync.poll(), vec![]);
+    }
+
+    #[test]
+    fn apply_remote_then_host_text_reports_a_single_no_files() {
+        let backend = FakeClipboardBackend::new();
+        let mut sync = files_sync(backend.clone());
+        backend.set_remote_files(&["/tmp/a.txt"], None);
+        assert_eq!(sync.poll().len(), 1);
+
+        sync.apply_remote("x");
+        backend.set_remote_change(Some("host"));
+        assert_eq!(
+            sync.poll(),
+            vec![
+                ClipboardEvent::NoFiles,
+                ClipboardEvent::Text("host".to_string())
+            ]
+        );
+        assert_eq!(sync.poll(), vec![]);
     }
 }
