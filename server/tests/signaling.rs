@@ -15,6 +15,10 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound for the next message in `recv`. Generous: on a loaded CI
+/// runner a reply behind password hashing (debug build, tests in parallel)
+/// can take more than `TIMEOUT` (flake `recv timed out` 2026-10-25, 2026-10-27).
+const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 /// Used where a test asserts the server stays *silent* (slice 3.5a: no
 /// `Bye` for a signaling-only disconnect, no `Error` for a stale `Bye`) --
 /// short because we're waiting for a negative to hold, not for an event.
@@ -129,7 +133,7 @@ async fn send(ws: &mut WsStream, msg: &SignalMessage) {
 /// Reads the next `SignalMessage`, skipping WS control frames.
 async fn recv(ws: &mut WsStream) -> SignalMessage {
     loop {
-        let item = timeout(TIMEOUT, ws.next())
+        let item = timeout(RECV_TIMEOUT, ws.next())
             .await
             .expect("recv timed out")
             .expect("stream ended before a message arrived")
