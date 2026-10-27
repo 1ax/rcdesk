@@ -30,7 +30,9 @@
 //! reserved up front with `create_new` (an empty placeholder, so two
 //! transfers can never pick the same name) and the part file replaces it on
 //! a successful `End`. Anything else (abort, protocol error, channel loss,
-//! task cancellation) removes both files.
+//! task cancellation) removes both files. A host crash leaves them behind, so
+//! every session start sweeps abandoned part files (and their empty
+//! placeholders) older than `STALE_PART_AGE` from the receive folder.
 //!
 //! Privacy: file names are logged at `debug` only, never file content.
 
@@ -56,6 +58,72 @@ pub mod windows;
 
 /// Extension of the in-progress file next to the final one.
 const PART_SUFFIX: &str = ".rcdesk-part";
+
+/// A part file untouched for this long is considered abandoned. An active
+/// receive updates the part file's mtime on every write, so 10 minutes without
+/// a write tell a dead file from a running transfer in another process (for
+/// example two hosts sharing one HOME).
+const STALE_PART_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// Removes abandoned `<name>.rcdesk-part` files (top level of `dir` only) not
+/// modified for `older_than`, plus the empty placeholder `<name>` next to each.
+/// A non-empty file with the final name is never touched. Errors are skipped.
+/// Returns the number of part files removed.
+fn sweep_stale_parts(dir: &Path, older_than: Duration) -> usize {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::debug!(error = %e, "stale part sweep: cannot read receive folder");
+            return 0;
+        }
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(final_name) = name.strip_suffix(PART_SUFFIX) else {
+            continue;
+        };
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > older_than);
+        if !stale {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::debug!(error = %e, name, "stale part sweep: cannot remove part file");
+            continue;
+        }
+        removed += 1;
+        if final_name.is_empty() {
+            continue;
+        }
+        let placeholder = dir.join(final_name);
+        match std::fs::symlink_metadata(&placeholder) {
+            Ok(m) if m.is_file() && m.len() == 0 => {
+                if let Err(e) = std::fs::remove_file(&placeholder) {
+                    tracing::debug!(error = %e, name = final_name, "stale part sweep: cannot remove placeholder");
+                }
+            }
+            _ => {}
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, "stale partial downloads removed");
+    }
+    removed
+}
 
 /// Longest sanitized file name, in UTF-8 bytes.
 const MAX_NAME_BYTES: usize = 200;
@@ -1028,6 +1096,12 @@ pub async fn run(
     dir: Option<PathBuf>,
     mut commands: mpsc::Receiver<FilesCommand>,
 ) {
+    if let Some(dir) = dir.clone() {
+        // Fire and forget: the sweep must not delay the session start.
+        drop(tokio::task::spawn_blocking(move || {
+            sweep_stale_parts(&dir, STALE_PART_AGE)
+        }));
+    }
     let mut session = Session {
         receiver: Receiver {
             channel: Arc::clone(&channel),
@@ -1158,6 +1232,82 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    fn make_old(path: &Path) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+    }
+
+    fn sweep_dir() -> PathBuf {
+        let dir = scratch_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn sweep_removes_old_part_and_empty_placeholder() {
+        let dir = sweep_dir();
+        std::fs::write(dir.join("a.txt"), b"").unwrap();
+        std::fs::write(dir.join("a.txt.rcdesk-part"), b"xyz").unwrap();
+        make_old(&dir.join("a.txt.rcdesk-part"));
+        assert_eq!(sweep_stale_parts(&dir, STALE_PART_AGE), 1);
+        assert!(!dir.join("a.txt").exists());
+        assert!(!dir.join("a.txt.rcdesk-part").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_keeps_non_empty_final_file() {
+        let dir = sweep_dir();
+        std::fs::write(dir.join("a.txt"), b"data").unwrap();
+        std::fs::write(dir.join("a.txt.rcdesk-part"), b"xyz").unwrap();
+        make_old(&dir.join("a.txt.rcdesk-part"));
+        assert_eq!(sweep_stale_parts(&dir, STALE_PART_AGE), 1);
+        assert!(dir.join("a.txt").exists());
+        assert!(!dir.join("a.txt.rcdesk-part").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_keeps_fresh_part() {
+        let dir = sweep_dir();
+        std::fs::write(dir.join("a.txt"), b"").unwrap();
+        std::fs::write(dir.join("a.txt.rcdesk-part"), b"xyz").unwrap();
+        assert_eq!(sweep_stale_parts(&dir, STALE_PART_AGE), 0);
+        assert!(dir.join("a.txt").exists());
+        assert!(dir.join("a.txt.rcdesk-part").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_does_not_recurse() {
+        let dir = sweep_dir();
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("a.txt"), b"").unwrap();
+        std::fs::write(sub.join("a.txt.rcdesk-part"), b"xyz").unwrap();
+        make_old(&sub.join("a.txt.rcdesk-part"));
+        assert_eq!(sweep_stale_parts(&dir, STALE_PART_AGE), 0);
+        assert!(sub.join("a.txt").exists());
+        assert!(sub.join("a.txt.rcdesk-part").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_keeps_empty_file_without_part() {
+        let dir = sweep_dir();
+        std::fs::write(dir.join("a.txt"), b"").unwrap();
+        assert_eq!(sweep_stale_parts(&dir, STALE_PART_AGE), 0);
+        assert!(dir.join("a.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_missing_dir_is_noop() {
+        let dir = scratch_dir();
+        assert_eq!(sweep_stale_parts(&dir, STALE_PART_AGE), 0);
     }
 
     fn text(msg: &FileMessage) -> FileChannelMessage {
