@@ -15,6 +15,15 @@ export default defineConfig({
     // outside CI (GITHUB_SHA unset), e.g. `npm run dev`/local `npm run build`.
     __BUILD_ID__: JSON.stringify(process.env.GITHUB_SHA?.slice(0, 7) ?? "dev"),
   },
+  build: {
+    rollupOptions: {
+      // Second entry (slice A4): the admin cabinet at /admin.html.
+      input: {
+        main: fileURLToPath(new URL("./index.html", import.meta.url)),
+        admin: fileURLToPath(new URL("./admin.html", import.meta.url)),
+      },
+    },
+  },
   server: {
     proxy: {
       "/ws": {

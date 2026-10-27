@@ -389,6 +389,7 @@ export function mount(root: Element | null): void {
           <h2>Браузеры</h2>
           <ul class="device-list" id="browser-list"></ul>
         </div>
+        <a id="admin-link" class="btn btn-secondary" href="/admin.html" hidden>Админка</a>
         <button id="sign-out-btn" class="btn btn-secondary account-danger-btn">Выйти</button>
         <p id="sign-out-hint" class="hint"></p>
         <p id="account-card-status" class="hint account-status"></p>
@@ -929,6 +930,7 @@ export function mount(root: Element | null): void {
   const signOutHintEl = root.querySelector<HTMLParagraphElement>("#sign-out-hint")!;
   const accountCardStatusEl = root.querySelector<HTMLParagraphElement>("#account-card-status")!;
   const accountBackBtn = root.querySelector<HTMLButtonElement>("#account-back-btn")!;
+  const adminLink = root.querySelector<HTMLAnchorElement>("#admin-link")!;
   const deviceListEl = root.querySelector<HTMLUListElement>("#device-list")!;
   // Slice 3.2d: the OPAQUE-login dialog, shown between `auth_required` and
   // either a successful `pake_finish` (the host then sends `offer`, see that
@@ -1803,6 +1805,7 @@ export function mount(root: Element | null): void {
 
   signaling.on("account", (msg) => {
     accountEmail = msg.email;
+    adminLink.hidden = !msg.is_admin;
     if (authPending === "change" && msg.email !== null) {
       // Email changed: back to the cabinet with a note.
       closeAuth();
@@ -1941,6 +1944,7 @@ export function mount(root: Element | null): void {
     passkeyFlow = null;
     passkeys = null;
     accountEmail = undefined;
+    adminLink.hidden = true;
     browsers = [];
     devices = [];
     closeAuth();

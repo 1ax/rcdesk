@@ -1,0 +1,254 @@
+/* Admin cabinet (slice A4). Variables come from style.css (imported by admin.ts). */
+.admin-body {
+  height: auto;
+  min-height: 100%;
+}
+
+.adm {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+.adm-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.adm-head h1 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  flex: 1 1 auto;
+}
+
+.adm-head .btn,
+.adm-msg .btn {
+  width: auto;
+  margin-top: 0;
+  display: inline-block;
+  text-decoration: none;
+}
+
+.adm-status {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.adm-msg {
+  max-width: 420px;
+  margin: 15vh auto 0;
+  padding: 24px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  text-align: center;
+}
+
+.adm-msg h1 {
+  margin: 0 0 12px;
+  font-size: 20px;
+}
+
+.adm-msg p {
+  margin: 0 0 16px;
+  color: var(--muted);
+}
+
+.adm-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.adm-tile {
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.adm-tile-label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.adm-tile-value {
+  margin-top: 4px;
+  font-size: 22px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.adm-tile-sub {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.adm-bar {
+  height: 6px;
+  margin-top: 8px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.adm-bar-fill {
+  height: 100%;
+  background: var(--accent);
+}
+
+.adm-bar-fill.is-danger {
+  background: var(--danger);
+}
+
+.adm-section {
+  margin-bottom: 20px;
+  padding: 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.adm-section h2 {
+  margin: 0 0 10px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.adm-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.adm-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 5px;
+  border-radius: 2px;
+}
+
+.adm-swatch.is-direct,
+.adm-chart .bar-direct {
+  background: var(--accent);
+  fill: var(--accent);
+}
+
+.adm-swatch.is-relay,
+.adm-chart .bar-relay {
+  background: #e0a84f;
+  fill: #e0a84f;
+}
+
+.adm-swatch.is-hours,
+.adm-chart .bar-hours {
+  background: var(--ok);
+  fill: var(--ok);
+}
+
+.adm-chart {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.adm-chart .axis-label {
+  fill: var(--muted);
+  font-size: 10px;
+}
+
+.adm-chart .axis-line {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.adm-chart .hit {
+  fill: transparent;
+}
+
+.adm-chart .hit:hover {
+  fill: rgba(255, 255, 255, 0.06);
+}
+
+.adm-empty {
+  margin: 0;
+  padding: 16px 0;
+  color: var(--muted);
+  text-align: center;
+  font-size: 13px;
+}
+
+.adm-scroll {
+  overflow-x: auto;
+}
+
+.adm-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.adm-table th,
+.adm-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.adm-table th {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 12px;
+}
+
+.adm-table tr:last-child td {
+  border-bottom: none;
+}
+
+.adm-muted {
+  color: var(--muted);
+}
+
+.adm-ok {
+  color: var(--ok);
+}
+
+.adm-note {
+  cursor: text;
+  min-width: 120px;
+}
+
+.adm-note:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.adm-note-input {
+  width: 100%;
+  min-width: 160px;
+  padding: 3px 6px;
+  font: inherit;
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  color: var(--text);
+}
+
+.adm-foot {
+  margin: 8px 0 24px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted);
+}
