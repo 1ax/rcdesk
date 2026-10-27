@@ -167,6 +167,9 @@ struct Inner {
     hosts: HashMap<String, HostEntry>,
     pin_to_host: HashMap<String, String>,
     sessions: HashMap<String, SessionEntry>,
+    /// D34: клиентские соединения и владелец, чей список устройств они
+    /// показывают (получатели push-`Devices` при смене присутствия).
+    watchers: Vec<(Tx, String)>,
 }
 
 #[derive(Clone, Default)]
@@ -592,6 +595,49 @@ impl Registry {
             host.session_id = None;
         }
         Some(session.host_tx)
+    }
+
+    /// D34: хост сеанса клиента (до закрытия сеанса), чтобы уведомить
+    /// владельцев устройства о смене занятости.
+    pub fn session_host_id(&self, session_id: &str, client_tx: &Tx) -> Option<String> {
+        let inner = self.inner.lock().expect("registry mutex poisoned");
+        let session = inner.sessions.get(session_id)?;
+        session
+            .client_tx
+            .same_channel(client_tx)
+            .then(|| session.host_id.clone())
+    }
+
+    /// D34: хосты всех сеансов клиентского соединения (до `disconnect_client`).
+    pub fn client_session_host_ids(&self, client_tx: &Tx) -> Vec<String> {
+        let inner = self.inner.lock().expect("registry mutex poisoned");
+        inner
+            .sessions
+            .values()
+            .filter(|s| s.client_tx.same_channel(client_tx))
+            .map(|s| s.host_id.clone())
+            .collect()
+    }
+
+    /// D34: запоминает (`Some`) или меняет владельца, список устройств которого
+    /// показывает это соединение; `None` -- забыть соединение.
+    pub fn watch_owner(&self, tx: &Tx, owner_id: Option<&str>) {
+        let mut inner = self.inner.lock().expect("registry mutex poisoned");
+        inner.watchers.retain(|(t, _)| !t.same_channel(tx));
+        if let Some(owner_id) = owner_id {
+            inner.watchers.push((tx.clone(), owner_id.to_string()));
+        }
+    }
+
+    /// D34: соединения, наблюдающие за владельцем `owner_id`.
+    pub fn owner_watchers(&self, owner_id: &str) -> Vec<Tx> {
+        let inner = self.inner.lock().expect("registry mutex poisoned");
+        inner
+            .watchers
+            .iter()
+            .filter(|(_, o)| o == owner_id)
+            .map(|(t, _)| t.clone())
+            .collect()
     }
 
     /// Called when a client connection is dropped without an explicit `Bye`.
@@ -1315,6 +1361,48 @@ mod tests {
         assert_eq!(registry.disconnect_client(&client_tx).len(), 1);
         assert_eq!(registry.host_presence("host1"), Some(false));
         assert!(registry.disconnect_client(&client_tx).is_empty());
+    }
+
+    #[test]
+    fn watch_owner_registers_switches_and_forgets_a_connection() {
+        let registry = Registry::new();
+        let (a, _a_rx) = channel();
+        let (b, _b_rx) = channel();
+        registry.watch_owner(&a, Some("o1"));
+        registry.watch_owner(&b, Some("o1"));
+        assert_eq!(registry.owner_watchers("o1").len(), 2);
+
+        registry.watch_owner(&a, Some("o2"));
+        let o1 = registry.owner_watchers("o1");
+        assert_eq!(o1.len(), 1);
+        assert!(o1[0].same_channel(&b));
+        let o2 = registry.owner_watchers("o2");
+        assert_eq!(o2.len(), 1);
+        assert!(o2[0].same_channel(&a));
+
+        registry.watch_owner(&a, None);
+        registry.watch_owner(&b, None);
+        assert!(registry.owner_watchers("o1").is_empty());
+        assert!(registry.owner_watchers("o2").is_empty());
+    }
+
+    #[test]
+    fn session_host_ids_are_visible_before_closing() {
+        let registry = Registry::new();
+        let (host_tx, _host_rx) = channel();
+        registry.register_host("A".to_string(), "a".to_string(), host_tx, None, false);
+        let (client_tx, _client_rx) = channel();
+        let (other_tx, _other_rx) = channel();
+        let (sid, _name, _tx) = registry
+            .join_by_host_id("A", client_tx.clone())
+            .expect("join ok");
+        assert_eq!(
+            registry.session_host_id(&sid, &client_tx).as_deref(),
+            Some("A")
+        );
+        assert!(registry.session_host_id(&sid, &other_tx).is_none());
+        assert_eq!(registry.client_session_host_ids(&client_tx), vec!["A"]);
+        assert!(registry.client_session_host_ids(&other_tx).is_empty());
     }
 
     #[test]

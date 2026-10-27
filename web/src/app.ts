@@ -302,9 +302,9 @@ const PING_INTERVAL_MS = 1000;
 const STATS_INTERVAL_MS = 1000;
 
 /** How often `app.ts` re-requests the device list (`list_devices`) while
- * the PIN/list screen is showing -- state (online/busy, a rename from
- * another tab) can change at any time. */
-const DEVICE_LIST_INTERVAL_MS = 10000;
+ * the PIN/list screen is showing. Only a safety net (D34): the main update
+ * is the server's push of `devices` on every presence/busy change. */
+const DEVICE_LIST_INTERVAL_MS = 60000;
 
 /** How long `#clipboard-note` stays visible after `ClipboardBridge.notify`
  * reports a too-large clipboard text (slice 2.5c, decision 5). */
@@ -1443,6 +1443,16 @@ export function mount(root: Element | null): void {
   function renderDeviceList(): void {
     const sorted = sortDevices(devices);
     devicesEl.hidden = sorted.length === 0;
+    // D34: a pushed `devices` can arrive mid-rename -- keep what was typed.
+    const prevInput = deviceListEl.querySelector<HTMLInputElement>(".device-rename-input");
+    const kept = prevInput
+      ? {
+          value: prevInput.value,
+          focused: document.activeElement === prevInput,
+          start: prevInput.selectionStart,
+          end: prevInput.selectionEnd,
+        }
+      : null;
     deviceListEl.innerHTML = "";
     const nowSecs = Math.floor(Date.now() / 1000);
 
@@ -1453,7 +1463,7 @@ export function mount(root: Element | null): void {
       if (renamingDeviceId === entry.device_id) {
         const input = document.createElement("input");
         input.className = "device-rename-input";
-        input.value = deviceLabel(entry);
+        input.value = kept?.value ?? deviceLabel(entry);
         input.addEventListener("keydown", (event) => {
           if (event.key === "Enter") {
             commitRename(entry.device_id, input.value);
@@ -1469,6 +1479,10 @@ export function mount(root: Element | null): void {
         li.appendChild(input);
         li.appendChild(saveBtn);
         deviceListEl.appendChild(li);
+        if (kept?.focused) {
+          input.focus();
+          input.setSelectionRange(kept.start, kept.end);
+        }
         continue;
       }
 
@@ -2082,9 +2096,10 @@ export function mount(root: Element | null): void {
     }, reconnectBackoffMs(reconnectAttempt));
   }
 
-  /** Polls the device list every `DEVICE_LIST_INTERVAL_MS` while the
-   * PIN/list screen is showing (state can change on another device or
-   * another tab at any time -- online/busy, a rename, ...); stopped for the
+  /** Fallback poll of the device list every `DEVICE_LIST_INTERVAL_MS` while
+   * the PIN/list screen is showing. The main update is the server's push of
+   * `devices` (D34) on presence/busy changes; the poll only covers what the
+   * push does not (e.g. a rename from another tab); stopped for the
    * duration of a session (see `showSessionScreen`) and restarted once
    * `teardown` returns to this screen (see `showPinScreen`). */
   function startDeviceListLoop(): void {

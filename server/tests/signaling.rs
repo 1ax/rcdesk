@@ -1168,6 +1168,8 @@ async fn connect_device_for_offline_device_returns_error() {
         SignalMessage::PeerJoined { .. } => {}
         other => panic!("expected peer_joined, got {other:?}"),
     }
+    // D34: linking the device pushes the busy state to the owner.
+    recv_devices(&mut client).await;
 
     // Dropping the host no longer sends the client a `Bye` (slice 3.5a), so
     // there's nothing to wait on for the server to notice the closed socket
@@ -1175,6 +1177,9 @@ async fn connect_device_for_offline_device_returns_error() {
     // that's happened -- while it's still in flight the host looks busy
     // (its stale session hasn't been cleared yet), not offline.
     drop(host);
+    // D34: the owner is told the device went offline.
+    let devices = recv_devices(&mut client).await;
+    assert!(!devices[0].online);
     let message = loop {
         send(
             &mut client,
@@ -1256,6 +1261,8 @@ async fn rename_device_updates_alias_and_forget_device_removes_it() {
         SignalMessage::PeerJoined { .. } => {}
         other => panic!("expected peer_joined, got {other:?}"),
     }
+    // D34: linking the device pushes the busy state to the owner.
+    recv_devices(&mut client).await;
 
     send(
         &mut client,
@@ -1982,6 +1989,8 @@ async fn host_name_and_alias_are_truncated_to_64_chars() {
         SignalMessage::PeerJoined { .. } => {}
         other => panic!("expected peer_joined, got {other:?}"),
     }
+    // D34: linking the device pushes the busy state to the owner.
+    recv_devices(&mut client).await;
 
     send(
         &mut client,
@@ -3493,4 +3502,123 @@ async fn admin_get_without_authentication_is_not_authenticated() {
     let mut ws = client_conn(&url).await;
     send(&mut ws, &SignalMessage::AdminGet).await;
     expect_not_authenticated(&mut ws).await;
+}
+
+/// D34: reads the next message and expects a pushed `Devices` list.
+async fn recv_devices(ws: &mut WsStream) -> Vec<proto::signal::DeviceEntry> {
+    match recv(ws).await {
+        SignalMessage::Devices { devices } => devices,
+        other => panic!("expected devices, got {other:?}"),
+    }
+}
+
+/// D34: registers a host, links it to a fresh owner by one PIN join + Bye and
+/// leaves the owner's client connected (authenticated) afterwards.
+/// Returns `(host, host_id, credentials, owner_client, owner_token)`.
+async fn host_linked_to_connected_owner(
+    url: &str,
+) -> (WsStream, String, DeviceCredentials, WsStream, String) {
+    let mut host = connect(url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: None,
+            session_id: None,
+            pin_rotation: false,
+        },
+    )
+    .await;
+    let (host_id, pin, creds) = match recv(&mut host).await {
+        SignalMessage::Registered {
+            host_id,
+            pin,
+            device: Some(device),
+            ..
+        } => (host_id, pin, device),
+        other => panic!("expected registered, got {other:?}"),
+    };
+    let mut client = connect(url).await;
+    hello(&mut client, Role::Client).await;
+    let (token, _) = client_auth(&mut client, None).await;
+    send(&mut client, &SignalMessage::Join { pin }).await;
+    let session_id = match recv(&mut client).await {
+        SignalMessage::Joined { session_id, .. } => session_id,
+        other => panic!("expected joined, got {other:?}"),
+    };
+    // Link happens after Joined; its busy push follows.
+    let devices = recv_devices(&mut client).await;
+    assert!(devices[0].busy);
+    assert!(matches!(
+        recv(&mut host).await,
+        SignalMessage::PeerJoined { .. }
+    ));
+    send(
+        &mut client,
+        &SignalMessage::Bye {
+            session_id,
+            reason: None,
+        },
+    )
+    .await;
+    assert!(matches!(recv(&mut host).await, SignalMessage::Bye { .. }));
+    let devices = recv_devices(&mut client).await;
+    assert!(devices[0].online && !devices[0].busy);
+    (host, host_id, creds, client, token)
+}
+
+// D34: presence changes are pushed as `Devices` to the owner's connected
+// clients without `list_devices`; another owner's client hears nothing.
+#[tokio::test]
+async fn presence_changes_are_pushed_to_the_owner_but_not_to_others() {
+    let url = spawn_server().await;
+    let (host, host_id, creds, mut owner, _token) = host_linked_to_connected_owner(&url).await;
+
+    let mut stranger = connect(&url).await;
+    hello(&mut stranger, Role::Client).await;
+    client_auth(&mut stranger, None).await;
+
+    drop(host);
+    let devices = recv_devices(&mut owner).await;
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].device_id, host_id);
+    assert!(!devices[0].online);
+
+    let (_host, response) = register_host_as(&url, "127.0.0.1", Some(creds)).await;
+    assert!(matches!(response, SignalMessage::Registered { .. }));
+    let devices = recv_devices(&mut owner).await;
+    assert!(devices[0].online && !devices[0].busy);
+
+    expect_silence(&mut stranger, SILENCE_TIMEOUT).await;
+}
+
+// D34: a ConnectDevice session and the client's disconnect flip `busy`
+// for the owner's other open connection.
+#[tokio::test]
+async fn session_busy_state_is_pushed_to_other_owner_connections() {
+    let url = spawn_server().await;
+    let (_host, host_id, _creds, mut owner, token) = host_linked_to_connected_owner(&url).await;
+    let mut watcher = connect(&url).await;
+    hello(&mut watcher, Role::Client).await;
+    client_auth(&mut watcher, Some(token)).await;
+
+    send(
+        &mut owner,
+        &SignalMessage::ConnectDevice {
+            device_id: host_id.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut owner).await,
+        SignalMessage::Joined { .. }
+    ));
+    let devices = recv_devices(&mut watcher).await;
+    assert_eq!(devices[0].device_id, host_id);
+    assert!(devices[0].busy);
+
+    drop(owner);
+    let devices = recv_devices(&mut watcher).await;
+    assert!(devices[0].online && !devices[0].busy);
 }

@@ -401,6 +401,7 @@ async fn run_host(
             tracing::info!(%session_id, "session left to p2p after signaling loss");
         }
     }
+    notify_device_owners(db, registry, &host_id);
     let _ = tx.send(SignalMessage::Registered {
         host_id: host_id.clone(),
         pin,
@@ -527,6 +528,7 @@ async fn run_host(
                         tracing::info!(%session_id, "host ended session");
                         end_session_logged(db, &session_id, "host_bye");
                         let _ = client_tx.send(SignalMessage::Bye { session_id, reason });
+                        notify_device_owners(db, registry, &host_id);
                     }
                     Some(None) => {
                         // Slice 3.2a (D35): a "detached" session -- reported
@@ -534,6 +536,7 @@ async fn run_host(
                         // `SessionEntry` here (or one that belonged to a
                         // different host_id) -- there's no client to notify.
                         tracing::debug!(%session_id, "host ended a detached session, nothing to notify");
+                        notify_device_owners(db, registry, &host_id);
                     }
                     None => {
                         // Unknown to the server -- most likely a stale
@@ -585,6 +588,7 @@ async fn run_host(
         // closing doesn't mean the P2P session is over, so no `Bye`.
         tracing::info!(%session_id, "session left to p2p after signaling loss");
     }
+    notify_device_owners(db, registry, &host_id);
 }
 
 /// Builds the `DeviceEntry` list for `Authenticated`/`Devices`: the owner's
@@ -612,6 +616,36 @@ fn device_entries_for_owner(
             }
         })
         .collect())
+}
+
+/// D34: присутствие или занятость устройства сменились -- каждому владельцу
+/// устройства, у которого есть открытые клиентские соединения, шлём свежий
+/// `Devices` (список собирается один раз на владельца). Ошибки БД только
+/// логируются.
+fn notify_device_owners(db: &Db, registry: &Registry, device_id: &str) {
+    let owners = match db.owners_of_device(device_id) {
+        Ok(owners) => owners,
+        Err(err) => {
+            tracing::warn!(?err, "failed to load device owners for presence push");
+            return;
+        }
+    };
+    for owner_id in owners {
+        let watchers = registry.owner_watchers(&owner_id);
+        if watchers.is_empty() {
+            continue;
+        }
+        match device_entries_for_owner(db, registry, &owner_id) {
+            Ok(devices) => {
+                for watcher in watchers {
+                    let _ = watcher.send(SignalMessage::Devices {
+                        devices: devices.clone(),
+                    });
+                }
+            }
+            Err(err) => tracing::warn!(?err, "failed to build devices for presence push"),
+        }
+    }
 }
 
 /// Браузер, под которым авторизовано соединение (слайс 3.7a).
@@ -1221,8 +1255,19 @@ async fn run_client(
     // memory only, consumed by the matching `Finish`.
     let mut passkey_registration: Option<PasskeyRegistration> = None;
     let mut passkey_login: Option<DiscoverableAuthentication> = None;
+    // D34: владелец, за которым соединение сейчас числится в registry
+    // (получатель push-`Devices`).
+    let mut watched_owner: Option<String> = None;
 
     loop {
+        // Сверяем в начале каждой итерации, до `next_message`: ни один
+        // `continue` ниже не пропустит смену владельца (вход, выход,
+        // слияние, отзыв токена).
+        let current_owner_id = session.as_ref().map(|s| s.owner_id.clone());
+        if current_owner_id != watched_owner {
+            registry.watch_owner(&tx, current_owner_id.as_deref());
+            watched_owner = current_owner_id;
+        }
         let msg = match next_message(stream, &tx, read_timeout).await {
             Some(msg) => msg,
             None => break,
@@ -1579,6 +1624,7 @@ async fn run_client(
                             ice_servers: ice.ice_servers(ice::now_unix(), &session_id),
                             session_id,
                         });
+                        notify_device_owners(db, registry, &device_id);
                     }
                     Err(err) => {
                         let _ = tx.send(SignalMessage::Error {
@@ -1704,6 +1750,7 @@ async fn run_client(
                                 tracing::error!(?err, "failed to link device to owner");
                             }
                         }
+                        notify_device_owners(db, registry, &host_id);
                     }
                     Err(err) => {
                         // Any failed join is an attempt: `host busy` or
@@ -1811,11 +1858,15 @@ async fn run_client(
                 }
             },
             SignalMessage::Bye { session_id, reason } => {
+                let session_host = registry.session_host_id(&session_id, &tx);
                 match registry.close_session_by_client(&session_id, &tx) {
                     Some(host_tx) => {
                         tracing::info!(%session_id, "client ended session");
                         end_session_logged(db, &session_id, "client_bye");
                         let _ = host_tx.send(SignalMessage::Bye { session_id, reason });
+                        if let Some(host_id) = session_host {
+                            notify_device_owners(db, registry, &host_id);
+                        }
                     }
                     None => {
                         // Unknown to the server -- most likely a stale
@@ -1835,10 +1886,15 @@ async fn run_client(
         }
     }
 
+    let freed_hosts = registry.client_session_host_ids(&tx);
     for (session_id, _host_tx) in registry.disconnect_client(&tx) {
         // Same reasoning as the host-side disconnect above: the socket
         // closing doesn't mean the P2P session is over, so no `Bye`.
         tracing::info!(%session_id, "session left to p2p after signaling loss");
+    }
+    registry.watch_owner(&tx, None);
+    for host_id in freed_hosts {
+        notify_device_owners(db, registry, &host_id);
     }
 }
 

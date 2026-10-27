@@ -963,6 +963,17 @@ impl Db {
         Ok(changed > 0)
     }
 
+    /// D34: все владельцы, к которым привязано устройство.
+    pub fn owners_of_device(&self, device_id: &str) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt =
+            conn.prepare("SELECT owner_id FROM ownership WHERE device_id = ?1 ORDER BY owner_id")?;
+        let rows = stmt
+            .query_map([device_id], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(rows)
+    }
+
     /// Devices belonging to `owner_id`, ordered by `added_at` then
     /// `device_id` (a deterministic order for tests and UI listings).
     pub fn devices_for_owner(&self, owner_id: &str) -> anyhow::Result<Vec<OwnedDevice>> {
@@ -2259,6 +2270,24 @@ mod tests {
 
         let devices = db.devices_for_owner("owner1").expect("devices for owner");
         assert_eq!(devices.len(), 1);
+    }
+
+    #[test]
+    fn owners_of_device_lists_every_linked_owner() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("b", 100).expect("owner b");
+        db.insert_owner("a", 100).expect("owner a");
+        db.insert_device("dev1", "hash1", "Mac", 100)
+            .expect("insert device");
+        db.insert_device("dev2", "hash2", "Win", 100)
+            .expect("insert device");
+        db.link_device("b", "dev1", 200).expect("link");
+        db.link_device("a", "dev1", 200).expect("link");
+        db.link_device("a", "dev2", 200).expect("link");
+
+        assert_eq!(db.owners_of_device("dev1").expect("owners"), ["a", "b"]);
+        assert_eq!(db.owners_of_device("dev2").expect("owners"), ["a"]);
+        assert!(db.owners_of_device("none").expect("owners").is_empty());
     }
 
     #[test]
