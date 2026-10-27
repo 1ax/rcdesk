@@ -302,6 +302,20 @@ impl Registry {
         inner.hosts.keys().cloned().collect()
     }
 
+    /// Ids of sessions that exist right now (A3: `AdminSession.active`):
+    /// live session entries plus sessions a re-registered host reports.
+    pub fn active_session_ids(&self) -> std::collections::HashSet<String> {
+        let inner = self.inner.lock().expect("registry mutex poisoned");
+        let mut ids: std::collections::HashSet<String> = inner.sessions.keys().cloned().collect();
+        ids.extend(
+            inner
+                .hosts
+                .values()
+                .filter_map(|host| host.session_id.clone()),
+        );
+        ids
+    }
+
     /// Whether the registry mutex is usable (not poisoned); for `/healthz`.
     pub fn is_healthy(&self) -> bool {
         self.inner.lock().is_ok()

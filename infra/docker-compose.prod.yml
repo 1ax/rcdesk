@@ -16,6 +16,11 @@ services:
     ports:
       - "127.0.0.1:8100:8080"
     env_file: .env
+    # Почты администраторов (A3) не в репо: приходят из GitHub-секрета
+    # RCDESK_ADMIN_EMAILS при деплое. `environment` перекрывает `env_file`,
+    # поэтому если секрет пуст -- админов нет, что бы ни лежало в .env.
+    environment:
+      RCDESK_ADMIN_EMAILS: ${RCDESK_ADMIN_EMAILS:-}
     # Именованный том, не bind-mount в ~/app/data: на пустом томе docker
     # наследует владельца/права из каталога /data образа (создан как
     # nobody:nogroup в server/Dockerfile), поэтому процесс внутри

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
@@ -92,6 +93,9 @@ pub struct AppState {
     /// Режим «LAN-хаб» (D47): аккаунтов, passkey и почты нет; клиент узнаёт
     /// об этом из `Authenticated.lan_hub` и прячет их UI.
     pub lan_hub: bool,
+    /// Почты администраторов (A3): trim + lowercase, как в `accounts`. В
+    /// LAN-хабе всегда пусто.
+    pub admin_emails: Arc<Vec<String>>,
 }
 
 pub fn app(
@@ -102,6 +106,29 @@ pub fn app(
     mailer: SharedMailer,
 ) -> Router {
     app_with_liveness(registry, ice, db, webauthn, mailer, Liveness::default())
+}
+
+/// Как [`app`], но с администраторами (A3): `admin_emails` -- почты уже в
+/// нижнем регистре (см. `admin::parse_admin_emails`).
+pub fn app_with_admins(
+    registry: Registry,
+    ice: IceConfig,
+    db: Db,
+    webauthn: SharedWebauthn,
+    mailer: SharedMailer,
+    admin_emails: Vec<String>,
+) -> Router {
+    build_app(
+        registry,
+        ice,
+        db,
+        webauthn,
+        mailer,
+        Liveness::default(),
+        GlobalLimiter::new(PIN_GLOBAL_BURST, PIN_GLOBAL_REFILL),
+        false,
+        admin_emails,
+    )
 }
 
 pub fn app_with_liveness(
@@ -123,6 +150,31 @@ pub fn app_with_liveness(
     )
 }
 
+/// Полная конфигурация (тесты): лимиты, liveness и администраторы.
+#[allow(clippy::too_many_arguments)]
+pub fn app_full(
+    registry: Registry,
+    ice: IceConfig,
+    db: Db,
+    webauthn: SharedWebauthn,
+    mailer: SharedMailer,
+    liveness: Liveness,
+    pin_global: GlobalLimiter,
+    admin_emails: Vec<String>,
+) -> Router {
+    build_app(
+        registry,
+        ice,
+        db,
+        webauthn,
+        mailer,
+        liveness,
+        pin_global,
+        false,
+        admin_emails,
+    )
+}
+
 pub fn app_with_limits(
     registry: Registry,
     ice: IceConfig,
@@ -133,7 +185,15 @@ pub fn app_with_limits(
     pin_global: GlobalLimiter,
 ) -> Router {
     build_app(
-        registry, ice, db, webauthn, mailer, liveness, pin_global, false,
+        registry,
+        ice,
+        db,
+        webauthn,
+        mailer,
+        liveness,
+        pin_global,
+        false,
+        Vec::new(),
     )
 }
 
@@ -155,6 +215,7 @@ pub fn lan_hub_app(
         Liveness::default(),
         GlobalLimiter::new(PIN_GLOBAL_BURST, PIN_GLOBAL_REFILL),
         true,
+        Vec::new(),
     )
 }
 
@@ -168,6 +229,7 @@ fn build_app(
     liveness: Liveness,
     pin_global: GlobalLimiter,
     lan_hub: bool,
+    admin_emails: Vec<String>,
 ) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -187,6 +249,7 @@ fn build_app(
             email_code_limiter: IpLimiter::new(EMAIL_CODE_BURST, EMAIL_CODE_REFILL),
             login_limiter: IpLimiter::new(LOGIN_BURST, LOGIN_REFILL),
             lan_hub,
+            admin_emails: Arc::new(admin_emails),
         })
 }
 

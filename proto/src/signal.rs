@@ -75,6 +75,138 @@ pub struct DeviceEntry {
     pub last_seen_at: i64,
 }
 
+/// Снимок админского кабинета (A3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AdminSnapshot {
+    #[ts(type = "number")]
+    pub generated_at: i64,
+    pub summary: AdminSummary,
+    pub users: Vec<AdminUser>,
+    pub devices: Vec<AdminDevice>,
+    pub sessions: Vec<AdminSession>,
+    pub daily: Vec<AdminDay>,
+}
+
+/// Сводные числа админского кабинета (A3). Месяц -- текущий календарный, UTC,
+/// по `started_at`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AdminSummary {
+    #[ts(type = "number")]
+    pub users_total: i64,
+    #[ts(type = "number")]
+    pub users_with_email: i64,
+    #[ts(type = "number")]
+    pub new_users_7d: i64,
+    #[ts(type = "number")]
+    pub new_users_30d: i64,
+    #[ts(type = "number")]
+    pub devices_total: i64,
+    #[ts(type = "number")]
+    pub hosts_online: i64,
+    #[ts(type = "number")]
+    pub sessions_active: i64,
+    #[ts(type = "number")]
+    pub bytes_month: i64,
+    #[ts(type = "number")]
+    pub relay_bytes_month: i64,
+    #[ts(type = "number")]
+    pub bytes_30d: i64,
+    #[ts(type = "number")]
+    pub relay_bytes_30d: i64,
+    /// Месячный бюджет релея в байтах (ARCHITECTURE §11).
+    #[ts(type = "number")]
+    pub relay_budget_bytes: i64,
+}
+
+/// Владелец в админском кабинете (A3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AdminUser {
+    pub owner_id: String,
+    pub email: Option<String>,
+    pub note: Option<String>,
+    #[ts(type = "number")]
+    pub created_at: i64,
+    #[ts(type = "number")]
+    pub last_active_at: i64,
+    #[ts(type = "number")]
+    pub devices: i64,
+    #[ts(type = "number")]
+    pub browsers: i64,
+    #[ts(type = "number")]
+    pub passkeys: i64,
+    #[ts(type = "number")]
+    pub sessions_total: i64,
+    #[ts(type = "number")]
+    pub seconds_total: i64,
+    #[ts(type = "number")]
+    pub bytes_30d: i64,
+    #[ts(type = "number")]
+    pub bytes_total: i64,
+}
+
+/// Устройство в админском кабинете (A3). `owners` -- почты владельцев,
+/// «анонимный» для владельца без почты.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AdminDevice {
+    pub device_id: String,
+    pub name: String,
+    pub owners: Vec<String>,
+    pub online: bool,
+    pub busy: bool,
+    #[ts(type = "number")]
+    pub created_at: i64,
+    #[ts(type = "number")]
+    pub last_seen_at: i64,
+    pub host_version: Option<String>,
+}
+
+/// Сеанс в админском кабинете (A3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AdminSession {
+    pub session_id: String,
+    pub device_id: String,
+    pub device_name: Option<String>,
+    pub owner_id: Option<String>,
+    pub email: Option<String>,
+    pub via: String,
+    pub client_ua: String,
+    #[ts(type = "number")]
+    pub started_at: i64,
+    #[ts(type = "number")]
+    pub last_seen_at: i64,
+    #[ts(type = "number | null")]
+    pub ended_at: Option<i64>,
+    pub end_reason: Option<String>,
+    /// Сеанс сейчас есть в реестре сервера.
+    pub active: bool,
+    #[ts(type = "number")]
+    pub bytes_sent: i64,
+    #[ts(type = "number")]
+    pub bytes_received: i64,
+    pub relay: bool,
+}
+
+/// Сутки (UTC) в админском кабинете (A3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AdminDay {
+    /// `YYYY-MM-DD`.
+    pub day: String,
+    #[ts(type = "number")]
+    pub sessions: i64,
+    #[ts(type = "number")]
+    pub seconds: i64,
+    #[ts(type = "number")]
+    pub bytes: i64,
+    #[ts(type = "number")]
+    pub relay_bytes: i64,
+}
+
 /// Один браузер владельца в списке (слайс 3.7a). `id` — идентификатор
 /// токена (не сам токен и не его хеш), `current` — токен этого соединения.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -316,7 +448,23 @@ pub enum SignalMessage {
     /// Сервер отвечает `Account`.
     GetAccount,
     /// server -> client: почта аккаунта владельца; `None` -- почты нет.
-    Account { email: Option<String> },
+    /// `is_admin` -- почта в списке администраторов сервера (A3).
+    Account {
+        email: Option<String>,
+        #[serde(default)]
+        is_admin: bool,
+    },
+    /// client -> server (A3): снимок админского кабинета. Только администратор;
+    /// остальным `Error { message: "forbidden" }`. Ответ: `AdminData`.
+    AdminGet,
+    /// client -> server (A3): заметка администратора о владельце (обрезается до
+    /// 200 символов, пустая строка -- снять). Ответ: свежий `AdminData`.
+    AdminSetNote {
+        owner_id: String,
+        note: Option<String>,
+    },
+    /// server -> client (A3): снимок админского кабинета.
+    AdminData { data: AdminSnapshot },
     /// client -> server: подключиться к своему устройству без PIN.
     ConnectDevice { device_id: String },
     /// client -> server: переименовать своё устройство (`alias = None` —
@@ -737,8 +885,88 @@ mod tests {
             SignalMessage::GetAccount,
             SignalMessage::Account {
                 email: Some("a@b.co".to_string()),
+                is_admin: true,
             },
-            SignalMessage::Account { email: None },
+            SignalMessage::Account {
+                email: None,
+                is_admin: false,
+            },
+            SignalMessage::AdminGet,
+            SignalMessage::AdminSetNote {
+                owner_id: "o1".to_string(),
+                note: Some("друг".to_string()),
+            },
+            SignalMessage::AdminSetNote {
+                owner_id: "o1".to_string(),
+                note: None,
+            },
+            SignalMessage::AdminData {
+                data: AdminSnapshot {
+                    generated_at: 1_700_000_000,
+                    summary: AdminSummary {
+                        users_total: 3,
+                        users_with_email: 2,
+                        new_users_7d: 1,
+                        new_users_30d: 2,
+                        devices_total: 4,
+                        hosts_online: 1,
+                        sessions_active: 1,
+                        bytes_month: 10,
+                        relay_bytes_month: 5,
+                        bytes_30d: 20,
+                        relay_bytes_30d: 6,
+                        relay_budget_bytes: 5_000_000_000_000,
+                    },
+                    users: vec![AdminUser {
+                        owner_id: "o1".to_string(),
+                        email: Some("a@b.co".to_string()),
+                        note: None,
+                        created_at: 1,
+                        last_active_at: 2,
+                        devices: 1,
+                        browsers: 2,
+                        passkeys: 0,
+                        sessions_total: 3,
+                        seconds_total: 60,
+                        bytes_30d: 7,
+                        bytes_total: 8,
+                    }],
+                    devices: vec![AdminDevice {
+                        device_id: "d1".to_string(),
+                        name: "Mac".to_string(),
+                        owners: vec!["a@b.co".to_string(), "анонимный".to_string()],
+                        online: true,
+                        busy: false,
+                        created_at: 1,
+                        last_seen_at: 2,
+                        host_version: Some("0.2.0".to_string()),
+                    }],
+                    sessions: vec![AdminSession {
+                        session_id: "s1".to_string(),
+                        device_id: "d1".to_string(),
+                        device_name: Some("Mac".to_string()),
+                        owner_id: None,
+                        email: None,
+                        via: "pin".to_string(),
+                        client_ua: "UA".to_string(),
+                        started_at: 1,
+                        last_seen_at: 2,
+                        ended_at: None,
+                        end_reason: None,
+                        active: true,
+                        bytes_sent: 3,
+                        bytes_received: 4,
+                        relay: false,
+                    }],
+                    daily: vec![AdminDay {
+                        day: "2026-10-27".to_string(),
+                        sessions: 1,
+                        seconds: 2,
+                        bytes: 3,
+                        relay_bytes: 0,
+                    }],
+                },
+            },
         ];
         for msg in messages {
             let json = serde_json::to_string(&msg).expect("serialize");
@@ -790,8 +1018,24 @@ mod tests {
                 password: "p".to_string()
             }
         );
-        let json = serde_json::to_string(&SignalMessage::Account { email: None }).expect("ser");
-        assert_eq!(json, r#"{"type":"account","email":null}"#);
+        let json = serde_json::to_string(&SignalMessage::Account {
+            email: None,
+            is_admin: false,
+        })
+        .expect("ser");
+        assert_eq!(json, r#"{"type":"account","email":null,"is_admin":false}"#);
+        // Старый сервер поле не шлёт.
+        let msg: SignalMessage =
+            serde_json::from_str(r#"{"type":"account","email":null}"#).expect("deserialize");
+        assert_eq!(
+            msg,
+            SignalMessage::Account {
+                email: None,
+                is_admin: false
+            }
+        );
+        let json = serde_json::to_string(&SignalMessage::AdminGet).expect("ser");
+        assert_eq!(json, r#"{"type":"admin_get"}"#);
     }
 
     #[test]

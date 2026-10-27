@@ -84,6 +84,47 @@ pub struct SessionRow {
     pub relay: bool,
 }
 
+fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
+    Ok(SessionRow {
+        session_id: row.get(0)?,
+        device_id: row.get(1)?,
+        owner_id: row.get(2)?,
+        via: row.get(3)?,
+        client_ua: row.get(4)?,
+        started_at: row.get(5)?,
+        last_seen_at: row.get(6)?,
+        ended_at: row.get(7)?,
+        end_reason: row.get(8)?,
+        bytes_sent: row.get(9)?,
+        bytes_received: row.get(10)?,
+        relay: row.get::<_, i64>(11)? != 0,
+    })
+}
+
+/// Владелец для админского кабинета (A3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminOwnerRow {
+    pub owner_id: String,
+    pub email: Option<String>,
+    pub note: Option<String>,
+    pub created_at: i64,
+    /// max(created_at, последнее использование токена, passkey).
+    pub last_active_at: i64,
+    pub devices: i64,
+    pub browsers: i64,
+    pub passkeys: i64,
+}
+
+/// Устройство для админского кабинета (A3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdminDeviceRow {
+    pub device_id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+    pub host_version: Option<String>,
+}
+
 /// Один passkey владельца в списке (слайс 3.7b). Сам `passkey_json` и
 /// идентификатор credential наружу не отдаются.
 #[derive(Debug, Clone, PartialEq)]
@@ -236,22 +277,7 @@ impl Db {
                         last_seen_at, ended_at, end_reason, bytes_sent, bytes_received, relay
                  FROM sessions WHERE session_id = ?1",
                 [session_id],
-                |row| {
-                    Ok(SessionRow {
-                        session_id: row.get(0)?,
-                        device_id: row.get(1)?,
-                        owner_id: row.get(2)?,
-                        via: row.get(3)?,
-                        client_ua: row.get(4)?,
-                        started_at: row.get(5)?,
-                        last_seen_at: row.get(6)?,
-                        ended_at: row.get(7)?,
-                        end_reason: row.get(8)?,
-                        bytes_sent: row.get(9)?,
-                        bytes_received: row.get(10)?,
-                        relay: row.get::<_, i64>(11)? != 0,
-                    })
-                },
+                session_from_row,
             )
             .optional()?;
         Ok(row)
@@ -333,6 +359,95 @@ impl Db {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let removed = conn.execute("DELETE FROM sessions WHERE started_at < ?1", [cutoff])?;
         Ok(removed)
+    }
+
+    /// Все владельцы со счётчиками для админского кабинета (A3).
+    pub fn admin_owner_rows(&self) -> anyhow::Result<Vec<AdminOwnerRow>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT o.owner_id, a.email, o.admin_note, o.created_at,
+                    MAX(o.created_at,
+                        COALESCE((SELECT MAX(last_used_at) FROM owner_tokens t
+                                  WHERE t.owner_id = o.owner_id), 0),
+                        COALESCE((SELECT MAX(last_used_at) FROM passkeys p
+                                  WHERE p.owner_id = o.owner_id), 0)),
+                    (SELECT COUNT(*) FROM ownership w WHERE w.owner_id = o.owner_id),
+                    (SELECT COUNT(*) FROM owner_tokens t WHERE t.owner_id = o.owner_id),
+                    (SELECT COUNT(*) FROM passkeys p WHERE p.owner_id = o.owner_id)
+             FROM owners o LEFT JOIN accounts a ON a.owner_id = o.owner_id
+             ORDER BY o.owner_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(AdminOwnerRow {
+                    owner_id: row.get(0)?,
+                    email: row.get(1)?,
+                    note: row.get(2)?,
+                    created_at: row.get(3)?,
+                    last_active_at: row.get(4)?,
+                    devices: row.get(5)?,
+                    browsers: row.get(6)?,
+                    passkeys: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Все устройства для админского кабинета (A3).
+    pub fn admin_device_rows(&self) -> anyhow::Result<Vec<AdminDeviceRow>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT device_id, name, created_at, last_seen_at, host_version
+             FROM devices ORDER BY device_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(AdminDeviceRow {
+                    device_id: row.get(0)?,
+                    name: row.get(1)?,
+                    created_at: row.get(2)?,
+                    last_seen_at: row.get(3)?,
+                    host_version: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Пары `(device_id, owner_id)` из `ownership` (A3).
+    pub fn admin_ownership(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare("SELECT device_id, owner_id FROM ownership")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Весь журнал сеансов, свежие первыми (A3).
+    pub fn all_sessions(&self) -> anyhow::Result<Vec<SessionRow>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT session_id, device_id, owner_id, via, client_ua, started_at,
+                    last_seen_at, ended_at, end_reason, bytes_sent, bytes_received, relay
+             FROM sessions ORDER BY started_at DESC, session_id",
+        )?;
+        let rows = stmt
+            .query_map([], session_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Пишет заметку администратора о владельце (`None` снимает её).
+    /// `false`, если владельца нет.
+    pub fn set_admin_note(&self, owner_id: &str, note: Option<&str>) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE owners SET admin_note = ?2 WHERE owner_id = ?1",
+            (owner_id, note),
+        )?;
+        Ok(changed > 0)
     }
 
     pub fn insert_owner(&self, owner_id: &str, now: i64) -> anyhow::Result<()> {

@@ -69,6 +69,16 @@ async fn spawn_with_mailer(
     global: rcdesk_server::ip_limit::GlobalLimiter,
     mailer: rcdesk_server::mail::SharedMailer,
 ) -> (String, Db) {
+    spawn_with_admins(ice, liveness, global, mailer, Vec::new()).await
+}
+
+async fn spawn_with_admins(
+    ice: IceConfig,
+    liveness: Liveness,
+    global: rcdesk_server::ip_limit::GlobalLimiter,
+    mailer: rcdesk_server::mail::SharedMailer,
+    admin_emails: Vec<String>,
+) -> (String, Db) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
@@ -82,8 +92,15 @@ async fn spawn_with_mailer(
     tokio::spawn(async move {
         axum::serve(
             listener,
-            rcdesk_server::app::app_with_limits(
-                registry, ice, db, webauthn, mailer, liveness, global,
+            rcdesk_server::app::app_full(
+                registry,
+                ice,
+                db,
+                webauthn,
+                mailer,
+                liveness,
+                global,
+                admin_emails,
             )
             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
@@ -2690,7 +2707,9 @@ async fn expect_signed_in(ws: &mut WsStream) -> (String, Vec<proto::signal::Devi
         other => panic!("expected authenticated, got {other:?}"),
     };
     let email = match recv(ws).await {
-        SignalMessage::Account { email: Some(email) } => email,
+        SignalMessage::Account {
+            email: Some(email), ..
+        } => email,
         other => panic!("expected account with email, got {other:?}"),
     };
     (token, devices, email)
@@ -2705,7 +2724,13 @@ async fn registration_binds_email_to_the_current_owner_and_password_login_finds_
     link_new_device(&db, &owner, "dev1");
 
     send(&mut a, &SignalMessage::GetAccount).await;
-    assert_eq!(recv(&mut a).await, SignalMessage::Account { email: None });
+    assert_eq!(
+        recv(&mut a).await,
+        SignalMessage::Account {
+            email: None,
+            is_admin: false
+        }
+    );
 
     let code = request_code(&mut a, &mailer, "bob@example.com").await;
     confirm(&mut a, " Bob@Example.com ", &code, "hunter22-pass").await;
@@ -2720,7 +2745,8 @@ async fn registration_binds_email_to_the_current_owner_and_password_login_finds_
     assert_eq!(
         recv(&mut a).await,
         SignalMessage::Account {
-            email: Some("bob@example.com".to_string())
+            email: Some("bob@example.com".to_string()),
+            is_admin: false
         }
     );
 
@@ -3087,7 +3113,8 @@ async fn email_change_moves_the_account_and_notifies_the_old_address() {
     assert_eq!(
         recv(&mut ws).await,
         SignalMessage::Account {
-            email: Some("new@example.com".to_string())
+            email: Some("new@example.com".to_string()),
+            is_admin: false
         }
     );
     assert_eq!(
@@ -3133,7 +3160,8 @@ async fn email_change_with_wrong_password_keeps_the_code_valid() {
     assert_eq!(
         recv(&mut ws).await,
         SignalMessage::Account {
-            email: Some("new@example.com".to_string())
+            email: Some("new@example.com".to_string()),
+            is_admin: false
         }
     );
 }
@@ -3295,4 +3323,174 @@ async fn session_log_records_join_stats_and_bye() {
     let row = db.session(&session_id).expect("query").expect("row");
     assert!(row.ended_at.is_some());
     assert_eq!(row.end_reason.as_deref(), Some("client_bye"));
+}
+
+// ---- Admin cabinet (A3) ----
+
+async fn spawn_with_admin_list(admins: &[&str]) -> (String, Db, RecordingMailer) {
+    let mailer = RecordingMailer::default();
+    let (url, db) = spawn_with_admins(
+        IceConfig::from_env(),
+        Liveness::default(),
+        rcdesk_server::ip_limit::GlobalLimiter::new(
+            rcdesk_server::app::PIN_GLOBAL_BURST,
+            rcdesk_server::app::PIN_GLOBAL_REFILL,
+        ),
+        std::sync::Arc::new(mailer.clone()),
+        rcdesk_server::admin::parse_admin_emails(&admins.join(",")),
+    )
+    .await;
+    (url, db, mailer)
+}
+
+async fn expect_forbidden(ws: &mut WsStream) {
+    assert_eq!(
+        recv(ws).await,
+        SignalMessage::Error {
+            message: "forbidden".to_string()
+        }
+    );
+}
+
+#[tokio::test]
+async fn admin_gets_snapshot_and_sets_note_while_others_are_forbidden() {
+    let (url, db, mailer) = spawn_with_admin_list(&[" Boss@Example.com "]).await;
+
+    // Анонимный владелец: не админ.
+    let mut anon = client_conn(&url).await;
+    let (anon_token, _) = client_auth(&mut anon, None).await;
+    let anon_owner = owner_of_token(&db, &anon_token).expect("owner");
+    send(&mut anon, &SignalMessage::GetAccount).await;
+    assert_eq!(
+        recv(&mut anon).await,
+        SignalMessage::Account {
+            email: None,
+            is_admin: false
+        }
+    );
+    send(&mut anon, &SignalMessage::AdminGet).await;
+    expect_forbidden(&mut anon).await;
+    send(
+        &mut anon,
+        &SignalMessage::AdminSetNote {
+            owner_id: anon_owner.clone(),
+            note: Some("x".to_string()),
+        },
+    )
+    .await;
+    expect_forbidden(&mut anon).await;
+    assert_eq!(db.admin_owner_rows().unwrap()[0].note, None);
+
+    // Обычный пользователь с почтой: не админ.
+    let (mut user, _) =
+        registered_conn(&url, &db, &mailer, "user@example.com", "hunter22-pass").await;
+    send(&mut user, &SignalMessage::AdminGet).await;
+    expect_forbidden(&mut user).await;
+
+    // Админ: Account.is_admin == true, AdminData, заметка.
+    let mut admin = client_conn(&url).await;
+    let (admin_token, _) = client_auth(&mut admin, None).await;
+    let admin_owner = owner_of_token(&db, &admin_token).expect("owner");
+    link_new_device(&db, &admin_owner, "dev-admin");
+    let code = request_code(&mut admin, &mailer, "boss@example.com").await;
+    confirm(&mut admin, "boss@example.com", &code, "hunter22-pass").await;
+    let (_, _, email) = expect_signed_in_admin(&mut admin).await;
+    assert_eq!(email, "boss@example.com");
+
+    send(&mut admin, &SignalMessage::AdminGet).await;
+    let data = match recv(&mut admin).await {
+        SignalMessage::AdminData { data } => data,
+        other => panic!("expected admin data, got {other:?}"),
+    };
+    assert_eq!(data.summary.users_total, 3);
+    assert_eq!(data.summary.users_with_email, 2);
+    assert_eq!(data.summary.devices_total, 1);
+    assert_eq!(data.daily.len(), 30);
+    assert!(data.users.iter().any(|u| u.owner_id == anon_owner));
+
+    let long = "я".repeat(250);
+    send(
+        &mut admin,
+        &SignalMessage::AdminSetNote {
+            owner_id: anon_owner.clone(),
+            note: Some(format!("  {long}  ")),
+        },
+    )
+    .await;
+    let data = match recv(&mut admin).await {
+        SignalMessage::AdminData { data } => data,
+        other => panic!("expected admin data, got {other:?}"),
+    };
+    let user = data
+        .users
+        .iter()
+        .find(|u| u.owner_id == anon_owner)
+        .expect("user");
+    assert_eq!(user.note.as_deref().map(|n| n.chars().count()), Some(200));
+
+    send(
+        &mut admin,
+        &SignalMessage::AdminSetNote {
+            owner_id: anon_owner.clone(),
+            note: Some("   ".to_string()),
+        },
+    )
+    .await;
+    let data = match recv(&mut admin).await {
+        SignalMessage::AdminData { data } => data,
+        other => panic!("expected admin data, got {other:?}"),
+    };
+    assert_eq!(
+        data.users
+            .iter()
+            .find(|u| u.owner_id == anon_owner)
+            .expect("user")
+            .note,
+        None
+    );
+}
+
+/// `expect_signed_in` для админа: `Account.is_admin` обязан быть `true`.
+async fn expect_signed_in_admin(
+    ws: &mut WsStream,
+) -> (String, Vec<proto::signal::DeviceEntry>, String) {
+    let token = match recv(ws).await {
+        SignalMessage::Authenticated { token, .. } => token,
+        other => panic!("expected authenticated, got {other:?}"),
+    };
+    match recv(ws).await {
+        SignalMessage::Account {
+            email: Some(email),
+            is_admin,
+        } => {
+            assert!(is_admin, "admin email must yield is_admin");
+            (token, Vec::new(), email)
+        }
+        other => panic!("expected account with email, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn admin_is_empty_without_configured_admins() {
+    let (url, db, mailer) = spawn_with_admin_list(&[]).await;
+    let (mut ws, _) =
+        registered_conn(&url, &db, &mailer, "boss@example.com", "hunter22-pass").await;
+    send(&mut ws, &SignalMessage::GetAccount).await;
+    assert_eq!(
+        recv(&mut ws).await,
+        SignalMessage::Account {
+            email: Some("boss@example.com".to_string()),
+            is_admin: false
+        }
+    );
+    send(&mut ws, &SignalMessage::AdminGet).await;
+    expect_forbidden(&mut ws).await;
+}
+
+#[tokio::test]
+async fn admin_get_without_authentication_is_not_authenticated() {
+    let (url, _db, _mailer) = spawn_with_admin_list(&["boss@example.com"]).await;
+    let mut ws = client_conn(&url).await;
+    send(&mut ws, &SignalMessage::AdminGet).await;
+    expect_not_authenticated(&mut ws).await;
 }

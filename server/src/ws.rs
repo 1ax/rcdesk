@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use tokio::time::{interval, timeout, MissedTickBehavior};
 
 use crate::accounts::{self, EmailCodes};
+use crate::admin;
 use crate::app::AppState;
 use crate::db::{Db, SetEmailOutcome};
 use crate::devices::{self, DeviceAuth};
@@ -148,6 +149,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
             email_code_limiter: &state.email_code_limiter,
             login_limiter: &state.login_limiter,
             lan_hub: state.lan_hub,
+            admin_emails: &state.admin_emails,
         },
         info,
         read_timeout,
@@ -631,6 +633,8 @@ struct AccountDeps<'a> {
     login_limiter: &'a IpLimiter,
     /// Режим «LAN-хаб» (D47): шлётся клиенту в `Authenticated`.
     lan_hub: bool,
+    /// Почты администраторов (A3), нижний регистр; в LAN-хабе пусто.
+    admin_emails: &'a [String],
 }
 
 /// Сколько ждём отправки письма с кодом.
@@ -833,11 +837,51 @@ fn send_authenticated(
     });
 }
 
+/// Почта в списке администраторов (почты в `accounts` и в списке уже в
+/// нижнем регистре).
+fn is_admin_email(admin_emails: &[String], email: Option<&str>) -> bool {
+    email.is_some_and(|email| admin_emails.iter().any(|admin| admin == email))
+}
+
+/// Администратор ли владелец. Ошибка БД -- в лог и `Error`, `None`.
+fn require_admin(db: &Db, admin_emails: &[String], owner_id: &str, tx: &Tx) -> Option<()> {
+    if admin_emails.is_empty() {
+        send_error(tx, "forbidden");
+        return None;
+    }
+    match db.email_for_owner(owner_id) {
+        Ok(email) if is_admin_email(admin_emails, email.as_deref()) => Some(()),
+        Ok(_) => {
+            send_error(tx, "forbidden");
+            None
+        }
+        Err(err) => {
+            tracing::error!(?err, "failed to check admin");
+            send_error(tx, "internal error");
+            None
+        }
+    }
+}
+
+/// Снимок кабинета клиенту.
+fn send_admin_data(db: &Db, registry: &Registry, tx: &Tx) {
+    match admin::build_snapshot(db, registry, ice::now_unix() as i64) {
+        Ok(data) => {
+            let _ = tx.send(SignalMessage::AdminData { data });
+        }
+        Err(err) => {
+            tracing::error!(?err, "failed to build admin snapshot");
+            send_error(tx, "internal error");
+        }
+    }
+}
+
 /// `Account` с почтой владельца.
-fn send_account(db: &Db, owner_id: &str, tx: &Tx) {
+fn send_account(db: &Db, admin_emails: &[String], owner_id: &str, tx: &Tx) {
     match db.email_for_owner(owner_id) {
         Ok(email) => {
-            let _ = tx.send(SignalMessage::Account { email });
+            let is_admin = is_admin_email(admin_emails, email.as_deref());
+            let _ = tx.send(SignalMessage::Account { email, is_admin });
         }
         Err(err) => {
             tracing::error!(?err, "failed to load account for owner");
@@ -960,7 +1004,7 @@ async fn handle_email_code_confirm(
         match result {
             Ok(token) => {
                 send_authenticated(db, registry, &account_id, token, deps.lan_hub, tx);
-                send_account(db, &account_id, tx);
+                send_account(db, deps.admin_emails, &account_id, tx);
             }
             Err(err) => {
                 tracing::error!(?err, "failed to reset password");
@@ -992,7 +1036,7 @@ async fn handle_email_code_confirm(
                 .map(|s| s.token.clone())
                 .unwrap_or_default();
             send_authenticated(db, registry, &owner_id, token, deps.lan_hub, tx);
-            send_account(db, &owner_id, tx);
+            send_account(db, deps.admin_emails, &owner_id, tx);
         }
         // Гонка: почту заняли между проверкой и вставкой.
         Ok(false) => send_error(tx, "already registered"),
@@ -1053,7 +1097,7 @@ async fn handle_password_login(
     match switch_to_account(db, session, &account_id, user_agent, now) {
         Ok(token) => {
             send_authenticated(db, registry, &account_id, token, deps.lan_hub, tx);
-            send_account(db, &account_id, tx);
+            send_account(db, deps.admin_emails, &account_id, tx);
         }
         Err(err) => {
             tracing::error!(?err, "failed to sign in with password");
@@ -1138,7 +1182,7 @@ async fn handle_email_change(
             return;
         }
     }
-    send_account(db, &owner_id, tx);
+    send_account(db, deps.admin_emails, &owner_id, tx);
     // Уведомление на старый адрес: сбой не откатывает смену и клиенту не виден.
     match timeout(
         MAIL_SEND_TIMEOUT,
@@ -1454,11 +1498,39 @@ async fn run_client(
                 )
                 .await;
             }
+            SignalMessage::AdminGet => {
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                    continue;
+                };
+                if require_admin(db, account_deps.admin_emails, &owner_id, &tx).is_none() {
+                    continue;
+                }
+                send_admin_data(db, registry, &tx);
+            }
+            SignalMessage::AdminSetNote {
+                owner_id: target,
+                note,
+            } => {
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                    continue;
+                };
+                if require_admin(db, account_deps.admin_emails, &owner_id, &tx).is_none() {
+                    continue;
+                }
+                let note = admin::normalize_note(note.as_deref());
+                match db.set_admin_note(&target, note.as_deref()) {
+                    Ok(_) => send_admin_data(db, registry, &tx),
+                    Err(err) => {
+                        tracing::error!(?err, "failed to set admin note");
+                        send_error(&tx, "internal error");
+                    }
+                }
+            }
             SignalMessage::GetAccount => {
                 let Some(owner_id) = require_owner(db, &mut session, &tx) else {
                     continue;
                 };
-                send_account(db, &owner_id, &tx);
+                send_account(db, account_deps.admin_emails, &owner_id, &tx);
             }
             SignalMessage::ConnectDevice { device_id } => {
                 let Some(owner_id) = require_owner(db, &mut session, &tx) else {

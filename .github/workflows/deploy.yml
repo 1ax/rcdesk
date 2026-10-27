@@ -98,6 +98,7 @@ jobs:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
           SSH_USER: ${{ secrets.SSH_USER }}
+          RCDESK_ADMIN_EMAILS: ${{ secrets.RCDESK_ADMIN_EMAILS }}
         run: |
           set -e
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
@@ -116,13 +117,14 @@ jobs:
           # Тег образа этого коммита (docker/metadata-action type=sha: 7 символов).
           # Тег передаётся env-переменной удалённому sh, скрипт идёт через heredoc.
           TAG="sha-$(echo "$GITHUB_SHA" | cut -c1-7)"
-          ssh $SSHOPTS "$SSH_USER@$SSH_HOST" "IMAGE_TAG=$TAG sh -s" <<'REMOTE'
+          ssh $SSHOPTS "$SSH_USER@$SSH_HOST" "IMAGE_TAG=$TAG RCDESK_ADMIN_EMAILS='$RCDESK_ADMIN_EMAILS' sh -s" <<'REMOTE'
             set -e
             chmod +x ~/app/traffic-monitor.sh
             chmod +x ~/app/backup-db.sh
             cd ~/app
             C="docker compose -f docker-compose.prod.yml"
             export IMAGE_TAG
+            export RCDESK_ADMIN_EMAILS
             $C pull
             $C up -d --remove-orphans
             for i in $(seq 1 10); do

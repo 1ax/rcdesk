@@ -1,4 +1,5 @@
-use rcdesk_server::app::{app, spawn_pin_rotation, Liveness};
+use rcdesk_server::admin::admin_emails_from_env;
+use rcdesk_server::app::{app_with_admins, spawn_pin_rotation, Liveness};
 use rcdesk_server::db::Db;
 use rcdesk_server::ice::IceConfig;
 use rcdesk_server::mail::mailer_from_env;
@@ -38,12 +39,15 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("rcdesk-server listening on {addr}");
 
     let shutdown_db = db.clone();
-    let service = app(
+    let admin_emails = admin_emails_from_env();
+    tracing::info!("admins configured: {}", admin_emails.len());
+    let service = app_with_admins(
         registry,
         IceConfig::from_env(),
         db,
         webauthn,
         mailer_from_env()?,
+        admin_emails,
     )
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
 
