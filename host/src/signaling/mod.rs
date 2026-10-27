@@ -2696,6 +2696,8 @@ fn update_failed(message: String) -> ControlMessage {
         state: proto::control::UpdateState::Failed,
         version: None,
         message: Some(message),
+        received: None,
+        total: None,
     }
 }
 
@@ -2724,15 +2726,28 @@ fn begin_update(
     tokio::spawn(async move {
         let progress_tx = tx.clone();
         let result = crate::updater::run_update(&dirs.work_dir, &dirs.log_dir, current, move |p| {
-            let (state, version) = match p {
-                UpdateProgress::Checking => (UpdateState::Checking, None),
-                UpdateProgress::Downloading(v) => (UpdateState::Downloading, Some(v.to_string())),
-                UpdateProgress::Installing(v) => (UpdateState::Installing, Some(v.to_string())),
+            let (state, version, received, total) = match p {
+                UpdateProgress::Checking => (UpdateState::Checking, None, None, None),
+                UpdateProgress::Downloading {
+                    version,
+                    received,
+                    total,
+                } => (
+                    UpdateState::Downloading,
+                    Some(version.to_string()),
+                    Some(received),
+                    total,
+                ),
+                UpdateProgress::Installing(v) => {
+                    (UpdateState::Installing, Some(v.to_string()), None, None)
+                }
             };
             let _ = progress_tx.send(ControlMessage::UpdateStatus {
                 state,
                 version,
                 message: None,
+                received,
+                total,
             });
         })
         .await;
@@ -2742,6 +2757,8 @@ fn begin_update(
                     state: UpdateState::UpToDate,
                     version: Some(v.to_string()),
                     message: None,
+                    received: None,
+                    total: None,
                 });
             }
             Ok(UpdateOutcome::InstallerLaunched(v)) => {
@@ -4295,6 +4312,8 @@ mod tests {
                     state: proto::control::UpdateState::Failed,
                     version: None,
                     message: Some("обновление недоступно на этом хосте".to_string()),
+                    received: None,
+                    total: None,
                 }
             ),
             Ok(_) => panic!("обновление не должно стартовать без update_dirs"),

@@ -40,9 +40,20 @@ function isOlder(a: [number, number, number], b: [number, number, number]): bool
   return false;
 }
 
-/** Текст плашки по `update_status` (слайс D50d). */
+/** Мегабайты (1024*1024) с одной цифрой и русской запятой: 4,2. */
+function formatMb(bytes: number): string {
+  return (bytes / (1024 * 1024)).toFixed(1).replace(".", ",");
+}
+
+/** Текст плашки по `update_status` (слайс D50d; D81 -- прогресс загрузки). */
 export function updateStatusLabel(
-  msg: { state: UpdateState; version: string | null; message: string | null },
+  msg: {
+    state: UpdateState;
+    version: string | null;
+    message: string | null;
+    received?: number | null;
+    total?: number | null;
+  },
   hostOs: HostOs | null,
 ): string {
   const v = msg.version ?? "";
@@ -50,7 +61,15 @@ export function updateStatusLabel(
     case "checking":
       return "Проверяю обновление…";
     case "downloading":
-      return `Скачиваю rcdesk ${v}…`;
+    {
+      const { received, total } = msg;
+      if (received === null || received === undefined) return `Скачиваю rcdesk ${v}…`;
+      if (total === null || total === undefined || total <= 0) {
+        return `Скачиваю rcdesk ${v}… ${formatMb(received)} МБ`;
+      }
+      const percent = Math.min(100, Math.floor((received * 100) / total));
+      return `Скачиваю rcdesk ${v}… ${formatMb(received)} из ${formatMb(total)} МБ (${percent}%)`;
+    }
     case "installing":
       return (
         `Устанавливаю rcdesk ${v} — сеанс прервётся` +

@@ -585,6 +585,8 @@ mod imp {
         let update_item = MenuItem::with_id("update", "", true, None);
         let mut update_shown = false;
         let update_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // D81: прогресс обновления из фоновой задачи в пункт меню (главный поток).
+        let (update_menu_tx, update_menu_rx) = std::sync::mpsc::channel::<UpdateMenuEvent>();
 
         let menu = Menu::new();
         menu.append(&version_item)
@@ -668,12 +670,27 @@ mod imp {
                     "update" => {
                         if !update_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
                             let started = update_started.clone();
+                            let menu_tx = update_menu_tx.clone();
+                            update_item.set_enabled(false);
+                            update_item.set_text("Проверяю обновление…");
                             runtime.spawn(async move {
+                                let progress_tx = menu_tx.clone();
                                 let result = updater::run_update(
                                     &agent::paths::data_dir(),
                                     &agent::paths::log_dir(),
                                     current_version(),
-                                    |p| tracing::info!(?p, "обновление: этап"),
+                                    move |p| {
+                                        // В лог -- только этапы, не каждую секунду загрузки.
+                                        if !matches!(
+                                            p,
+                                            updater::UpdateProgress::Downloading { received, .. }
+                                                if received > 0
+                                        ) {
+                                            tracing::info!(?p, "обновление: этап");
+                                        }
+                                        let _ = progress_tx
+                                            .send(UpdateMenuEvent::Text(update_menu_text(&p)));
+                                    },
                                 )
                                 .await;
                                 match result {
@@ -683,10 +700,12 @@ mod imp {
                                     Ok(updater::UpdateOutcome::UpToDate(v)) => {
                                         tracing::info!(version = %v, "обновление не требуется");
                                         started.store(false, std::sync::atomic::Ordering::SeqCst);
+                                        let _ = menu_tx.send(UpdateMenuEvent::Finished);
                                     }
                                     Err(err) => {
                                         tracing::warn!(error = %err, "не удалось обновиться автоматически, открываю страницу загрузки");
                                         started.store(false, std::sync::atomic::Ordering::SeqCst);
+                                        let _ = menu_tx.send(UpdateMenuEvent::Finished);
                                         open_url(update_check::DOWNLOAD_URL);
                                     }
                                 }
@@ -710,6 +729,21 @@ mod imp {
                         &mut curtain_main,
                     ),
                     _ => {}
+                }
+            }
+
+            while let Ok(event) = update_menu_rx.try_recv() {
+                match event {
+                    UpdateMenuEvent::Text(text) => {
+                        update_item.set_enabled(false);
+                        update_item.set_text(text);
+                    }
+                    UpdateMenuEvent::Finished => {
+                        if let Some(latest) = *update_rx.borrow() {
+                            update_item.set_text(format!("Установить обновление {latest}"));
+                        }
+                        update_item.set_enabled(true);
+                    }
                 }
             }
 
@@ -822,6 +856,36 @@ mod imp {
 
     /// Opens the log file for viewing: `open` on macOS (launches Console.app
     /// or whatever handles `.log` files), `notepad.exe` on Windows.
+    /// D81: события обновления для пункта меню (из фоновой задачи в главный поток).
+    enum UpdateMenuEvent {
+        /// Новый текст пункта на время обновления.
+        Text(String),
+        /// Обновление не запущено (актуально/ошибка): вернуть пункт в исходный вид.
+        Finished,
+    }
+
+    /// Текст пункта меню по этапу обновления.
+    fn update_menu_text(p: &updater::UpdateProgress) -> String {
+        match p {
+            updater::UpdateProgress::Checking => "Проверяю обновление…".to_string(),
+            updater::UpdateProgress::Downloading {
+                version,
+                received,
+                total,
+            } => match total {
+                Some(total) if *total > 0 => {
+                    let percent = (received.saturating_mul(100) / total).min(100);
+                    format!("Скачиваю {version} — {percent}%")
+                }
+                _ => format!(
+                    "Скачиваю {version} — {:.1} МБ",
+                    *received as f64 / (1024.0 * 1024.0)
+                ),
+            },
+            updater::UpdateProgress::Installing(version) => format!("Устанавливаю {version}…"),
+        }
+    }
+
     fn open_log(path: &Path) {
         #[cfg(target_os = "macos")]
         {

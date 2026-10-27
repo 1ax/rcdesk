@@ -48,6 +48,30 @@ describe("updateStatusLabel", () => {
       "Скачиваю rcdesk 0.2.0…",
     );
   });
+  it("downloading with progress and total", () => {
+    expect(
+      updateStatusLabel(
+        { ...base, state: "downloading", version: "0.3.3", received: 4_404_019, total: 13_958_644 },
+        null,
+      ),
+    ).toBe("Скачиваю rcdesk 0.3.3… 4,2 из 13,3 МБ (31%)");
+  });
+  it("downloading with progress, percent capped at 100", () => {
+    expect(
+      updateStatusLabel(
+        { ...base, state: "downloading", version: "0.3.3", received: 2_000_000, total: 1_000_000 },
+        null,
+      ),
+    ).toBe("Скачиваю rcdesk 0.3.3… 1,9 из 1,0 МБ (100%)");
+  });
+  it("downloading with progress without total", () => {
+    expect(
+      updateStatusLabel(
+        { ...base, state: "downloading", version: "0.3.3", received: 4_404_019, total: null },
+        null,
+      ),
+    ).toBe("Скачиваю rcdesk 0.3.3… 4,2 МБ");
+  });
   it("installing on windows", () => {
     expect(updateStatusLabel({ ...base, state: "installing", version: "0.2.0" }, "windows")).toBe(
       "Устанавливаю rcdesk 0.2.0 — сеанс прервётся",

@@ -208,11 +208,18 @@ pub enum ControlMessage {
     UpdateHost,
     /// host -> client: ход обновления (слайс D50d). `version` -- целевая
     /// версия (`Downloading`/`Installing`/`UpToDate`), `message` -- причина
-    /// при `Failed`.
+    /// при `Failed`. `received`/`total` -- байты установщика при
+    /// `Downloading` (D81); `total` неизвестен, если сервер не сообщил размер.
     UpdateStatus {
         state: UpdateState,
         version: Option<String>,
         message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "number | null", optional)]
+        received: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "number | null", optional)]
+        total: Option<u64>,
     },
 }
 
@@ -583,6 +590,8 @@ mod tests {
                 state,
                 version: Some("0.2.0".to_string()),
                 message: None,
+                received: None,
+                total: None,
             };
             let json = serde_json::to_string(&msg).expect("serialize");
             assert_eq!(
@@ -598,12 +607,33 @@ mod tests {
             state: UpdateState::Failed,
             version: None,
             message: Some("нет сети".to_string()),
+            received: None,
+            total: None,
         };
         let json = serde_json::to_string(&failed).expect("serialize");
         assert_eq!(
             json,
             r#"{"type":"update_status","state":"failed","version":null,"message":"нет сети"}"#
         );
+    }
+
+    /// D81: прогресс загрузки несёт `received`/`total`; без них поля нет.
+    #[test]
+    fn update_status_with_progress_has_exact_shape() {
+        let msg = ControlMessage::UpdateStatus {
+            state: UpdateState::Downloading,
+            version: Some("0.3.3".to_string()),
+            message: None,
+            received: Some(4_404_019),
+            total: Some(13_900_000),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"update_status","state":"downloading","version":"0.3.3","message":null,"received":4404019,"total":13900000}"#
+        );
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, msg);
     }
 
     /// Слайс D50d: старый `host_info` без `update_available` -- `false`.

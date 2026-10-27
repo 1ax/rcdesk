@@ -30,7 +30,13 @@ const INSTALL_LOG_FILE: &str = "update-install.log";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateProgress {
     Checking,
-    Downloading(Version),
+    /// Загрузка установщика: `received` -- байт получено, `total` -- размер
+    /// (если сервер сообщил).
+    Downloading {
+        version: Version,
+        received: u64,
+        total: Option<u64>,
+    },
     Installing(Version),
 }
 
@@ -43,9 +49,61 @@ pub enum UpdateOutcome {
     InstallerLaunched(Version),
 }
 
-/// Скачивает `url` в файл `out`.
+/// Колбэк прогресса загрузки: (получено байт, всего байт, если известно).
+pub type DownloadProgress<'a> = &'a (dyn Fn(u64, Option<u64>) + Send + Sync);
+
+/// Скачивает `url` в файл `out`, сообщая прогресс через `on_progress`.
 pub trait Downloader: Send + Sync {
-    fn download(&self, url: &str, out: &Path) -> impl Future<Output = anyhow::Result<()>> + Send;
+    fn download(
+        &self,
+        url: &str,
+        out: &Path,
+        on_progress: DownloadProgress<'_>,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+}
+
+/// Как часто опрашивать размер скачиваемого файла.
+const PROGRESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// `content-length` последнего блока заголовков из вывода `curl -sIL` (при
+/// редиректах блоков несколько, у 302 GitHub -- `content-length: 0`; регистр
+/// имени не важен). Нет в последнем блоке, мусор или 0 -- `None`.
+fn content_length_from_headers(headers: &str) -> Option<u64> {
+    let mut found = None;
+    for line in headers.lines() {
+        if line.starts_with("HTTP/") {
+            found = None;
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            if let Ok(n) = value.trim().parse::<u64>() {
+                found = Some(n);
+            }
+        }
+    }
+    found.filter(|&n| n > 0)
+}
+
+/// Размер файла по HEAD-запросу; любая ошибка -- `None`.
+async fn fetch_content_length(curl: &Path, url: &str) -> Option<u64> {
+    let mut command = tokio::process::Command::new(curl);
+    platform::update::hide_console(&mut command);
+    let output = command
+        .args(["-sIL", "--proto", "=https", "--max-time", "30"])
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    content_length_from_headers(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Запускает установщик без ожидания завершения.
@@ -57,33 +115,74 @@ pub trait Launcher: Send + Sync {
 struct CurlDownloader;
 
 impl Downloader for CurlDownloader {
-    async fn download(&self, url: &str, out: &Path) -> anyhow::Result<()> {
+    async fn download(
+        &self,
+        url: &str,
+        out: &Path,
+        on_progress: DownloadProgress<'_>,
+    ) -> anyhow::Result<()> {
+        use tokio::io::AsyncReadExt;
+
         let curl = platform::update::curl_path();
+        let total = fetch_content_length(&curl, url).await;
         let mut command = tokio::process::Command::new(&curl);
         platform::update::hide_console(&mut command);
-        let output = command
+        let mut child = command
             .args([
                 "-fsSL",
                 "--proto",
                 "=https",
                 "--retry",
+                "3",
+                "--retry-delay",
                 "2",
+                "--speed-limit",
+                "1024",
+                "--speed-time",
+                "60",
                 "--max-time",
-                "900",
+                "1800",
                 "-o",
             ])
             .arg(out)
             .arg(url)
             .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .output()
-            .await
+            .spawn()
             .with_context(|| format!("не запустить {}", curl.display()))?;
-        if !output.status.success() {
+        let mut stderr = child.stderr.take();
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(s) = stderr.as_mut() {
+                let _ = s.read_to_end(&mut buf).await;
+            }
+            buf
+        });
+
+        let mut ticker = tokio::time::interval(PROGRESS_POLL_INTERVAL);
+        let mut last = 0u64;
+        let status = loop {
+            tokio::select! {
+                status = child.wait() => {
+                    break status.with_context(|| format!("не дождаться {}", curl.display()))?;
+                }
+                _ = ticker.tick() => {
+                    let size = tokio::fs::metadata(out).await.map(|m| m.len()).unwrap_or(0);
+                    if size != last {
+                        last = size;
+                        on_progress(size, total);
+                    }
+                }
+            }
+        };
+        let stderr_bytes = stderr_task.await.unwrap_or_default();
+        if !status.success() {
             bail!(
                 "curl завершился с кодом {:?}: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
+                status.code(),
+                String::from_utf8_lossy(&stderr_bytes).trim()
             );
         }
         Ok(())
@@ -209,11 +308,11 @@ async fn run_update_with(
     let manifest_path = dir.join(MANIFEST_FILE);
     let sig_path = dir.join(SIGNATURE_FILE);
     downloader
-        .download(MANIFEST_URL, &manifest_path)
+        .download(MANIFEST_URL, &manifest_path, &|_, _| {})
         .await
         .context("не скачался манифест обновления")?;
     downloader
-        .download(SIGNATURE_URL, &sig_path)
+        .download(SIGNATURE_URL, &sig_path, &|_, _| {})
         .await
         .context("не скачалась подпись манифеста")?;
     let json = std::fs::read(&manifest_path).context("не прочитать манифест")?;
@@ -227,12 +326,22 @@ async fn run_update_with(
 
     let version = manifest.version;
     tracing::info!(%version, asset = asset_name, "обновление: скачивание установщика");
-    progress(UpdateProgress::Downloading(version));
+    progress(UpdateProgress::Downloading {
+        version,
+        received: 0,
+        total: None,
+    });
     let installer: PathBuf = dir.join(asset_name);
     let asset_url =
         format!("https://github.com/1ax/rcdesk/releases/download/v{version}/{asset_name}");
     downloader
-        .download(&asset_url, &installer)
+        .download(&asset_url, &installer, &|received, total| {
+            progress(UpdateProgress::Downloading {
+                version,
+                received,
+                total,
+            })
+        })
         .await
         .context("не скачался установщик обновления")?;
     update_verify::check_asset(&manifest, asset_name, &installer)?;
@@ -282,7 +391,12 @@ mod tests {
     }
 
     impl Downloader for FakeDownloader {
-        async fn download(&self, url: &str, out: &Path) -> anyhow::Result<()> {
+        async fn download(
+            &self,
+            url: &str,
+            out: &Path,
+            on_progress: DownloadProgress<'_>,
+        ) -> anyhow::Result<()> {
             self.urls.lock().unwrap().push(url.to_string());
             if let Some(d) = self.delay {
                 tokio::time::sleep(d).await;
@@ -295,7 +409,9 @@ mod tests {
             if self.corrupt == Some(name) {
                 data.push(b'!');
             }
-            std::fs::write(out, data)?;
+            on_progress(0, Some(data.len() as u64));
+            std::fs::write(out, &data)?;
+            on_progress(data.len() as u64, Some(data.len() as u64));
             Ok(())
         }
     }
@@ -351,6 +467,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn content_length_takes_last_block_case_insensitive() {
+        let h = "HTTP/2 302\r\nlocation: https://x\r\nContent-Length: 0\r\n\r\nHTTP/2 200\r\ncontent-length: 13900000\r\n\r\n";
+        assert_eq!(content_length_from_headers(h), Some(13_900_000));
+        assert_eq!(
+            content_length_from_headers("CONTENT-LENGTH:  42 \n"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn content_length_ignores_garbage_and_missing() {
+        assert_eq!(content_length_from_headers(""), None);
+        assert_eq!(
+            content_length_from_headers("HTTP/2 200\r\netag: x\r\n"),
+            None
+        );
+        assert_eq!(content_length_from_headers("content-length: abc\r\n"), None);
+        assert_eq!(content_length_from_headers("no colon here"), None);
+        // Последний ответ без длины: длина редиректа не подхватывается.
+        assert_eq!(
+            content_length_from_headers(
+                "HTTP/2 302\r\ncontent-length: 0\r\n\r\nHTTP/2 200\r\netag: x\r\n"
+            ),
+            None
+        );
+        // Мусорное значение в последнем блоке не затирает предыдущее валидное.
+        assert_eq!(
+            content_length_from_headers("content-length: 5\r\ncontent-length: x\r\n"),
+            Some(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn installer_download_reports_progress() {
+        let _s = SERIAL.lock().await;
+        let work = tmp("progress");
+        let (dl, l) = (FakeDownloader::default(), FakeLauncher::default());
+        let events = Mutex::new(Vec::new());
+        run_update_with(
+            &dl,
+            &l,
+            &[test_key()],
+            NOW,
+            ASSET,
+            &work,
+            &work,
+            Version(1, 0, 0),
+            |p| events.lock().unwrap().push(p),
+        )
+        .await
+        .unwrap();
+        let size = std::fs::metadata(work.join("update").join(ASSET))
+            .unwrap()
+            .len();
+        let events = events.into_inner().unwrap();
+        let downloads: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                UpdateProgress::Downloading {
+                    received, total, ..
+                } => Some((*received, *total)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(downloads.first(), Some(&(0, None)));
+        assert!(downloads.contains(&(0, Some(size))));
+        assert_eq!(downloads.last(), Some(&(size, Some(size))));
     }
 
     #[tokio::test]
