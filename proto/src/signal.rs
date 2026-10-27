@@ -360,6 +360,23 @@ pub enum SignalMessage {
         #[serde(default)]
         retry_after_secs: Option<u32>,
     },
+    /// host -> server (журнал сеансов): кумулятивная статистика трафика
+    /// сеанса `session_id` с его начала (не дельты). `relay` — выбранная
+    /// ICE-пара идёт через TURN-релей хотя бы с одной стороны;
+    /// `final_report` — последний отчёт, сеанс завершён. Сервер ничего не
+    /// отвечает. `#[serde(default)]` на флагах: отчёт без них — обычный,
+    /// не релейный.
+    SessionStats {
+        session_id: String,
+        #[ts(type = "number")]
+        bytes_sent: u64,
+        #[ts(type = "number")]
+        bytes_received: u64,
+        #[serde(default)]
+        relay: bool,
+        #[serde(default)]
+        final_report: bool,
+    },
     /// server -> either side
     Error { message: String },
 }
@@ -380,6 +397,42 @@ mod tests {
 
         let round_tripped: SignalMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, hello);
+    }
+
+    #[test]
+    fn session_stats_round_trips_and_has_snake_case_tag() {
+        let stats = SignalMessage::SessionStats {
+            session_id: "s1".to_string(),
+            bytes_sent: 10,
+            bytes_received: 20,
+            relay: true,
+            final_report: false,
+        };
+        let json = serde_json::to_string(&stats).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"session_stats","session_id":"s1","bytes_sent":10,"bytes_received":20,"relay":true,"final_report":false}"#
+        );
+        let parsed: SignalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, stats);
+    }
+
+    #[test]
+    fn session_stats_flags_default_to_false() {
+        let parsed: SignalMessage = serde_json::from_str(
+            r#"{"type":"session_stats","session_id":"s1","bytes_sent":1,"bytes_received":2}"#,
+        )
+        .expect("deserialize");
+        assert_eq!(
+            parsed,
+            SignalMessage::SessionStats {
+                session_id: "s1".to_string(),
+                bytes_sent: 1,
+                bytes_received: 2,
+                relay: false,
+                final_report: false,
+            }
+        );
     }
 
     /// Slice 4.6b: `Bye` without `reason` keeps the old wire form.

@@ -1,7 +1,7 @@
 //! Суточная уборка БД (долг D53): пустые анонимные владельцы и устройства без
 //! владельца. Общая для `rcdesk-server` и LAN-хаба хоста (D47).
 
-use crate::db::{Db, DEVICE_IDLE_TTL_SECS, OWNER_IDLE_TTL_SECS};
+use crate::db::{Db, DEVICE_IDLE_TTL_SECS, OWNER_IDLE_TTL_SECS, SESSION_RETENTION_SECS};
 use crate::ice::now_unix;
 use crate::registry::Registry;
 
@@ -26,6 +26,11 @@ pub fn spawn_maintenance(db: Db, registry: Registry) -> tokio::task::JoinHandle<
                 Ok(0) => {}
                 Ok(n) => tracing::info!("pruned {n} unowned devices"),
                 Err(err) => tracing::warn!("failed to prune unowned devices: {err:#}"),
+            }
+            match db.prune_sessions(now_unix(), SESSION_RETENTION_SECS) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("pruned {n} old session log rows"),
+                Err(err) => tracing::warn!("failed to prune session log: {err:#}"),
             }
         }
     })

@@ -21,7 +21,7 @@ use rusqlite::{Connection, OptionalExtension};
 /// Schema version this binary expects (`PRAGMA user_version`). Bump this
 /// and extend `migrate` when the schema changes; `migrate` itself must stay
 /// idempotent (safe to run against an already-migrated database).
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Сколько секунд владелец без устройств и passkey может не появляться,
 /// прежде чем `prune_empty_owners` его удалит (долг D53).
@@ -62,6 +62,26 @@ pub struct OwnedDevice {
     pub alias: Option<String>,
     pub added_at: i64,
     pub last_seen_at: i64,
+}
+
+/// Сколько секунд хранится запись журнала сеансов (`prune_sessions`).
+pub const SESSION_RETENTION_SECS: u64 = 365 * 24 * 3600;
+
+/// Запись журнала сеансов (`sessions`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionRow {
+    pub session_id: String,
+    pub device_id: String,
+    pub owner_id: Option<String>,
+    pub via: String,
+    pub client_ua: String,
+    pub started_at: i64,
+    pub last_seen_at: i64,
+    pub ended_at: Option<i64>,
+    pub end_reason: Option<String>,
+    pub bytes_sent: i64,
+    pub bytes_received: i64,
+    pub relay: bool,
 }
 
 /// Один passkey владельца в списке (слайс 3.7b). Сам `passkey_json` и
@@ -173,6 +193,146 @@ impl Db {
             (name, now, device_id),
         )?;
         Ok(changed > 0)
+    }
+
+    /// Записывает версию хоста (из `Hello`) в `devices.host_version`.
+    /// Возвращает `false`, если устройства нет.
+    pub fn set_host_version(&self, device_id: &str, version: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE devices SET host_version = ?1 WHERE device_id = ?2",
+            (version, device_id),
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Открывает запись журнала сеансов. `via` — `'pin'` или `'device'`.
+    /// Повторная вставка того же `session_id` игнорируется.
+    pub fn insert_session(
+        &self,
+        session_id: &str,
+        device_id: &str,
+        owner_id: Option<&str>,
+        via: &str,
+        client_ua: &str,
+        now: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions
+                (session_id, device_id, owner_id, via, client_ua, started_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            (session_id, device_id, owner_id, via, client_ua, now),
+        )?;
+        Ok(())
+    }
+
+    /// Запись журнала сеансов по `session_id`.
+    pub fn session(&self, session_id: &str) -> anyhow::Result<Option<SessionRow>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT session_id, device_id, owner_id, via, client_ua, started_at,
+                        last_seen_at, ended_at, end_reason, bytes_sent, bytes_received, relay
+                 FROM sessions WHERE session_id = ?1",
+                [session_id],
+                |row| {
+                    Ok(SessionRow {
+                        session_id: row.get(0)?,
+                        device_id: row.get(1)?,
+                        owner_id: row.get(2)?,
+                        via: row.get(3)?,
+                        client_ua: row.get(4)?,
+                        started_at: row.get(5)?,
+                        last_seen_at: row.get(6)?,
+                        ended_at: row.get(7)?,
+                        end_reason: row.get(8)?,
+                        bytes_sent: row.get(9)?,
+                        bytes_received: row.get(10)?,
+                        relay: row.get::<_, i64>(11)? != 0,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Версия хоста из `devices.host_version`.
+    pub fn host_version(&self, device_id: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let v = conn
+            .query_row(
+                "SELECT host_version FROM devices WHERE device_id = ?1",
+                [device_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(v.flatten())
+    }
+
+    /// Обновляет статистику сеанса от хоста `device_id` (чужие строки не
+    /// трогаются). Значения кумулятивные: байты = max(старое, новое),
+    /// `relay` = старое OR новое. `final_report` закрывает ещё не закрытый
+    /// сеанс (`end_reason = 'host'`). Возвращает `false`, если такой строки
+    /// нет.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_session_stats(
+        &self,
+        session_id: &str,
+        device_id: &str,
+        bytes_sent: u64,
+        bytes_received: u64,
+        relay: bool,
+        final_report: bool,
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        // SQLite хранит INTEGER как i64.
+        let sent = i64::try_from(bytes_sent).unwrap_or(i64::MAX);
+        let received = i64::try_from(bytes_received).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE sessions SET
+                bytes_sent = MAX(bytes_sent, ?3),
+                bytes_received = MAX(bytes_received, ?4),
+                relay = MAX(relay, ?5),
+                last_seen_at = ?7,
+                ended_at = CASE WHEN ?6 AND ended_at IS NULL THEN ?7 ELSE ended_at END,
+                end_reason = CASE WHEN ?6 AND ended_at IS NULL THEN 'host' ELSE end_reason END
+             WHERE session_id = ?1 AND device_id = ?2",
+            (
+                session_id,
+                device_id,
+                sent,
+                received,
+                relay as i64,
+                final_report,
+                now,
+            ),
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Завершает сеанс в журнале, только если он ещё не завершён.
+    /// `last_seen_at` обновляется всегда. Возвращает `false`, если строки нет.
+    pub fn end_session(&self, session_id: &str, reason: &str, now: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE sessions SET
+                last_seen_at = ?3,
+                ended_at = COALESCE(ended_at, ?3),
+                end_reason = CASE WHEN ended_at IS NULL THEN ?2 ELSE end_reason END
+             WHERE session_id = ?1",
+            (session_id, reason, now),
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Удаляет записи журнала с `started_at` старше `now - max_age_secs`.
+    pub fn prune_sessions(&self, now: u64, max_age_secs: u64) -> anyhow::Result<usize> {
+        let cutoff = now.saturating_sub(max_age_secs) as i64;
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let removed = conn.execute("DELETE FROM sessions WHERE started_at < ?1", [cutoff])?;
+        Ok(removed)
     }
 
     pub fn insert_owner(&self, owner_id: &str, now: i64) -> anyhow::Result<()> {
@@ -564,6 +724,10 @@ impl Db {
             (from, to),
         )?;
         tx.execute("DELETE FROM ownership WHERE owner_id = ?1", [from])?;
+        tx.execute(
+            "UPDATE sessions SET owner_id = ?2 WHERE owner_id = ?1",
+            (from, to),
+        )?;
         tx.execute("DELETE FROM owners WHERE owner_id = ?1", [from])?;
         tx.commit()?;
         Ok(true)
@@ -727,18 +891,20 @@ fn configure(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Полная схема v4.
-const SCHEMA_V4: &str = "CREATE TABLE IF NOT EXISTS devices (
+/// Полная схема v5.
+const SCHEMA_V5: &str = "CREATE TABLE IF NOT EXISTS devices (
             device_id    TEXT PRIMARY KEY,
             secret_hash  TEXT NOT NULL,
             name         TEXT NOT NULL,
             created_at   INTEGER NOT NULL,
-            last_seen_at INTEGER NOT NULL
+            last_seen_at INTEGER NOT NULL,
+            host_version TEXT
          );
          CREATE TABLE IF NOT EXISTS owners (
             owner_id         TEXT PRIMARY KEY,
             created_at       INTEGER NOT NULL,
-            webauthn_user_id TEXT
+            webauthn_user_id TEXT,
+            admin_note       TEXT
          );
          CREATE UNIQUE INDEX IF NOT EXISTS owners_webauthn_user_id
             ON owners(webauthn_user_id);
@@ -772,13 +938,30 @@ const SCHEMA_V4: &str = "CREATE TABLE IF NOT EXISTS devices (
             password_hash       TEXT NOT NULL,
             created_at          INTEGER NOT NULL,
             password_changed_at INTEGER NOT NULL
-         );";
+         );
+         CREATE TABLE IF NOT EXISTS sessions (
+            session_id     TEXT PRIMARY KEY,
+            device_id      TEXT NOT NULL,
+            owner_id       TEXT,
+            via            TEXT NOT NULL,
+            client_ua      TEXT NOT NULL DEFAULT '',
+            started_at     INTEGER NOT NULL,
+            last_seen_at   INTEGER NOT NULL,
+            ended_at       INTEGER,
+            end_reason     TEXT,
+            bytes_sent     INTEGER NOT NULL DEFAULT 0,
+            bytes_received INTEGER NOT NULL DEFAULT 0,
+            relay          INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE INDEX IF NOT EXISTS sessions_started_at ON sessions(started_at);
+         CREATE INDEX IF NOT EXISTS sessions_owner_id ON sessions(owner_id);
+         CREATE INDEX IF NOT EXISTS sessions_device_id ON sessions(device_id);";
 
-/// Приводит базу к `SCHEMA_VERSION`: версия 0 — сразу полная схема v4,
+/// Приводит базу к `SCHEMA_VERSION`: версия 0 — сразу полная схема v5,
 /// версия 1 — цепочка v1 -> v2 (токен из `owners` переезжает в
 /// `owner_tokens`) -> v3 -> v4, версия 2 — v2 -> v3 (passkey) -> v4,
-/// версия 3 — v3 -> v4 (учётные записи «почта + пароль»). Идемпотентна: на
-/// актуальной базе — no-op.
+/// версия 3 — v3 -> v4 (учётные записи «почта + пароль»), версия 4 —
+/// v4 -> v5 (журнал сеансов). Идемпотентна: на актуальной базе — no-op.
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version >= SCHEMA_VERSION {
@@ -786,7 +969,7 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
     }
 
     if version == 0 {
-        conn.execute_batch(SCHEMA_V4)?;
+        conn.execute_batch(SCHEMA_V5)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         return Ok(());
     }
@@ -797,7 +980,41 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
     if version <= 2 {
         migrate_v2_to_v3(conn)?;
     }
-    migrate_v3_to_v4(conn)
+    if version <= 3 {
+        migrate_v3_to_v4(conn)?;
+    }
+    migrate_v4_to_v5(conn)
+}
+
+/// v4 -> v5 (админский кабинет): `devices.host_version`, `owners.admin_note`
+/// и таблица `sessions` (журнал сеансов, без внешних ключей — переживает
+/// уборку владельцев и устройств). Одна транзакция.
+fn migrate_v4_to_v5(conn: &Connection) -> anyhow::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE devices ADD COLUMN host_version TEXT;
+         ALTER TABLE owners ADD COLUMN admin_note TEXT;
+         CREATE TABLE sessions (
+            session_id     TEXT PRIMARY KEY,
+            device_id      TEXT NOT NULL,
+            owner_id       TEXT,
+            via            TEXT NOT NULL,
+            client_ua      TEXT NOT NULL DEFAULT '',
+            started_at     INTEGER NOT NULL,
+            last_seen_at   INTEGER NOT NULL,
+            ended_at       INTEGER,
+            end_reason     TEXT,
+            bytes_sent     INTEGER NOT NULL DEFAULT 0,
+            bytes_received INTEGER NOT NULL DEFAULT 0,
+            relay          INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE INDEX sessions_started_at ON sessions(started_at);
+         CREATE INDEX sessions_owner_id ON sessions(owner_id);
+         CREATE INDEX sessions_device_id ON sessions(device_id);",
+    )?;
+    tx.pragma_update(None, "user_version", 5)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// v3 -> v4 (слайс 3.8a): таблица `accounts` (почта + хеш пароля владельца).
@@ -1073,13 +1290,13 @@ mod tests {
     }
 
     #[test]
-    fn fresh_db_has_user_version_four() {
+    fn fresh_db_has_user_version_five() {
         let db = Db::in_memory().expect("open in-memory db");
         let conn = db.conn.lock().expect("db mutex poisoned");
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read user_version");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -1214,7 +1431,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v1_to_v4_keeps_owners_ownership_devices_and_tokens() {
+    fn migration_v1_to_v5_keeps_owners_ownership_devices_and_tokens() {
         let conn = Connection::open_in_memory().expect("open");
         conn.pragma_update(None, "foreign_keys", true).expect("fk");
         conn.execute_batch(
@@ -1235,12 +1452,12 @@ mod tests {
         )
         .expect("build v1 database");
 
-        migrate(&conn).expect("migrate v1 -> v4");
+        migrate(&conn).expect("migrate v1 -> v5");
 
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let fk: i64 = conn
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .expect("fk");
@@ -1291,7 +1508,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v2_to_v4_keeps_owners_tokens_and_ownership() {
+    fn migration_v2_to_v5_keeps_owners_tokens_and_ownership() {
         let conn = Connection::open_in_memory().expect("open");
         conn.pragma_update(None, "foreign_keys", true).expect("fk");
         conn.execute_batch(
@@ -1317,13 +1534,13 @@ mod tests {
         )
         .expect("build v2 database");
 
-        migrate(&conn).expect("migrate v2 -> v4");
+        migrate(&conn).expect("migrate v2 -> v5");
         migrate(&conn).expect("re-run migration is a no-op");
 
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -1342,7 +1559,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v3_to_v4_keeps_rows_and_adds_accounts() {
+    fn migration_v3_to_v5_keeps_rows_and_adds_accounts() {
         let conn = Connection::open_in_memory().expect("open");
         conn.pragma_update(None, "foreign_keys", true).expect("fk");
         conn.execute_batch(
@@ -1377,13 +1594,13 @@ mod tests {
         )
         .expect("build v3 database");
 
-        migrate(&conn).expect("migrate v3 -> v4");
+        migrate(&conn).expect("migrate v3 -> v5");
         migrate(&conn).expect("re-run migration is a no-op");
 
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -1398,6 +1615,230 @@ mod tests {
         assert!(db
             .insert_account("owner1", "a@b.co", "hash", 80)
             .expect("insert account"));
+    }
+
+    #[test]
+    fn migration_v4_to_v5_keeps_rows_and_adds_sessions() {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.pragma_update(None, "foreign_keys", true).expect("fk");
+        conn.execute_batch(
+            "CREATE TABLE devices (
+                device_id TEXT PRIMARY KEY, secret_hash TEXT NOT NULL, name TEXT NOT NULL,
+                created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL);
+             CREATE TABLE owners (
+                owner_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL,
+                webauthn_user_id TEXT);
+             CREATE UNIQUE INDEX owners_webauthn_user_id ON owners(webauthn_user_id);
+             CREATE TABLE owner_tokens (
+                token_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL REFERENCES owners(owner_id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE, user_agent TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL);
+             CREATE TABLE ownership (
+                owner_id TEXT NOT NULL REFERENCES owners(owner_id) ON DELETE CASCADE,
+                device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+                alias TEXT, added_at INTEGER NOT NULL, PRIMARY KEY (owner_id, device_id));
+             CREATE TABLE passkeys (
+                passkey_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL REFERENCES owners(owner_id) ON DELETE CASCADE,
+                credential_id TEXT NOT NULL UNIQUE, passkey_json TEXT NOT NULL,
+                user_agent TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL);
+             CREATE TABLE accounts (
+                owner_id TEXT PRIMARY KEY REFERENCES owners(owner_id) ON DELETE CASCADE,
+                email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL, password_changed_at INTEGER NOT NULL);
+             INSERT INTO devices VALUES ('dev1', 'sh', 'My Mac', 10, 20);
+             INSERT INTO owners VALUES ('owner1', 50, 'u1');
+             INSERT INTO ownership VALUES ('owner1', 'dev1', 'Work', 60);
+             INSERT INTO accounts VALUES ('owner1', 'a@b.co', 'h', 70, 70);
+             PRAGMA user_version = 4;",
+        )
+        .expect("build v4 database");
+
+        migrate(&conn).expect("migrate v4 -> v5");
+        migrate(&conn).expect("re-run migration is a no-op");
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 5);
+
+        let db = Db {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        assert_eq!(db.devices_for_owner("owner1").expect("devices").len(), 1);
+        assert_eq!(db.host_version("dev1").expect("version"), None);
+        assert!(db.set_host_version("dev1", "0.3.0").expect("set"));
+        assert_eq!(
+            db.host_version("dev1").expect("version").as_deref(),
+            Some("0.3.0")
+        );
+        db.insert_session("s1", "dev1", Some("owner1"), "pin", "UA", 100)
+            .expect("insert session");
+        assert!(db.session("s1").expect("query").is_some());
+        let conn = db.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE owners SET admin_note = 'n' WHERE owner_id = 'owner1'",
+            [],
+        )
+        .expect("admin_note column exists");
+    }
+
+    fn session_db() -> Db {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_session("s1", "dev1", Some("owner1"), "pin", "UA", 100)
+            .expect("insert session");
+        db
+    }
+
+    #[test]
+    fn insert_session_round_trips_and_is_open() {
+        let db = session_db();
+        let row = db.session("s1").expect("query").expect("row");
+        assert_eq!(row.device_id, "dev1");
+        assert_eq!(row.owner_id.as_deref(), Some("owner1"));
+        assert_eq!(row.via, "pin");
+        assert_eq!(row.client_ua, "UA");
+        assert_eq!((row.started_at, row.last_seen_at), (100, 100));
+        assert_eq!((row.ended_at, row.end_reason.as_deref()), (None, None));
+        assert_eq!(
+            (row.bytes_sent, row.bytes_received, row.relay),
+            (0, 0, false)
+        );
+        // Повторная вставка того же id не падает и не меняет строку.
+        db.insert_session("s1", "dev9", None, "device", "X", 500)
+            .expect("duplicate insert ignored");
+        assert_eq!(db.session("s1").expect("q").expect("row"), row);
+    }
+
+    #[test]
+    fn record_session_stats_is_cumulative_max_and_relay_sticky() {
+        let db = session_db();
+        assert!(db
+            .record_session_stats("s1", "dev1", 100, 200, false, false, 110)
+            .expect("stats"));
+        // Меньшие значения (например, после сброса счётчика) не уменьшают байты.
+        assert!(db
+            .record_session_stats("s1", "dev1", 50, 300, true, false, 120)
+            .expect("stats"));
+        assert!(db
+            .record_session_stats("s1", "dev1", 150, 100, false, false, 130)
+            .expect("stats"));
+        let row = db.session("s1").expect("q").expect("row");
+        assert_eq!((row.bytes_sent, row.bytes_received), (150, 300));
+        assert!(row.relay);
+        assert_eq!(row.last_seen_at, 130);
+        assert_eq!(row.ended_at, None);
+    }
+
+    #[test]
+    fn record_session_stats_ignores_foreign_device_and_unknown_session() {
+        let db = session_db();
+        assert!(!db
+            .record_session_stats("s1", "other", 999, 999, true, true, 110)
+            .expect("stats"));
+        assert!(!db
+            .record_session_stats("nope", "dev1", 1, 1, false, false, 110)
+            .expect("stats"));
+        let row = db.session("s1").expect("q").expect("row");
+        assert_eq!(
+            (row.bytes_sent, row.bytes_received, row.relay),
+            (0, 0, false)
+        );
+        assert_eq!((row.last_seen_at, row.ended_at), (100, None));
+    }
+
+    #[test]
+    fn record_session_stats_final_closes_once() {
+        let db = session_db();
+        db.record_session_stats("s1", "dev1", 10, 20, false, true, 150)
+            .expect("stats");
+        let row = db.session("s1").expect("q").expect("row");
+        assert_eq!(row.ended_at, Some(150));
+        assert_eq!(row.end_reason.as_deref(), Some("host"));
+        // Второй final не перезаписывает момент и причину.
+        db.record_session_stats("s1", "dev1", 30, 40, false, true, 200)
+            .expect("stats");
+        let row = db.session("s1").expect("q").expect("row");
+        assert_eq!(row.ended_at, Some(150));
+        assert_eq!(row.end_reason.as_deref(), Some("host"));
+        assert_eq!((row.bytes_sent, row.bytes_received), (30, 40));
+        assert_eq!(row.last_seen_at, 200);
+    }
+
+    #[test]
+    fn end_session_is_idempotent_and_keeps_first_reason() {
+        let db = session_db();
+        assert!(db.end_session("s1", "client_bye", 120).expect("end"));
+        assert!(db.end_session("s1", "host_bye", 130).expect("end again"));
+        let row = db.session("s1").expect("q").expect("row");
+        assert_eq!(row.ended_at, Some(120));
+        assert_eq!(row.end_reason.as_deref(), Some("client_bye"));
+        assert_eq!(row.last_seen_at, 130);
+        assert!(!db.end_session("nope", "x", 1).expect("unknown"));
+    }
+
+    #[test]
+    fn prune_sessions_removes_only_old_rows() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_session("old", "d", None, "pin", "", 100)
+            .expect("insert");
+        db.insert_session("new", "d", None, "pin", "", 900)
+            .expect("insert");
+        assert_eq!(db.prune_sessions(1000, 500).expect("prune"), 1);
+        assert!(db.session("old").expect("q").is_none());
+        assert!(db.session("new").expect("q").is_some());
+        assert_eq!(db.prune_sessions(1000, 500).expect("prune"), 0);
+    }
+
+    #[test]
+    fn sessions_survive_owner_and_device_cleanup() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("o1", 10).expect("owner");
+        db.insert_device("d1", "h", "Mac", 10).expect("device");
+        db.insert_session("s1", "d1", Some("o1"), "pin", "", 20)
+            .expect("insert");
+        assert_eq!(db.prune_empty_owners(10_000_000, 1).expect("prune"), 1);
+        assert_eq!(
+            db.prune_unowned_devices(10_000_000, 1, &[]).expect("prune"),
+            1
+        );
+        assert!(db.session("s1").expect("q").is_some());
+    }
+
+    #[test]
+    fn merge_anonymous_owner_moves_sessions() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("anon", 10).expect("owner");
+        db.insert_owner("acc", 10).expect("owner");
+        db.insert_session("s1", "d1", Some("anon"), "pin", "", 20)
+            .expect("insert");
+        db.insert_session("s2", "d1", Some("acc"), "pin", "", 20)
+            .expect("insert");
+        assert!(db.merge_anonymous_owner("anon", "acc").expect("merge"));
+        assert_eq!(
+            db.session("s1")
+                .expect("q")
+                .expect("row")
+                .owner_id
+                .as_deref(),
+            Some("acc")
+        );
+        assert_eq!(
+            db.session("s2")
+                .expect("q")
+                .expect("row")
+                .owner_id
+                .as_deref(),
+            Some("acc")
+        );
+    }
+
+    #[test]
+    fn set_host_version_unknown_device_is_false() {
+        let db = Db::in_memory().expect("open in-memory db");
+        assert!(!db.set_host_version("nope", "1").expect("set"));
     }
 
     #[test]

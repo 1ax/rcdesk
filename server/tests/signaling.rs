@@ -3209,3 +3209,90 @@ async fn email_change_requires_an_account_and_an_owner() {
     email_change(&mut anon, "nope", "123456", "hunter22-pass").await;
     expect_error(&mut anon, "invalid email").await;
 }
+
+// Журнал сеансов: Join по PIN создаёт строку (via='pin'), SessionStats хоста
+// пишет байты, Bye клиента закрывает сеанс.
+#[tokio::test]
+async fn session_log_records_join_stats_and_bye() {
+    let (url, db) = spawn_server_with_db().await;
+
+    let mut host = connect(&url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: None,
+            session_id: None,
+            pin_rotation: false,
+        },
+    )
+    .await;
+    let (host_id, pin) = match recv(&mut host).await {
+        SignalMessage::Registered { host_id, pin, .. } => (host_id, pin),
+        other => panic!("expected registered, got {other:?}"),
+    };
+    assert_eq!(
+        db.host_version(&host_id).expect("query").as_deref(),
+        Some("0.1.0")
+    );
+
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    send(&mut client, &SignalMessage::Join { pin }).await;
+    let session_id = match recv(&mut client).await {
+        SignalMessage::Joined { session_id, .. } => session_id,
+        other => panic!("expected joined, got {other:?}"),
+    };
+    match recv(&mut host).await {
+        SignalMessage::PeerJoined { .. } => {}
+        other => panic!("expected peer_joined, got {other:?}"),
+    }
+
+    let row = db.session(&session_id).expect("query").expect("row");
+    assert_eq!(row.via, "pin");
+    assert_eq!(row.device_id, host_id);
+    assert_eq!(row.owner_id, None);
+    assert_eq!(row.ended_at, None);
+
+    send(
+        &mut host,
+        &SignalMessage::SessionStats {
+            session_id: session_id.clone(),
+            bytes_sent: 1000,
+            bytes_received: 2000,
+            relay: true,
+            final_report: false,
+        },
+    )
+    .await;
+    // Сервер ничего не отвечает; ждём применения статистики опросом БД.
+    let mut applied = false;
+    for _ in 0..40 {
+        let row = db.session(&session_id).expect("query").expect("row");
+        if row.bytes_sent == 1000 {
+            assert_eq!(row.bytes_received, 2000);
+            assert!(row.relay);
+            applied = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(applied, "session stats were not recorded");
+
+    send(
+        &mut client,
+        &SignalMessage::Bye {
+            session_id: session_id.clone(),
+            reason: None,
+        },
+    )
+    .await;
+    match recv(&mut host).await {
+        SignalMessage::Bye { .. } => {}
+        other => panic!("expected bye, got {other:?}"),
+    }
+    let row = db.session(&session_id).expect("query").expect("row");
+    assert!(row.ended_at.is_some());
+    assert_eq!(row.end_reason.as_deref(), Some("client_bye"));
+}

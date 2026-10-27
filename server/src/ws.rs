@@ -237,8 +237,8 @@ async fn run_connection(
     read_timeout: Duration,
     pin_ttl: Duration,
 ) {
-    let role = match next_message(stream, &tx, read_timeout).await {
-        Some(SignalMessage::Hello { role, .. }) => role,
+    let (role, version) = match next_message(stream, &tx, read_timeout).await {
+        Some(SignalMessage::Hello { role, version }) => (role, version),
         Some(_) => {
             let _ = tx.send(SignalMessage::Error {
                 message: "expected hello".to_string(),
@@ -258,6 +258,7 @@ async fn run_connection(
                 db,
                 device_limiter,
                 info.ip,
+                version,
                 read_timeout,
             )
             .await
@@ -292,6 +293,7 @@ async fn run_host(
     db: &Db,
     device_limiter: &IpLimiter,
     ip: IpAddr,
+    version: String,
     read_timeout: Duration,
 ) {
     let (name, device, session_id, pin_rotation) =
@@ -353,6 +355,12 @@ async fn run_host(
         }
         DeviceAuth::Known { device_id } => (device_id, None),
     };
+
+    if let Err(err) =
+        db.set_host_version(&host_id, owners::truncate_chars(&version, MAX_NAME_CHARS))
+    {
+        tracing::error!(?err, "failed to record host version");
+    }
 
     let (pin, displaced) = registry.register_host(
         host_id.clone(),
@@ -515,6 +523,7 @@ async fn run_host(
                 match registry.close_session_by_host(&host_id, &session_id) {
                     Some(Some(client_tx)) => {
                         tracing::info!(%session_id, "host ended session");
+                        end_session_logged(db, &session_id, "host_bye");
                         let _ = client_tx.send(SignalMessage::Bye { session_id, reason });
                     }
                     Some(None) => {
@@ -531,6 +540,32 @@ async fn run_host(
                         // be live; a quiet no-op instead of `Error`.
                         tracing::debug!(%session_id, "bye for a session not in session");
                     }
+                }
+            }
+            // Журнал сеансов: кумулятивная статистика трафика от хоста. Ответа
+            // нет; сеанса может не быть в registry (переподключение) -- решает
+            // только БД, и хост трогает лишь свои строки.
+            SignalMessage::SessionStats {
+                session_id,
+                bytes_sent,
+                bytes_received,
+                relay,
+                final_report,
+            } => {
+                match db.record_session_stats(
+                    &session_id,
+                    &host_id,
+                    bytes_sent,
+                    bytes_received,
+                    relay,
+                    final_report,
+                    ice::now_unix() as i64,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::debug!(%session_id, "session_stats for an unknown session");
+                    }
+                    Err(err) => tracing::error!(?err, "failed to record session stats"),
                 }
             }
             _ => {
@@ -613,6 +648,35 @@ fn current_owner(db: &Db, session: &mut Option<ClientSession>) -> anyhow::Result
     }
     *session = None;
     Ok(None)
+}
+
+/// Закрывает запись журнала сеансов; ошибка БД только логируется.
+fn end_session_logged(db: &Db, session_id: &str, reason: &str) {
+    if let Err(err) = db.end_session(session_id, reason, ice::now_unix() as i64) {
+        tracing::error!(?err, "failed to end session log row");
+    }
+}
+
+/// Открывает запись журнала сеансов; ошибка БД только логируется.
+fn insert_session_logged(
+    db: &Db,
+    session_id: &str,
+    host_id: &str,
+    owner_id: Option<&str>,
+    via: &str,
+    user_agent: &str,
+) {
+    let client_ua = owners::truncate_user_agent(user_agent);
+    if let Err(err) = db.insert_session(
+        session_id,
+        host_id,
+        owner_id,
+        via,
+        client_ua,
+        ice::now_unix() as i64,
+    ) {
+        tracing::error!(?err, "failed to insert session log row");
+    }
 }
 
 /// `current_owner` для веток, которым владелец обязателен: сама отвечает
@@ -1421,6 +1485,14 @@ async fn run_client(
                 match registry.join_by_host_id(&device_id, tx.clone()) {
                     Ok((session_id, host_name, host_tx)) => {
                         tracing::info!(%session_id, "client connected to device");
+                        insert_session_logged(
+                            db,
+                            &session_id,
+                            &device_id,
+                            Some(&owner_id),
+                            "device",
+                            &user_agent,
+                        );
                         let _ = tx.send(SignalMessage::Joined {
                             session_id: session_id.clone(),
                             host_name,
@@ -1524,6 +1596,18 @@ async fn run_client(
                 match registry.join(&pin, tx.clone(), pin_ttl, Instant::now()) {
                     Ok((session_id, host_id, host_name, host_tx, new_pin)) => {
                         tracing::info!(%session_id, "client joined");
+                        let owner = current_owner(db, &mut session);
+                        if let Err(err) = &owner {
+                            tracing::error!(?err, "failed to check owner token");
+                        }
+                        insert_session_logged(
+                            db,
+                            &session_id,
+                            &host_id,
+                            owner.as_ref().ok().and_then(|o| o.as_deref()),
+                            "pin",
+                            &user_agent,
+                        );
                         let _ = tx.send(SignalMessage::Joined {
                             session_id: session_id.clone(),
                             host_name,
@@ -1541,16 +1625,12 @@ async fn run_client(
                         if let Some(pin) = new_pin {
                             let _ = host_tx.send(SignalMessage::PinChanged { pin });
                         }
-                        match current_owner(db, &mut session) {
-                            Ok(Some(owner_id)) => {
-                                if let Err(err) =
-                                    db.link_device(&owner_id, &host_id, ice::now_unix() as i64)
-                                {
-                                    tracing::error!(?err, "failed to link device to owner");
-                                }
+                        if let Ok(Some(owner_id)) = owner {
+                            if let Err(err) =
+                                db.link_device(&owner_id, &host_id, ice::now_unix() as i64)
+                            {
+                                tracing::error!(?err, "failed to link device to owner");
                             }
-                            Ok(None) => {}
-                            Err(err) => tracing::error!(?err, "failed to check owner token"),
                         }
                     }
                     Err(err) => {
@@ -1662,6 +1742,7 @@ async fn run_client(
                 match registry.close_session_by_client(&session_id, &tx) {
                     Some(host_tx) => {
                         tracing::info!(%session_id, "client ended session");
+                        end_session_logged(db, &session_id, "client_bye");
                         let _ = host_tx.send(SignalMessage::Bye { session_id, reason });
                     }
                     None => {
