@@ -490,7 +490,7 @@ describe("FileReceiver", () => {
     ch.hostSays(offerMsg(3, [["a.txt", 5]]));
     ch.hostSays(offerMsg(4, [["b.txt", 1]]));
     expect(rx.fetch()).toBe(true);
-    expect(ch.trace()).toEqual([{ type: "fetch", list_id: 4 }]);
+    expect(ch.trace()).toEqual([{ type: "fetch", list_id: 4, fetch: 1 }]);
     // A second fetch while downloading is ignored.
     expect(rx.fetch()).toBe(false);
     expect(ch.trace().length).toBe(1);
@@ -613,6 +613,38 @@ describe("FileReceiver", () => {
     expect(ev.errors).toEqual([]);
     // A new fetch works again.
     expect(rx.fetch()).toBe(true);
+  });
+
+  it("ignores a stale start after cancel and fetch, accepts the new request", () => {
+    const { ch, ev, rx } = setupRecv();
+    ch.hostSays(offerMsg(1, [["a", 3], ["b", 1]]));
+    rx.fetch();
+    ch.hostSays({ type: "start", id: H, name: "a", size: 3, fetch: 1 });
+    rx.cancel();
+    expect(rx.fetch()).toBe(true);
+    expect(ch.trace()[2]).toEqual({ type: "fetch", list_id: 1, fetch: 2 });
+    // The host sent the next file of the old list before it saw the abort.
+    ch.hostSays({ type: "start", id: H + 1, name: "b", size: 1, fetch: 1 });
+    hostChunk(ch, bin(9));
+    ch.hostSays({ type: "end", id: H + 1 });
+    expect(ev.files).toEqual([]);
+    expect(ev.errors).toEqual([]);
+    expect(ev.progress).toEqual(["a 0/3 1/2"]);
+    // The new request is served.
+    ch.hostSays({ type: "start", id: H + 2, name: "a", size: 1, fetch: 2 });
+    hostChunk(ch, bin(5));
+    ch.hostSays({ type: "end", id: H + 2 });
+    expect(ev.files.map((f) => f.name)).toEqual(["a"]);
+  });
+
+  it("accepts a start without a request number (old host)", () => {
+    const { ch, ev, rx } = setupRecv();
+    ch.hostSays(offerMsg(1, [["a", 1]]));
+    rx.fetch();
+    ch.hostSays({ type: "start", id: H, name: "a", size: 1 });
+    hostChunk(ch, bin(5));
+    ch.hostSays({ type: "end", id: H });
+    expect(ev.files.map((f) => f.name)).toEqual(["a"]);
   });
 
   it("aborts with protocol when the size does not match", () => {

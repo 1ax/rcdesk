@@ -29,6 +29,17 @@
 //! read error); the client discards it and waits for the next `Start`.
 //! `Saved` is not used for downloads.
 //!
+//! Request numbers: `Fetch` may carry `fetch`, a number the client picks and
+//! increases with every request. The host repeats it in the `fetch` field of
+//! every `Start` of that download. The client ignores (with its chunks, `End`
+//! and `Abort`) any `Start` whose `fetch` differs from its current request,
+//! so files of a cancelled download that were already in flight cannot be
+//! taken for files of the next one. A `Start` without `fetch` (old host) is
+//! accepted. If the host receives `Fetch` after the client's `Abort` while
+//! the cancelled send is still stopping, it waits for that send to stop and
+//! then serves the new `Fetch`. Both fields are omitted from the JSON when
+//! absent.
+//!
 //! Folder upload (slice 3.4e): the client sends a folder as a plain sequence
 //! of single-file transfers. Each `Start` of such a file carries `folder`
 //! (a number the client picks, unique per sent root folder within the
@@ -81,6 +92,8 @@ pub enum FileMessage {
     /// (always below 2^53, so it is a plain `number` in TypeScript).
     /// `folder` / `dir` (slice 3.4e, see the module docs) place the file
     /// inside an uploaded folder; `name` stays the bare file name.
+    /// `fetch` (downloads only) repeats the request number of the `Fetch`
+    /// this file belongs to; see the module docs.
     Start {
         id: u32,
         name: String,
@@ -90,6 +103,8 @@ pub enum FileMessage {
         folder: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fetch: Option<u32>,
     },
     /// Sender -> receiver: all chunks of transfer `id` have been sent.
     End { id: u32 },
@@ -107,8 +122,14 @@ pub enum FileMessage {
         files: Vec<OfferedFile>,
         skipped_folders: u32,
     },
-    /// Client -> host: send all files of offer `list_id`.
-    Fetch { list_id: u32 },
+    /// Client -> host: send all files of offer `list_id`. `fetch` is an
+    /// optional request number chosen by the client, echoed in every
+    /// download `Start`.
+    Fetch {
+        list_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fetch: Option<u32>,
+    },
 }
 
 #[cfg(test)]
@@ -131,6 +152,7 @@ mod tests {
                 size: 9_007_199_254_740_000,
                 folder: None,
                 dir: None,
+                fetch: None,
             },
             r#"{"type":"start","id":7,"name":"a.txt","size":9007199254740000}"#,
         );
@@ -145,6 +167,7 @@ mod tests {
                 size: 5,
                 folder: Some(2),
                 dir: Some("Фото/2024".to_string()),
+                fetch: None,
             },
             r#"{"type":"start","id":8,"name":"b.txt","size":5,"folder":2,"dir":"Фото/2024"}"#,
         );
@@ -161,8 +184,24 @@ mod tests {
                 name: "a".into(),
                 size: 0,
                 folder: None,
-                dir: None
+                dir: None,
+                fetch: None
             }
+        );
+    }
+
+    #[test]
+    fn start_with_fetch_has_exact_shape() {
+        check(
+            FileMessage::Start {
+                id: 9,
+                name: "c.txt".to_string(),
+                size: 1,
+                folder: None,
+                dir: None,
+                fetch: Some(3),
+            },
+            r#"{"type":"start","id":9,"name":"c.txt","size":1,"fetch":3}"#,
         );
     }
 
@@ -229,8 +268,18 @@ mod tests {
     #[test]
     fn fetch_has_exact_shape() {
         check(
-            FileMessage::Fetch { list_id: 4 },
+            FileMessage::Fetch {
+                list_id: 4,
+                fetch: None,
+            },
             r#"{"type":"fetch","list_id":4}"#,
+        );
+        check(
+            FileMessage::Fetch {
+                list_id: 4,
+                fetch: Some(2),
+            },
+            r#"{"type":"fetch","list_id":4,"fetch":2}"#,
         );
     }
 }

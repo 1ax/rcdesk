@@ -463,6 +463,7 @@ impl Receiver {
                 size,
                 folder,
                 dir,
+                ..
             } => self.on_start(id, name, size, folder, dir).await,
             FileMessage::End { id } => self.on_end(id).await,
             FileMessage::Abort { id, .. } => {
@@ -802,10 +803,25 @@ impl Downloader {
         }
     }
 
-    fn fetch(&mut self, list_id: u32) {
+    async fn fetch(&mut self, list_id: u32, request: Option<u32>) {
         if self.sending.as_ref().is_some_and(Outgoing::is_running) {
-            tracing::debug!(list_id, "fetch while a download is running, ignoring");
-            return;
+            let cancelled = self
+                .sending
+                .as_ref()
+                .is_some_and(|o| o.cancel.load(Ordering::Relaxed));
+            if !cancelled {
+                tracing::debug!(list_id, "fetch while a download is running, ignoring");
+                return;
+            }
+            // The client cancelled and asks again at once: let the old send
+            // stop, then serve the new request. Wait on the handle by
+            // reference, so `Outgoing::drop` (which aborts) cannot cut the
+            // task short; the old `Outgoing` is replaced below.
+            if let Some(out) = self.sending.as_mut() {
+                if let Err(err) = (&mut out.handle).await {
+                    tracing::debug!(?err, "cancelled download task ended abnormally");
+                }
+            }
         }
         let Some((current, entries)) = self.list.as_ref() else {
             tracing::debug!(list_id, "fetch without an offer, ignoring");
@@ -830,6 +846,7 @@ impl Downloader {
             entries,
             Arc::clone(&self.next_file_id),
             Arc::clone(&cancel),
+            request,
         ));
         self.sending = Some(Outgoing { handle, cancel });
     }
@@ -856,13 +873,14 @@ async fn send_files(
     entries: Vec<OfferEntry>,
     next_file_id: Arc<AtomicU32>,
     cancel: Arc<AtomicBool>,
+    request: Option<u32>,
 ) {
     for entry in entries {
         if cancel.load(Ordering::Relaxed) {
             return;
         }
         let id = next_file_id.fetch_add(1, Ordering::Relaxed);
-        match send_one(channel.as_ref(), id, &entry, &cancel).await {
+        match send_one(channel.as_ref(), id, &entry, &cancel, request).await {
             Ok(()) => {}
             Err(err) => {
                 tracing::debug!(?err, id, "download stopped, channel failed");
@@ -879,9 +897,10 @@ async fn send_one(
     id: u32,
     entry: &OfferEntry,
     cancel: &AtomicBool,
+    request: Option<u32>,
 ) -> anyhow::Result<()> {
     if entry.kind == EntryKind::Folder {
-        return send_folder(channel, id, entry, cancel).await;
+        return send_folder(channel, id, entry, cancel, request).await;
     }
     let opened = async {
         let file = tokio::fs::File::open(&entry.path).await?;
@@ -906,6 +925,7 @@ async fn send_one(
                     size: entry.size,
                     folder: None,
                     dir: None,
+                    fetch: request,
                 },
             )
             .await?;
@@ -928,6 +948,7 @@ async fn send_one(
             size,
             folder: None,
             dir: None,
+            fetch: request,
         },
     )
     .await?;
@@ -972,6 +993,7 @@ async fn send_folder(
     id: u32,
     entry: &OfferEntry,
     cancel: &AtomicBool,
+    request: Option<u32>,
 ) -> anyhow::Result<()> {
     let root = entry.path.clone();
     let manifest = match tokio::task::spawn_blocking(move || zip::walk(&root)).await {
@@ -998,6 +1020,7 @@ async fn send_folder(
                 size: entry.size,
                 folder: None,
                 dir: None,
+                fetch: request,
             },
         )
         .await?;
@@ -1013,6 +1036,7 @@ async fn send_folder(
             size,
             folder: None,
             dir: None,
+            fetch: request,
         },
     )
     .await?;
@@ -1068,7 +1092,9 @@ impl Session {
     async fn on_message(&mut self, msg: FileChannelMessage) {
         if msg.is_string {
             match serde_json::from_slice::<FileMessage>(&msg.data) {
-                Ok(FileMessage::Fetch { list_id }) => self.downloader.fetch(list_id),
+                Ok(FileMessage::Fetch { list_id, fetch }) => {
+                    self.downloader.fetch(list_id, fetch).await
+                }
                 Ok(m) => {
                     if let FileMessage::Abort { id, reason } = &m {
                         self.downloader.client_abort(*id, *reason);
@@ -1331,6 +1357,7 @@ mod tests {
             size,
             folder: None,
             dir: None,
+            fetch: None,
         })
     }
 
@@ -1492,6 +1519,7 @@ mod tests {
             size: 1,
             folder,
             dir: dir.map(str::to_string),
+            fetch: None,
         })
     }
 
@@ -1898,7 +1926,10 @@ mod tests {
     }
 
     fn fetch(list_id: u32) -> FileChannelMessage {
-        text(&FileMessage::Fetch { list_id })
+        text(&FileMessage::Fetch {
+            list_id,
+            fetch: None,
+        })
     }
 
     #[tokio::test]
@@ -1965,7 +1996,8 @@ mod tests {
                 name: "a.txt".into(),
                 size: 5,
                 folder: None,
-                dir: None
+                dir: None,
+                fetch: None,
             })
         );
         assert_eq!(log[3], msg(FileMessage::End { id: HOST_ID_BASE }));
@@ -1976,7 +2008,8 @@ mod tests {
                 name: "pack.zip".into(),
                 size: zip_size,
                 folder: None,
-                dir: None
+                dir: None,
+                fetch: None,
             })
         );
         let mut total = 0u64;
@@ -2061,7 +2094,8 @@ mod tests {
                 name: "big.bin".into(),
                 size: big.len() as u64,
                 folder: None,
-                dir: None
+                dir: None,
+                fetch: None,
             })
         );
         let mut got = Vec::new();
@@ -2083,7 +2117,8 @@ mod tests {
                 name: "empty.txt".into(),
                 size: 0,
                 folder: None,
-                dir: None
+                dir: None,
+                fetch: None,
             })
         );
         assert_eq!(
@@ -2144,7 +2179,8 @@ mod tests {
                     name: "a.txt".into(),
                     size: 3,
                     folder: None,
-                    dir: None
+                    dir: None,
+                    fetch: None,
                 },
                 FileMessage::Abort {
                     id: HOST_ID_BASE,
@@ -2155,7 +2191,8 @@ mod tests {
                     name: "b.txt".into(),
                     size: 2,
                     folder: None,
-                    dir: None
+                    dir: None,
+                    fetch: None,
                 },
                 FileMessage::End {
                     id: HOST_ID_BASE + 1
@@ -2188,6 +2225,72 @@ mod tests {
         h.set_outstanding(0);
         h.wait_download_done().await;
         assert!(h.sent().contains(&FileMessage::End { id: HOST_ID_BASE }));
+    }
+
+    fn fetch_n(list_id: u32, n: u32) -> FileChannelMessage {
+        text(&FileMessage::Fetch {
+            list_id,
+            fetch: Some(n),
+        })
+    }
+
+    fn start_fetches(sent: &[FileMessage]) -> Vec<Option<u32>> {
+        sent.iter()
+            .filter_map(|m| match m {
+                FileMessage::Start { fetch, .. } => Some(*fetch),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fetch_right_after_cancel_serves_the_new_request() {
+        let mut h = Harness::new(true);
+        let a = put(&h, "a.bin", &[1u8; 1000]);
+        let b = put(&h, "b.bin", &[2u8; 1000]);
+        h.command(FilesCommand::Offer(vec![a, b])).await;
+        h.set_outstanding(SEND_HIGH_WATER + 1); // stall before the first chunk
+        h.feed(vec![fetch_n(1, 1)]).await;
+        h.wait_log_len(2).await; // offer + start
+        h.feed(vec![
+            text(&FileMessage::Abort {
+                id: HOST_ID_BASE,
+                reason: AbortReason::Cancelled,
+            }),
+            fetch_n(1, 2),
+        ])
+        .await;
+        h.set_outstanding(0);
+        h.wait_download_done().await;
+        let sent = h.sent();
+        assert_eq!(start_fetches(&sent), [Some(1), Some(2), Some(2)]);
+        assert!(!sent.contains(&FileMessage::End { id: HOST_ID_BASE }));
+        for id in [HOST_ID_BASE + 1, HOST_ID_BASE + 2] {
+            assert!(sent.contains(&FileMessage::End { id }), "{sent:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn start_carries_the_request_number_of_its_fetch() {
+        let mut h = Harness::new(true);
+        let a = put(&h, "a.txt", b"aaa");
+        let b = put(&h, "b.txt", b"bb");
+        h.command(FilesCommand::Offer(vec![a, b])).await;
+        h.feed(vec![fetch_n(1, 7)]).await;
+        h.wait_download_done().await;
+        assert_eq!(start_fetches(&h.sent()), [Some(7), Some(7)]);
+    }
+
+    #[tokio::test]
+    async fn start_without_request_number_omits_the_field() {
+        let mut h = Harness::new(true);
+        let a = put(&h, "a.txt", b"aaa");
+        h.command(FilesCommand::Offer(vec![a])).await;
+        h.feed(vec![fetch(1)]).await;
+        h.wait_download_done().await;
+        assert_eq!(start_fetches(&h.sent()), [None]);
+        let json = serde_json::to_string(&h.sent()[1]).unwrap();
+        assert!(!json.contains("fetch"), "{json}");
     }
 
     #[tokio::test]

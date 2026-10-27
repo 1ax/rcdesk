@@ -402,6 +402,8 @@ export class FileReceiver {
   /** After `cancel`, everything the host still sends is dropped until the
    * next `fetch`. */
   private cancelled = false;
+  /** Number of the latest `fetch` request; the host echoes it in `start`. */
+  private fetchSeq = 0;
 
   constructor(channel: FileChannelLike, callbacks: FileReceiverCallbacks = {}) {
     this.channel = channel;
@@ -422,12 +424,14 @@ export class FileReceiver {
       return false;
     }
     this.cancelled = false;
+    const request = this.fetchSeq + 1;
     try {
-      this.sendJson({ type: "fetch", list_id: offer.listId });
+      this.sendJson({ type: "fetch", list_id: offer.listId, fetch: request });
     } catch {
       this.cb.onError?.("", "closed");
       return false;
     }
+    this.fetchSeq = request;
     this.list = { total: offer.files.length, done: 0, budget: total };
     return true;
   }
@@ -516,7 +520,13 @@ export class FileReceiver {
         this.cb.onOffer?.(msg.files, msg.skipped_folders);
         return;
       case "start":
-        if (msg.id >= HOST_ID_BASE) this.onStart(msg.id, msg.name, msg.size);
+        if (msg.id >= HOST_ID_BASE) {
+          // A `start` echoing another request number belongs to a download
+          // cancelled earlier: ignore it (its chunks, `end` and `abort` find
+          // no `current` and are dropped). No number = an old host.
+          if (msg.fetch != null && msg.fetch !== this.fetchSeq) return;
+          this.onStart(msg.id, msg.name, msg.size);
+        }
         return;
       case "end":
         if (msg.id >= HOST_ID_BASE) this.onEnd(msg.id);
