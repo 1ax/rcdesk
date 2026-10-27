@@ -610,6 +610,40 @@ fn path_from_report(report: &RTCStatsReport) -> Option<PathInfo> {
     })
 }
 
+/// Cumulative traffic of one peer connection plus whether it goes through a
+/// TURN relay; reported to the server as `SignalMessage::SessionStats`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrafficStats {
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub relay: bool,
+}
+
+impl TrafficStats {
+    /// Pure core of `traffic_from_report`: `transport_bytes` is
+    /// `(sent, received)` of the bundled transport; `None` means the report
+    /// has no transport entry yet. `relay` is true when either end of the
+    /// selected pair is a relay candidate.
+    fn from_parts(transport_bytes: Option<(u64, u64)>, path: Option<&PathInfo>) -> Option<Self> {
+        let (bytes_sent, bytes_received) = transport_bytes?;
+        Some(Self {
+            bytes_sent,
+            bytes_received,
+            relay: path.is_some_and(|p| p.local.typ == "relay" || p.remote.typ == "relay"),
+        })
+    }
+}
+
+/// Transport-level counters (not the selected candidate pair's): the single
+/// bundled transport carries video (SRTP), all data channels (SCTP/DTLS)
+/// and ICE/DTLS overhead, and stays cumulative across a pair change.
+fn traffic_from_report(report: &RTCStatsReport) -> Option<TrafficStats> {
+    TrafficStats::from_parts(
+        report.transport().map(|t| (t.bytes_sent, t.bytes_received)),
+        path_from_report(report).as_ref(),
+    )
+}
+
 /// `(label, RTCDataChannelInit)` for the four channels every session opens
 /// before the offer is created (see ARCHITECTURE.md §5).
 fn data_channel_specs() -> [(&'static str, RTCDataChannelInit); 4] {
@@ -835,6 +869,14 @@ impl PeerSession {
     pub async fn selected_path(&self) -> Option<PathInfo> {
         let report = self.pc.get_stats(Instant::now(), StatsSelector::None).await;
         path_from_report(&report)
+    }
+
+    /// Cumulative bytes sent/received over the connection since it started,
+    /// and whether the selected path is a relay. `None` while the transport
+    /// has no stats yet.
+    pub async fn traffic_stats(&self) -> Option<TrafficStats> {
+        let report = self.pc.get_stats(Instant::now(), StatsSelector::None).await;
+        traffic_from_report(&report)
     }
 
     /// This session's unique tag (fix to slice 3.5b) -- see
@@ -1422,6 +1464,24 @@ mod tests {
             "candidate:bXv"
         ));
         assert!(!candidate_id_matches("anything", ""));
+    }
+
+    #[test]
+    fn traffic_from_parts_sums_transport_and_flags_relay() {
+        let t = |l: &str, r: &str| TrafficStats::from_parts(Some((10, 20)), Some(&path(l, r)));
+        assert_eq!(
+            t("host", "srflx"),
+            Some(TrafficStats {
+                bytes_sent: 10,
+                bytes_received: 20,
+                relay: false
+            })
+        );
+        assert!(t("relay", "host").unwrap().relay);
+        assert!(t("host", "relay").unwrap().relay);
+        assert!(!TrafficStats::from_parts(Some((1, 2)), None).unwrap().relay);
+        assert!(TrafficStats::from_parts(None, Some(&path("host", "host"))).is_none());
+        assert!(traffic_from_report(&RTCStatsReport::default()).is_none());
     }
 
     #[test]

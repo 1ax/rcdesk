@@ -782,6 +782,14 @@ impl SignalingClient {
         let mut timeout_checker = tokio::time::interval(keepalive.interval);
         timeout_checker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut timed_out = false;
+        // Periodic traffic report to the server. Lives per connection: while
+        // signaling is down the loop is not running, so reports are simply
+        // skipped; the counters are cumulative, the next one catches up.
+        let mut stats_ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + SESSION_STATS_INTERVAL,
+            SESSION_STATS_INTERVAL,
+        );
+        stats_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -833,6 +841,13 @@ impl SignalingClient {
                 }
                 Some(cmd) = commands.recv() => {
                     handle_agent_command(cmd, &pin, status, &out_tx, &mut slot.active, &mut slot.current_session_id, &mut slot.pending_auth).await;
+                }
+                _ = stats_ticker.tick() => {
+                    if let (Some(active), Some(session_id)) =
+                        (slot.active.as_ref(), slot.current_session_id.as_deref())
+                    {
+                        send_session_stats(&active.peer, &out_tx, session_id, false).await;
+                    }
                 }
                 _ = timeout_checker.tick() => {
                     let silence = last_incoming.elapsed();
@@ -1377,7 +1392,57 @@ mod disconnect_grace_tests {
     }
 }
 
+/// How often the host reports cumulative session traffic to the server.
+const SESSION_STATS_INTERVAL: Duration = Duration::from_secs(60);
+/// Upper bound for reading WebRTC stats so ending a session is never held up.
+const SESSION_STATS_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Builds `SignalMessage::SessionStats` from a traffic snapshot.
+fn session_stats_message(
+    session_id: &str,
+    stats: crate::transport::TrafficStats,
+    final_report: bool,
+) -> SignalMessage {
+    SignalMessage::SessionStats {
+        session_id: session_id.to_string(),
+        bytes_sent: stats.bytes_sent,
+        bytes_received: stats.bytes_received,
+        relay: stats.relay,
+        final_report,
+    }
+}
+
+/// Reads the peer's traffic (bounded by `SESSION_STATS_TIMEOUT`) and queues a
+/// `SessionStats` for the server. Silently does nothing without stats.
+async fn send_session_stats(
+    peer: &PeerSession,
+    out_tx: &mpsc::UnboundedSender<SignalMessage>,
+    session_id: &str,
+    final_report: bool,
+) {
+    let stats = tokio::time::timeout(SESSION_STATS_TIMEOUT, peer.traffic_stats())
+        .await
+        .ok()
+        .flatten();
+    if let Some(stats) = stats {
+        let _ = out_tx.send(session_stats_message(session_id, stats, final_report));
+    }
+}
+
 impl ActiveSession {
+    /// `shutdown`, preceded by the final `SessionStats` (before any `Bye` the
+    /// caller sends afterwards). `session_id` is `None` when unknown.
+    async fn shutdown_reporting(
+        self,
+        out_tx: &mpsc::UnboundedSender<SignalMessage>,
+        session_id: Option<&str>,
+    ) {
+        if let Some(session_id) = session_id {
+            send_session_stats(&self.peer, out_tx, session_id, true).await;
+        }
+        self.shutdown().await;
+    }
+
     async fn shutdown(self) {
         self.peer.close().await;
         self.video.stop();
@@ -1599,7 +1664,8 @@ async fn handle_signal_message(
         } => {
             if let Some(old) = active.take() {
                 tracing::info!("new PeerJoined while a session was active; closing the old one");
-                old.shutdown().await;
+                old.shutdown_reporting(out_tx, current_session_id.as_deref())
+                    .await;
                 let _ = status.send(AgentStatus::Registered {
                     pin: pin.to_string(),
                 });
@@ -1675,7 +1741,8 @@ async fn handle_signal_message(
                 if !ok {
                     tracing::warn!(%session_id, "answer failed dtls binding check, ending session");
                     if let Some(old) = active.take() {
-                        old.shutdown().await;
+                        old.shutdown_reporting(out_tx, current_session_id.as_deref())
+                            .await;
                         let _ = status.send(AgentStatus::Registered {
                             pin: pin.to_string(),
                         });
@@ -1703,7 +1770,8 @@ async fn handle_signal_message(
             };
             if set_answer_failed {
                 if let Some(old) = active.take() {
-                    old.shutdown().await;
+                    old.shutdown_reporting(out_tx, current_session_id.as_deref())
+                        .await;
                     let _ = status.send(AgentStatus::Registered {
                         pin: pin.to_string(),
                     });
@@ -1896,7 +1964,8 @@ async fn handle_signal_message(
             if current_session_id.as_deref() == Some(session_id.as_str()) {
                 tracing::info!(%session_id, "session ended by peer");
                 if let Some(old) = active.take() {
-                    old.shutdown().await;
+                    old.shutdown_reporting(out_tx, current_session_id.as_deref())
+                        .await;
                     let _ = status.send(AgentStatus::Registered {
                         pin: pin.to_string(),
                     });
@@ -2080,7 +2149,7 @@ async fn handle_agent_command(
             };
             let session_id = current_session_id.take();
             tracing::info!(?session_id, "ending session (End session command)");
-            old.shutdown().await;
+            old.shutdown_reporting(out_tx, session_id.as_deref()).await;
             if let Some(session_id) = session_id {
                 let _ = out_tx.send(SignalMessage::Bye {
                     session_id,
@@ -2175,7 +2244,8 @@ async fn handle_session_event(
                 RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
             ) {
                 if let Some(old) = active.take() {
-                    old.shutdown().await;
+                    old.shutdown_reporting(out_tx, current_session_id.as_deref())
+                        .await;
                     let _ = status.send(AgentStatus::Registered {
                         pin: pin.to_string(),
                     });
@@ -2203,7 +2273,8 @@ async fn handle_session_event(
             if matches_current && matches_pending {
                 tracing::info!(%session_id, "disconnect grace window expired, ending session");
                 if let Some(old) = active.take() {
-                    old.shutdown().await;
+                    old.shutdown_reporting(out_tx, current_session_id.as_deref())
+                        .await;
                     let _ = status.send(AgentStatus::Registered {
                         pin: pin.to_string(),
                     });
@@ -2254,7 +2325,8 @@ async fn handle_session_event(
                 // after the slot is already empty.
                 if let Some(old) = active.take() {
                     tracing::info!("control data channel closed by remote peer, ending session");
-                    old.shutdown().await;
+                    old.shutdown_reporting(out_tx, current_session_id.as_deref())
+                        .await;
                     let _ = status.send(AgentStatus::Registered {
                         pin: pin.to_string(),
                     });
@@ -2284,7 +2356,8 @@ async fn handle_session_event(
             if active.as_ref().is_some_and(|a| a.session_tag == tag) {
                 if let Some(old) = active.take() {
                     tracing::warn!("video pipeline failed, ending session");
-                    old.shutdown().await;
+                    old.shutdown_reporting(out_tx, current_session_id.as_deref())
+                        .await;
                     let _ = status.send(AgentStatus::Registered {
                         pin: pin.to_string(),
                     });
@@ -4453,6 +4526,22 @@ mod tests {
     /// typed error and the resulting `Bye` carries `DisplayUnavailable`;
     /// any other failure stays a plain `Bye`. The wait timeout is shrunk via
     /// `start_session_with_display_wait` so the test doesn't sit out 5 s.
+    /// Ending a session with a live peer queues the final `SessionStats`
+    /// first -- ahead of the host's own `Bye`.
+    fn expect_final_stats(out_rx: &mut mpsc::UnboundedReceiver<SignalMessage>) {
+        match out_rx.try_recv().expect("expected a final SessionStats") {
+            SignalMessage::SessionStats {
+                session_id,
+                final_report,
+                ..
+            } => {
+                assert_eq!(session_id, "sess-1");
+                assert!(final_report);
+            }
+            other => panic!("expected SessionStats, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn empty_display_list_yields_bye_with_display_unavailable() {
         let mut ctx = test_ctx();
@@ -5003,6 +5092,7 @@ mod tests {
         )
         .await;
 
+        expect_final_stats(&mut out_rx);
         assert_eq!(
             out_rx.try_recv().expect("expected bye"),
             SignalMessage::Bye {
@@ -5060,6 +5150,7 @@ mod tests {
 
         // Slice E3: binding passed, `set_answer` failed on the synthetic SDP
         // -> the session is ended with a Bye.
+        expect_final_stats(&mut out_rx);
         assert_eq!(
             out_rx
                 .try_recv()
@@ -6244,6 +6335,7 @@ mod tests {
 
         assert!(active.is_none());
         assert_eq!(current_session_id, None);
+        expect_final_stats(&mut out_rx);
         assert_eq!(
             out_rx.try_recv().expect("expected a Bye message"),
             SignalMessage::Bye {
@@ -6953,6 +7045,7 @@ mod tests {
                 pin: "111111".to_string()
             }
         );
+        expect_final_stats(&mut out_rx);
         assert_eq!(
             out_rx.try_recv().expect("expected a Bye message"),
             SignalMessage::Bye {
@@ -7290,6 +7383,7 @@ mod tests {
                 pin: "111111".to_string()
             }
         );
+        expect_final_stats(&mut out_rx);
         assert_eq!(
             out_rx.try_recv().expect("expected a Bye message"),
             SignalMessage::Bye {
