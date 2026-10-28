@@ -141,6 +141,8 @@ import {
   connectionBannerLabel,
   connectionStateOutcome,
   DISCONNECT_GRACE_MS,
+  PAGEHIDE_RESUME_CHECK_MS,
+  PageHideTracker,
   RECOVERY_RESPONSE_TIMEOUT_MS,
   recoveryDelayMs,
   recoveryExhausted,
@@ -1160,6 +1162,8 @@ export function mount(root: Element | null): void {
   // losing a session (see `beginRecovery`) -- the session screen stays up
   // throughout, showing the "reconnecting" status/banner.
   let recovering = false;
+  // D67b: set when a `pagehide` closed a live session (see its listener).
+  const pageHide = new PageHideTracker();
   // 1-based attempt count for `sessionRecovery.recoveryDelayMs`'s backoff;
   // only meaningful while `recovering`.
   let recoveryAttempt = 0;
@@ -2729,6 +2733,7 @@ export function mount(root: Element | null): void {
     clipboardNoteEl.textContent = "";
     session?.close();
     session = null;
+    pageHide.clear();
     sessionId = null;
     prevSnapshot = undefined;
     video.srcObject = null;
@@ -3356,7 +3361,16 @@ export function mount(root: Element | null): void {
   // unreliable on mobile Safari in particular). Not guaranteed to reach the
   // server -- the socket may already be down -- but when it does, the host
   // learns the session is over immediately instead of only noticing once its
-  // own connection drops.
+  // own connection drops. D67b: Chrome on Windows also sends `pagehide` on
+  // system sleep, but the page survives -- so a live session closed here is
+  // remembered and, if the page is still around afterwards, recovered.
+  function onReturnAfterPageHide(): void {
+    if (pageHide.takePageHideReturn() && session !== null) {
+      console.warn("[rcdesk] session closed by pagehide, recovering");
+      handleSessionLost();
+    }
+  }
+  window.addEventListener("pageshow", onReturnAfterPageHide);
   window.addEventListener("pagehide", () => {
     // Slice 3.5b: an intentional end of session -- no point in a page that's
     // going away scheduling a recovery attempt (or the grace window that
@@ -3367,7 +3381,9 @@ export function mount(root: Element | null): void {
     if (sessionId) {
       signaling.send({ type: "bye", session_id: sessionId });
     }
+    pageHide.arm(session !== null);
     session?.close();
+    window.setTimeout(onReturnAfterPageHide, PAGEHIDE_RESUME_CHECK_MS);
   });
 
   // One connection for the whole tab (see where `signaling` is declared
