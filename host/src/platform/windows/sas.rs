@@ -1,6 +1,10 @@
 //! Ctrl+Alt+Del из сеанса (слайс D46). Комбинацию нельзя передать из
 //! браузера, поэтому хост вызывает документированный `SendSAS(FALSE)` из
-//! `sas.dll`; Windows выполняет его только при политике
+//! `sas.dll`. По документации вызывать его должна служба: живьём в 0.3.5
+//! вызов из помощника (`serve --machine`, SYSTEM в консольном сеансе)
+//! Windows игнорирует. Поэтому помощник лишь выставляет именованное событие
+//! `Global\rcdesk-sas` ([`request`]), а поток службы ([`spawn_listener`])
+//! ждёт его и вызывает `SendSAS`. Windows выполняет вызов только при политике
 //! `SoftwareSASGeneration` (HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\
 //! Policies\System, REG_DWORD, 1 = разрешено службам), которую при старте
 //! службы выставляет `ensure_policy`.
@@ -17,26 +21,128 @@
 //! ```
 
 use anyhow::Context;
-use windows::core::PCWSTR;
+use windows::core::{Owned, PCWSTR};
+use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL, WAIT_OBJECT_0};
 use windows::Win32::Security::Authentication::Identity::SendSAS;
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE,
     KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_VALUE_TYPE,
 };
+use windows::Win32::System::Threading::{
+    CreateEventW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE,
+};
 
 const POLICY_SUBKEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
 const POLICY_VALUE: &str = "SoftwareSASGeneration";
+/// Имя события, которым помощник просит службу послать SAS.
+const SAS_EVENT_NAME: &str = r"Global\rcdesk-sas";
+/// Доступ к событию только у SYSTEM (помощник и служба -- оба SYSTEM).
+const SAS_EVENT_SDDL: &str = "D:P(A;;GA;;;SY)";
 
 fn wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Посылает Secure Attention Sequence (Ctrl+Alt+Del) в консольный сеанс.
-pub fn send() {
+/// Вызывать только из потока службы ([`spawn_listener`]).
+fn send() {
     // Safety: `SendSAS` не принимает указателей; `false` -- вызов от службы,
     // не от имени пользователя. Возвращаемого значения нет.
     unsafe { SendSAS(false) };
     tracing::info!("ctrl+alt+del sent (SendSAS)");
+}
+
+/// Создаёт событие `Global\rcdesk-sas` и запускает поток, который на каждое
+/// его выставление вызывает `SendSAS`. Только для службы. Поток живёт до
+/// конца процесса службы (join не нужен), хендл события не закрывается.
+pub fn spawn_listener() -> anyhow::Result<std::thread::JoinHandle<()>> {
+    let sddl = wide_null(SAS_EVENT_SDDL);
+    let name = wide_null(SAS_EVENT_NAME);
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // Safety: `sddl` -- валидная NUL-терминированная строка, переживает
+    // вызов; `descriptor` -- валидный out-параметр, память выделяет система
+    // (освобождается `LocalFree` ниже); размер не нужен.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+    }
+    .context("ConvertStringSecurityDescriptorToSecurityDescriptorW")?;
+
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: false.into(),
+    };
+    // Safety: `attributes` и `name` живут до конца вызова; дескриптор в
+    // `attributes` валиден до `LocalFree` ниже (система копирует его в объект).
+    let created = unsafe {
+        CreateEventW(
+            Some(&attributes),
+            false,
+            false,
+            PCWSTR::from_raw(name.as_ptr()),
+        )
+    };
+
+    // Safety: `descriptor.0` выделен системой через `LocalAlloc` внутри
+    // `Convert...` и освобождается ровно один раз, здесь, на всех путях;
+    // `HLOCAL` и `PSECURITY_DESCRIPTOR` -- обёртки над одним указателем.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+    }
+    let event = created.context("CreateEventW(Global\\rcdesk-sas)")?;
+
+    // `HANDLE` не `Send`; передаём значение указателя числом. Событие в
+    // потоке не закрывается: оно нужно до конца процесса.
+    let raw = event.0 as usize;
+    let handle = std::thread::Builder::new()
+        .name("sas-listener".into())
+        .spawn(move || {
+            let event = HANDLE(raw as *mut std::ffi::c_void);
+            loop {
+                // Safety: `event` -- действительный хендл события, не
+                // закрывается до конца процесса.
+                let wait = unsafe { WaitForSingleObject(event, INFINITE) };
+                if wait != WAIT_OBJECT_0 {
+                    tracing::warn!(result = wait.0, "ожидание события rcdesk-sas прервано");
+                    break;
+                }
+                send();
+            }
+        })
+        .context("запуск потока sas-listener")?;
+    Ok(handle)
+}
+
+/// Просит службу послать Ctrl+Alt+Del: выставляет событие `Global\rcdesk-sas`.
+/// Вызывается из помощника; любая ошибка (например, служба старая и события
+/// нет) -- только `warn!`.
+pub fn request() {
+    if let Err(err) = request_inner() {
+        tracing::warn!(error = %format!("{err:#}"), "не удалось запросить ctrl+alt+del у службы");
+    }
+}
+
+fn request_inner() -> anyhow::Result<()> {
+    let name = wide_null(SAS_EVENT_NAME);
+    // Safety: `name` -- NUL-терминированная строка, переживает вызов.
+    let opened = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR::from_raw(name.as_ptr())) }
+        .context("OpenEventW(Global\\rcdesk-sas)")?;
+    // Safety: `opened` -- свежий хендл из успешного `OpenEventW`; `Owned`
+    // закроет его ровно один раз.
+    let event = unsafe { Owned::new(opened) };
+    // Safety: `*event` -- действительный хендл с правом EVENT_MODIFY_STATE.
+    unsafe { SetEvent(*event) }.context("SetEvent")?;
+    tracing::info!("ctrl+alt+del requested from service");
+    Ok(())
 }
 
 /// Включает `SoftwareSASGeneration = 1`, если значения нет или оно 0;

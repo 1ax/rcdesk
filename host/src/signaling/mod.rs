@@ -2480,8 +2480,9 @@ async fn handle_session_event(
                         }
                         Ok(ControlMessage::SendCtrlAltDel) => {
                             if active.is_some() && ctx.machine_mode {
-                                // `SendSAS` -- блокирующий syscall.
-                                tokio::task::spawn_blocking(crate::platform::sas::send);
+                                // Помощник лишь выставляет событие службе (`SendSAS`
+                                // вызывает она); syscall блокирующий.
+                                tokio::task::spawn_blocking(crate::platform::sas::request);
                             } else {
                                 tracing::debug!(
                                     label,

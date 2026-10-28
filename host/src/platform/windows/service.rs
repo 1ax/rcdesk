@@ -744,6 +744,10 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     if let Err(err) = super::sas::ensure_policy() {
         tracing::warn!(error = %format!("{err:#}"), "не удалось включить SoftwareSASGeneration");
     }
+    // D46c: SendSAS должна вызывать служба; помощник просит через событие.
+    if let Err(err) = super::sas::spawn_listener() {
+        tracing::warn!(error = %format!("{err:#}"), "не удалось запустить слушатель ctrl+alt+del");
+    }
 
     // Хаб стартует до первого тика супервизора; помощник и так
     // переподключается с backoff, ждать готовности хаба не нужно.

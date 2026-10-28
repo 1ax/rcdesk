@@ -60,11 +60,11 @@ pub mod display_wake {
         DisplayWakeGuard
     }
 }
-/// Ctrl+Alt+Del из сеанса (D46): на Windows -- `SendSAS`, на остальных
+/// Ctrl+Alt+Del из сеанса (D46): на Windows -- запрос службе (она вызывает `SendSAS`), на остальных
 /// платформах -- заглушка без эффекта.
 #[cfg(target_os = "windows")]
 pub mod sas {
-    pub use super::windows::sas::send;
+    pub use super::windows::sas::request;
 
     pub const SUPPORTED: bool = true;
 }
@@ -73,7 +73,7 @@ pub mod sas {
     pub const SUPPORTED: bool = false;
 
     /// Заглушка: SAS есть только на Windows.
-    pub fn send() {
+    pub fn request() {
         tracing::warn!("ctrl+alt+del is not supported on this platform, ignoring");
     }
 }
