@@ -2478,6 +2478,17 @@ async fn handle_session_event(
                                 }
                             }
                         }
+                        Ok(ControlMessage::SendCtrlAltDel) => {
+                            if active.is_some() && ctx.machine_mode {
+                                // `SendSAS` -- блокирующий syscall.
+                                tokio::task::spawn_blocking(crate::platform::sas::send);
+                            } else {
+                                tracing::debug!(
+                                    label,
+                                    "send_ctrl_alt_del without active session or machine mode, ignoring"
+                                );
+                            }
+                        }
                         Ok(ControlMessage::UpdateHost) => {
                             if let Some(active) = active.as_ref() {
                                 match begin_update(ctx) {
@@ -2582,6 +2593,7 @@ async fn handle_session_event(
                     active.curtain.is_some(),
                     active.input_source.is_some(),
                     update_available(ctx),
+                    ctx.machine_mode && crate::platform::sas::SUPPORTED,
                 );
                 match active.peer.send_control(&host_info).await {
                     Ok(true) => {}
@@ -2672,6 +2684,7 @@ fn host_info_message(
     curtain_available: bool,
     input_source_available: bool,
     update_available: bool,
+    ctrl_alt_del_available: bool,
 ) -> ControlMessage {
     ControlMessage::HostInfo {
         os: crate::platform::host_os(),
@@ -2680,6 +2693,7 @@ fn host_info_message(
         input_source_available,
         version: Some(crate::build_info::VERSION.to_string()),
         update_available,
+        ctrl_alt_del_available,
     }
 }
 
@@ -4273,7 +4287,7 @@ mod tests {
     #[test]
     fn host_info_message_reports_this_hosts_os() {
         assert_eq!(
-            host_info_message(true, false, false, false),
+            host_info_message(true, false, false, false, false),
             ControlMessage::HostInfo {
                 os: crate::platform::host_os(),
                 files_enabled: true,
@@ -4281,10 +4295,11 @@ mod tests {
                 input_source_available: false,
                 version: Some(crate::build_info::VERSION.to_string()),
                 update_available: false,
+                ctrl_alt_del_available: false,
             }
         );
         assert_eq!(
-            host_info_message(false, true, true, false),
+            host_info_message(false, true, true, false, false),
             ControlMessage::HostInfo {
                 os: crate::platform::host_os(),
                 files_enabled: false,
@@ -4292,8 +4307,21 @@ mod tests {
                 input_source_available: true,
                 version: Some(crate::build_info::VERSION.to_string()),
                 update_available: false,
+                ctrl_alt_del_available: false,
             }
         );
+    }
+
+    /// Слайс D46: флаг `ctrl_alt_del_available` доезжает до `HostInfo`.
+    #[test]
+    fn host_info_reports_ctrl_alt_del_availability() {
+        for available in [true, false] {
+            assert!(matches!(
+                host_info_message(true, false, false, false, available),
+                ControlMessage::HostInfo { ctrl_alt_del_available, .. }
+                    if ctrl_alt_del_available == available
+            ));
+        }
     }
 
     /// Слайс D50d: без `update_dirs` обновление недоступно.
@@ -4302,7 +4330,7 @@ mod tests {
         let ctx = test_ctx();
         assert!(!update_available(&ctx));
         assert!(matches!(
-            host_info_message(true, false, false, update_available(&ctx)),
+            host_info_message(true, false, false, update_available(&ctx), false),
             ControlMessage::HostInfo {
                 update_available: false,
                 ..
@@ -7526,7 +7554,7 @@ mod tests {
     fn host_info_reports_input_source_availability() {
         for available in [true, false] {
             assert!(matches!(
-                host_info_message(true, false, available, false),
+                host_info_message(true, false, available, false, false),
                 ControlMessage::HostInfo { input_source_available, .. }
                     if input_source_available == available
             ));

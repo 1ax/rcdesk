@@ -27,4 +27,9 @@ version: string | null,
  * Хост умеет обновиться из сеанса (слайс D50d). Старый JSON без
  * поля -- `false`.
  */
-update_available: boolean, } | { "type": "set_curtain", on: boolean, } | { "type": "curtain_status", on: boolean, reason: string | null, } | { "type": "switch_input_source" } | { "type": "input_source", label: string, } | { "type": "update_host" } | { "type": "update_status", state: UpdateState, version: string | null, message: string | null, received?: number | null, total?: number | null, };
+update_available: boolean, 
+/**
+ * Хост умеет послать Ctrl+Alt+Del (слайс D46) -- только полный
+ * режим Windows. Старый JSON без поля -- `false`.
+ */
+ctrl_alt_del_available: boolean, } | { "type": "set_curtain", on: boolean, } | { "type": "curtain_status", on: boolean, reason: string | null, } | { "type": "switch_input_source" } | { "type": "send_ctrl_alt_del" } | { "type": "input_source", label: string, } | { "type": "update_host" } | { "type": "update_status", state: UpdateState, version: string | null, message: string | null, received?: number | null, total?: number | null, };

@@ -60,6 +60,23 @@ pub mod display_wake {
         DisplayWakeGuard
     }
 }
+/// Ctrl+Alt+Del из сеанса (D46): на Windows -- `SendSAS`, на остальных
+/// платформах -- заглушка без эффекта.
+#[cfg(target_os = "windows")]
+pub mod sas {
+    pub use super::windows::sas::send;
+
+    pub const SUPPORTED: bool = true;
+}
+#[cfg(not(target_os = "windows"))]
+pub mod sas {
+    pub const SUPPORTED: bool = false;
+
+    /// Заглушка: SAS есть только на Windows.
+    pub fn send() {
+        tracing::warn!("ctrl+alt+del is not supported on this platform, ignoring");
+    }
+}
 /// Следование потока за входным рабочим столом (D45a): на Windows --
 /// `OpenInputDesktop` + `SetThreadDesktop` (экран блокировки, UAC),
 /// на остальных платформах -- заглушки без эффекта.

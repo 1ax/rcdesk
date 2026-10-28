@@ -738,6 +738,13 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     );
     tracing::info!("rcdesk service running");
 
+    // D46: SendSAS работает только при SoftwareSASGeneration; включаем
+    // политику при каждом старте службы (в т.ч. после обновления на уже
+    // установленных машинах). Сбой не мешает службе.
+    if let Err(err) = super::sas::ensure_policy() {
+        tracing::warn!(error = %format!("{err:#}"), "не удалось включить SoftwareSASGeneration");
+    }
+
     // Хаб стартует до первого тика супервизора; помощник и так
     // переподключается с backoff, ждать готовности хаба не нужно.
     let hub = if HUB_MODE.load(Ordering::SeqCst) {

@@ -149,6 +149,9 @@ windows = { version = "0.61", features = [
     # следуют за входным рабочим столом (Winlogon/UAC).
     "Win32_System_StationsAndDesktops",
     "Win32_System_Services",
+    # SendSAS (platform::windows::sas, D46) -- Ctrl+Alt+Del из сеанса
+    # (кнопка клиента; нужна политика SoftwareSASGeneration).
+    "Win32_Security_Authentication_Identity",
     # WTSGetActiveConsoleSessionId (platform::windows::service, 4.1a) --
     # номер активной консольной сессии, в которой служба запускает помощника.
     "Win32_System_RemoteDesktop",

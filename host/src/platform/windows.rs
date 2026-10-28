@@ -9,6 +9,7 @@ pub mod monitors;
 pub mod mouse;
 pub mod netifs;
 pub mod power;
+pub mod sas;
 pub mod service;
 pub mod update;
 

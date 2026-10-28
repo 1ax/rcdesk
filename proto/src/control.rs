@@ -185,6 +185,10 @@ pub enum ControlMessage {
         /// поля -- `false`.
         #[serde(default)]
         update_available: bool,
+        /// Хост умеет послать Ctrl+Alt+Del (слайс D46) -- только полный
+        /// режим Windows. Старый JSON без поля -- `false`.
+        #[serde(default)]
+        ctrl_alt_del_available: bool,
     },
     /// client -> host: включить (`on: true`) или выключить шторку (слайс
     /// 4.2c). Шторка закрывает физический монитор хоста чёрным окном
@@ -199,6 +203,10 @@ pub enum ControlMessage {
     /// client -> host: переключить раскладку клавиатуры хоста на следующую
     /// (слайс 4.6c). Хост отвечает `InputSource` с новой меткой.
     SwitchInputSource,
+    /// client -> host: послать Ctrl+Alt+Del (слайс D46). Из браузера эту
+    /// комбинацию передать нельзя, хост вызывает `SendSAS`. Работает только
+    /// в полном режиме Windows; ответа нет.
+    SendCtrlAltDel,
     /// host -> client: метка текущей раскладки хоста (слайс 4.6c), например
     /// `"RU"`. Шлётся после `HostInfo`, в ответ на `SwitchInputSource` и при
     /// любом изменении раскладки на самом хосте.
@@ -454,13 +462,14 @@ mod tests {
                 input_source_available: true,
                 version: Some("0.1.1".to_string()),
                 update_available: true,
+                ctrl_alt_del_available: false,
             };
 
             let json = serde_json::to_string(&msg).expect("serialize");
             assert_eq!(
                 json,
                 format!(
-                    r#"{{"type":"host_info","os":"{wire}","files_enabled":true,"curtain_available":false,"input_source_available":true,"version":"0.1.1","update_available":true}}"#
+                    r#"{{"type":"host_info","os":"{wire}","files_enabled":true,"curtain_available":false,"input_source_available":true,"version":"0.1.1","update_available":true,"ctrl_alt_del_available":false}}"#
                 )
             );
 
@@ -518,8 +527,48 @@ mod tests {
                 input_source_available: false,
                 version: None,
                 update_available: false,
+                ctrl_alt_del_available: false,
             }
         );
+    }
+
+    /// Слайс D46: JSON без `ctrl_alt_del_available` разбирается в `false`.
+    #[test]
+    fn host_info_without_ctrl_alt_del_available_parses_as_false() {
+        let json = r#"{"type":"host_info","os":"windows","files_enabled":true,"curtain_available":false,"input_source_available":false,"version":"0.2.3","update_available":false}"#;
+        let msg: ControlMessage = serde_json::from_str(json).expect("deserialize");
+        assert!(matches!(
+            msg,
+            ControlMessage::HostInfo {
+                ctrl_alt_del_available: false,
+                ..
+            }
+        ));
+    }
+
+    /// Слайс D46: `ctrl_alt_del_available: true` переживает round-trip.
+    #[test]
+    fn host_info_with_ctrl_alt_del_available_round_trips() {
+        let json = r#"{"type":"host_info","os":"windows","files_enabled":true,"curtain_available":false,"input_source_available":false,"version":"0.2.3","update_available":false,"ctrl_alt_del_available":true}"#;
+        let msg: ControlMessage = serde_json::from_str(json).expect("deserialize");
+        assert!(matches!(
+            msg,
+            ControlMessage::HostInfo {
+                ctrl_alt_del_available: true,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_string(&msg).expect("serialize"), json);
+    }
+
+    /// Слайс D46: `send_ctrl_alt_del` без полей.
+    #[test]
+    fn send_ctrl_alt_del_round_trips_through_json_with_exact_shape() {
+        let msg = ControlMessage::SendCtrlAltDel;
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(json, r#"{"type":"send_ctrl_alt_del"}"#);
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, msg);
     }
 
     /// Слайс D50a: JSON без `version` (хосты 0.1.0) разбирается в `None`.
@@ -536,7 +585,7 @@ mod tests {
     /// Слайс D50a: `version` переживает круговой round-trip.
     #[test]
     fn host_info_with_version_round_trips() {
-        let json = r#"{"type":"host_info","os":"windows","files_enabled":true,"curtain_available":false,"input_source_available":false,"version":"0.2.3","update_available":false}"#;
+        let json = r#"{"type":"host_info","os":"windows","files_enabled":true,"curtain_available":false,"input_source_available":false,"version":"0.2.3","update_available":false,"ctrl_alt_del_available":false}"#;
         let msg: ControlMessage = serde_json::from_str(json).expect("deserialize");
         assert!(matches!(
             &msg,
