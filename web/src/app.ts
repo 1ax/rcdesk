@@ -8,6 +8,7 @@
 // `pointer` have arrived, `attachInput` (see `input.ts`) starts forwarding
 // mouse/keyboard events to the host.
 
+import { ctrlAltDelMessage, ctrlAltDelVisible } from "./ctrlAltDel";
 import "./style.css";
 import { SignalingClient } from "./signaling";
 import { PeerSession, toRtcIceServers } from "./session";
@@ -498,6 +499,14 @@ export function mount(root: Element | null): void {
           >
             Яз
           </button>
+          <button
+            id="ctrl-alt-del-btn"
+            class="btn btn-secondary"
+            title="Отправить Ctrl+Alt+Del (экран безопасности Windows)"
+            hidden
+          >
+            Ctrl+Alt+Del
+          </button>
           <button id="keyboard-btn" class="btn btn-secondary" hidden>Клавиатура</button>
           <button id="touch-mode-btn" class="btn btn-secondary" title="Режим касаний" hidden></button>
           <button id="fullscreen-btn" class="btn btn-secondary" hidden>На весь экран</button>
@@ -889,6 +898,18 @@ export function mount(root: Element | null): void {
     sendSwitchInputSource();
     // The button is clicked mid-typing: give the keyboard back to the video
     // so the next keys reach the host (and Space/Enter don't re-press it).
+    focusVideoUnlessTyping();
+  });
+  // Slice D46b: Ctrl+Alt+Del for a Windows host in full mode.
+  const ctrlAltDelBtn = root.querySelector<HTMLButtonElement>("#ctrl-alt-del-btn")!;
+  let ctrlAltDelAvailable = false;
+  function renderCtrlAltDelBtn(): void {
+    ctrlAltDelBtn.hidden = !ctrlAltDelVisible(ctrlAltDelAvailable);
+  }
+  ctrlAltDelBtn.addEventListener("click", () => {
+    const dc = controlChannel;
+    if (!dc || dc.readyState !== "open") return;
+    dc.send(JSON.stringify(ctrlAltDelMessage()));
     focusVideoUnlessTyping();
   });
   // `document.fullscreenEnabled` doesn't change over a tab's lifetime, so
@@ -2343,6 +2364,8 @@ export function mount(root: Element | null): void {
         renderCurtain();
         inputSourceAvailable = msg.input_source_available;
         renderLayoutBtn(null);
+        ctrlAltDelAvailable = msg.ctrl_alt_del_available === true;
+        renderCtrlAltDelBtn();
         // Слайс D50a: плашка, если хост старее клиента.
         const outdated = hostOutdatedLabel(msg.version, __APP_VERSION__);
         hostOutdatedTextEl.textContent = outdated ?? "";
@@ -2697,6 +2720,8 @@ export function mount(root: Element | null): void {
     renderCurtain();
     inputSourceAvailable = false;
     renderLayoutBtn(null);
+    ctrlAltDelAvailable = false;
+    renderCtrlAltDelBtn();
     if (fileSender) {
       fileSender.cancelAll();
       fileSender.dispose();
