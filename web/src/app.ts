@@ -108,6 +108,15 @@ import {
   sortDevices,
 } from "./myDevices";
 import {
+  WAKE_TIMEOUT_MS,
+  applyDevices,
+  applyWakeError,
+  applyWakeSent,
+  createWakeState,
+  startWake,
+  wakeStatusFor,
+} from "./wake";
+import {
   loadQualityPreset,
   QUALITY_PRESET_LABELS,
   saveQualityPreset,
@@ -1127,6 +1136,10 @@ export function mount(root: Element | null): void {
   let reconnectAttempt = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let deviceListTimer: ReturnType<typeof setInterval> | undefined;
+  // Slice W: "Включить" (Wake-on-LAN) bookkeeping and its 1 s redraw ticker,
+  // which runs only while some wake is still within `WAKE_TIMEOUT_MS`.
+  const wakeState = createWakeState();
+  let wakeTimer: ReturnType<typeof setInterval> | undefined;
   // Slice 3.5b: the persistent device id from the current/last `Joined`
   // (`#[serde(default)]` on the wire, so `null` with a pre-3.5b server) --
   // what `beginRecovery` reconnects to after losing a session. Cleared on
@@ -1493,7 +1506,8 @@ export function mount(root: Element | null): void {
       nameEl.textContent = deviceLabel(entry);
       const statusEl = document.createElement("span");
       statusEl.className = "device-status";
-      statusEl.textContent = deviceStatusLabel(entry, nowSecs);
+      const wake = wakeStatusFor(wakeState, entry, Date.now());
+      statusEl.textContent = wake.status ?? deviceStatusLabel(entry, nowSecs);
       info.appendChild(nameEl);
       info.appendChild(statusEl);
 
@@ -1513,6 +1527,17 @@ export function mount(root: Element | null): void {
         beginSession(() =>
           signaling.send({ type: "connect_device", device_id: entry.device_id }),
         );
+      });
+
+      const wakeBtn = document.createElement("button");
+      wakeBtn.className = "btn device-wake";
+      wakeBtn.textContent = wake.view.buttonLabel;
+      wakeBtn.disabled = connectionLost || wake.view.buttonDisabled;
+      wakeBtn.addEventListener("click", () => {
+        startWake(wakeState, entry.device_id, Date.now());
+        signaling.send({ type: "wake_device", device_id: entry.device_id });
+        ensureWakeTicker();
+        renderDeviceList();
       });
 
       const renameBtn = document.createElement("button");
@@ -1540,13 +1565,30 @@ export function mount(root: Element | null): void {
         renderDeviceList();
       });
 
-      actions.appendChild(connectRowBtn);
+      actions.appendChild(wake.view.showButton ? wakeBtn : connectRowBtn);
       actions.appendChild(renameBtn);
       actions.appendChild(forgetBtn);
       li.appendChild(info);
       li.appendChild(actions);
       deviceListEl.appendChild(li);
     }
+  }
+
+  /** Starts the 1 s redraw ticker for the "Включаю… м:сс" counter (one timer
+   * at most); it stops itself once no wake is within its timeout. */
+  function ensureWakeTicker(): void {
+    if (wakeTimer !== undefined) return;
+    wakeTimer = setInterval(() => {
+      const now = Date.now();
+      const active = [...wakeState.waiting.values()].some(
+        (w) => now - w.startedMs < WAKE_TIMEOUT_MS,
+      );
+      if (!active && wakeTimer !== undefined) {
+        clearInterval(wakeTimer);
+        wakeTimer = undefined;
+      }
+      renderDeviceList();
+    }, 1000);
   }
 
   /** Sends the renamed alias (or `null` to clear it, when blank after
@@ -2896,7 +2938,12 @@ export function mount(root: Element | null): void {
 
   signaling.on("devices", (msg) => {
     devices = msg.devices;
+    applyDevices(wakeState, devices);
     renderDeviceList();
+  });
+
+  signaling.on("wake_sent", () => {
+    applyWakeSent(wakeState);
   });
 
   signaling.on("joined", (msg) => {
@@ -3221,6 +3268,12 @@ export function mount(root: Element | null): void {
   });
 
   signaling.on("error", (msg) => {
+    // Slice W: the answer to a pending `wake_device` -- shown on the device
+    // row only; session logic is untouched.
+    if (applyWakeError(wakeState, msg.message)) {
+      renderDeviceList();
+      return;
+    }
     if (recovering) {
       // A recovery attempt's `connect_device` was rejected (device offline
       // or busy, most likely) -- try again per the backoff schedule, or
