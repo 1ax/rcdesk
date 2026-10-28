@@ -620,6 +620,7 @@ impl SignalingClient {
                 session_id,
                 // D44: the host understands `PinChanged` (see `apply_pin_change`).
                 pin_rotation: true,
+                ifaces: Vec::new(),
             },
         )
         .await?;

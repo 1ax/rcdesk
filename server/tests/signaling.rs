@@ -246,6 +246,7 @@ async fn host_and_joined_client(url: &str) -> (WsStream, WsStream, String, Strin
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -282,6 +283,7 @@ async fn host_registers_and_receives_six_digit_pin() {
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -317,6 +319,7 @@ async fn client_join_succeeds_and_host_is_notified() {
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -603,6 +606,7 @@ async fn register_plain_host(url: &str) -> (WsStream, String) {
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -710,6 +714,7 @@ async fn host_without_device_credentials_is_issued_fresh_ones() {
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -740,6 +745,7 @@ async fn reconnecting_with_issued_credentials_reuses_host_id() {
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -763,6 +769,7 @@ async fn reconnecting_with_issued_credentials_reuses_host_id() {
             device: Some(credentials),
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -794,6 +801,7 @@ async fn reconnecting_with_wrong_secret_is_rejected() {
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -817,6 +825,7 @@ async fn reconnecting_with_wrong_secret_is_rejected() {
             }),
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -845,6 +854,7 @@ async fn reconnecting_with_unknown_device_id_is_rejected() {
             }),
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -873,6 +883,7 @@ async fn re_registering_same_device_displaces_old_connection_without_bye_to_its_
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -911,6 +922,7 @@ async fn re_registering_same_device_displaces_old_connection_without_bye_to_its_
             device: Some(credentials),
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -991,6 +1003,7 @@ async fn joining_by_pin_after_client_auth_links_device_to_owner() {
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -1046,6 +1059,7 @@ async fn connect_device_starts_a_session_for_a_linked_device() {
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -1152,6 +1166,7 @@ async fn connect_device_for_offline_device_returns_error() {
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -1245,6 +1260,7 @@ async fn rename_device_updates_alias_and_forget_device_removes_it() {
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -1312,6 +1328,7 @@ async fn bye_for_unknown_session_from_host_or_client_is_a_silent_no_op() {
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -1361,6 +1378,7 @@ async fn host_reconnect_with_live_session_id_marks_device_busy_until_bye() {
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -1421,6 +1439,7 @@ async fn host_reconnect_with_live_session_id_marks_device_busy_until_bye() {
             device: Some(credentials),
             session_id: Some("s-live".to_string()),
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -1506,6 +1525,7 @@ async fn wrong_pin_attempts_are_rate_limited_per_ip() {
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -1586,6 +1606,7 @@ async fn second_connection_with_same_token_shares_devices_and_lists_one_browser(
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -1973,6 +1994,7 @@ async fn host_name_and_alias_are_truncated_to_64_chars() {
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -2115,6 +2137,7 @@ async fn register_host_as(
             device,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -2187,6 +2210,7 @@ async fn registered_has_only_stun_but_joined_and_peer_joined_have_turn() {
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -2263,6 +2287,7 @@ async fn silent_peer_is_disconnected_after_read_timeout() {
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -2313,6 +2338,7 @@ async fn register_host_with_rotation(url: &str, pin_rotation: bool) -> (WsStream
             device: None,
             session_id: None,
             pin_rotation,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -3266,6 +3292,7 @@ async fn session_log_records_join_stats_and_bye() {
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -3531,6 +3558,7 @@ async fn host_linked_to_connected_owner(
             device: None,
             session_id: None,
             pin_rotation: false,
+            ifaces: Vec::new(),
         },
     )
     .await;
@@ -3625,4 +3653,316 @@ async fn session_busy_state_is_pushed_to_other_owner_connections() {
     drop(owner);
     let devices = recv_devices(&mut watcher).await;
     assert!(devices[0].online && !devices[0].busy);
+}
+
+// ---------------------------------------------------------------------
+// Слайс W: Wake-on-LAN
+// ---------------------------------------------------------------------
+
+fn nic(mac: &str, ip: &str, prefix: u8) -> proto::signal::NetIface {
+    proto::signal::NetIface {
+        mac: mac.to_string(),
+        ipv4: ip.to_string(),
+        prefix,
+    }
+}
+
+/// Регистрирует хост с картами `ifaces` и привязывает к владельцу `client`
+/// (PIN-вход + Bye). Возвращает (хост, device_id, учётные данные).
+async fn wake_host(
+    url: &str,
+    client: &mut WsStream,
+    device: Option<DeviceCredentials>,
+    ifaces: Vec<proto::signal::NetIface>,
+) -> (WsStream, String, DeviceCredentials) {
+    let mut host = connect(url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "Wake Host".to_string(),
+            device,
+            session_id: None,
+            pin_rotation: false,
+            ifaces,
+        },
+    )
+    .await;
+    let (host_id, pin, creds) = match recv(&mut host).await {
+        SignalMessage::Registered {
+            host_id,
+            pin,
+            device,
+            ..
+        } => (host_id, pin, device),
+        other => panic!("expected registered, got {other:?}"),
+    };
+    send(client, &SignalMessage::Join { pin }).await;
+    let session_id = match recv(client).await {
+        SignalMessage::Joined { session_id, .. } => session_id,
+        other => panic!("expected joined, got {other:?}"),
+    };
+    wait_devices(client, |d| {
+        d.iter().any(|e| e.device_id == host_id && e.busy)
+    })
+    .await;
+    assert!(matches!(
+        recv(&mut host).await,
+        SignalMessage::PeerJoined { .. }
+    ));
+    send(
+        client,
+        &SignalMessage::Bye {
+            session_id,
+            reason: None,
+        },
+    )
+    .await;
+    assert!(matches!(recv(&mut host).await, SignalMessage::Bye { .. }));
+    wait_devices(client, |d| {
+        d.iter()
+            .any(|e| e.device_id == host_id && e.online && !e.busy)
+    })
+    .await;
+    (
+        host,
+        host_id.clone(),
+        creds.unwrap_or(DeviceCredentials {
+            device_id: host_id,
+            secret: String::new(),
+        }),
+    )
+}
+
+/// Читает пуши `Devices`, пока список не удовлетворит `pred`.
+async fn wait_devices(
+    ws: &mut WsStream,
+    pred: impl Fn(&[proto::signal::DeviceEntry]) -> bool,
+) -> Vec<proto::signal::DeviceEntry> {
+    for _ in 0..10 {
+        let devices = recv_devices(ws).await;
+        if pred(&devices) {
+            return devices;
+        }
+    }
+    panic!("expected devices state never arrived");
+}
+
+async fn wake_owner(url: &str) -> WsStream {
+    let mut client = connect(url).await;
+    hello(&mut client, Role::Client).await;
+    client_auth(&mut client, None).await;
+    client
+}
+
+fn entry<'a>(
+    devices: &'a [proto::signal::DeviceEntry],
+    id: &str,
+) -> &'a proto::signal::DeviceEntry {
+    devices.iter().find(|d| d.device_id == id).expect("device")
+}
+
+#[tokio::test]
+async fn wake_device_sends_command_to_waker_in_same_subnet() {
+    let url = spawn_server().await;
+    let mut owner = wake_owner(&url).await;
+    let (mut waker, waker_id, _) = wake_host(
+        &url,
+        &mut owner,
+        None,
+        vec![nic("AA:00:00:00:00:01", "192.168.1.10", 24)],
+    )
+    .await;
+    let (target, target_id, _) = wake_host(
+        &url,
+        &mut owner,
+        None,
+        vec![nic("aa:00:00:00:00:02", "192.168.1.20", 24)],
+    )
+    .await;
+    drop(target);
+    let devices = wait_devices(&mut owner, |d| {
+        d.iter().any(|e| e.device_id == target_id && !e.online)
+    })
+    .await;
+    assert!(entry(&devices, &target_id).can_wake);
+    assert!(!entry(&devices, &waker_id).can_wake);
+
+    send(
+        &mut owner,
+        &SignalMessage::WakeDevice {
+            device_id: target_id.clone(),
+        },
+    )
+    .await;
+    match recv(&mut waker).await {
+        SignalMessage::SendWake { targets } => assert_eq!(
+            targets,
+            vec![proto::signal::WakeTarget {
+                mac: "aa:00:00:00:00:02".to_string(),
+                broadcast: "192.168.1.255".to_string(),
+            }]
+        ),
+        other => panic!("expected send_wake, got {other:?}"),
+    }
+    assert_eq!(
+        recv(&mut owner).await,
+        SignalMessage::WakeSent {
+            device_id: target_id.clone(),
+            wakers: 1
+        }
+    );
+
+    // Повтор в течение 10 с отклоняется.
+    send(
+        &mut owner,
+        &SignalMessage::WakeDevice {
+            device_id: target_id,
+        },
+    )
+    .await;
+    expect_error(&mut owner, "too many attempts").await;
+}
+
+#[tokio::test]
+async fn wake_waker_in_other_subnet_is_not_a_waker() {
+    let url = spawn_server().await;
+    let mut owner = wake_owner(&url).await;
+    let (_waker, _, _) = wake_host(
+        &url,
+        &mut owner,
+        None,
+        vec![nic("aa:00:00:00:00:01", "192.168.2.10", 24)],
+    )
+    .await;
+    let (target, target_id, _) = wake_host(
+        &url,
+        &mut owner,
+        None,
+        vec![nic("aa:00:00:00:00:02", "192.168.1.20", 24)],
+    )
+    .await;
+    drop(target);
+    let devices = wait_devices(&mut owner, |d| {
+        d.iter().any(|e| e.device_id == target_id && !e.online)
+    })
+    .await;
+    assert!(!entry(&devices, &target_id).can_wake);
+
+    send(
+        &mut owner,
+        &SignalMessage::WakeDevice {
+            device_id: target_id,
+        },
+    )
+    .await;
+    expect_error(&mut owner, "no waker online").await;
+}
+
+#[tokio::test]
+async fn wake_host_of_other_owner_is_not_a_waker() {
+    let url = spawn_server().await;
+    let mut owner = wake_owner(&url).await;
+    let mut stranger = wake_owner(&url).await;
+    let (mut foreign, _, _) = wake_host(
+        &url,
+        &mut stranger,
+        None,
+        vec![nic("aa:00:00:00:00:09", "192.168.1.30", 24)],
+    )
+    .await;
+    let (target, target_id, _) = wake_host(
+        &url,
+        &mut owner,
+        None,
+        vec![nic("aa:00:00:00:00:02", "192.168.1.20", 24)],
+    )
+    .await;
+    drop(target);
+    let devices = wait_devices(&mut owner, |d| {
+        d.iter().any(|e| e.device_id == target_id && !e.online)
+    })
+    .await;
+    assert!(!entry(&devices, &target_id).can_wake);
+    send(
+        &mut owner,
+        &SignalMessage::WakeDevice {
+            device_id: target_id,
+        },
+    )
+    .await;
+    expect_error(&mut owner, "no waker online").await;
+    expect_silence(&mut foreign, Duration::from_millis(200)).await;
+}
+
+#[tokio::test]
+async fn wake_online_target_and_foreign_device_are_rejected() {
+    let url = spawn_server().await;
+    let mut owner = wake_owner(&url).await;
+    let (_host, host_id, _) = wake_host(
+        &url,
+        &mut owner,
+        None,
+        vec![nic("aa:00:00:00:00:01", "192.168.1.10", 24)],
+    )
+    .await;
+    send(
+        &mut owner,
+        &SignalMessage::WakeDevice { device_id: host_id },
+    )
+    .await;
+    expect_error(&mut owner, "device online").await;
+
+    send(
+        &mut owner,
+        &SignalMessage::WakeDevice {
+            device_id: "no-such-device".to_string(),
+        },
+    )
+    .await;
+    expect_error(&mut owner, "device not linked").await;
+}
+
+#[tokio::test]
+async fn wake_old_host_without_ifaces_is_no_waker_and_keeps_target_ifaces() {
+    let (url, db) = spawn_server_with_db().await;
+    let mut owner = wake_owner(&url).await;
+    let (_old_host, _, _) = wake_host(&url, &mut owner, None, Vec::new()).await;
+    let (target, target_id, creds) = wake_host(
+        &url,
+        &mut owner,
+        None,
+        vec![nic("aa:00:00:00:00:02", "192.168.1.20", 24)],
+    )
+    .await;
+    assert_eq!(db.device_ifaces(&target_id).expect("ifaces").len(), 1);
+    drop(target);
+    let devices = wait_devices(&mut owner, |d| {
+        d.iter().any(|e| e.device_id == target_id && !e.online)
+    })
+    .await;
+    assert!(
+        !entry(&devices, &target_id).can_wake,
+        "old host is no waker"
+    );
+
+    // Повторная регистрация с пустым списком не стирает сохранённые карты.
+    let mut again = connect(&url).await;
+    hello(&mut again, Role::Host).await;
+    send(
+        &mut again,
+        &SignalMessage::HostRegister {
+            name: "Wake Host".to_string(),
+            device: Some(creds),
+            session_id: None,
+            pin_rotation: false,
+            ifaces: Vec::new(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut again).await,
+        SignalMessage::Registered { .. }
+    ));
+    assert_eq!(db.device_ifaces(&target_id).expect("ifaces").len(), 1);
 }

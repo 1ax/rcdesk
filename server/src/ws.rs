@@ -15,7 +15,8 @@ use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
-use proto::signal::{BrowserEntry, DeviceEntry, EmailCodePurpose, Role, SignalMessage};
+use proto::signal::{BrowserEntry, DeviceEntry, EmailCodePurpose, NetIface, Role, SignalMessage};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::time::{interval, timeout, MissedTickBehavior};
@@ -33,6 +34,7 @@ use crate::passkeys::{
     self, DiscoverableAuthentication, PasskeyError, PasskeyRegistration, SharedWebauthn,
 };
 use crate::registry::{Registry, Tx};
+use crate::wake;
 
 /// Максимальный размер входящего WebSocket-сообщения/кадра. Самый большой
 /// легитимный кадр: `Offer.sdp` — единицы КБ, JSON WebAuthn — 1–2 КБ. Дефолт
@@ -298,14 +300,15 @@ async fn run_host(
     version: String,
     read_timeout: Duration,
 ) {
-    let (name, device, session_id, pin_rotation) =
+    let (name, device, session_id, pin_rotation, ifaces) =
         match next_message(stream, &tx, read_timeout).await {
             Some(SignalMessage::HostRegister {
                 name,
                 device,
                 session_id,
                 pin_rotation,
-            }) => (name, device, session_id, pin_rotation),
+                ifaces,
+            }) => (name, device, session_id, pin_rotation, ifaces),
             Some(_) => {
                 let _ = tx.send(SignalMessage::Error {
                     message: "expected host_register".to_string(),
@@ -362,6 +365,14 @@ async fn run_host(
         db.set_host_version(&host_id, owners::truncate_chars(&version, MAX_NAME_CHARS))
     {
         tracing::error!(?err, "failed to record host version");
+    }
+    // Слайс W: пустой список (старый хост или не смог перечислить карты) не
+    // стирает сохранённые; непустой -- валидируется и заменяет набор целиком.
+    if !ifaces.is_empty() {
+        let valid = wake::validate_ifaces(&ifaces);
+        if let Err(err) = db.set_device_ifaces(&host_id, &valid) {
+            tracing::error!(?err, "failed to record host network interfaces");
+        }
     }
 
     let (pin, displaced) = registry.register_host(
@@ -602,20 +613,63 @@ fn device_entries_for_owner(
     owner_id: &str,
 ) -> anyhow::Result<Vec<DeviceEntry>> {
     let devices = db.devices_for_owner(owner_id)?;
+    let ifaces = owner_ifaces(db, &devices)?;
     Ok(devices
-        .into_iter()
+        .iter()
         .map(|device| {
             let presence = registry.host_presence(&device.device_id);
             DeviceEntry {
-                device_id: device.device_id,
-                name: device.name,
-                alias: device.alias,
+                device_id: device.device_id.clone(),
+                name: device.name.clone(),
+                alias: device.alias.clone(),
                 online: presence.is_some(),
                 busy: presence == Some(true),
                 last_seen_at: device.last_seen_at,
+                can_wake: presence.is_none()
+                    && !wakers_for(registry, &devices, &ifaces, &device.device_id).is_empty(),
             }
         })
         .collect())
+}
+
+/// Слайс W: сохранённые карты всех устройств владельца.
+fn owner_ifaces(
+    db: &Db,
+    devices: &[crate::db::OwnedDevice],
+) -> anyhow::Result<HashMap<String, Vec<NetIface>>> {
+    let mut map = HashMap::new();
+    for device in devices {
+        map.insert(
+            device.device_id.clone(),
+            db.device_ifaces(&device.device_id)?,
+        );
+    }
+    Ok(map)
+}
+
+/// Слайс W: будильники для `target_id` среди устройств владельца -- онлайн
+/// (busy тоже годится) устройства с картами в той же подсети. Возвращает
+/// (device_id будильника, что ему отправить).
+fn wakers_for(
+    registry: &Registry,
+    devices: &[crate::db::OwnedDevice],
+    ifaces: &HashMap<String, Vec<NetIface>>,
+    target_id: &str,
+) -> Vec<(String, Vec<proto::signal::WakeTarget>)> {
+    let Some(target_ifaces) = ifaces.get(target_id).filter(|i| !i.is_empty()) else {
+        return Vec::new();
+    };
+    let candidates: Vec<(String, Vec<NetIface>)> = devices
+        .iter()
+        .filter(|d| d.device_id != target_id)
+        .filter(|d| registry.host_presence(&d.device_id).is_some())
+        .filter_map(|d| {
+            ifaces
+                .get(&d.device_id)
+                .map(|i| (d.device_id.clone(), i.clone()))
+        })
+        .collect();
+    wake::select_wakers(target_ifaces, &candidates)
 }
 
 /// D34: присутствие или занятость устройства сменились -- каждому владельцу
@@ -1632,6 +1686,61 @@ async fn run_client(
                         });
                     }
                 }
+            }
+            SignalMessage::WakeDevice { device_id } => {
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                    continue;
+                };
+
+                let devices = match db.devices_for_owner(&owner_id) {
+                    Ok(devices) => devices,
+                    Err(err) => {
+                        tracing::error!(?err, "failed to check device ownership");
+                        send_error(&tx, "internal error");
+                        continue;
+                    }
+                };
+                if !devices.iter().any(|d| d.device_id == device_id) {
+                    send_error(&tx, "device not linked");
+                    continue;
+                }
+                if registry.host_presence(&device_id).is_some() {
+                    send_error(&tx, "device online");
+                    continue;
+                }
+                if !registry.wake_attempt_allowed(
+                    &device_id,
+                    Instant::now(),
+                    Duration::from_secs(wake::WAKE_COOLDOWN_SECS),
+                ) {
+                    send_error(&tx, "too many attempts");
+                    continue;
+                }
+                let ifaces = match owner_ifaces(db, &devices) {
+                    Ok(ifaces) => ifaces,
+                    Err(err) => {
+                        tracing::error!(?err, "failed to load device interfaces");
+                        send_error(&tx, "internal error");
+                        continue;
+                    }
+                };
+                let mut sent = 0u32;
+                for (waker_id, targets) in wakers_for(registry, &devices, &ifaces, &device_id) {
+                    if let Some(waker_tx) = registry.host_tx(&waker_id) {
+                        if waker_tx.send(SignalMessage::SendWake { targets }).is_ok() {
+                            sent += 1;
+                        }
+                    }
+                }
+                if sent == 0 {
+                    send_error(&tx, "no waker online");
+                    continue;
+                }
+                tracing::info!(%device_id, wakers = sent, "wake command sent");
+                let _ = tx.send(SignalMessage::WakeSent {
+                    device_id,
+                    wakers: sent,
+                });
             }
             SignalMessage::RenameDevice { device_id, alias } => {
                 let Some(owner_id) = require_owner(db, &mut session, &tx) else {

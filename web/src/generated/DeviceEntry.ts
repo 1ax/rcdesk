@@ -5,4 +5,10 @@
  * назвал сам хост (имя машины), `alias` — переименование владельцем,
  * `online`/`busy` — сиюминутное состояние из реестра соединений.
  */
-export type DeviceEntry = { device_id: string, name: string, alias: string | null, online: boolean, busy: boolean, last_seen_at: bigint, };
+export type DeviceEntry = { device_id: string, name: string, alias: string | null, online: boolean, busy: boolean, last_seen_at: bigint, 
+/**
+ * Слайс W: офлайн-устройство можно включить по сети (есть сохранённые
+ * карты и онлайн-будильник в той же подсети). `#[serde(default)]`:
+ * старый сервер поля не шлёт.
+ */
+can_wake: boolean, };

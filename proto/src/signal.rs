@@ -61,6 +61,26 @@ pub struct DeviceCredentials {
     pub secret: String,
 }
 
+/// Сетевая карта хоста (слайс W): нужна серверу, чтобы выбрать «будильник»
+/// в той же подсети для Wake-on-LAN. `mac` -- `aa:bb:cc:dd:ee:ff` (нижний
+/// регистр), `ipv4` -- адрес строкой, `prefix` -- длина префикса.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct NetIface {
+    pub mac: String,
+    pub ipv4: String,
+    pub prefix: u8,
+}
+
+/// Куда будильнику слать magic packet (слайс W): `mac` цели и IPv4
+/// широковещательный адрес её подсети.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WakeTarget {
+    pub mac: String,
+    pub broadcast: String,
+}
+
 /// Одно устройство в списке владельца (слайс 3.1). `name` — как его
 /// назвал сам хост (имя машины), `alias` — переименование владельцем,
 /// `online`/`busy` — сиюминутное состояние из реестра соединений.
@@ -73,6 +93,11 @@ pub struct DeviceEntry {
     pub online: bool,
     pub busy: bool,
     pub last_seen_at: i64,
+    /// Слайс W: офлайн-устройство можно включить по сети (есть сохранённые
+    /// карты и онлайн-будильник в той же подсети). `#[serde(default)]`:
+    /// старый сервер поля не шлёт.
+    #[serde(default)]
+    pub can_wake: bool,
 }
 
 /// Снимок админского кабинета (A3).
@@ -261,6 +286,10 @@ pub enum SignalMessage {
         /// host sends nothing (= `false`) and keeps a static PIN.
         #[serde(default)]
         pin_rotation: bool,
+        /// Слайс W: сетевые карты хоста для Wake-on-LAN. `#[serde(default)]`:
+        /// старый хост шлёт без поля (= пусто, сохранённое не трогаем).
+        #[serde(default)]
+        ifaces: Vec<NetIface>,
     },
     /// server -> host. `device` carries freshly issued credentials (slice
     /// 3.1) only on a host's very first registration; on a successful
@@ -467,6 +496,13 @@ pub enum SignalMessage {
     AdminData { data: AdminSnapshot },
     /// client -> server: подключиться к своему устройству без PIN.
     ConnectDevice { device_id: String },
+    /// client -> server (слайс W): включить выключенное устройство по сети.
+    /// Ответ: `WakeSent` или `Error`.
+    WakeDevice { device_id: String },
+    /// server -> host (слайс W): отправить magic packet на каждую цель.
+    SendWake { targets: Vec<WakeTarget> },
+    /// server -> client (слайс W): команда ушла `wakers` будильникам.
+    WakeSent { device_id: String, wakers: u32 },
     /// client -> server: переименовать своё устройство (`alias = None` —
     /// снять переименование). В ответ сервер шлёт обновлённый `Devices`.
     RenameDevice {
@@ -675,6 +711,7 @@ mod tests {
                 device: None,
                 session_id: None,
                 pin_rotation: false,
+                ifaces: Vec::new(),
             }
         );
     }
@@ -686,6 +723,7 @@ mod tests {
             device: None,
             session_id: Some("sess-live".to_string()),
             pin_rotation: false,
+            ifaces: Vec::new(),
         };
 
         let json = serde_json::to_string(&host_register).expect("serialize");
@@ -705,6 +743,7 @@ mod tests {
                 device: None,
                 session_id: None,
                 pin_rotation: false,
+                ifaces: Vec::new(),
             }
         );
     }
@@ -746,6 +785,7 @@ mod tests {
                 online: true,
                 busy: false,
                 last_seen_at: 1234,
+                can_wake: true,
             }],
             lan_hub: true,
         };
@@ -1156,5 +1196,79 @@ mod tests {
         })
         .expect("serialize");
         assert_eq!(json, r#"{"type":"pin_changed","pin":"123456"}"#);
+    }
+
+    #[test]
+    fn wake_messages_round_trip_with_snake_case_tags() {
+        let wake = SignalMessage::WakeDevice {
+            device_id: "d1".to_string(),
+        };
+        let json = serde_json::to_string(&wake).expect("serialize");
+        assert_eq!(json, r#"{"type":"wake_device","device_id":"d1"}"#);
+        assert_eq!(
+            serde_json::from_str::<SignalMessage>(&json).expect("deserialize"),
+            wake
+        );
+
+        let send = SignalMessage::SendWake {
+            targets: vec![WakeTarget {
+                mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                broadcast: "192.168.1.255".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&send).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"send_wake","targets":[{"mac":"aa:bb:cc:dd:ee:ff","broadcast":"192.168.1.255"}]}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SignalMessage>(&json).expect("deserialize"),
+            send
+        );
+
+        let sent = SignalMessage::WakeSent {
+            device_id: "d1".to_string(),
+            wakers: 2,
+        };
+        let json = serde_json::to_string(&sent).expect("serialize");
+        assert_eq!(json, r#"{"type":"wake_sent","device_id":"d1","wakers":2}"#);
+        assert_eq!(
+            serde_json::from_str::<SignalMessage>(&json).expect("deserialize"),
+            sent
+        );
+    }
+
+    #[test]
+    fn host_register_with_ifaces_round_trips_through_json() {
+        let reg = SignalMessage::HostRegister {
+            name: "PC".to_string(),
+            device: None,
+            session_id: None,
+            pin_rotation: true,
+            ifaces: vec![NetIface {
+                mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                ipv4: "192.168.1.10".to_string(),
+                prefix: 24,
+            }],
+        };
+        let json = serde_json::to_string(&reg).expect("serialize");
+        let back: SignalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, reg);
+    }
+
+    #[test]
+    fn host_register_without_ifaces_field_deserializes_to_empty() {
+        let json = r#"{"type":"host_register","name":"PC"}"#;
+        match serde_json::from_str::<SignalMessage>(json).expect("deserialize") {
+            SignalMessage::HostRegister { ifaces, .. } => assert!(ifaces.is_empty()),
+            other => panic!("expected HostRegister, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_entry_without_can_wake_field_deserializes_to_false() {
+        let json = r#"{"device_id":"d","name":"n","alias":null,"online":false,"busy":false,"last_seen_at":1}"#;
+        let entry: DeviceEntry = serde_json::from_str(json).expect("deserialize");
+        assert!(!entry.can_wake);
     }
 }

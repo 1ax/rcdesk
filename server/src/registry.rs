@@ -170,6 +170,9 @@ struct Inner {
     /// D34: клиентские соединения и владелец, чей список устройств они
     /// показывают (получатели push-`Devices` при смене присутствия).
     watchers: Vec<(Tx, String)>,
+    /// Слайс W: когда в последний раз пытались включить устройство
+    /// (ограничение частоты `WakeDevice`).
+    wake_attempts: HashMap<String, Instant>,
 }
 
 #[derive(Clone, Default)]
@@ -518,6 +521,27 @@ impl Registry {
             .map(|host| host.session_id.is_some())
     }
 
+    /// Слайс W: канал онлайн-хоста (для `SendWake`); `None`, если оффлайн.
+    pub fn host_tx(&self, host_id: &str) -> Option<Tx> {
+        let inner = self.inner.lock().expect("registry mutex poisoned");
+        inner.hosts.get(host_id).map(|host| host.tx.clone())
+    }
+
+    /// Слайс W: можно ли сейчас пытаться включить `device_id` -- не чаще
+    /// раза в `cooldown`. Разрешённая попытка запоминается; устаревшие записи
+    /// удаляются.
+    pub fn wake_attempt_allowed(&self, device_id: &str, now: Instant, cooldown: Duration) -> bool {
+        let mut inner = self.inner.lock().expect("registry mutex poisoned");
+        inner
+            .wake_attempts
+            .retain(|_, at| now.saturating_duration_since(*at) < cooldown);
+        if inner.wake_attempts.contains_key(device_id) {
+            return false;
+        }
+        inner.wake_attempts.insert(device_id.to_string(), now);
+        true
+    }
+
     /// Looks up the client tx for a session, validating that `host_id` is
     /// currently the host of `session_id`. The extra `s.host_id == host_id`
     /// filter (slice 3.2a/D35) matters once `register_host` can leave a
@@ -708,6 +732,26 @@ mod tests {
 
     fn ttl() -> Duration {
         Duration::from_secs(600)
+    }
+
+    #[test]
+    fn wake_attempts_are_limited_per_device_and_expire() {
+        let registry = Registry::new();
+        let t0 = Instant::now();
+        let cd = Duration::from_secs(10);
+        assert!(registry.wake_attempt_allowed("d1", t0, cd));
+        assert!(!registry.wake_attempt_allowed("d1", t0 + Duration::from_secs(9), cd));
+        assert!(registry.wake_attempt_allowed("d2", t0 + Duration::from_secs(9), cd));
+        assert!(registry.wake_attempt_allowed("d1", t0 + Duration::from_secs(10), cd));
+    }
+
+    #[test]
+    fn host_tx_is_some_only_for_online_host() {
+        let registry = Registry::new();
+        let (tx, _rx) = channel();
+        assert!(registry.host_tx("h").is_none());
+        registry.register_host("h".to_string(), "H".to_string(), tx.clone(), None, false);
+        assert!(registry.host_tx("h").expect("online").same_channel(&tx));
     }
 
     #[test]

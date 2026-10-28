@@ -10,4 +10,5 @@ pub mod maintenance;
 pub mod owners;
 pub mod passkeys;
 pub mod registry;
+pub mod wake;
 pub mod ws;

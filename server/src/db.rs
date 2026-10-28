@@ -21,7 +21,7 @@ use rusqlite::{Connection, OptionalExtension};
 /// Schema version this binary expects (`PRAGMA user_version`). Bump this
 /// and extend `migrate` when the schema changes; `migrate` itself must stay
 /// idempotent (safe to run against an already-migrated database).
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Сколько секунд владелец без устройств и passkey может не появляться,
 /// прежде чем `prune_empty_owners` его удалит (долг D53).
@@ -245,6 +245,47 @@ impl Db {
             (version, device_id),
         )?;
         Ok(changed > 0)
+    }
+
+    /// Слайс W: заменяет набор сетевых карт устройства целиком (одна
+    /// транзакция).
+    pub fn set_device_ifaces(
+        &self,
+        device_id: &str,
+        ifaces: &[proto::signal::NetIface],
+    ) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM device_ifaces WHERE device_id = ?1",
+            [device_id],
+        )?;
+        for iface in ifaces {
+            tx.execute(
+                "INSERT INTO device_ifaces (device_id, mac, ipv4, prefix) VALUES (?1, ?2, ?3, ?4)",
+                (device_id, &iface.mac, &iface.ipv4, iface.prefix),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Слайс W: сохранённые сетевые карты устройства.
+    pub fn device_ifaces(&self, device_id: &str) -> anyhow::Result<Vec<proto::signal::NetIface>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT mac, ipv4, prefix FROM device_ifaces WHERE device_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt
+            .query_map([device_id], |row| {
+                Ok(proto::signal::NetIface {
+                    mac: row.get(0)?,
+                    ipv4: row.get(1)?,
+                    prefix: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Открывает запись журнала сеансов. `via` — `'pin'` или `'device'`.
@@ -1017,8 +1058,8 @@ fn configure(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Полная схема v5.
-const SCHEMA_V5: &str = "CREATE TABLE IF NOT EXISTS devices (
+/// Полная схема v6.
+const SCHEMA_V6: &str = "CREATE TABLE IF NOT EXISTS devices (
             device_id    TEXT PRIMARY KEY,
             secret_hash  TEXT NOT NULL,
             name         TEXT NOT NULL,
@@ -1081,13 +1122,21 @@ const SCHEMA_V5: &str = "CREATE TABLE IF NOT EXISTS devices (
          );
          CREATE INDEX IF NOT EXISTS sessions_started_at ON sessions(started_at);
          CREATE INDEX IF NOT EXISTS sessions_owner_id ON sessions(owner_id);
-         CREATE INDEX IF NOT EXISTS sessions_device_id ON sessions(device_id);";
+         CREATE INDEX IF NOT EXISTS sessions_device_id ON sessions(device_id);
+         CREATE TABLE IF NOT EXISTS device_ifaces (
+            device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+            mac       TEXT NOT NULL,
+            ipv4      TEXT NOT NULL,
+            prefix    INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS device_ifaces_device_id ON device_ifaces(device_id);";
 
-/// Приводит базу к `SCHEMA_VERSION`: версия 0 — сразу полная схема v5,
+/// Приводит базу к `SCHEMA_VERSION`: версия 0 — сразу полная схема v6,
 /// версия 1 — цепочка v1 -> v2 (токен из `owners` переезжает в
 /// `owner_tokens`) -> v3 -> v4, версия 2 — v2 -> v3 (passkey) -> v4,
 /// версия 3 — v3 -> v4 (учётные записи «почта + пароль»), версия 4 —
-/// v4 -> v5 (журнал сеансов). Идемпотентна: на актуальной базе — no-op.
+/// v4 -> v5 (журнал сеансов), версия 5 — v5 -> v6 (сетевые карты
+/// устройств для Wake-on-LAN). Идемпотентна: на актуальной базе — no-op.
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version >= SCHEMA_VERSION {
@@ -1095,7 +1144,7 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
     }
 
     if version == 0 {
-        conn.execute_batch(SCHEMA_V5)?;
+        conn.execute_batch(SCHEMA_V6)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         return Ok(());
     }
@@ -1109,7 +1158,28 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
     if version <= 3 {
         migrate_v3_to_v4(conn)?;
     }
-    migrate_v4_to_v5(conn)
+    if version <= 4 {
+        migrate_v4_to_v5(conn)?;
+    }
+    migrate_v5_to_v6(conn)
+}
+
+/// v5 -> v6 (слайс W): таблица `device_ifaces` (сетевые карты хоста для
+/// Wake-on-LAN), каскадно чистится вместе с устройством. Одна транзакция.
+fn migrate_v5_to_v6(conn: &Connection) -> anyhow::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE device_ifaces (
+            device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+            mac       TEXT NOT NULL,
+            ipv4      TEXT NOT NULL,
+            prefix    INTEGER NOT NULL
+         );
+         CREATE INDEX device_ifaces_device_id ON device_ifaces(device_id);",
+    )?;
+    tx.pragma_update(None, "user_version", 6)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// v4 -> v5 (админский кабинет): `devices.host_version`, `owners.admin_note`
@@ -1416,13 +1486,13 @@ mod tests {
     }
 
     #[test]
-    fn fresh_db_has_user_version_five() {
+    fn fresh_db_has_user_version_six() {
         let db = Db::in_memory().expect("open in-memory db");
         let conn = db.conn.lock().expect("db mutex poisoned");
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read user_version");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     #[test]
@@ -1583,7 +1653,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let fk: i64 = conn
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .expect("fk");
@@ -1666,7 +1736,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -1726,7 +1796,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -1788,7 +1858,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -1809,6 +1879,66 @@ mod tests {
             [],
         )
         .expect("admin_note column exists");
+    }
+
+    #[test]
+    fn migration_v5_to_v6_adds_device_ifaces_and_cascades() {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.pragma_update(None, "foreign_keys", true).expect("fk");
+        conn.execute_batch(
+            "CREATE TABLE devices (
+                device_id TEXT PRIMARY KEY, secret_hash TEXT NOT NULL, name TEXT NOT NULL,
+                created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+                host_version TEXT);
+             INSERT INTO devices VALUES ('dev1', 'sh', 'My Mac', 10, 20, NULL);
+             PRAGMA user_version = 5;",
+        )
+        .expect("build v5 database");
+
+        migrate(&conn).expect("migrate v5 -> v6");
+        migrate(&conn).expect("re-run migration is a no-op");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 6);
+
+        let db = Db {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        let iface = proto::signal::NetIface {
+            mac: "aa:bb:cc:dd:ee:ff".to_string(),
+            ipv4: "192.168.1.5".to_string(),
+            prefix: 24,
+        };
+        db.set_device_ifaces("dev1", std::slice::from_ref(&iface))
+            .expect("set");
+        assert_eq!(db.device_ifaces("dev1").expect("get"), vec![iface]);
+        {
+            let conn = db.conn.lock().expect("db mutex poisoned");
+            conn.execute("DELETE FROM devices WHERE device_id = 'dev1'", [])
+                .expect("delete device");
+        }
+        assert!(db.device_ifaces("dev1").expect("get").is_empty());
+    }
+
+    #[test]
+    fn set_device_ifaces_replaces_whole_set() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_device("dev1", "h", "Mac", 1).expect("device");
+        let mk = |mac: &str| proto::signal::NetIface {
+            mac: mac.to_string(),
+            ipv4: "10.0.0.5".to_string(),
+            prefix: 24,
+        };
+        db.set_device_ifaces("dev1", &[mk("aa:aa:aa:aa:aa:01"), mk("aa:aa:aa:aa:aa:02")])
+            .expect("set");
+        assert_eq!(db.device_ifaces("dev1").expect("get").len(), 2);
+        db.set_device_ifaces("dev1", &[mk("aa:aa:aa:aa:aa:03")])
+            .expect("set");
+        let got = db.device_ifaces("dev1").expect("get");
+        assert_eq!(got, vec![mk("aa:aa:aa:aa:aa:03")]);
+        db.set_device_ifaces("dev1", &[]).expect("clear");
+        assert!(db.device_ifaces("dev1").expect("get").is_empty());
     }
 
     fn session_db() -> Db {
