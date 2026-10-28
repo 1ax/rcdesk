@@ -360,6 +360,8 @@ fn router_loop(
         let rect = *capture_rect
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // D45: поток ввода следует за входным рабочим столом (Winlogon/UAC).
+        crate::platform::desktop::sync_thread();
         apply(
             &msg,
             injector.as_mut(),

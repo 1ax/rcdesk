@@ -916,6 +916,12 @@ async fn run_serve(opts: ServeOptions) -> anyhow::Result<()> {
     let power = machine_dir
         .is_some()
         .then(rcdesk_host::platform::windows::power::SessionActivityThread::spawn);
+    // Windows, машинный режим: потоки захвата/ввода/курсора следуют за входным
+    // рабочим столом (экран блокировки, UAC) -- D45a.
+    #[cfg(target_os = "windows")]
+    if machine_dir.is_some() {
+        rcdesk_host::platform::desktop::enable();
+    }
 
     let (status_tx, mut status_rx) = watch::channel(AgentStatus::Connecting);
     let print_task = tokio::spawn(async move {

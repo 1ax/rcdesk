@@ -60,6 +60,8 @@ impl Default for WinCursorSource {
 
 impl CursorSource for WinCursorSource {
     fn current(&mut self) -> Option<CursorState> {
+        // D45: поток курсора следует за входным рабочим столом (Winlogon/UAC).
+        crate::platform::desktop::sync_thread();
         let mut info = CURSORINFO {
             cbSize: size_of::<CURSORINFO>() as u32,
             ..Default::default()

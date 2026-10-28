@@ -144,6 +144,10 @@ windows = { version = "0.61", features = [
     # OpenSCManagerW/CreateServiceW/StartServiceCtrlDispatcherW/SetServiceStatus
     # и др. (platform::windows::service, 4.1a) -- служба SYSTEM `rcdesk` и
     # управление ею из CLI (`service install|uninstall|start|stop|status`).
+    # OpenInputDesktop/SetThreadDesktop/GetUserObjectInformationW
+    # (platform::windows::desktop, D45a) -- потоки захвата/ввода/курсора
+    # следуют за входным рабочим столом (Winlogon/UAC).
+    "Win32_System_StationsAndDesktops",
     "Win32_System_Services",
     # WTSGetActiveConsoleSessionId (platform::windows::service, 4.1a) --
     # номер активной консольной сессии, в которой служба запускает помощника.

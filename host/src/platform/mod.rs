@@ -60,6 +60,28 @@ pub mod display_wake {
         DisplayWakeGuard
     }
 }
+/// Следование потока за входным рабочим столом (D45a): на Windows --
+/// `OpenInputDesktop` + `SetThreadDesktop` (экран блокировки, UAC),
+/// на остальных платформах -- заглушки без эффекта.
+#[cfg(target_os = "windows")]
+pub use windows::desktop;
+#[cfg(not(target_os = "windows"))]
+pub mod desktop {
+    /// Заглушка: следовать не за чем.
+    pub fn enable() {}
+
+    pub fn is_enabled() -> bool {
+        false
+    }
+
+    pub fn sync_thread() -> bool {
+        false
+    }
+
+    pub fn sync_thread_now() -> bool {
+        false
+    }
+}
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub use other::autostart;
 #[cfg(target_os = "windows")]

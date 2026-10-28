@@ -24,6 +24,13 @@
 //! `show_cursor: false` and the cursor shape being sent to the client
 //! through a separate channel (`cursor::windows::WinCursorSource`).
 //!
+//! D45: in machine mode the capture thread follows the input desktop
+//! (`platform::desktop`): when Windows switches to `Winlogon` (lock screen,
+//! UAC) the thread is rebound and the GDI surface is recreated, since DCs
+//! and DIB sections made on the old desktop are useless there. A `BitBlt`
+//! failure while following is not fatal (it would stop the whole video
+//! pipeline): the tick is skipped after a re-sync attempt.
+//!
 //! Compiles only on `windows-latest` in CI: there is no Windows machine
 //! available to this executor run, so every signature/type below comes from
 //! reading the `windows` 0.61.3 source fetched into the local registry
@@ -36,7 +43,7 @@ use std::mem::size_of;
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetMonitorInfoW,
@@ -44,6 +51,8 @@ use windows::Win32::Graphics::Gdi::{
     HGDIOBJ, HMONITOR, MONITORINFO, SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+
+use crate::platform;
 
 use super::{frame_unchanged, CaptureError, FramePacer, FrameSource, RawFrame};
 
@@ -55,15 +64,21 @@ struct Dib {
     pixels: *mut u8,
 }
 
-pub struct GdiSource {
+/// DCs and DIB sections of one capture surface; recreated when the thread
+/// moves to another desktop (D45).
+struct GdiSurface {
     hdc_screen: HDC,
     hdc_mem: HDC,
     /// Two DIB sections used in turn (see `next_frame` for the invariant).
     dibs: [Dib; 2],
-    /// Index of the active section, the one the next `BitBlt` writes into.
-    cur: usize,
     /// The bitmap `hdc_mem` had selected before our first `SelectObject`.
     old_bitmap: HGDIOBJ,
+}
+
+pub struct GdiSource {
+    surface: GdiSurface,
+    /// Index of the active section, the one the next `BitBlt` writes into.
+    cur: usize,
     /// False until the first frame has been handed out; until then section
     /// `1 - cur` holds no valid previous frame to compare against.
     has_prev: bool,
@@ -73,6 +88,9 @@ pub struct GdiSource {
     height: u32,
     pacer: FramePacer,
     stop: Arc<AtomicBool>,
+    /// True until the first tick has run its unthrottled desktop sync.
+    first_tick: bool,
+    last_warn: Option<Instant>,
 }
 
 impl GdiSource {
@@ -115,7 +133,33 @@ impl GdiSource {
         // breaks 4:2:0 chroma subsampling downstream in `to_i420`).
         let width = width - width % 2;
         let height = height - height % 2;
+        let surface = GdiSurface::new(width, height)?;
+        Ok(Self {
+            surface,
+            cur: 0,
+            has_prev: false,
+            origin,
+            width,
+            height,
+            pacer: FramePacer::new(fps),
+            stop: Arc::new(AtomicBool::new(false)),
+            first_tick: true,
+            last_warn: None,
+        })
+    }
 
+    /// Replaces the surface after a desktop switch; the next frame is sent
+    /// even if it looks like the previous one.
+    fn recreate_surface(&mut self) -> Result<(), CaptureError> {
+        self.surface = GdiSurface::new(self.width, self.height)?;
+        self.cur = 0;
+        self.has_prev = false;
+        Ok(())
+    }
+}
+
+impl GdiSurface {
+    fn new(width: u32, height: u32) -> Result<Self, CaptureError> {
         // Safety: `GetDC(None)` asks for the DC of the whole screen; a null
         // return means "unavailable" per MSDN, not undefined behaviour.
         let hdc_screen = unsafe { GetDC(None) };
@@ -199,14 +243,7 @@ impl GdiSource {
             hdc_screen,
             hdc_mem,
             dibs: [dib0, dib1],
-            cur: 0,
             old_bitmap,
-            has_prev: false,
-            origin,
-            width,
-            height,
-            pacer: FramePacer::new(fps),
-            stop: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -246,6 +283,18 @@ impl FrameSource for GdiSource {
             }
             self.pacer.wait();
 
+            // D45: follow the input desktop (lock screen, UAC); no-op unless
+            // machine mode enabled it. The first tick syncs unthrottled.
+            let switched = if self.first_tick {
+                self.first_tick = false;
+                platform::desktop::sync_thread_now()
+            } else {
+                platform::desktop::sync_thread()
+            };
+            if switched {
+                self.recreate_surface()?;
+            }
+
             // Invariant: section `1 - cur` always holds the last frame handed
             // out; the active section `cur` is overwritten by every `BitBlt`.
             // So an unchanged (static) screen costs no copies at all, and a
@@ -256,7 +305,10 @@ impl FrameSource for GdiSource {
             // unconditionally is a cheap GDI call, simpler than tracking
             // which section is currently selected.
             unsafe {
-                SelectObject(self.hdc_mem, self.dibs[self.cur].hbitmap.into());
+                SelectObject(
+                    self.surface.hdc_mem,
+                    self.surface.dibs[self.cur].hbitmap.into(),
+                );
             }
 
             // Safety: `hdc_mem` and `hdc_screen` are valid for the whole
@@ -265,20 +317,40 @@ impl FrameSource for GdiSource {
             // no layered click-through popups" behaviour `ScapSource`
             // already has with `show_cursor: false` -- decided by the
             // architect for slice 2.1c.
-            unsafe {
+            let blt = unsafe {
                 BitBlt(
-                    self.hdc_mem,
+                    self.surface.hdc_mem,
                     0,
                     0,
                     self.width as i32,
                     self.height as i32,
-                    Some(self.hdc_screen),
+                    Some(self.surface.hdc_screen),
                     self.origin.0,
                     self.origin.1,
                     SRCCOPY,
                 )
+            };
+            if let Err(err) = blt {
+                if !platform::desktop::is_enabled() {
+                    return Err(CaptureError::Backend(format!("BitBlt: {err}")));
+                }
+                // D45: `BitBlt` briefly fails while the input desktop switches
+                // (e.g. to `Winlogon`); an error here would stop the whole
+                // video pipeline, so re-sync and retry on the next tick.
+                if platform::desktop::sync_thread_now() {
+                    self.recreate_surface()?;
+                } else {
+                    let now = Instant::now();
+                    if self
+                        .last_warn
+                        .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(10))
+                    {
+                        self.last_warn = Some(now);
+                        tracing::warn!("BitBlt failed, skipping tick: {err}");
+                    }
+                }
+                continue;
             }
-            .map_err(|err| CaptureError::Backend(format!("BitBlt: {err}")))?;
 
             let len = self.width as usize * self.height as usize * 4;
             // Safety: each `pixels` points into a DIB section that stays
@@ -287,8 +359,10 @@ impl FrameSource for GdiSource {
             // synchronous, so `BitBlt` above has finished writing every
             // pixel by the time it returns control here. The inactive
             // section is not being written by anyone.
-            let cur: &[u8] = unsafe { slice::from_raw_parts(self.dibs[self.cur].pixels, len) };
-            let prev: &[u8] = unsafe { slice::from_raw_parts(self.dibs[1 - self.cur].pixels, len) };
+            let cur: &[u8] =
+                unsafe { slice::from_raw_parts(self.surface.dibs[self.cur].pixels, len) };
+            let prev: &[u8] =
+                unsafe { slice::from_raw_parts(self.surface.dibs[1 - self.cur].pixels, len) };
 
             if self.has_prev && frame_unchanged(Some(prev), cur) {
                 continue;
@@ -316,7 +390,7 @@ impl FrameSource for GdiSource {
     }
 }
 
-impl Drop for GdiSource {
+impl Drop for GdiSurface {
     fn drop(&mut self) {
         // Safety: reverses `new`'s construction order; every handle here
         // was created there and is not touched again after this.
