@@ -58,7 +58,8 @@ unsafe fn link_info(sa: *const libc::sockaddr) -> Option<([u8; 6], IfaceKind)> {
     let sll = sa as *const libc::sockaddr_ll;
     let mut mac = [0u8; 6];
     if (*sll).sll_halen == 6 {
-        mac.copy_from_slice(&(*sll).sll_addr[..6]);
+        let addr = (*sll).sll_addr;
+        mac.copy_from_slice(&addr[..6]);
     }
     // Тип определяется позже по имени (нужен /sys), здесь заглушка.
     Some((mac, IfaceKind::Ethernet))
