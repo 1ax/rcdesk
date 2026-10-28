@@ -43,3 +43,4 @@ pub mod transport;
 pub mod update_check;
 pub mod update_verify;
 pub mod updater;
+pub mod wake;

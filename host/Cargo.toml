@@ -156,6 +156,12 @@ windows = { version = "0.61", features = [
     # (platform::windows::service, 4.1a) -- защищённый DACL (SYSTEM +
     # Administrators) на машинный каталог данных %ProgramData%\rcdesk.
     "Win32_Security_Authorization",
+    # GetAdaptersAddresses/IP_ADAPTER_ADDRESSES_LH (platform::windows::netifs,
+    # слайс W) -- MAC/IPv4/маска сетевых карт для Wake-on-LAN. Структура
+    # требует ещё Ndis (IF_OPER_STATUS) и WinSock (SOCKET_ADDRESS, SOCKADDR_IN).
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
 ] }
 # Буфер обмена (2.5b): текст только, default-features=false drops the
 # `image-data` feature (image crate, extra objc2-core-graphics on macOS).
@@ -164,10 +170,13 @@ windows = { version = "0.61", features = [
 # accepted, separate crate family, not a duplicate of the same crate.
 arboard = { version = "3.6", default-features = false }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# geteuid() для роли полного режима и отказа `fullmode install` без прав (D51).
-# Уже есть в Cargo.lock транзитивно; больше ничего из libc не используется.
+[target.'cfg(unix)'.dependencies]
+# geteuid() для роли полного режима и отказа `fullmode install` без прав (D51);
+# getifaddrs() для Wake-on-LAN (platform::unix_netifs, слайс W). Уже есть в
+# Cargo.lock транзитивно.
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
 # Версии совпадают с теми, что уже тянет `enigo` для macOS (см. Cargo.lock) --
 # не добавляет вторую версию objc2*/ в граф.
 objc2 = { version = "0.6", features = ["relax-void-encoding"] }

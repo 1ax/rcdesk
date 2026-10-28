@@ -6,6 +6,7 @@ pub mod event_loop;
 pub mod keyboard;
 pub mod monitors;
 pub mod mouse;
+pub mod netifs;
 pub mod power;
 pub mod service;
 pub mod update;

@@ -620,7 +620,9 @@ impl SignalingClient {
                 session_id,
                 // D44: the host understands `PinChanged` (see `apply_pin_change`).
                 pin_rotation: true,
-                ifaces: Vec::new(),
+                // Слайс W: карты перечисляются при каждой (пере)регистрации --
+                // адрес мог смениться.
+                ifaces: crate::wake::local_ifaces(),
             },
         )
         .await?;
@@ -818,6 +820,12 @@ impl SignalingClient {
 
                     if let SignalMessage::PinChanged { pin: new_pin } = msg {
                         apply_pin_change(new_pin, &mut pin, status);
+                        continue;
+                    }
+
+                    // Слайс W: разбудить соседа magic packet'ом; серверу не отвечаем.
+                    if let SignalMessage::SendWake { targets } = msg {
+                        tokio::task::spawn_blocking(move || crate::wake::send_wake(&targets));
                         continue;
                     }
 

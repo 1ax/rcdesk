@@ -2,6 +2,8 @@
 mod macos;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod other;
+#[cfg(unix)]
+mod unix_netifs;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
@@ -83,6 +85,16 @@ pub use macos::update;
 pub use other::update;
 #[cfg(target_os = "windows")]
 pub use windows::update;
+
+/// Сетевые интерфейсы для Wake-on-LAN (слайс W): unix-реализация на
+/// `getifaddrs`, Windows -- на `GetAdaptersAddresses`, под одним cfg-free
+/// путём `platform::netifs::raw_ifaces`.
+pub mod netifs {
+    #[cfg(unix)]
+    pub use super::unix_netifs::raw_ifaces;
+    #[cfg(target_os = "windows")]
+    pub use super::windows::netifs::raw_ifaces;
+}
 
 #[cfg(target_os = "macos")]
 pub fn name() -> &'static str {
