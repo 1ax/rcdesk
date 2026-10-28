@@ -12,6 +12,8 @@ class FakePeerConnection implements RTCPeerConnectionLike {
   ondatachannel: ((event: RTCDataChannelEvent) => void) | null = null;
   onconnectionstatechange: (() => void) | null = null;
   connectionState: RTCPeerConnectionState = "new";
+  onsignalingstatechange: (() => void) | null = null;
+  signalingState: RTCSignalingState = "stable";
 
   async setRemoteDescription(_desc: RTCSessionDescriptionInit): Promise<void> {
     this.calls.push("setRemoteDescription");
@@ -160,5 +162,47 @@ describe("PeerSession ontrack jitterBufferTarget", () => {
     const { pc, onTrack } = setup();
     pc.ontrack?.({ streams: [stream] } as unknown as RTCTrackEvent);
     expect(onTrack).toHaveBeenCalledWith(stream);
+  });
+});
+
+describe("PeerSession onClosedUnexpectedly (D67c)", () => {
+  function setup() {
+    let pc!: FakePeerConnection;
+    const onClosedUnexpectedly = vi.fn();
+    const session = new PeerSession({ iceServers: [] }, { onClosedUnexpectedly }, () => {
+      pc = new FakePeerConnection();
+      return pc;
+    });
+    return { pc, session, onClosedUnexpectedly };
+  }
+
+  it("fires once when the browser closes the connection", () => {
+    const { pc, onClosedUnexpectedly } = setup();
+    pc.signalingState = "closed";
+    pc.onsignalingstatechange?.();
+    expect(onClosedUnexpectedly).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fire a second time on a repeated event", () => {
+    const { pc, onClosedUnexpectedly } = setup();
+    pc.signalingState = "closed";
+    pc.onsignalingstatechange?.();
+    pc.onsignalingstatechange?.();
+    expect(onClosedUnexpectedly).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fire after our own close()", () => {
+    const { pc, session, onClosedUnexpectedly } = setup();
+    session.close();
+    pc.signalingState = "closed";
+    pc.onsignalingstatechange?.();
+    expect(onClosedUnexpectedly).not.toHaveBeenCalled();
+  });
+
+  it("does not fire for a non-closed signalingState", () => {
+    const { pc, onClosedUnexpectedly } = setup();
+    pc.signalingState = "stable";
+    pc.onsignalingstatechange?.();
+    expect(onClosedUnexpectedly).not.toHaveBeenCalled();
   });
 });

@@ -5,8 +5,6 @@ import {
   connectionBannerLabel,
   connectionStateOutcome,
   MAX_RECOVERY_ATTEMPTS,
-  PAGEHIDE_RESUME_CHECK_MS,
-  PageHideTracker,
   RECOVERY_RESPONSE_TIMEOUT_MS,
   recoveryDelayMs,
   recoveryExhausted,
@@ -141,41 +139,5 @@ describe("byeReasonOutcome", () => {
 describe("RECOVERY_RESPONSE_TIMEOUT_MS", () => {
   it("is a positive number of milliseconds", () => {
     expect(RECOVERY_RESPONSE_TIMEOUT_MS).toBeGreaterThan(0);
-  });
-});
-
-describe("PageHideTracker", () => {
-  it("is not armed without a session", () => {
-    const t = new PageHideTracker();
-    t.arm(false);
-    expect(t.takePageHideReturn()).toBe(false);
-  });
-
-  it("fires exactly once after arming with a session", () => {
-    const t = new PageHideTracker();
-    t.arm(true);
-    expect(t.takePageHideReturn()).toBe(true);
-    expect(t.takePageHideReturn()).toBe(false);
-  });
-
-  it("is re-armed by a repeated pagehide", () => {
-    const t = new PageHideTracker();
-    t.arm(true);
-    t.takePageHideReturn();
-    t.arm(true);
-    expect(t.takePageHideReturn()).toBe(true);
-  });
-
-  it("is reset by clear", () => {
-    const t = new PageHideTracker();
-    t.arm(true);
-    t.clear();
-    expect(t.takePageHideReturn()).toBe(false);
-  });
-});
-
-describe("PAGEHIDE_RESUME_CHECK_MS", () => {
-  it("is a positive number of milliseconds", () => {
-    expect(PAGEHIDE_RESUME_CHECK_MS).toBeGreaterThan(0);
   });
 });

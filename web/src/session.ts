@@ -22,6 +22,8 @@ export interface RTCPeerConnectionLike {
   ondatachannel: ((event: RTCDataChannelEvent) => void) | null;
   onconnectionstatechange: (() => void) | null;
   connectionState: RTCPeerConnectionState;
+  onsignalingstatechange: (() => void) | null;
+  signalingState: RTCSignalingState;
   sctp?: { maxMessageSize: number } | null;
 }
 
@@ -34,6 +36,10 @@ export interface PeerSessionCallbacks {
   onTrack?: (stream: MediaStream) => void;
   onDataChannel?: (label: string, dc: RTCDataChannel) => void;
   onConnectionStateChange?: (state: RTCPeerConnectionState) => void;
+  /** D67c: the browser closed the connection itself (e.g. Chrome on system
+   * sleep) -- `signalingState` becomes "closed" without a
+   * `connectionstatechange`. Fires at most once, never after our own `close()`. */
+  onClosedUnexpectedly?: () => void;
 }
 
 function defaultFactory(config: RTCConfiguration): RTCPeerConnectionLike {
@@ -75,6 +81,8 @@ export function toRtcIceServers(servers: IceServer[]): RTCIceServer[] {
 export class PeerSession {
   private readonly pc: RTCPeerConnectionLike;
   private readonly dataChannels = new Map<string, RTCDataChannel>();
+  private closedByUs = false;
+  private closedUnexpectedlyReported = false;
 
   constructor(
     config: { iceServers: RTCIceServer[] },
@@ -121,6 +129,17 @@ export class PeerSession {
     this.pc.onconnectionstatechange = () => {
       callbacks.onConnectionStateChange?.(this.pc.connectionState);
     };
+
+    this.pc.onsignalingstatechange = () => {
+      if (
+        this.pc.signalingState === "closed" &&
+        !this.closedByUs &&
+        !this.closedUnexpectedlyReported
+      ) {
+        this.closedUnexpectedlyReported = true;
+        callbacks.onClosedUnexpectedly?.();
+      }
+    };
   }
 
   /** Applies the host's offer, creates an answer, sets it as the local
@@ -155,6 +174,7 @@ export class PeerSession {
   }
 
   close(): void {
+    this.closedByUs = true;
     this.pc.close();
   }
 }

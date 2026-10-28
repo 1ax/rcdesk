@@ -152,31 +152,3 @@ export function connectionBannerLabel(phase: ConnectionBannerPhase): string | nu
       return null;
   }
 }
-
-/** How long after `pagehide` to check whether the page is still alive (D67b):
- * a page that is really unloading never runs the timer; one that survives
- * (Chrome on Windows sends `pagehide` on system sleep) runs it on wake. */
-export const PAGEHIDE_RESUME_CHECK_MS = 1000;
-
-/** Whether the last `pagehide` closed a live session (D67b). Armed only if a
- * session existed; consumed once by `takePageHideReturn`. */
-export class PageHideTracker {
-  private armed = false;
-
-  /** Records a `pagehide`; arms only when a session was active. */
-  arm(hadSession: boolean): void {
-    this.armed = hadSession;
-  }
-
-  /** `true` exactly once after `arm(true)`, then resets. */
-  takePageHideReturn(): boolean {
-    const was = this.armed;
-    this.armed = false;
-    return was;
-  }
-
-  /** Drops a pending arm (a session ended or a new one started). */
-  clear(): void {
-    this.armed = false;
-  }
-}
