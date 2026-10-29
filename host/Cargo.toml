@@ -116,6 +116,10 @@ windows = { version = "0.61", features = [
     # crate requires all three on that one method).
     "Win32_System_Com",
     "Win32_System_Ole",
+    # STGMEDIUM/IDataObject::GetData/ReleaseStgMedium (clipboard::windows,
+    # D87c) -- the `windows` crate gates them on this feature together with
+    # Win32_Graphics_Gdi (above) and Win32_System_Com.
+    "Win32_System_Com_StructuredStorage",
     # VARIANT, the value type ICodecAPI::SetValue takes.
     "Win32_System_Variant",
     # GetClipboardSequenceNumber (clipboard::windows) -- cheap OS change
