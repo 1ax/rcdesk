@@ -63,6 +63,10 @@ mod imp {
     /// iteration) and then on this interval.
     const PERMISSIONS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+    /// Как часто просмотрщик PIN (D83b) читает `status.json` помощника.
+    #[cfg(target_os = "windows")]
+    const VIEWER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
     /// Первая проверка обновлений -- через столько после старта агента (4.3d).
     const UPDATE_FIRST_CHECK_DELAY: Duration = Duration::from_secs(60);
     /// Дальше -- раз в час (D70: при раз в сутки пункт меню после релиза
@@ -301,16 +305,6 @@ mod imp {
             }
         };
 
-        // Windows, полный режим (4.1a): пока работает служба `rcdesk`, её
-        // помощник держит хост в консольной сессии -- второй агент не нужен.
-        #[cfg(target_os = "windows")]
-        {
-            if platform::windows::service::is_running() {
-                tracing::info!("служба rcdesk работает (полный режим), агент не нужен");
-                std::process::exit(0);
-            }
-        }
-
         let data_dir = agent::paths::data_dir();
         let _lock = match agent::lock::acquire(&data_dir) {
             Ok(Some(lock)) => lock,
@@ -323,6 +317,17 @@ mod imp {
                 std::process::exit(1);
             }
         };
+
+        // Windows, полный режим (D83b): пока работает служба `rcdesk`, её помощник
+        // держит хост в консольной сессии -- вместо второго агента значок
+        // показывает PIN из `status.json` (лок пользователя уже взят выше).
+        #[cfg(target_os = "windows")]
+        {
+            if platform::windows::service::is_running() {
+                tracing::info!("служба rcdesk работает (полный режим), просмотрщик PIN");
+                run_pin_viewer();
+            }
+        }
 
         // Полный режим macOS: состояние общее для обеих ролей (машинный
         // каталог), и держим машинный лок регистрации до конца процесса.
@@ -850,6 +855,117 @@ mod imp {
 
                 model = new_model;
                 last_status = status;
+            }
+        }
+    }
+
+    /// Windows, полный режим (D83b): значок с PIN от имени пользователя. Источник --
+    /// `status.json` помощника службы (раз в секунду, в отдельном потоке), меню
+    /// ничего на машине не меняет. Не возвращается.
+    #[cfg(target_os = "windows")]
+    fn run_pin_viewer() -> ! {
+        use rcdesk_host::agent::viewer::{viewer_status, StatusDedup};
+
+        let (status_tx, status_rx) = std::sync::mpsc::channel::<AgentStatus>();
+        std::thread::spawn(move || {
+            let machine_dir = agent::paths::machine_data_dir();
+            let mut dedup = StatusDedup::default();
+            loop {
+                let status = viewer_status(rcdesk_host::service::read_status(&machine_dir));
+                if let Some(changed) = dedup.observe(status) {
+                    if status_tx.send(changed).is_err() {
+                        return;
+                    }
+                }
+                std::thread::sleep(VIEWER_POLL_INTERVAL);
+            }
+        });
+
+        platform::event_loop::pump(Duration::ZERO);
+
+        let perms = probe_permissions();
+        let mut model = menu_model(&AgentStatus::Connecting, &perms);
+
+        let status_item = MenuItem::with_id("status", &model.status_text, false, None);
+        let copy_pin_item =
+            MenuItem::with_id("copy_pin", "Копировать PIN", model.pin.is_some(), None);
+        let hide_item = MenuItem::with_id("quit", "Скрыть значок", true, None);
+
+        let menu = Menu::new();
+        menu.append(&status_item).expect("append status menu item");
+        menu.append(&copy_pin_item).expect("append copy pin item");
+        menu.append(&PredefinedMenuItem::separator())
+            .expect("append separator");
+        menu.append(&hide_item).expect("append hide item");
+
+        let icon = Icon::from_rgba(render_icon(model.icon, ICON_SIZE), ICON_SIZE, ICON_SIZE)
+            .expect("render_icon always produces a valid-sized RGBA buffer");
+        let tray_icon = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip(&model.tooltip)
+            .with_icon(icon)
+            .build()
+            .expect("failed to build the tray icon");
+
+        loop {
+            platform::event_loop::pump(PUMP_INTERVAL);
+
+            while let Ok(event) = MenuEvent::receiver().try_recv() {
+                match event.id().0.as_str() {
+                    "copy_pin" => {
+                        if let Some(pin) = &model.pin {
+                            match arboard::Clipboard::new() {
+                                Ok(mut clipboard) => {
+                                    if let Err(err) = clipboard.set_text(pin.clone()) {
+                                        tracing::warn!(error = %err, "failed to copy PIN to clipboard");
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(error = %err, "failed to open clipboard");
+                                }
+                            }
+                        }
+                    }
+                    "quit" => {
+                        // Значок убираем явно, иначе он висит в трее до наведения мыши.
+                        drop(tray_icon);
+                        std::process::exit(0);
+                    }
+                    _ => {}
+                }
+            }
+
+            // Последний из накопившихся статусов (поток шлёт только смены).
+            let mut latest = None;
+            while let Ok(status) = status_rx.try_recv() {
+                latest = Some(status);
+            }
+            if let Some(status) = latest {
+                let new_model = menu_model(&status, &perms);
+                if new_model.status_text != model.status_text {
+                    status_item.set_text(&new_model.status_text);
+                }
+                if new_model.tooltip != model.tooltip {
+                    let _ = tray_icon.set_tooltip(Some(&new_model.tooltip));
+                }
+                copy_pin_item.set_enabled(new_model.pin.is_some());
+                if new_model.icon != model.icon {
+                    match Icon::from_rgba(
+                        render_icon(new_model.icon, ICON_SIZE),
+                        ICON_SIZE,
+                        ICON_SIZE,
+                    ) {
+                        Ok(icon) => {
+                            if let Err(err) = tray_icon.set_icon(Some(icon)) {
+                                tracing::warn!(error = %err, "failed to update the tray icon");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "failed to build the tray icon image");
+                        }
+                    }
+                }
+                model = new_model;
             }
         }
     }

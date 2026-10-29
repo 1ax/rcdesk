@@ -15,6 +15,7 @@ pub mod logging;
 pub mod menu;
 pub mod paths;
 pub mod permissions;
+pub mod viewer;
 
 pub use icon::{render_icon, IconState};
 pub use menu::{menu_model, MenuModel};
