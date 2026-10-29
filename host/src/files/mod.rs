@@ -760,16 +760,16 @@ impl Downloader {
                             kind: EntryKind::Folder,
                         }),
                         Ok(Err(err)) => {
-                            tracing::debug!(path = %path.display(), ?err, "cannot walk folder, skipping")
+                            tracing::warn!(path = %path.display(), ?err, "cannot walk folder, skipping")
                         }
                         Err(err) => {
-                            tracing::debug!(path = %path.display(), ?err, "folder walk failed, skipping")
+                            tracing::warn!(path = %path.display(), ?err, "folder walk failed, skipping")
                         }
                     }
                 }
                 Ok(_) => tracing::debug!(path = %path.display(), "not a regular file, skipping"),
                 Err(err) => {
-                    tracing::debug!(path = %path.display(), ?err, "cannot stat copied path, skipping")
+                    tracing::warn!(path = %path.display(), ?err, "cannot stat copied path, skipping")
                 }
             }
         }
@@ -786,7 +786,7 @@ impl Downloader {
                 size: e.size,
             })
             .collect();
-        tracing::debug!(
+        tracing::info!(
             list_id,
             files = entries.len(),
             skipped_folders,
