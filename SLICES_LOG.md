@@ -11,7 +11,26 @@
 > Всё, что НИЖЕ разделителя `---`, — append-only история. Архитектор при старте
 > чата читает сначала голову, в тело ныряет по ссылке на слайс.
 
-**Состояние на 2026-10-29 (12:25 МСК): D87b выпущен в 0.3.9 — причина D87 найдена.**
+**Состояние на 2026-10-29 (14:30 МСК): D87c выпущен в 0.3.10 — D87 НЕ починен, OLE-путь упёрся в GetData.**
+- **D87c `edaa538`** (squash `wip/d87c`: первый push упал на windows-latest — исполнитель при фиксе потерял
+  `struct OleGuard;`, поправлено архитектором; force-push запрещён классификатором, поэтому в main — squash): если
+  в Win32-буфере нет `CF_HDROP`, но есть `DataObject`, помощник на время чтения делает `OleInitialize` →
+  `OleGetClipboard` → `GetData(CF_HDROP, TYMED_HGLOBAL)`. Новая фича `windows` `Win32_System_Com_StructuredStorage`
+  (STGMEDIUM/GetData/ReleaseStgMedium). Выпуск **0.3.10** `d8f1183`: Release `40851392972` — одобрение окружения
+  опоздало на ~1,5 ч (цикл ожидания архитектора истёк за 10 мин до гейта; одобрено по слову «выпуск 0.3.10»);
+  Deploy `40851392988` — флак `files::tests::cancelling_create_unique_midway_leaves_no_files` на windows
+  (`leaked: a19.bin, a19.bin.rcdesk-part`), `rerun --failed` зелёный. Подпись — боевой ключ, Verified.
+- **Живьём:** `logo1.svg` «Копировать» → «Скачать» нет. `helper.log`: `seq=120 formats=49161:DataObject hdrop=false`,
+  затем `WARN OLE clipboard has no readable CF_HDROP error=Ошибка в структуре FORMATETC (0x80040064)`
+  (DV_E_FORMATETC). То есть `OleGetClipboard` из SYSTEM работает, но обёртка OLE-буфера, видимо, сверяет формат
+  со списком Win32-буфера, где помощнику виден только `DataObject`. Почему SYSTEM видит в буфере один формат, а
+  процесс пользователя — все, не выяснено.
+- **Развилка D87d (владельцу):** (а) читать буфер в `rcdesk-agent` от пользователя (там PowerShell видит FileDrop) и
+  передавать список помощнику — нужен новый канал agent → helper; (б) ещё один диагностический выпуск
+  (`EnumFormatEtc` объекта, `FileNameW`/`Shell IDList Array`) — дёшево, но исход неясен. Рекомендация — (а).
+- Долг: флак `cancelling_create_unique_midway_leaves_no_files` на windows-latest (Deploy 0.3.10).
+
+**Предыдущее (12:25 МСК): D87b выпущен в 0.3.9 — причина D87 найдена.**
 - **D87b `47f4cc3`**: на каждой смене буфера (при включённых файлах) info `clipboard formats seen (D87b)` —
   `seq`, все форматы `EnumClipboardFormats` (id:имя), `hdrop`; на старте сеанса `clipboard sync started files_enabled`.
   CI `wip/d87b` `40846789610` зелёный (windows-latest), ветка удалена. Выпуск **0.3.9** `9ae0c41`: Release
