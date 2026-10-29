@@ -204,10 +204,27 @@ pub fn build_real_clipboard_backend() -> anyhow::Result<Box<dyn ClipboardBackend
 }
 
 #[cfg(target_os = "windows")]
-pub fn build_real_clipboard_backend() -> anyhow::Result<Box<dyn ClipboardBackend>> {
+pub fn build_real_clipboard_backend(
+    machine_mode: bool,
+) -> anyhow::Result<Box<dyn ClipboardBackend>> {
+    // D87d: in full mode the helper runs as SYSTEM and takes the copied-file
+    // list from the tray agent of the console user. Computed on every build
+    // (per session): the console user may have changed.
+    let agent_files_dir = if machine_mode {
+        match crate::files::windows::local_app_data_dir(true) {
+            Ok(dir) => Some(dir.join("rcdesk")),
+            Err(err) => {
+                tracing::warn!(error = %err, "no console user data dir; copied files from Explorer will not be offered");
+                None
+            }
+        }
+    } else {
+        None
+    };
     Ok(
-        Box::new(crate::clipboard::windows::WinClipboardBackend::new()?)
-            as Box<dyn ClipboardBackend>,
+        Box::new(crate::clipboard::windows::WinClipboardBackend::new(
+            agent_files_dir,
+        )?) as Box<dyn ClipboardBackend>,
     )
 }
 
@@ -303,9 +320,14 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
     let build_clipboard: Option<BuildClipboard> = if no_clipboard {
         None
     } else {
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        #[cfg(target_os = "macos")]
         {
             Some(Box::new(build_real_clipboard_backend) as BuildClipboard)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let machine_mode = opts.data_dir.is_some();
+            Some(Box::new(move || build_real_clipboard_backend(machine_mode)) as BuildClipboard)
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {

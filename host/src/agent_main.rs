@@ -67,6 +67,10 @@ mod imp {
     #[cfg(target_os = "windows")]
     const VIEWER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+    /// Как часто просмотрщик (D87d) сверяет номер изменения буфера обмена.
+    #[cfg(target_os = "windows")]
+    const CLIPBOARD_FILES_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
     /// Первая проверка обновлений -- через столько после старта агента (4.3d).
     const UPDATE_FIRST_CHECK_DELAY: Duration = Duration::from_secs(60);
     /// Дальше -- раз в час (D70: при раз в сутки пункт меню после релиза
@@ -859,6 +863,39 @@ mod imp {
         }
     }
 
+    /// D87d: при смене номера изменения буфера (и один раз на старте) читает
+    /// список файлов и пишет его в `clipboard-files.json` каталога данных
+    /// пользователя; помощник берёт его оттуда по тому же номеру.
+    #[cfg(target_os = "windows")]
+    fn run_clipboard_files_publisher() {
+        use ::windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
+        use rcdesk_host::clipboard::agent_files::{write_agent_files, AgentFiles};
+
+        let dir = agent::paths::data_dir();
+        let mut last_seq: Option<u32> = None;
+        loop {
+            // Safety: no preconditions -- a plain Win32 query.
+            let seq = unsafe { GetClipboardSequenceNumber() };
+            if last_seq != Some(seq) {
+                let paths =
+                    rcdesk_host::clipboard::windows::read_clipboard_files().unwrap_or_default();
+                let files = AgentFiles {
+                    seq: u64::from(seq),
+                    paths,
+                };
+                // Номер запоминаем только после записи: при ошибке
+                // (например, файл занят помощником) повторим на следующем шаге.
+                match write_agent_files(&dir, &files) {
+                    Ok(()) => last_seq = Some(seq),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "failed to write the clipboard file list");
+                    }
+                }
+            }
+            std::thread::sleep(CLIPBOARD_FILES_POLL_INTERVAL);
+        }
+    }
+
     /// Windows, полный режим (D83b): значок с PIN от имени пользователя. Источник --
     /// `status.json` помощника службы (раз в секунду, в отдельном потоке), меню
     /// ничего на машине не меняет. Не возвращается.
@@ -880,6 +917,10 @@ mod imp {
                 std::thread::sleep(VIEWER_POLL_INTERVAL);
             }
         });
+
+        // D87d: помощник от SYSTEM не видит файлы Проводника в буфере --
+        // читаем их тут, от имени пользователя, и кладём в файл.
+        std::thread::spawn(run_clipboard_files_publisher);
 
         platform::event_loop::pump(Duration::ZERO);
 

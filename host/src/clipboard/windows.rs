@@ -15,6 +15,11 @@
 //! `IDataObject`, so when `CF_HDROP` is absent but `DataObject` is present
 //! `read_file_list` falls back to `OleGetClipboard` (`read_file_list_ole`).
 //!
+//! D87d: in full mode (helper as SYSTEM) even the OLE read fails, so the helper
+//! takes the file list from the tray agent running as the user
+//! (`super::agent_files`); `WinClipboardBackend::get_file_list` waits for the
+//! agent's entry for the current clipboard sequence number.
+//!
 //! Compiles only on `windows-latest` in CI: there is no Windows machine
 //! available to this executor run, so `GetClipboardSequenceNumber`'s
 //! signature below comes from reading the `windows` 0.61.3 source fetched
@@ -22,7 +27,7 @@
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use windows::Win32::Foundation::{GetLastError, ERROR_SUCCESS};
@@ -36,6 +41,7 @@ use windows::Win32::System::Ole::{
 };
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 
+use super::agent_files;
 use super::ClipboardBackend;
 
 /// Closes the clipboard on drop, so every early return releases it.
@@ -227,12 +233,36 @@ fn read_file_list_ole() -> Option<Vec<PathBuf>> {
     Some(list)
 }
 
+/// Outcome of one `read_file_list_impl` call (D87d).
+struct FileListRead {
+    /// The file list, `None` when there are no (readable) files.
+    files: Option<Vec<PathBuf>>,
+    /// The Win32 clipboard had the OLE `DataObject` format but no `CF_HDROP`:
+    /// the files, if any, are only reachable through OLE (or, for a SYSTEM
+    /// helper, through the tray agent).
+    data_object_only: bool,
+}
+
+/// Reads the file list the way the tray agent does (Win32, then the OLE
+/// fallback) and returns it. `None` when there are no files. Used by
+/// `rcdesk-agent` (D87d) to hand the list to the SYSTEM helper, which cannot
+/// read it itself.
+pub fn read_clipboard_files() -> Option<Vec<PathBuf>> {
+    read_file_list_impl(true).files
+}
+
 /// Reads the `CF_HDROP` path list straight through Win32, logging every
-/// failure (arboard hides them, D87). `None` when there are no files. D87b:
-/// logs the clipboard formats this process sees on every call. D87c: when
-/// `CF_HDROP` is absent but the OLE `DataObject` format is present (Explorer),
-/// falls back to `read_file_list_ole` after closing the Win32 clipboard.
-fn read_file_list() -> Option<Vec<PathBuf>> {
+/// failure (arboard hides them, D87). `files` is `None` when there are no
+/// files. D87b: logs the clipboard formats this process sees on every call.
+/// D87c: when `CF_HDROP` is absent but the OLE `DataObject` format is present
+/// (Explorer), falls back to `read_file_list_ole` after closing the Win32
+/// clipboard -- unless `try_ole` is false (D87d: the SYSTEM helper, where the
+/// OLE read always fails).
+fn read_file_list_impl(try_ole: bool) -> FileListRead {
+    let none = |data_object_only| FileListRead {
+        files: None,
+        data_object_only,
+    };
     // Another application may hold the clipboard for a moment.
     let mut opened = None;
     for attempt in 0..5 {
@@ -249,7 +279,9 @@ fn read_file_list() -> Option<Vec<PathBuf>> {
             Err(_) => std::thread::sleep(Duration::from_millis(10)),
         }
     }
-    let guard = opened?;
+    let Some(guard) = opened else {
+        return none(false);
+    };
 
     let (formats, enum_error, has_data_object) = list_formats();
     // Safety: no preconditions; also fine with the clipboard open.
@@ -274,10 +306,15 @@ fn read_file_list() -> Option<Vec<PathBuf>> {
     if !hdrop_available {
         // OLE must not be called with the Win32 clipboard open.
         drop(guard);
-        return if has_data_object {
+        let data_object_only = has_data_object;
+        let files = if data_object_only && try_ole {
             read_file_list_ole()
         } else {
             None
+        };
+        return FileListRead {
+            files,
+            data_object_only,
         };
     }
 
@@ -287,7 +324,7 @@ fn read_file_list() -> Option<Vec<PathBuf>> {
         Ok(handle) => handle,
         Err(err) => {
             tracing::warn!(error = %err, "CF_HDROP is on the clipboard but could not be read");
-            return None;
+            return none(false);
         }
     };
     // `guard` stays alive until the end of the function, so the handle is
@@ -295,23 +332,35 @@ fn read_file_list() -> Option<Vec<PathBuf>> {
     let list = paths_from_hdrop(HDROP(handle.0));
     if list.is_empty() {
         tracing::warn!("CF_HDROP had no readable paths");
-        return None;
+        return none(false);
     }
     tracing::info!(count = list.len(), "clipboard file list read");
-    Some(list)
+    FileListRead {
+        files: Some(list),
+        data_object_only: false,
+    }
 }
+
+/// How long the helper waits for the agent's entry for the current clipboard
+/// change (D87d), and how often it looks.
+const AGENT_FILES_TIMEOUT: Duration = Duration::from_secs(1);
+const AGENT_FILES_STEP: Duration = Duration::from_millis(50);
 
 pub struct WinClipboardBackend {
     // `arboard::Clipboard`'s Windows backend is a zero-sized `Clipboard(())`
     // (see arboard 3.6.1 `src/platform/windows.rs`), trivially `Send`, so a
     // single instance can be held here and reused across calls.
     clipboard: arboard::Clipboard,
+    /// D87d: the console user's rcdesk data directory where the tray agent
+    /// drops the file list (full-mode helper only); `None` otherwise.
+    agent_files_dir: Option<PathBuf>,
 }
 
 impl WinClipboardBackend {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(agent_files_dir: Option<PathBuf>) -> anyhow::Result<Self> {
         Ok(Self {
             clipboard: arboard::Clipboard::new()?,
+            agent_files_dir,
         })
     }
 }
@@ -337,7 +386,27 @@ impl ClipboardBackend for WinClipboardBackend {
     }
 
     fn get_file_list(&mut self) -> Option<Vec<PathBuf>> {
-        read_file_list()
+        let read = read_file_list_impl(self.agent_files_dir.is_none());
+        if read.files.is_some() {
+            return read.files;
+        }
+        if !read.data_object_only {
+            return None;
+        }
+        let dir: &Path = self.agent_files_dir.as_deref()?;
+        // Safety: no preconditions -- a plain Win32 query.
+        let seq = unsafe { GetClipboardSequenceNumber() };
+        match agent_files::wait_for_seq(dir, u64::from(seq), AGENT_FILES_TIMEOUT, AGENT_FILES_STEP)
+        {
+            Some(list) => {
+                tracing::info!(count = list.len(), "clipboard file list read from agent");
+                Some(list)
+            }
+            None => {
+                tracing::info!(seq, "no file list from agent for this clipboard change");
+                None
+            }
+        }
     }
 
     fn set_text(&mut self, text: &str) -> anyhow::Result<()> {

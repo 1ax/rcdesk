@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+pub mod agent_files;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(target_os = "windows")]

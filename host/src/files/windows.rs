@@ -24,17 +24,33 @@
 use std::path::PathBuf;
 
 use windows::core::Owned;
+use windows::core::GUID;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::GetCurrentProcessId;
-use windows::Win32::UI::Shell::{FOLDERID_Downloads, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+use windows::Win32::UI::Shell::{
+    FOLDERID_Downloads, FOLDERID_LocalAppData, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+};
 
 /// The Downloads folder (`FOLDERID_Downloads`). With `console_user == false`
 /// it belongs to the current process's user; with `true` (full-mode helper
 /// running as SYSTEM) to the user logged on to this process's session, and
 /// an error means nobody is logged on there.
 pub fn downloads_dir(console_user: bool) -> anyhow::Result<PathBuf> {
+    known_folder(&FOLDERID_Downloads, "Downloads", console_user)
+}
+
+/// `%LOCALAPPDATA%` (`FOLDERID_LocalAppData`), with the same `console_user`
+/// meaning as [`downloads_dir`] (D87d).
+pub fn local_app_data_dir(console_user: bool) -> anyhow::Result<PathBuf> {
+    known_folder(&FOLDERID_LocalAppData, "LocalAppData", console_user)
+}
+
+/// A known folder of the current user (`console_user == false`) or of the
+/// user logged on to this process's session (`true`). `name` is only for
+/// the error message.
+fn known_folder(id: &GUID, name: &str, console_user: bool) -> anyhow::Result<PathBuf> {
     let token = if console_user {
         Some(console_user_token()?)
     } else {
@@ -42,12 +58,12 @@ pub fn downloads_dir(console_user: bool) -> anyhow::Result<PathBuf> {
     };
     // `None` means "the current user".
     let htoken = token.as_ref().map(|t| **t);
-    // Safety: `FOLDERID_Downloads` is a valid GUID constant; `htoken` is
-    // `None` or a live token owned by `token` above. On success the returned string is allocated
-    // by the shell with `CoTaskMemAlloc` and must be freed with
+    // Safety: `id` is a valid GUID reference; `htoken` is `None` or a live
+    // token owned by `token` above. On success the returned string is
+    // allocated by the shell with `CoTaskMemAlloc` and must be freed with
     // `CoTaskMemFree`, which happens below on every path after success.
-    let pwstr = unsafe { SHGetKnownFolderPath(&FOLDERID_Downloads, KF_FLAG_DEFAULT, htoken) }
-        .map_err(|err| anyhow::anyhow!("SHGetKnownFolderPath(Downloads) failed: {err}"))?;
+    let pwstr = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, htoken) }
+        .map_err(|err| anyhow::anyhow!("SHGetKnownFolderPath({name}) failed: {err}"))?;
     // Safety: `pwstr` is a valid NUL-terminated UTF-16 string returned just
     // above and not yet freed.
     let path = unsafe { pwstr.to_string() };
