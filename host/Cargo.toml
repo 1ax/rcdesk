@@ -173,6 +173,13 @@ windows = { version = "0.61", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    # CreateEnvironmentBlock/DestroyEnvironmentBlock (platform::windows::service,
+    # D91) -- окружение вошедшего пользователя (LOCALAPPDATA и др.) для значка
+    # PIN, который служба запускает в его сеансе.
+    "Win32_System_Environment",
+    # GetTickCount64 (platform::windows::service, D91) -- аптайм системы:
+    # при загрузке значок поднимает HKLM Run, служба его не запускает.
+    "Win32_System_SystemInformation",
 ] }
 # Буфер обмена (2.5b): текст только, default-features=false drops the
 # `image-data` feature (image crate, extra objc2-core-graphics on macOS).

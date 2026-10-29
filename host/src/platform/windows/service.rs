@@ -92,7 +92,7 @@ use anyhow::Context;
 use windows::core::{Owned, BOOL, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     LocalFree, ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED,
-    ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_SERVICE_ALREADY_RUNNING,
+    ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_NO_TOKEN, ERROR_SERVICE_ALREADY_RUNNING,
     ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_NOT_ACTIVE, HANDLE, HLOCAL, NO_ERROR,
     WAIT_OBJECT_0,
 };
@@ -107,12 +107,13 @@ use windows::Win32::Security::{
     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     SECURITY_MAX_SID_SIZE, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
 };
+use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
-use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
+use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows::Win32::System::Services::{
     ChangeServiceConfig2W, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
     OpenServiceW, QueryServiceStatus, RegisterServiceCtrlHandlerExW, SetServiceStatus,
@@ -125,9 +126,11 @@ use windows::Win32::System::Services::{
     SERVICE_STATUS_CURRENT_STATE, SERVICE_STATUS_HANDLE, SERVICE_STOP, SERVICE_STOPPED,
     SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
 };
+use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
-    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_INFORMATION, STARTUPINFOW,
+    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+    PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 use crate::agent::logging;
@@ -135,8 +138,8 @@ use crate::agent::paths::{data_dir, machine_data_dir, machine_log_dir};
 use crate::hub::{self, HubConfig};
 use crate::service::{
     active_session_from_raw, helper_command_line, helper_server, migrate_files,
-    service_command_line, validate_server, Action, HelperState, ServiceState, Supervisor,
-    MIGRATED_FILES, SERVICE_LOG, SERVICE_NAME,
+    service_command_line, should_launch_agent_at_start, validate_server, Action, HelperState,
+    ServiceState, Supervisor, MIGRATED_FILES, SERVICE_LOG, SERVICE_NAME,
 };
 
 /// Имя в services.msc.
@@ -755,6 +758,9 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
             if let Err(err) = super::autostart::ensure_machine_autostart(&agent) {
                 tracing::warn!(error = %format!("{err:#}"), "не удалось прописать автозапуск просмотрщика PIN");
             }
+            // D91: самообновление убило значок, а HKLM Run сработает только
+            // при следующем входе -- поднимаем значок в сеансе пользователя.
+            launch_agent_at_start(&agent);
         }
         Err(err) => {
             tracing::warn!(error = %format!("{err:#}"), "не найден rcdesk-agent для автозапуска просмотрщика PIN");
@@ -918,6 +924,113 @@ fn tick_once(
             }
         },
     }
+}
+
+/// D91: один раз при старте службы запускает значок PIN в консольной сессии.
+/// Сбой службе не мешает (только warn).
+fn launch_agent_at_start(agent: &Path) {
+    // Safety: `GetTickCount64` без параметров.
+    let uptime = Duration::from_millis(unsafe { GetTickCount64() });
+    if !should_launch_agent_at_start(uptime) {
+        tracing::info!(
+            uptime_s = uptime.as_secs(),
+            "система только загрузилась: значок PIN поднимет HKLM Run (D91)"
+        );
+        return;
+    }
+    if let Err(err) = launch_agent_in_console_session(agent) {
+        tracing::warn!(error = %format!("{err:#}"), "не удалось запустить значок PIN (D91)");
+    }
+}
+
+/// Блок окружения пользователя; `DestroyEnvironmentBlock` в `Drop`.
+struct EnvironmentBlock(*mut c_void);
+
+impl Drop for EnvironmentBlock {
+    fn drop(&mut self) {
+        // Safety: указатель вернул успешный `CreateEnvironmentBlock` и ещё
+        // не освобождался.
+        if let Err(err) = unsafe { DestroyEnvironmentBlock(self.0) } {
+            tracing::warn!(error = %err, "DestroyEnvironmentBlock failed");
+        }
+    }
+}
+
+/// Запускает `rcdesk-agent.exe` (значок PIN) в активной консольной сессии от
+/// имени вошедшего пользователя (D91). Без Job object: значок не должен
+/// умирать вместе со службой. Процессы не проверяем: если значок уже
+/// работает, второй экземпляр берёт `agent.lock` в `%LOCALAPPDATA%\rcdesk`,
+/// не получает его и выходит с кодом 0 (`agent::lock`).
+fn launch_agent_in_console_session(agent: &Path) -> anyhow::Result<()> {
+    // Safety: вызов без параметров.
+    let Some(session) = active_session_from_raw(unsafe { WTSGetActiveConsoleSessionId() }) else {
+        tracing::info!("нет активной консольной сессии, значок PIN не запускаем (D91)");
+        return Ok(());
+    };
+
+    let mut token = HANDLE::default();
+    // Safety: `token` -- валидный out-параметр; служба работает под SYSTEM
+    // (у LocalSystem есть `SeTcbPrivilege`, нужная этому вызову).
+    if let Err(err) = unsafe { WTSQueryUserToken(session, &mut token) } {
+        if code_is(&err, ERROR_NO_TOKEN.0) {
+            tracing::info!(session, "в консоли никто не вошёл, значок PIN не запускаем");
+            return Ok(());
+        }
+        return Err(win_err("WTSQueryUserToken", err));
+    }
+    // Safety: хендл только что вернул успешный `WTSQueryUserToken`.
+    let token = unsafe { Owned::new(token) };
+
+    // Окружение пользователя обязательно: агент берёт каталоги из
+    // `LOCALAPPDATA`, в окружении SYSTEM он писал бы не туда.
+    let mut env_ptr: *mut c_void = std::ptr::null_mut();
+    // Safety: `token` -- живой токен пользователя; `env_ptr` -- валидный
+    // out-параметр; наследование окружения службы отключено (`false`).
+    unsafe { CreateEnvironmentBlock(&mut env_ptr, Some(*token), false) }
+        .map_err(|e| win_err("CreateEnvironmentBlock", e))?;
+    let env = EnvironmentBlock(env_ptr);
+
+    let mut command_line = wide_null(&format!("\"{}\"", agent.display()));
+    let mut desktop = wide_null(HELPER_DESKTOP);
+    let cwd = agent.parent().map(wide_path);
+    let cwd_ptr = cwd.as_ref().map_or(PCWSTR::null(), |w| PCWSTR(w.as_ptr()));
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        lpDesktop: PWSTR(desktop.as_mut_ptr()),
+        ..Default::default()
+    };
+    let mut info = PROCESS_INFORMATION::default();
+    // Safety: `token` -- первичный токен пользователя из
+    // `WTSQueryUserToken`; имя приложения null, команда в изменяемом буфере
+    // `command_line`; атрибуты не заданы, хендлы не наследуются (`false`);
+    // `env` -- блок в Unicode (`CREATE_UNICODE_ENVIRONMENT`), живёт до конца
+    // функции; `cwd`, `desktop`, `startup`, `info` переживают вызов.
+    unsafe {
+        CreateProcessAsUserW(
+            Some(*token),
+            PCWSTR::null(),
+            Some(PWSTR(command_line.as_mut_ptr())),
+            None,
+            None,
+            false,
+            CREATE_UNICODE_ENVIRONMENT,
+            Some(env.0.cast_const()),
+            cwd_ptr,
+            &startup,
+            &mut info,
+        )
+    }
+    .map_err(|e| win_err("CreateProcessAsUserW", e))?;
+    // Safety: оба хендла только что вернул успешный `CreateProcessAsUserW`;
+    // закрываем сразу, значок живёт сам по себе.
+    let _process = unsafe { Owned::new(info.hProcess) };
+    let _thread = unsafe { Owned::new(info.hThread) };
+    tracing::info!(
+        pid = info.dwProcessId,
+        session,
+        "значок PIN запущен в сеансе пользователя (D91)"
+    );
+    Ok(())
 }
 
 /// Живой помощник: хендл процесса и Job object, который убьёт его при

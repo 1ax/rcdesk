@@ -99,6 +99,18 @@ pub fn active_session_from_raw(raw: u32) -> Option<u32> {
     }
 }
 
+/// Минимальный аптайм системы, с которого служба сама запускает значок PIN (D91).
+/// При загрузке служба стартует раньше Explorer: значок, запущенный сразу,
+/// не нашёл бы панель задач и не показал бы иконку; её поднимает HKLM Run
+/// после входа. Служба запускает значок только при перезапуске посреди
+/// сеанса (самообновление: установщик убил значок).
+pub const AGENT_LAUNCH_MIN_UPTIME: Duration = Duration::from_secs(120);
+
+/// Запускать ли значок PIN при старте службы по аптайму системы (D91).
+pub fn should_launch_agent_at_start(uptime: Duration) -> bool {
+    uptime >= AGENT_LAUNCH_MIN_UPTIME
+}
+
 /// Состояние службы для печати (`service status`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
@@ -346,6 +358,13 @@ pub fn migrate_files(from: &Path, to: &Path, names: &[&str]) -> io::Result<Vec<S
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn agent_launch_uptime_guard() {
+        assert!(!should_launch_agent_at_start(Duration::from_secs(0)));
+        assert!(!should_launch_agent_at_start(Duration::from_secs(119)));
+        assert!(should_launch_agent_at_start(Duration::from_secs(120)));
+    }
 
     fn scratch_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
