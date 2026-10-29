@@ -7,7 +7,9 @@
 //! `file_list()` turns any `clipboard_win` error into
 //! `ContentNotAvailable`, which hides why copied Explorer files never reach
 //! the client (D87). `read_file_list` below talks to Win32 directly and logs
-//! every failure with the Win32 error code.
+//! every failure with the Win32 error code. D87b: every call also logs one
+//! line with the clipboard formats the process actually sees
+//! (`EnumClipboardFormats`) and whether `CF_HDROP` is among them.
 //!
 //! Compiles only on `windows-latest` in CI: there is no Windows machine
 //! available to this executor run, so `GetClipboardSequenceNumber`'s
@@ -19,9 +21,10 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use windows::Win32::Foundation::{GetLastError, ERROR_SUCCESS};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, GetClipboardData, GetClipboardSequenceNumber, IsClipboardFormatAvailable,
-    OpenClipboard,
+    CloseClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardFormatNameW,
+    GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
 };
 use windows::Win32::System::Ole::CF_HDROP;
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
@@ -41,15 +44,61 @@ impl Drop for ClipboardGuard {
     }
 }
 
-/// Reads the `CF_HDROP` path list straight through Win32, logging every
-/// failure (arboard hides them, D87). `None` when there are no files.
-fn read_file_list() -> Option<Vec<PathBuf>> {
-    // Safety: no preconditions; does not need the clipboard to be open.
-    if unsafe { IsClipboardFormatAvailable(u32::from(CF_HDROP.0)) }.is_err() {
-        // No files on the clipboard: normal, not logged.
-        return None;
+/// Human-readable name of a clipboard format: registered formats (id >=
+/// 0xC000) by `GetClipboardFormatNameW`, standard ones from a short table,
+/// anything else as a bare number.
+fn format_label(id: u32) -> String {
+    if id >= 0xC000 {
+        let mut buf = [0u16; 256];
+        // Safety: `buf` is a valid writable buffer; the call returns the
+        // number of characters copied (0 on failure) and needs no open
+        // clipboard.
+        let n = unsafe { GetClipboardFormatNameW(id, &mut buf) };
+        if n > 0 {
+            let n = (n as usize).min(buf.len());
+            return format!("{id}:{}", String::from_utf16_lossy(&buf[..n]));
+        }
+        return id.to_string();
     }
+    let name = match id {
+        1 => "CF_TEXT",
+        2 => "CF_BITMAP",
+        7 => "CF_OEMTEXT",
+        8 => "CF_DIB",
+        13 => "CF_UNICODETEXT",
+        15 => "CF_HDROP",
+        16 => "CF_LOCALE",
+        17 => "CF_DIBV5",
+        _ => return id.to_string(),
+    };
+    format!("{id}:{name}")
+}
 
+/// Lists the formats currently on the clipboard. The clipboard must be open.
+/// Returns the label string and the Win32 error left after the enumeration
+/// ended (`None` for `ERROR_SUCCESS`).
+fn list_formats() -> (String, Option<u32>) {
+    let mut labels = Vec::new();
+    let mut format = 0u32;
+    loop {
+        // Safety: the clipboard is open on this thread; `format` is 0 or the
+        // previous result, as the API requires.
+        format = unsafe { EnumClipboardFormats(format) };
+        if format == 0 {
+            break;
+        }
+        labels.push(format_label(format));
+    }
+    // Safety: no preconditions; reads the calling thread's last error.
+    let last = unsafe { GetLastError() };
+    let code = (last != ERROR_SUCCESS).then_some(last.0);
+    (labels.join(", "), code)
+}
+
+/// Reads the `CF_HDROP` path list straight through Win32, logging every
+/// failure (arboard hides them, D87). `None` when there are no files. D87b:
+/// logs the clipboard formats this process sees on every call.
+fn read_file_list() -> Option<Vec<PathBuf>> {
     // Another application may hold the clipboard for a moment.
     let mut opened = None;
     for attempt in 0..5 {
@@ -67,6 +116,30 @@ fn read_file_list() -> Option<Vec<PathBuf>> {
         }
     }
     let _guard = opened?;
+
+    let (formats, enum_error) = list_formats();
+    // Safety: no preconditions; also fine with the clipboard open.
+    let hdrop_available = unsafe { IsClipboardFormatAvailable(u32::from(CF_HDROP.0)) }.is_ok();
+    // Safety: no preconditions -- a plain Win32 query.
+    let seq = unsafe { GetClipboardSequenceNumber() };
+    match enum_error {
+        Some(code) => tracing::info!(
+            seq,
+            formats = %formats,
+            hdrop = hdrop_available,
+            enum_error = code,
+            "clipboard formats seen (D87b)"
+        ),
+        None => tracing::info!(
+            seq,
+            formats = %formats,
+            hdrop = hdrop_available,
+            "clipboard formats seen (D87b)"
+        ),
+    }
+    if !hdrop_available {
+        return None;
+    }
 
     // Safety: the clipboard is open (held by `_guard`). The returned handle
     // is owned by the clipboard and must not be freed or kept after close.

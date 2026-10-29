@@ -3354,6 +3354,7 @@ async fn start_session_with_display_wait(
             Ok(backend) => {
                 let mut clipboard_sync = ClipboardSync::new(backend);
                 clipboard_sync.set_files_enabled(files_enabled);
+                tracing::info!(files_enabled, "clipboard sync started");
                 let sync = Arc::new(Mutex::new(clipboard_sync));
                 let mut clipboard_watcher =
                     clipboard::watch(Arc::clone(&sync), clipboard::CLIPBOARD_POLL_INTERVAL);
