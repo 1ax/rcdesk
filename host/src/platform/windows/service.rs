@@ -557,6 +557,10 @@ pub fn uninstall() -> anyhow::Result<()> {
     }
     // Safety: `service` -- хендл с правом DELETE (в `SERVICE_ALL_ACCESS`).
     unsafe { DeleteService(*service) }.map_err(|e| win_err("DeleteService", e))?;
+    // D83c: убираем машинный автозапуск просмотрщика; сбой удаление не прерывает.
+    if let Err(err) = super::autostart::remove_machine_autostart() {
+        eprintln!("предупреждение: не удалось убрать автозапуск просмотрщика PIN: {err:#}");
+    }
     println!("Служба {SERVICE_NAME} удалена");
     println!("Данные не тронуты: {}", machine_data_dir().display());
     Ok(())
@@ -743,6 +747,18 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     // установленных машинах). Сбой не мешает службе.
     if let Err(err) = super::sas::ensure_policy() {
         tracing::warn!(error = %format!("{err:#}"), "не удалось включить SoftwareSASGeneration");
+    }
+    // D83c: машинный автозапуск просмотрщика PIN (rcdesk-agent) для входа
+    // любого пользователя; сбой службе не мешает.
+    match crate::agent::autostart::agent_path() {
+        Ok(agent) => {
+            if let Err(err) = super::autostart::ensure_machine_autostart(&agent) {
+                tracing::warn!(error = %format!("{err:#}"), "не удалось прописать автозапуск просмотрщика PIN");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "не найден rcdesk-agent для автозапуска просмотрщика PIN");
+        }
     }
     // D46c: SendSAS должна вызывать служба; помощник просит через событие.
     if let Err(err) = super::sas::spawn_listener() {

@@ -245,6 +245,21 @@ pub fn run_value_matches(stored: &str, agent: &Path) -> bool {
     stored.to_lowercase() == format_run_value(agent).to_lowercase()
 }
 
+/// D83c: имя машинного `HKLM\...\Run`-значения, которое служба прописывает
+/// для запуска `rcdesk-agent.exe` (просмотрщик PIN) при входе любого
+/// пользователя. Отличается от `RUN_VALUE_NAME`, чтобы `autostart on/off`
+/// пользователя его не затрагивал.
+pub const MACHINE_RUN_VALUE_NAME: &str = "rcdesk-viewer";
+
+/// Нужно ли (пере)записать машинное значение: его нет или оно не указывает
+/// на `agent` (сравнение как в `run_value_matches`).
+pub fn machine_run_value_needs_write(stored: Option<&str>, agent: &Path) -> bool {
+    match stored {
+        Some(stored) => !run_value_matches(stored, agent),
+        None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,5 +403,32 @@ mod tests {
         let agent = Path::new(r"C:\rcdesk\rcdesk-agent.exe");
         assert!(run_value_matches(r#""c:\rcdesk\rcdesk-agent.exe""#, agent));
         assert!(!run_value_matches(r#""C:\other\rcdesk-agent.exe""#, agent));
+    }
+
+    #[test]
+    fn machine_run_value_name_differs_from_user_one() {
+        assert_ne!(MACHINE_RUN_VALUE_NAME, RUN_VALUE_NAME);
+    }
+
+    #[test]
+    fn machine_run_value_needs_write_when_absent_or_different() {
+        let agent = Path::new(r"C:\Program Files\rcdesk\rcdesk-agent.exe");
+        assert!(machine_run_value_needs_write(None, agent));
+        assert!(machine_run_value_needs_write(
+            Some(r#""C:\old\rcdesk-agent.exe""#),
+            agent
+        ));
+        assert!(machine_run_value_needs_write(Some(""), agent));
+    }
+
+    #[test]
+    fn machine_run_value_not_rewritten_when_matching_ignoring_case() {
+        let agent = Path::new(r"C:\Program Files\rcdesk\rcdesk-agent.exe");
+        let stored = format_run_value(agent);
+        assert!(!machine_run_value_needs_write(Some(&stored), agent));
+        assert!(!machine_run_value_needs_write(
+            Some(&stored.to_uppercase()),
+            agent
+        ));
     }
 }

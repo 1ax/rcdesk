@@ -19,6 +19,10 @@
 //! pub unsafe fn RegCloseKey(hkey: HKEY) -> WIN32_ERROR
 //! ```
 //!
+//! D83c (`ensure_machine_autostart`/`remove_machine_autostart`) использует
+//! те же сверенные сигнатуры с `HKEY_LOCAL_MACHINE` (константа `HKEY` из того
+//! же модуля, что и `HKEY_CURRENT_USER`; `sas.rs` уже открывает по ней ключ).
+//!
 //! `RegCreateKeyExW` (the other function named in this slice's plan) is
 //! `#[cfg(feature = "Win32_Security")]` in this crate version -- its
 //! `lpsecurityattributes: Option<*const SECURITY_ATTRIBUTES>` parameter
@@ -50,10 +54,13 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegDeleteKeyValueW, RegGetValueW, RegOpenKeyExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_WRITE, REG_SZ, RRF_RT_REG_SZ,
+    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_SZ, RRF_RT_REG_SZ,
 };
 
-use crate::agent::autostart::{format_run_value, run_value_matches, RUN_VALUE_NAME};
+use crate::agent::autostart::{
+    format_run_value, machine_run_value_needs_write, run_value_matches, MACHINE_RUN_VALUE_NAME,
+    RUN_VALUE_NAME,
+};
 
 const RUN_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
@@ -137,12 +144,93 @@ pub fn disable() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// D83c: машинный автозапуск просмотрщика PIN (`rcdesk-agent.exe`) для входа
+/// любого пользователя -- `HKLM\...\Run`, значение `MACHINE_RUN_VALUE_NAME`
+/// (не пересекается с пользовательским `rcdesk`). Пишет только если значения
+/// нет или оно отличается. Вызывается службой (SYSTEM), правам хватает.
+pub fn ensure_machine_autostart(agent: &Path) -> anyhow::Result<()> {
+    let stored = read_run_value_in(HKEY_LOCAL_MACHINE, MACHINE_RUN_VALUE_NAME)?;
+    if !machine_run_value_needs_write(stored.as_deref(), agent) {
+        return Ok(());
+    }
+
+    let subkey = wide_null(RUN_SUBKEY);
+    let mut hkey = HKEY(std::ptr::null_mut());
+    // Safety: `subkey` переживает вызов; `&mut hkey` -- валидный `*mut HKEY`.
+    let open_result = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR::from_raw(subkey.as_ptr()),
+            None,
+            KEY_WRITE,
+            &mut hkey,
+        )
+    };
+    open_result
+        .ok()
+        .context("RegOpenKeyExW(HKLM...CurrentVersion\\Run) failed")?;
+
+    let wide_value = wide_null(&format_run_value(agent));
+    // Safety: `u16`-буфер как байты для `&[u8]`; длина `* 2` посчитана по
+    // тому же буферу, чтения за границу нет.
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(wide_value.as_ptr().cast::<u8>(), wide_value.len() * 2)
+    };
+    let value_name = wide_null(MACHINE_RUN_VALUE_NAME);
+    // Safety: `hkey` открыт выше с KEY_WRITE и закрывается ниже в любом
+    // случае; `value_name`/`bytes` переживают вызов.
+    let set_result = unsafe {
+        RegSetValueExW(
+            hkey,
+            PCWSTR::from_raw(value_name.as_ptr()),
+            None,
+            REG_SZ,
+            Some(bytes),
+        )
+    };
+    // Safety: `hkey` -- действительный открытый хендл из `RegOpenKeyExW`.
+    let close_result = unsafe { RegCloseKey(hkey) };
+
+    set_result
+        .ok()
+        .context("RegSetValueExW(HKLM rcdesk-viewer) failed")?;
+    close_result.ok().context("RegCloseKey failed")?;
+    tracing::info!(agent = %agent.display(), "machine autostart for the PIN viewer set");
+    Ok(())
+}
+
+/// Удаляет машинный автозапуск просмотрщика; отсутствие значения -- не ошибка.
+pub fn remove_machine_autostart() -> anyhow::Result<()> {
+    let subkey = wide_null(RUN_SUBKEY);
+    let value_name = wide_null(MACHINE_RUN_VALUE_NAME);
+    // Safety: `subkey`/`value_name` переживают вызов.
+    let result = unsafe {
+        RegDeleteKeyValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR::from_raw(subkey.as_ptr()),
+            PCWSTR::from_raw(value_name.as_ptr()),
+        )
+    };
+    if result == ERROR_FILE_NOT_FOUND {
+        return Ok(());
+    }
+    result
+        .ok()
+        .context("RegDeleteKeyValueW(HKLM rcdesk-viewer) failed")?;
+    Ok(())
+}
+
 /// `None` when the `rcdesk` value doesn't exist (or the `Run` key itself
 /// doesn't, which `RegGetValueW` reports the same way) -- not an error, just
 /// "not enabled".
 fn read_run_value() -> anyhow::Result<Option<String>> {
+    read_run_value_in(HKEY_CURRENT_USER, RUN_VALUE_NAME)
+}
+
+/// Как `read_run_value`, но для произвольного куста (`HKCU`/`HKLM`) и имени.
+fn read_run_value_in(root: HKEY, name: &str) -> anyhow::Result<Option<String>> {
     let subkey = wide_null(RUN_SUBKEY);
-    let value_name = wide_null(RUN_VALUE_NAME);
+    let value_name = wide_null(name);
     let subkey_pcwstr = PCWSTR::from_raw(subkey.as_ptr());
     let value_pcwstr = PCWSTR::from_raw(value_name.as_ptr());
 
@@ -154,7 +242,7 @@ fn read_run_value() -> anyhow::Result<Option<String>> {
     // subkey path directly.
     let size_result = unsafe {
         RegGetValueW(
-            HKEY_CURRENT_USER,
+            root,
             subkey_pcwstr,
             value_pcwstr,
             RRF_RT_REG_SZ,
@@ -179,7 +267,7 @@ fn read_run_value() -> anyhow::Result<Option<String>> {
     // in/out size contract; `subkey`/`value_name` still outlive this call.
     let read_result = unsafe {
         RegGetValueW(
-            HKEY_CURRENT_USER,
+            root,
             subkey_pcwstr,
             value_pcwstr,
             RRF_RT_REG_SZ,
