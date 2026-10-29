@@ -4,17 +4,25 @@
 //! платформенное (SCM, токены, `CreateProcessAsUserW`) живёт в
 //! `platform::windows::service`; здесь -- то, что тестируется на любой ОС:
 //! командные строки службы и помощника, автомат-супервизор помощника,
-//! файл `pin.txt` в машинном каталоге данных, перенос файлов из
+//! файл статуса помощника `status.json` в машинном каталоге данных (PIN и
+//! состояние), перенос файлов из
 //! пользовательского каталога установщика.
 
 use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
+use crate::signaling::AgentStatus;
+
 /// Имя службы в SCM.
 pub const SERVICE_NAME: &str = "rcdesk";
-/// PIN текущей регистрации: помощник пишет, `service status` читает.
-pub const PIN_FILE: &str = "pin.txt";
+/// Статус помощника (состояние + PIN): помощник пишет, `service status`
+/// (и значок трея) читает.
+pub const STATUS_FILE: &str = "status.json";
+/// Устаревший файл PIN (до D83a): помощник удаляет его при старте.
+pub const LEGACY_PIN_FILE: &str = "pin.txt";
 /// Лог самой службы (`machine_log_dir()`).
 pub const SERVICE_LOG: &str = "service.log";
 /// Лог помощника (`serve --machine`, `machine_log_dir()`).
@@ -222,20 +230,100 @@ impl Supervisor {
     }
 }
 
-/// Записывает PIN в `dir/pin.txt` (атомарно, через `fsutil`).
-pub fn write_pin(dir: &Path, pin: &str) -> io::Result<()> {
-    crate::fsutil::write_private_atomic(&dir.join(PIN_FILE), pin.as_bytes())
+/// Состояние помощника в файле статуса.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusState {
+    Connecting,
+    Registered,
+    InSession,
 }
 
-/// PIN из `dir/pin.txt`; `None`, если файла нет, он пуст или не читается.
-pub fn read_pin(dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join(PIN_FILE)).ok()?;
-    let pin = text.trim();
-    if pin.is_empty() {
-        None
-    } else {
-        Some(pin.to_string())
+/// Содержимое `status.json`: `{"state":"in_session","pin":"123456"}`.
+/// `pin` есть только у `registered` и `in_session`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HelperStatus {
+    pub state: StatusState,
+    pub pin: Option<String>,
+}
+
+impl HelperStatus {
+    /// `Reconnecting` и `Connecting` -- оба `connecting` без PIN.
+    pub fn from_agent(status: &AgentStatus) -> Self {
+        match status {
+            AgentStatus::Connecting | AgentStatus::Reconnecting { .. } => Self {
+                state: StatusState::Connecting,
+                pin: None,
+            },
+            AgentStatus::Registered { pin } => Self {
+                state: StatusState::Registered,
+                pin: Some(pin.clone()),
+            },
+            AgentStatus::InSession { pin } => Self {
+                state: StatusState::InSession,
+                pin: Some(pin.clone()),
+            },
+        }
     }
+
+    /// Обратно в `AgentStatus`; `None`, если у `registered`/`in_session`
+    /// нет непустого PIN.
+    pub fn to_agent(&self) -> Option<AgentStatus> {
+        let pin = self.pin.as_deref().filter(|p| !p.is_empty());
+        match self.state {
+            StatusState::Connecting => Some(AgentStatus::Connecting),
+            StatusState::Registered => pin.map(|p| AgentStatus::Registered { pin: p.to_string() }),
+            StatusState::InSession => pin.map(|p| AgentStatus::InSession { pin: p.to_string() }),
+        }
+    }
+
+    /// Сериализованное содержимое файла (для записи и дедупа).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        // Структура из строк и enum сериализуется всегда.
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+}
+
+/// Статус из `dir/status.json`; `None`, если файла нет, он не читается или
+/// содержит не тот JSON.
+pub fn read_status(dir: &Path) -> Option<HelperStatus> {
+    let bytes = std::fs::read(dir.join(STATUS_FILE)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// PIN из `dir/status.json` (есть в `registered` и `in_session`).
+pub fn read_pin(dir: &Path) -> Option<String> {
+    let status = read_status(dir)?;
+    match status.state {
+        StatusState::Connecting => None,
+        StatusState::Registered | StatusState::InSession => {
+            status.pin.filter(|pin| !pin.is_empty())
+        }
+    }
+}
+
+/// Удаляет устаревший `pin.txt` (ошибки игнорируются).
+pub fn remove_legacy_pin_file(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(LEGACY_PIN_FILE));
+}
+
+/// Запись файла статуса не на Windows: приватно (0600) и атомарно. На
+/// Windows то же делает `platform::windows::status_file` с DACL.
+pub fn write_status_file_portable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    crate::fsutil::write_private_atomic(path, bytes)
+}
+
+/// SDDL файла статуса на Windows: SYSTEM и Administrators -- полный доступ,
+/// пользователь активной консоли (если он есть) -- чтение. DACL защищён от
+/// наследования.
+pub fn status_file_sddl(console_user_sid: Option<&str>) -> String {
+    let mut sddl = String::from("D:P(A;;FA;;;SY)(A;;FA;;;BA)");
+    if let Some(sid) = console_user_sid {
+        sddl.push_str("(A;;FR;;;");
+        sddl.push_str(sid);
+        sddl.push(')');
+    }
+    sddl
 }
 
 /// Копирует из `from` в `to` те файлы из `names`, которые есть в `from` и
@@ -513,14 +601,105 @@ mod tests {
     }
 
     #[test]
-    fn pin_round_trip() {
+    fn agent_status_round_trips_through_the_status_file() {
+        let cases = [
+            (AgentStatus::Connecting, AgentStatus::Connecting),
+            (
+                AgentStatus::Reconnecting {
+                    error: "x".into(),
+                    retry_in: Duration::from_secs(3),
+                },
+                AgentStatus::Connecting,
+            ),
+            (
+                AgentStatus::Registered {
+                    pin: "123456".into(),
+                },
+                AgentStatus::Registered {
+                    pin: "123456".into(),
+                },
+            ),
+            (
+                AgentStatus::InSession {
+                    pin: "654321".into(),
+                },
+                AgentStatus::InSession {
+                    pin: "654321".into(),
+                },
+            ),
+        ];
+        let dir = scratch_dir("status-round-trip");
+        for (input, expected) in cases {
+            let bytes = HelperStatus::from_agent(&input).to_bytes();
+            std::fs::write(dir.join(STATUS_FILE), &bytes).unwrap();
+            let back = read_status(&dir).and_then(|s| s.to_agent());
+            assert_eq!(back, Some(expected));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_json_has_the_documented_shape() {
+        let bytes = HelperStatus::from_agent(&AgentStatus::InSession {
+            pin: "111222".into(),
+        })
+        .to_bytes();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            r#"{"state":"in_session","pin":"111222"}"#
+        );
+        let bytes = HelperStatus::from_agent(&AgentStatus::Connecting).to_bytes();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            r#"{"state":"connecting","pin":null}"#
+        );
+    }
+
+    #[test]
+    fn registered_without_pin_is_rejected() {
+        let status = HelperStatus {
+            state: StatusState::Registered,
+            pin: None,
+        };
+        assert_eq!(status.to_agent(), None);
+    }
+
+    #[test]
+    fn pin_is_read_from_the_status_file() {
         let dir = scratch_dir("pin");
         assert_eq!(read_pin(&dir), None);
-        write_pin(&dir, "123456").unwrap();
+        let write = |text: &str| std::fs::write(dir.join(STATUS_FILE), text).unwrap();
+        write(r#"{"state":"in_session","pin":"123456"}"#);
         assert_eq!(read_pin(&dir).as_deref(), Some("123456"));
-        write_pin(&dir, "654321").unwrap();
+        write(r#"{"state":"registered","pin":"654321"}"#);
         assert_eq!(read_pin(&dir).as_deref(), Some("654321"));
+        write(r#"{"state":"connecting","pin":null}"#);
+        assert_eq!(read_pin(&dir), None);
+        write(r#"{"state":"connecting","pin":"111111"}"#);
+        assert_eq!(read_pin(&dir), None);
+        write("{broken");
+        assert_eq!(read_pin(&dir), None);
+        assert_eq!(read_status(&dir), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_pin_file_is_removed() {
+        let dir = scratch_dir("legacy-pin");
+        std::fs::write(dir.join(LEGACY_PIN_FILE), "123456").unwrap();
+        remove_legacy_pin_file(&dir);
+        assert!(!dir.join(LEGACY_PIN_FILE).exists());
+        remove_legacy_pin_file(&dir); // повторно и без файла -- не ошибка
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_sddl_with_and_without_user() {
+        assert_eq!(status_file_sddl(None), "D:P(A;;FA;;;SY)(A;;FA;;;BA)");
+        assert_eq!(
+            status_file_sddl(Some("S-1-5-21-1-2-3-1001")),
+            "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;S-1-5-21-1-2-3-1001)"
+        );
     }
 
     #[test]

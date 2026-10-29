@@ -11,6 +11,7 @@ pub mod netifs;
 pub mod power;
 pub mod sas;
 pub mod service;
+pub mod status_file;
 pub mod update;
 
 pub(super) fn name() -> &'static str {

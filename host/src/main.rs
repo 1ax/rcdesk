@@ -125,8 +125,8 @@ enum Command {
         #[arg(long, value_enum, default_value_t = EncoderBackend::Auto)]
         encoder: EncoderBackend,
         /// Windows, полный режим (слайс 4.1a): помощник службы `rcdesk`. Данные
-        /// -- в `%ProgramData%\rcdesk\`, лог -- `helper.log`, PIN -- в `pin.txt`
-        /// вместо stdout. Запускается только службой.
+        /// -- в `%ProgramData%\rcdesk\`, лог -- `helper.log`, PIN и состояние -- в
+        /// `status.json` вместо stdout. Запускается только службой.
         #[cfg(target_os = "windows")]
         #[arg(long, hide = true)]
         machine: bool,
@@ -406,9 +406,7 @@ fn run_service(action: ServiceAction) -> anyhow::Result<()> {
             let data = agent::paths::machine_data_dir();
             match common::read_pin(&data) {
                 Some(pin) => println!("PIN: {pin}"),
-                None => println!(
-                    "PIN: нет (помощник ещё не зарегистрирован, либо нужны права администратора)"
-                ),
+                None => println!("PIN: нет (помощник ещё не зарегистрирован)"),
             }
             if rcdesk_host::settings::hub_enabled(&data) {
                 println!(
@@ -889,6 +887,34 @@ fn serve_log_dir(opts: &ServeOptions) -> PathBuf {
     agent::paths::log_dir()
 }
 
+/// Машинный режим: записывает `status.json`, если содержимое изменилось.
+/// Ошибка записи логируется, `last` не обновляется -- следующая смена
+/// статуса попробует снова.
+fn persist_status(
+    dir: &std::path::Path,
+    status: &rcdesk_host::service::HelperStatus,
+    last: &mut Option<Vec<u8>>,
+) {
+    let bytes = status.to_bytes();
+    if last.as_deref() == Some(bytes.as_slice()) {
+        return;
+    }
+    write_status_bytes(dir, &bytes, last);
+}
+
+/// Пишет `bytes` в `dir/status.json` и запоминает их в `last` при успехе.
+fn write_status_bytes(dir: &std::path::Path, bytes: &[u8], last: &mut Option<Vec<u8>>) {
+    let path = dir.join(rcdesk_host::service::STATUS_FILE);
+    #[cfg(target_os = "windows")]
+    let result = rcdesk_host::platform::windows::status_file::write_status_file(&path, bytes);
+    #[cfg(not(target_os = "windows"))]
+    let result = rcdesk_host::service::write_status_file_portable(&path, bytes);
+    match result {
+        Ok(()) => *last = Some(bytes.to_vec()),
+        Err(err) => tracing::warn!(error = %err, "не удалось записать status.json"),
+    }
+}
+
 async fn run_serve(opts: ServeOptions) -> anyhow::Result<()> {
     let name = app::resolve_host_name(opts.name.as_deref());
     let mut ctx = app::build_host_context(&opts)?;
@@ -907,9 +933,13 @@ async fn run_serve(opts: ServeOptions) -> anyhow::Result<()> {
 
     let device_store = DeviceStore::for_server(&opts.resolved_data_dir(), &opts.server);
 
-    // Машинный режим (`--machine`, 4.1a): PIN уходит в `pin.txt` каталога
-    // данных, а не в stdout (у помощника службы консоли нет).
+    // Машинный режим (`--machine`, 4.1a): PIN и состояние уходят в
+    // `status.json` каталога данных, а не в stdout (у помощника службы консоли
+    // нет). Устаревший `pin.txt` (до D83a) удаляется.
     let machine_dir = opts.data_dir.clone();
+    if let Some(dir) = &machine_dir {
+        rcdesk_host::service::remove_legacy_pin_file(dir);
+    }
     // Windows, машинный режим: удержание системы от сна на время сеанса из
     // одного выделенного потока (`SetThreadExecutionState` потоковый).
     #[cfg(target_os = "windows")]
@@ -927,22 +957,82 @@ async fn run_serve(opts: ServeOptions) -> anyhow::Result<()> {
     let print_task = tokio::spawn(async move {
         let mut last_printed: Option<String> = None;
         let mut in_session = false;
-        while status_rx.changed().await.is_ok() {
+        // Машинный режим: последнее записанное содержимое `status.json`
+        // (дедуп) и, на Windows, SID пользователя консоли, под которого
+        // выставлен DACL файла.
+        let mut last_written: Option<Vec<u8>> = None;
+        #[cfg(target_os = "windows")]
+        let mut last_sid: Option<String> = None;
+        #[cfg(target_os = "windows")]
+        let mut sid_tick = tokio::time::interval(Duration::from_secs(5));
+        if let Some(dir) = &machine_dir {
+            // Начальный статус затирает файл прошлого запуска с устаревшим PIN.
+            #[cfg(target_os = "windows")]
+            {
+                last_sid = rcdesk_host::platform::windows::status_file::console_user_sid();
+            }
+            persist_status(
+                dir,
+                &rcdesk_host::service::HelperStatus::from_agent(&AgentStatus::Connecting),
+                &mut last_written,
+            );
+        }
+        loop {
+            // Windows, машинный режим: раз в 5 с проверяем смену пользователя
+            // консоли (вход на экране входа PIN не меняет, а DACL файла
+            // зависит от SID пользователя).
+            let sid_check = async {
+                #[cfg(target_os = "windows")]
+                {
+                    sid_tick.tick().await;
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let status_changed = tokio::select! {
+                changed = status_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    true
+                }
+                _ = sid_check, if machine_dir.is_some() => false,
+            };
+            if !status_changed {
+                #[cfg(target_os = "windows")]
+                if let Some(dir) = &machine_dir {
+                    let sid = rcdesk_host::platform::windows::status_file::console_user_sid();
+                    if sid != last_sid {
+                        last_sid = sid;
+                        // Тот же JSON, новый DACL.
+                        if let Some(bytes) = last_written.take() {
+                            write_status_bytes(dir, &bytes, &mut last_written);
+                        }
+                    }
+                }
+                continue;
+            }
             let now_in_session;
             {
                 let status = status_rx.borrow();
                 now_in_session = matches!(&*status, AgentStatus::InSession { .. });
-                if let AgentStatus::Registered { pin } = &*status {
-                    if last_printed.as_deref() != Some(pin.as_str()) {
-                        match &machine_dir {
-                            Some(dir) => {
-                                if let Err(err) = rcdesk_host::service::write_pin(dir, pin) {
-                                    tracing::warn!(error = %err, "не удалось записать pin.txt");
-                                }
+                match &machine_dir {
+                    Some(dir) => {
+                        persist_status(
+                            dir,
+                            &rcdesk_host::service::HelperStatus::from_agent(&status),
+                            &mut last_written,
+                        );
+                    }
+                    None => {
+                        if let AgentStatus::Registered { pin } = &*status {
+                            if last_printed.as_deref() != Some(pin.as_str()) {
+                                println!("PIN: {pin}");
+                                last_printed = Some(pin.clone());
                             }
-                            None => println!("PIN: {pin}"),
                         }
-                        last_printed = Some(pin.clone());
                     }
                 }
             }
