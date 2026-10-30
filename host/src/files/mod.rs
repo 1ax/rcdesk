@@ -394,13 +394,35 @@ impl Drop for ActiveReceive {
     }
 }
 
-/// How many more times `remove_with_retry` tries a file that could not be
-/// removed right away, and how long it waits before each try (5 s in all).
-const REMOVE_RETRIES: u32 = 20;
-const REMOVE_RETRY_DELAY: Duration = Duration::from_millis(250);
+/// How `remove_with_retry` retries a file that could not be removed right
+/// away: first `REMOVE_FAST_RETRIES` tries every `REMOVE_FAST_DELAY`, then
+/// `REMOVE_SLOW_RETRIES` tries every `REMOVE_SLOW_DELAY` (60 s in all). With
+/// 5 s of retries the cancellation test still leaked files on windows-latest;
+/// the suspect is an antivirus holding a fresh file for longer than that.
+const REMOVE_FAST_RETRIES: u32 = 20;
+const REMOVE_FAST_DELAY: Duration = Duration::from_millis(250);
+const REMOVE_SLOW_RETRIES: u32 = 55;
+const REMOVE_SLOW_DELAY: Duration = Duration::from_secs(1);
+/// Number of retries in all.
+const REMOVE_RETRIES: u32 = REMOVE_FAST_RETRIES + REMOVE_SLOW_RETRIES;
+/// Total time `remove_with_retry` keeps retrying (used by the tests).
+#[cfg(test)]
+const REMOVE_TOTAL: Duration = Duration::from_millis(
+    REMOVE_FAST_DELAY.as_millis() as u64 * REMOVE_FAST_RETRIES as u64
+        + REMOVE_SLOW_DELAY.as_millis() as u64 * REMOVE_SLOW_RETRIES as u64,
+);
+
+/// Delay before retry number `attempt` (counted from 0).
+fn remove_retry_delay(attempt: u32) -> Duration {
+    if attempt < REMOVE_FAST_RETRIES {
+        REMOVE_FAST_DELAY
+    } else {
+        REMOVE_SLOW_DELAY
+    }
+}
 
 /// Removes `paths`, best effort. A file that cannot be removed right away is
-/// retried for a few seconds on a background thread: on Windows a freshly
+/// retried for up to a minute on a background thread: on Windows a freshly
 /// created file is often held open by an antivirus scan (Defender on CI),
 /// and `DeleteFile` fails with a sharing violation until it lets go -- the
 /// part file and placeholder would then stay in Downloads forever. A plain
@@ -415,8 +437,8 @@ fn remove_with_retry(paths: Vec<PathBuf>) {
         return;
     }
     std::thread::spawn(move || {
-        for _ in 0..REMOVE_RETRIES {
-            std::thread::sleep(REMOVE_RETRY_DELAY);
+        for attempt in 0..REMOVE_RETRIES {
+            std::thread::sleep(remove_retry_delay(attempt));
             left.retain(|p| !try_remove(p));
             if left.is_empty() {
                 return;
@@ -1460,7 +1482,7 @@ mod tests {
     /// Сколько ждать, пока уборка после отмены уберёт файлы.
     ///
     /// Уборка живёт в `Drop for ActiveReceive`, а `remove_with_retry` на
-    /// Windows повторяет до `REMOVE_RETRIES` раз по `REMOVE_RETRY_DELAY`.
+    /// Windows повторяет до `REMOVE_RETRIES` раз (всего `REMOVE_TOTAL`).
     /// Отсчёт начинается не раньше, чем блокирующая задача доберётся до
     /// очереди пула: отменённый `spawn_blocking` не прекращается, поэтому
     /// двадцать попыток встают в очередь и последняя стартует позже всех.
@@ -1468,7 +1490,33 @@ mod tests {
     /// меньше худшего случая уборки, и тест падает на последней попытке
     /// (`leaked: ["a19.bin", "a19.bin.rcdesk-part"]` в CI 2026-10-23).
     fn cleanup_wait() -> std::time::Duration {
-        REMOVE_RETRY_DELAY * REMOVE_RETRIES + std::time::Duration::from_secs(15)
+        REMOVE_TOTAL + std::time::Duration::from_secs(15)
+    }
+
+    /// Отчёт об оставшихся файлах: пробует удалить каждый и пишет итог
+    /// (`removed` -- уборка просто не запускалась; ошибка -- файл кто-то держит).
+    fn leak_report(h: &Harness) -> Vec<String> {
+        h.files()
+            .into_iter()
+            .map(|name| match std::fs::remove_file(h.dir.join(&name)) {
+                Ok(()) => format!("{name}: removed"),
+                Err(e) => format!("{name}: {:?} ({e})", e.kind()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn remove_retry_delay_slows_down_and_sums_to_total() {
+        assert_eq!(remove_retry_delay(0), REMOVE_FAST_DELAY);
+        assert_eq!(
+            remove_retry_delay(REMOVE_FAST_RETRIES - 1),
+            REMOVE_FAST_DELAY
+        );
+        assert_eq!(remove_retry_delay(REMOVE_FAST_RETRIES), REMOVE_SLOW_DELAY);
+        assert_eq!(remove_retry_delay(REMOVE_RETRIES - 1), REMOVE_SLOW_DELAY);
+        let sum: Duration = (0..REMOVE_RETRIES).map(remove_retry_delay).sum();
+        assert_eq!(sum, REMOVE_TOTAL);
+        assert_eq!(REMOVE_TOTAL, Duration::from_secs(60));
     }
 
     /// Ждёт, пока каталог не опустеет, но не дольше [`cleanup_wait`].
@@ -1875,7 +1923,8 @@ mod tests {
         // The cleanup may finish later on a blocking thread, or after the
         // retries of `remove_with_retry` (Windows).
         wait_until_empty(&h).await;
-        assert!(h.files().is_empty(), "leaked: {:?}", h.files());
+        let left = h.files();
+        assert!(left.is_empty(), "leaked: {:?}", leak_report(&h));
     }
 
     #[tokio::test]
@@ -1895,7 +1944,8 @@ mod tests {
         // Cleanup may finish later on a blocking thread, or after the
         // retries of `remove_with_retry` (Windows).
         wait_until_empty(&h).await;
-        assert!(h.files().is_empty(), "leaked: {:?}", h.files());
+        let left = h.files();
+        assert!(left.is_empty(), "leaked: {:?}", leak_report(&h));
     }
 
     #[tokio::test]
