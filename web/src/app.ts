@@ -708,7 +708,13 @@ export function mount(root: Element | null): void {
   // H5-4: the session bar was collapsed automatically for the keyboard in landscape.
   let barAutoCollapsed = false;
   function applyZoom(next: Zoom): void {
-    zoom = clampZoom(next, sessionVideoEl.clientWidth, sessionVideoEl.clientHeight);
+    zoom = clampZoom(
+      next,
+      sessionVideoEl.clientWidth,
+      sessionVideoEl.clientHeight,
+      video.videoWidth,
+      video.videoHeight,
+    );
     zoomLayer.style.transform = zoomCss(zoom);
     viewAnchor = anchorOf(
       zoom,

@@ -43,6 +43,43 @@ describe("zoom", () => {
     });
   });
 
+  it("clampZoom keeps the shown frame, not the letterbox, in cover (D79)", () => {
+    // Container 400x800, video 1600x900: frame 400x225, offsetY 287.5.
+    expect(clampZoom({ scale: 2, tx: -999, ty: -999 }, 400, 800, 1600, 900)).toEqual({
+      scale: 2,
+      tx: -400,
+      ty: -400,
+    });
+    expect(clampZoom({ scale: 2, tx: 50, ty: -999 }, 400, 800, 1600, 900)).toEqual({
+      scale: 2,
+      tx: 0,
+      ty: -400,
+    });
+    expect(clampZoom({ scale: 4, tx: 0, ty: 0 }, 400, 800, 1600, 900).ty).toBe(-1150);
+    expect(clampZoom({ scale: 4, tx: 0, ty: -9999 }, 400, 800, 1600, 900).ty).toBe(-1250);
+    expect(clampZoom({ scale: 1, tx: 123, ty: -77 }, 400, 800, 1600, 900)).toEqual({
+      scale: 1,
+      tx: 0,
+      ty: 0,
+    });
+  });
+
+  it("clampZoom without video size keeps the old behaviour (D79)", () => {
+    const old = { scale: 2, tx: 0, ty: -300 };
+    expect(clampZoom({ scale: 2, tx: 50, ty: -999 }, 400, 300)).toEqual(old);
+    expect(clampZoom({ scale: 2, tx: 50, ty: -999 }, 400, 300, 0, 0)).toEqual(old);
+    expect(clampZoom({ scale: 2, tx: 50, ty: -999 }, 400, 300, 0, 900)).toEqual(old);
+  });
+
+  it("clampZoom centres a pillarboxed frame on x (D79)", () => {
+    // Container 800x400, video 900x1600: frame 225x400, offsetX 287.5.
+    expect(clampZoom({ scale: 2, tx: 0, ty: -999 }, 800, 400, 900, 1600)).toEqual({
+      scale: 2,
+      tx: -400,
+      ty: -400,
+    });
+  });
+
   it("followPoint moves only when the point is within the margin", () => {
     const z = { scale: 2, tx: -200, ty: -100 };
     expect(followPoint(z, 200, 150, 400, 300, 24)).toEqual(z);

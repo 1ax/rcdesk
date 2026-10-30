@@ -21,12 +21,38 @@ export function identityZoom(): Zoom {
 /** Zoom the phone keyboard brings in (slice H5-2). */
 export const KEYBOARD_ZOOM = 2;
 
-/** Keeps `scale` in `[ZOOM_MIN, ZOOM_MAX]` and the container fully covered. */
-export function clampZoom(z: Zoom, w: number, h: number): Zoom {
+/** Keeps `scale` in `[ZOOM_MIN, ZOOM_MAX]` and the shown video frame (not the
+ * letterbox) covering the container, or centred on an axis it is smaller on (D79). */
+export function clampZoom(
+  z: Zoom,
+  w: number,
+  h: number,
+  videoWidth = 0,
+  videoHeight = 0,
+): Zoom {
   const scale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z.scale));
-  const tx = Math.min(0, Math.max(w - w * scale, z.tx));
-  const ty = Math.min(0, Math.max(h - h * scale, z.ty));
-  return { scale, tx, ty };
+  const f = frameLayout({ left: 0, top: 0, width: w, height: h }, videoWidth, videoHeight);
+  if (f === null) {
+    return {
+      scale,
+      tx: Math.min(0, Math.max(w - w * scale, z.tx)),
+      ty: Math.min(0, Math.max(h - h * scale, z.ty)),
+    };
+  }
+  return {
+    scale,
+    tx: clampAxis(z.tx, scale, f.offsetX, f.displayWidth, w),
+    ty: clampAxis(z.ty, scale, f.offsetY, f.displayHeight, h),
+  };
+}
+
+/** One axis of `clampZoom`: frame at `[off, off + size]` inside a container of `ext`. */
+function clampAxis(t: number, scale: number, off: number, size: number, ext: number): number {
+  if (size * scale >= ext) {
+    // `0 - x`, not `-x`: keeps +0 (not -0) when the frame starts at the edge.
+    return Math.min(0 - off * scale, Math.max(ext - (off + size) * scale, t));
+  }
+  return ext / 2 - (off + size / 2) * scale;
 }
 
 /** Zooms by `factor` keeping the container point `(px, py)` in place. */
