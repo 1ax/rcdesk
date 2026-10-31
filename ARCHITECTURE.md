@@ -245,6 +245,12 @@ TURN-креды выдаются в `Joined` и `PeerJoined`: хост берё�
 `AdminGet`/`AdminSetNote` → `AdminData` по `/ws` только владельцу с почтой из `RCDESK_ADMIN_EMAILS` (GitHub-секрет,
 передаётся деплоем в compose `environment`); в LAN-хабе админов нет. Страница — `web/admin.html` (вторая точка
 входа Vite, без новых зависимостей).
+Включение по сети без rcdesk на цели (D84/D85, схема v7): таблица `wake_devices` владельца — `manual`
+(имя, MAC, сеть из известных сетей хостов владельца; будится онлайн-хостом той же подсети) и `router`
+(роутер-будильник: в БД только SHA-256 токена). Роутер не держит WebSocket — опрашивает `GET /wake/poll`
+(`Authorization: Bearer`, раз в 10 с по скрипту MikroTik/OpenWrt из веба), ответ — MAC через запятую из очереди
+в памяти (TTL 60 с); онлайн — опрос не старше 30 с, лимит 30 залпом / 1 в 2 с на IP. `DeviceEntry.kind`
+различает `host`/`manual`/`router`.
 
 ### 4.4 Общие типы (`proto/`)
 
@@ -648,7 +654,7 @@ VPS владельца (FastVPS, Эстония), отдельный польз�
 в именованном томе `db-data`, смонтированном в `/data`: том пустой при создании наследует
 владельца каталога из образа (`/data` создан как `nobody`), поэтому контейнер под `USER
 nobody` пишет в него без `chown` на VPS, где у пользователя `rcdesk` нет root. nginx FastPanel: статика
-`web/dist`, прокси `/ws` и `/healthz` на 8080, TLS от панели. DNS `rcdesk.app` → VPS;
+`web/dist`, прокси `/ws`, `/healthz` и `/wake/poll` на 8080, TLS от панели. DNS `rcdesk.app` → VPS;
 `turn.rcdesk.app` → тот же IP (без CDN-прокси). Порты: 443 (https/wss), 3478 udp/tcp и
 5349 tls (TURN), диапазон relay UDP 49152–65535. Деплой — GitHub Actions по push в `main`
 после зелёных гейтов (фаза 3).
