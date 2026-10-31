@@ -1519,12 +1519,23 @@ mod tests {
         assert_eq!(REMOVE_TOTAL, Duration::from_secs(60));
     }
 
-    /// Ждёт, пока каталог не опустеет, но не дольше [`cleanup_wait`].
+    /// Ждёт, пока каталог не станет пустым и не продержится пустым
+    /// [`EMPTY_STABLE`], но не дольше [`cleanup_wait`]. Одной пустой
+    /// проверки мало: отменённый `create_unique` мог ещё стоять в очереди
+    /// блокирующих задач и создать файлы позже (CI 2026-10-30: `a19.bin:
+    /// removed`, `.rcdesk-part: NotFound` -- файлы никто не держал).
     async fn wait_until_empty(h: &Harness) {
+        const EMPTY_STABLE: std::time::Duration = std::time::Duration::from_secs(2);
         let deadline = std::time::Instant::now() + cleanup_wait();
+        let mut empty_since: Option<std::time::Instant> = None;
         while std::time::Instant::now() < deadline {
             if h.files().is_empty() {
-                return;
+                let since = *empty_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= EMPTY_STABLE {
+                    return;
+                }
+            } else {
+                empty_since = None;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
