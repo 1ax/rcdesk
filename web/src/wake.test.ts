@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { DeviceEntry } from "./generated/DeviceEntry";
 import {
+  MANUAL_SENT_MS,
   WAKE_TIMEOUT_MS,
   applyDevices,
   applyWakeError,
@@ -127,5 +128,37 @@ describe("wake state flow (device list)", () => {
     expect(wakeStatusFor(createWakeState(), entry({ can_wake: false }), 0).view.showButton).toBe(
       false,
     );
+  });
+});
+
+describe("wakeView for manual devices", () => {
+  const manual = (over: Partial<DeviceEntry> = {}) => entry({ kind: "manual", ...over });
+
+  it("idle: button by can_wake, no status", () => {
+    expect(wakeView(manual(), undefined, 0)).toMatchObject({ showButton: true, status: null });
+    expect(wakeView(manual({ can_wake: false }), undefined, 0).showButton).toBe(false);
+  });
+
+  it("after click: disabled 'Отправлено' for 15 s", () => {
+    const v = wakeView(manual(), { startedMs: 1000 }, 1000 + MANUAL_SENT_MS - 1);
+    expect(v.showButton).toBe(true);
+    expect(v.buttonDisabled).toBe(true);
+    expect(v.buttonLabel).toBe("Отправлено");
+    expect(v.status).toBe("Команда отправлена — обычно включается за 1–2 мин");
+  });
+
+  it("after 15 s: back to the usual view without timeout text", () => {
+    const v = wakeView(manual(), { startedMs: 1000 }, 1000 + MANUAL_SENT_MS);
+    expect(v).toMatchObject({
+      showButton: true,
+      buttonDisabled: false,
+      buttonLabel: "Включить",
+      status: null,
+    });
+  });
+
+  it("host behaviour is unchanged", () => {
+    const v = wakeView(entry(), { startedMs: 0 }, MANUAL_SENT_MS + 1);
+    expect(v.buttonLabel).toBe("Включаю…");
   });
 });

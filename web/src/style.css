@@ -865,3 +865,73 @@ body {
 #account-guest .btn + .btn {
   margin-top: 10px;
 }
+
+/* D84/D85: add-device forms and the router script panel. */
+.wake-add-buttons,
+.wake-add-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.wake-add-panel[hidden],
+.wake-add-buttons[hidden] {
+  display: none;
+}
+
+.wake-add-field {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  font-size: 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+}
+
+.wake-add-field:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.wake-add-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.wake-add-row .btn,
+.wake-add-row .btn-secondary {
+  width: auto;
+  margin-top: 0;
+  flex: 1 1 auto;
+}
+
+.wake-tab.active {
+  border-color: var(--accent);
+}
+
+.wake-add-error {
+  color: var(--danger);
+  margin: 0;
+}
+
+.wake-add-error:empty {
+  display: none;
+}
+
+.wake-script {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 260px;
+  overflow-x: auto;
+  overflow-y: auto;
+  white-space: pre;
+  font-size: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  user-select: all;
+}

@@ -209,3 +209,36 @@ describe("clearOwnerToken", () => {
     ).not.toThrow();
   });
 });
+
+describe("D84/D85 device kinds", () => {
+  it("canConnect is false for non-host kinds even when online", () => {
+    expect(canConnect(device({ kind: "router", online: true }))).toBe(false);
+    expect(canConnect(device({ kind: "manual", online: true }))).toBe(false);
+  });
+
+  it("status label for manual", () => {
+    expect(deviceStatusLabel(device({ kind: "manual", online: false }), 2000)).toBe(
+      "Без rcdesk · включается по сети",
+    );
+  });
+
+  it("status label for router online and offline", () => {
+    expect(deviceStatusLabel(device({ kind: "router", online: true }), 1000)).toBe(
+      "Роутер-будильник · в сети",
+    );
+    expect(
+      deviceStatusLabel(device({ kind: "router", online: false, last_seen_at: 1000n }), 1000 + 300),
+    ).toBe("Роутер-будильник · не в сети (последний опрос 5 минут назад)");
+  });
+
+  it("sorts hosts, then manual, then routers, each by name", () => {
+    const sorted = sortDevices([
+      device({ device_id: "r1", name: "Роутер А", kind: "router" }),
+      device({ device_id: "m2", name: "Б NAS", kind: "manual", online: false }),
+      device({ device_id: "h1", name: "Z Host", online: false }),
+      device({ device_id: "m1", name: "А NAS", kind: "manual", online: false }),
+      device({ device_id: "h0", name: "Y Host", online: true }),
+    ]);
+    expect(sorted.map((d) => d.device_id)).toEqual(["h0", "h1", "m1", "m2", "r1"]);
+  });
+});

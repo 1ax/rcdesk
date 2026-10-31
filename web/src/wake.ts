@@ -7,6 +7,10 @@ import type { DeviceEntry } from "./generated/DeviceEntry";
 /** How long the client waits for a woken device to come online. */
 export const WAKE_TIMEOUT_MS = 180_000;
 
+/** D84: how long a manual device (no rcdesk, never reports online) shows
+ * "Отправлено" after the click. */
+export const MANUAL_SENT_MS = 15_000;
+
 /** One device being woken: when the click happened. */
 export interface Waking {
   startedMs: number;
@@ -37,6 +41,22 @@ export function wakeView(
   waking: Waking | undefined,
   nowMs: number,
 ): WakeView {
+  if (entry.kind === "manual") {
+    if (waking !== undefined && nowMs - waking.startedMs < MANUAL_SENT_MS) {
+      return {
+        showButton: true,
+        buttonDisabled: true,
+        buttonLabel: "Отправлено",
+        status: "Команда отправлена — обычно включается за 1–2 мин",
+      };
+    }
+    return {
+      showButton: entry.can_wake,
+      buttonDisabled: false,
+      buttonLabel: "Включить",
+      status: null,
+    };
+  }
   if (entry.online) {
     return { showButton: false, buttonDisabled: false, buttonLabel: "Включить", status: null };
   }

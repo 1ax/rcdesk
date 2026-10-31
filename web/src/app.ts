@@ -58,6 +58,9 @@ import {
 } from "./fullscreen";
 import type { NavigatorWithKeyboard } from "./fullscreen";
 import { ScreenWakeLock } from "./wakeLock";
+import type { WakeNetwork } from "./generated/WakeNetwork";
+import { mikrotikScript, openwrtScript } from "./routerScripts";
+import { addDeviceErrorLabel, findNetwork, networkLabel, networkValue } from "./wakeDevices";
 import { VideoResume } from "./videoResume";
 import { inputBlockedLabel } from "./inputBlocked";
 import { hostOutdatedLabel, updateStatusLabel } from "./hostVersion";
@@ -367,6 +370,11 @@ export function mount(root: Element | null): void {
         <div class="devices" id="devices" hidden>
           <h2>Мои компьютеры</h2>
           <ul class="device-list" id="device-list"></ul>
+          <div class="wake-add-buttons" id="wake-add-buttons">
+            <button id="add-manual-btn" class="btn btn-secondary">Добавить устройство по MAC</button>
+            <button id="add-router-btn" class="btn btn-secondary">Добавить роутер-будильник</button>
+          </div>
+          <div class="wake-add-panel" id="wake-add-panel" hidden></div>
         </div>
         <p class="hint pin-hint">Или введите PIN с экрана хоста</p>
         <input
@@ -968,6 +976,10 @@ export function mount(root: Element | null): void {
   const accountBackBtn = root.querySelector<HTMLButtonElement>("#account-back-btn")!;
   const adminLink = root.querySelector<HTMLAnchorElement>("#admin-link")!;
   const deviceListEl = root.querySelector<HTMLUListElement>("#device-list")!;
+  const addManualBtn = root.querySelector<HTMLButtonElement>("#add-manual-btn")!;
+  const addRouterBtn = root.querySelector<HTMLButtonElement>("#add-router-btn")!;
+  const wakeAddButtonsEl = root.querySelector<HTMLDivElement>("#wake-add-buttons")!;
+  const wakeAddPanelEl = root.querySelector<HTMLDivElement>("#wake-add-panel")!;
   // Slice 3.2d: the OPAQUE-login dialog, shown between `auth_required` and
   // either a successful `pake_finish` (the host then sends `offer`, see that
   // handler below) or a cancel/teardown.
@@ -1166,6 +1178,17 @@ export function mount(root: Element | null): void {
   // Slice W: "Включить" (Wake-on-LAN) bookkeeping and its 1 s redraw ticker,
   // which runs only while some wake is still within `WAKE_TIMEOUT_MS`.
   const wakeState = createWakeState();
+
+  // D84/D85: "add device by MAC" / "add router-waker" forms. `addKind` is the
+  // form being opened/shown; `addStage` walks networks-requested -> form ->
+  // sending. `routerPanel` holds the one-time token only until "Готово".
+  type AddKind = "manual" | "router";
+  let addKind: AddKind | null = null;
+  let addStage: "idle" | "loading" | "form" | "sending" = "idle";
+  let addNetworks: WakeNetwork[] = [];
+  let addError = "";
+  let routerPanel: { token: string; name: string; script: "mikrotik" | "openwrt" } | null = null;
+  let addDraft = { name: "", mac: "", network: "" };
   let wakeTimer: ReturnType<typeof setInterval> | undefined;
   // Slice 3.5b: the persistent device id from the current/last `Joined`
   // (`#[serde(default)]` on the wire, so `null` with a pre-3.5b server) --
@@ -1584,7 +1607,9 @@ export function mount(root: Element | null): void {
           signaling.send({ type: "forget_device", device_id: entry.device_id });
           // Slice E2: drop the remembered "host requires a password" flag.
           const forgetStorage = ownerStorage();
-          if (forgetStorage !== null) clearAuthRequired(forgetStorage, entry.device_id);
+          if (forgetStorage !== null && entry.kind === "host") {
+            clearAuthRequired(forgetStorage, entry.device_id);
+          }
           confirmingForgetId = null;
         } else {
           confirmingForgetId = entry.device_id;
@@ -1592,7 +1617,11 @@ export function mount(root: Element | null): void {
         renderDeviceList();
       });
 
-      actions.appendChild(wake.view.showButton ? wakeBtn : connectRowBtn);
+      if (entry.kind === "host") {
+        actions.appendChild(wake.view.showButton ? wakeBtn : connectRowBtn);
+      } else if (entry.kind === "manual" && wake.view.showButton) {
+        actions.appendChild(wakeBtn);
+      }
       actions.appendChild(renameBtn);
       actions.appendChild(forgetBtn);
       li.appendChild(info);
@@ -1600,6 +1629,191 @@ export function mount(root: Element | null): void {
       deviceListEl.appendChild(li);
     }
   }
+
+  /** Renders the add-device form / router-script panel into `#wake-add-panel`
+   * from the closure state above. Called only on state changes (not on every
+   * `devices` push) so typed text survives list refreshes. */
+  function renderAddPanel(): void {
+    wakeAddPanelEl.innerHTML = "";
+    const idle = addStage === "idle" && routerPanel === null;
+    wakeAddButtonsEl.hidden = !idle;
+    wakeAddPanelEl.hidden = idle;
+    if (idle) return;
+
+    if (routerPanel !== null) {
+      const panel = routerPanel;
+      const note = document.createElement("p");
+      note.className = "hint";
+      note.textContent = "Токен показывается один раз — скопируйте скрипт сейчас";
+      const tabs = document.createElement("div");
+      tabs.className = "wake-add-row";
+      const pre = document.createElement("pre");
+      pre.className = "wake-script";
+      const origin = location.origin;
+      const scriptText = (): string =>
+        panel.script === "mikrotik"
+          ? mikrotikScript(origin, panel.token, panel.name)
+          : openwrtScript(origin, panel.token, panel.name);
+      pre.textContent = scriptText();
+      for (const [id, label] of [
+        ["mikrotik", "MikroTik"],
+        ["openwrt", "OpenWrt"],
+      ] as const) {
+        const b = document.createElement("button");
+        b.className = panel.script === id ? "btn btn-secondary wake-tab active" : "btn btn-secondary wake-tab";
+        b.textContent = label;
+        b.addEventListener("click", () => {
+          panel.script = id;
+          renderAddPanel();
+        });
+        tabs.appendChild(b);
+      }
+      const copyStatus = document.createElement("p");
+      copyStatus.className = "hint";
+      const copyBtn = document.createElement("button");
+      copyBtn.className = "btn btn-secondary";
+      copyBtn.textContent = "Копировать";
+      copyBtn.addEventListener("click", () => {
+        const selectAll = (): void => {
+          const range = document.createRange();
+          range.selectNodeContents(pre);
+          const sel = window.getSelection();
+          sel?.removeAllRanges();
+          sel?.addRange(range);
+        };
+        navigator.clipboard.writeText(scriptText()).then(
+          () => {
+            copyStatus.textContent = "Скопировано";
+          },
+          () => {
+            selectAll();
+            copyStatus.textContent = "Не удалось скопировать — текст выделен, скопируйте вручную";
+          },
+        );
+      });
+      const doneBtn = document.createElement("button");
+      doneBtn.className = "btn";
+      doneBtn.textContent = "Готово";
+      doneBtn.addEventListener("click", () => {
+        routerPanel = null;
+        renderAddPanel();
+      });
+      const row = document.createElement("div");
+      row.className = "wake-add-row";
+      row.appendChild(copyBtn);
+      row.appendChild(doneBtn);
+      wakeAddPanelEl.append(note, tabs, pre, row, copyStatus);
+      return;
+    }
+
+    const closeBtn = (label: string): HTMLButtonElement => {
+      const b = document.createElement("button");
+      b.className = "btn btn-secondary";
+      b.textContent = label;
+      b.addEventListener("click", () => {
+        addKind = null;
+        addStage = "idle";
+        addError = "";
+        renderAddPanel();
+      });
+      return b;
+    };
+
+    if (addStage === "loading") {
+      const p = document.createElement("p");
+      p.className = "hint";
+      p.textContent = "Загрузка…";
+      wakeAddPanelEl.appendChild(p);
+      return;
+    }
+
+    if (addNetworks.length === 0) {
+      const p = document.createElement("p");
+      p.className = "hint";
+      p.textContent = "Нет известных сетей: нужен компьютер с rcdesk 0.3.4+ в этой сети";
+      wakeAddPanelEl.append(p, closeBtn("Закрыть"));
+      return;
+    }
+
+    const sending = addStage === "sending";
+    const select = document.createElement("select");
+    select.className = "wake-add-field";
+    for (const n of addNetworks) {
+      const o = document.createElement("option");
+      o.value = networkValue(n);
+      o.textContent = networkLabel(n);
+      select.appendChild(o);
+    }
+    select.value = addDraft.network || networkValue(addNetworks[0]!);
+    const nameInput = document.createElement("input");
+    nameInput.className = "wake-add-field";
+    nameInput.maxLength = 64;
+    nameInput.placeholder = "Имя";
+    nameInput.setAttribute("aria-label", "Имя");
+    nameInput.value = addDraft.name;
+    const macInput = document.createElement("input");
+    macInput.className = "wake-add-field";
+    macInput.placeholder = "aa:bb:cc:dd:ee:ff";
+    macInput.setAttribute("aria-label", "MAC");
+    macInput.autocomplete = "off";
+    macInput.value = addDraft.mac;
+    const keep = (): void => {
+      addDraft = { name: nameInput.value, mac: macInput.value, network: select.value };
+    };
+    for (const el of [select, nameInput, macInput]) {
+      el.disabled = sending;
+      el.addEventListener("input", keep);
+      el.addEventListener("change", keep);
+    }
+    const errEl = document.createElement("p");
+    errEl.className = "hint wake-add-error";
+    errEl.textContent = addError;
+    const addBtn = document.createElement("button");
+    addBtn.className = "btn";
+    addBtn.textContent = "Добавить";
+    addBtn.disabled = sending || connectionLost;
+    addBtn.addEventListener("click", () => {
+      keep();
+      const net = findNetwork(addNetworks, select.value);
+      if (net === undefined) return;
+      const name = nameInput.value.trim();
+      addError = "";
+      addStage = "sending";
+      if (addKind === "router") {
+        routerNameForPanel = name;
+        signaling.send({ type: "add_router_waker", name, network: net.network, prefix: net.prefix });
+      } else {
+        signaling.send({
+          type: "add_manual_device",
+          name,
+          mac: macInput.value.trim(),
+          network: net.network,
+          prefix: net.prefix,
+        });
+      }
+      renderAddPanel();
+    });
+    const row = document.createElement("div");
+    row.className = "wake-add-row";
+    row.append(addBtn, closeBtn("Отмена"));
+    wakeAddPanelEl.append(select, nameInput);
+    if (addKind === "manual") wakeAddPanelEl.appendChild(macInput);
+    wakeAddPanelEl.append(errEl, row);
+  }
+
+  let routerNameForPanel = "";
+
+  /** Click on one of the "add" buttons: ask for the known networks first. */
+  function openAddForm(kind: AddKind): void {
+    addKind = kind;
+    addStage = "loading";
+    addError = "";
+    addDraft = { name: "", mac: "", network: "" };
+    signaling.send({ type: "list_wake_networks" });
+    renderAddPanel();
+  }
+  addManualBtn.addEventListener("click", () => openAddForm("manual"));
+  addRouterBtn.addEventListener("click", () => openAddForm("router"));
 
   /** Starts the 1 s redraw ticker for the "Включаю… м:сс" counter (one timer
    * at most); it stops itself once no wake is within its timeout. */
@@ -2971,6 +3185,29 @@ export function mount(root: Element | null): void {
     devices = msg.devices;
     applyDevices(wakeState, devices);
     renderDeviceList();
+    // D84: the answer to `add_manual_device` -- close the form.
+    // (A router form closes on `router_waker_added` instead, whichever of the
+    // two messages arrives first.)
+    if (addStage === "sending" && addKind === "manual") {
+      addKind = null;
+      addStage = "idle";
+      renderAddPanel();
+    }
+  });
+
+  signaling.on("wake_networks", (msg) => {
+    if (addStage !== "loading") return;
+    addNetworks = msg.networks;
+    addStage = "form";
+    renderAddPanel();
+  });
+
+  signaling.on("router_waker_added", (msg) => {
+    if (addStage !== "sending" || addKind !== "router") return;
+    addKind = null;
+    addStage = "idle";
+    routerPanel = { token: msg.token, name: routerNameForPanel, script: "mikrotik" };
+    renderAddPanel();
   });
 
   signaling.on("wake_sent", () => {
@@ -3307,6 +3544,17 @@ export function mount(root: Element | null): void {
   });
 
   signaling.on("error", (msg) => {
+    // D84/D85: an answer to `add_manual_device` / `add_router_waker` -- shown
+    // under the form only.
+    if (addStage === "sending") {
+      const label = addDeviceErrorLabel(msg.message);
+      if (label !== null) {
+        addStage = "form";
+        addError = label;
+        renderAddPanel();
+        return;
+      }
+    }
     // Slice W: the answer to a pending `wake_device` -- shown on the device
     // row only; session logic is untouched.
     if (applyWakeError(wakeState, msg.message)) {

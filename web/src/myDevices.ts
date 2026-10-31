@@ -20,7 +20,7 @@ export function deviceLabel(entry: DeviceEntry): string {
 /** Whether `entry` can be connected to right now without a PIN -- online and
  * not already busy with another client. */
 export function canConnect(entry: DeviceEntry): boolean {
-  return entry.online && !entry.busy;
+  return entry.kind === "host" && entry.online && !entry.busy;
 }
 
 /** Correctly declines a Russian noun after a count, choosing among the three
@@ -59,16 +59,23 @@ export function formatLastSeen(lastSeenAtSecs: number, nowSecs: number): string 
  * seconds (injected rather than read from `Date.now()` here so this stays a
  * pure function of its inputs, same reasoning as the rest of this module). */
 export function deviceStatusLabel(entry: DeviceEntry, nowSecs: number): string {
+  if (entry.kind === "manual") return "Без rcdesk · включается по сети";
+  if (entry.kind === "router") {
+    if (entry.online) return "Роутер-будильник · в сети";
+    return `Роутер-будильник · не в сети (последний опрос ${formatLastSeen(Number(entry.last_seen_at), nowSecs)})`;
+  }
   if (entry.online) return entry.busy ? "Занят" : "В сети";
   return `Не в сети (${formatLastSeen(Number(entry.last_seen_at), nowSecs)})`;
 }
 
 /** Sorts devices for display: connectable ones first (online and not busy),
- * then the rest that are online (busy), then offline -- alphabetically by
+ * then the rest that are online (busy), then offline, then manual devices, then routers -- alphabetically by
  * `deviceLabel` within each group, using the Russian locale so it declines
  * accented/Cyrillic letters correctly. Does not mutate `devices`. */
 export function sortDevices(devices: DeviceEntry[]): DeviceEntry[] {
   function rank(entry: DeviceEntry): number {
+    if (entry.kind === "manual") return 3;
+    if (entry.kind === "router") return 4;
     if (canConnect(entry)) return 0;
     if (entry.online) return 1;
     return 2;
