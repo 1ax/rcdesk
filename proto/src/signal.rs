@@ -81,6 +81,29 @@ pub struct WakeTarget {
     pub broadcast: String,
 }
 
+/// Вид устройства в списке владельца (D84/D85): `Host` — машина с rcdesk,
+/// `Manual` — устройство без rcdesk (NAS), которое будят по MAC соседним
+/// хостом, `Router` — роутер-будильник.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum DeviceKind {
+    #[default]
+    Host,
+    Manual,
+    Router,
+}
+
+/// Сеть, в которой у владельца есть хост-будильник (D84): `network` — адрес
+/// сети (`192.168.88.0`), `label` — имена хостов владельца в ней через `, `.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WakeNetwork {
+    pub network: String,
+    pub prefix: u8,
+    pub label: String,
+}
+
 /// Одно устройство в списке владельца (слайс 3.1). `name` — как его
 /// назвал сам хост (имя машины), `alias` — переименование владельцем,
 /// `online`/`busy` — сиюминутное состояние из реестра соединений.
@@ -98,6 +121,10 @@ pub struct DeviceEntry {
     /// старый сервер поля не шлёт.
     #[serde(default)]
     pub can_wake: bool,
+    /// D84: вид устройства. `#[serde(default)]`: старый сервер поля не шлёт
+    /// -> `Host`.
+    #[serde(default)]
+    pub kind: DeviceKind,
 }
 
 /// Снимок админского кабинета (A3).
@@ -503,6 +530,19 @@ pub enum SignalMessage {
     SendWake { targets: Vec<WakeTarget> },
     /// server -> client (слайс W): команда ушла `wakers` будильникам.
     WakeSent { device_id: String, wakers: u32 },
+    /// client -> server (D84): какие сети доступны для ручных устройств.
+    /// Ответ: `WakeNetworks`.
+    ListWakeNetworks,
+    /// server -> client (D84): сети, где у владельца есть хост-будильник.
+    WakeNetworks { networks: Vec<WakeNetwork> },
+    /// client -> server (D84): добавить «ручное» устройство (без rcdesk) по
+    /// MAC в одной из сетей `WakeNetworks`. Ответ: `Devices` или `Error`.
+    AddManualDevice {
+        name: String,
+        mac: String,
+        network: String,
+        prefix: u8,
+    },
     /// client -> server: переименовать своё устройство (`alias = None` —
     /// снять переименование). В ответ сервер шлёт обновлённый `Devices`.
     RenameDevice {
@@ -786,6 +826,7 @@ mod tests {
                 busy: false,
                 last_seen_at: 1234,
                 can_wake: true,
+                kind: DeviceKind::Host,
             }],
             lan_hub: true,
         };
@@ -1263,6 +1304,59 @@ mod tests {
             SignalMessage::HostRegister { ifaces, .. } => assert!(ifaces.is_empty()),
             other => panic!("expected HostRegister, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn manual_device_messages_round_trip_with_snake_case_tags() {
+        let list = SignalMessage::ListWakeNetworks;
+        let json = serde_json::to_string(&list).expect("serialize");
+        assert_eq!(json, r#"{"type":"list_wake_networks"}"#);
+        assert_eq!(
+            serde_json::from_str::<SignalMessage>(&json).expect("deserialize"),
+            list
+        );
+
+        let nets = SignalMessage::WakeNetworks {
+            networks: vec![WakeNetwork {
+                network: "192.168.88.0".to_string(),
+                prefix: 24,
+                label: "PC, Mac".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&nets).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"wake_networks","networks":[{"network":"192.168.88.0","prefix":24,"label":"PC, Mac"}]}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SignalMessage>(&json).expect("deserialize"),
+            nets
+        );
+
+        let add = SignalMessage::AddManualDevice {
+            name: "NAS".to_string(),
+            mac: "aa:bb:cc:dd:ee:01".to_string(),
+            network: "192.168.88.0".to_string(),
+            prefix: 24,
+        };
+        let json = serde_json::to_string(&add).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"add_manual_device","name":"NAS","mac":"aa:bb:cc:dd:ee:01","network":"192.168.88.0","prefix":24}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SignalMessage>(&json).expect("deserialize"),
+            add
+        );
+    }
+
+    #[test]
+    fn device_entry_without_kind_field_deserializes_to_host() {
+        let json = r#"{"device_id":"d","name":"n","alias":null,"online":false,"busy":false,"last_seen_at":1}"#;
+        let entry: DeviceEntry = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(entry.kind, DeviceKind::Host);
+        let manual = serde_json::to_string(&DeviceKind::Manual).expect("serialize");
+        assert_eq!(manual, r#""manual""#);
     }
 
     #[test]

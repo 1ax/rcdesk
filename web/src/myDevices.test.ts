@@ -21,6 +21,7 @@ function device(overrides: Partial<DeviceEntry> = {}): DeviceEntry {
     busy: false,
     last_seen_at: 1000n,
     can_wake: false,
+    kind: "host",
     ...overrides,
   };
 }

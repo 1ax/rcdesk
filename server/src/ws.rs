@@ -15,7 +15,9 @@ use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
-use proto::signal::{BrowserEntry, DeviceEntry, EmailCodePurpose, NetIface, Role, SignalMessage};
+use proto::signal::{
+    BrowserEntry, DeviceEntry, DeviceKind, EmailCodePurpose, NetIface, Role, SignalMessage,
+};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -33,7 +35,7 @@ use crate::owners;
 use crate::passkeys::{
     self, DiscoverableAuthentication, PasskeyError, PasskeyRegistration, SharedWebauthn,
 };
-use crate::registry::{Registry, Tx};
+use crate::registry::{random_token, Registry, Tx};
 use crate::wake;
 
 /// Максимальный размер входящего WebSocket-сообщения/кадра. Самый большой
@@ -613,8 +615,10 @@ fn device_entries_for_owner(
     owner_id: &str,
 ) -> anyhow::Result<Vec<DeviceEntry>> {
     let devices = db.devices_for_owner(owner_id)?;
-    let ifaces = owner_ifaces(db, &devices)?;
-    Ok(devices
+    let wake_rows = db.wake_devices_for_owner(owner_id)?;
+    let mut ifaces = owner_ifaces(db, &devices)?;
+    add_wake_device_ifaces(&mut ifaces, &wake_rows);
+    let mut entries: Vec<DeviceEntry> = devices
         .iter()
         .map(|device| {
             let presence = registry.host_presence(&device.device_id);
@@ -627,9 +631,61 @@ fn device_entries_for_owner(
                 last_seen_at: device.last_seen_at,
                 can_wake: presence.is_none()
                     && !wakers_for(registry, &devices, &ifaces, &device.device_id).is_empty(),
+                kind: DeviceKind::Host,
             }
         })
-        .collect())
+        .collect();
+    for row in &wake_rows {
+        let manual = row.kind == "manual";
+        entries.push(DeviceEntry {
+            device_id: row.wake_id.clone(),
+            name: row.name.clone(),
+            alias: None,
+            online: false,
+            busy: false,
+            last_seen_at: row.created_at,
+            can_wake: manual && !wakers_for(registry, &devices, &ifaces, &row.wake_id).is_empty(),
+            kind: if manual {
+                DeviceKind::Manual
+            } else {
+                DeviceKind::Router
+            },
+        });
+    }
+    Ok(entries)
+}
+
+/// D84: «ручные» устройства (kind manual) как цели будильника -- одна
+/// условная карта `{ mac, network, prefix }` под ключом `wake_id`.
+/// `select_wakers` берёт `ip & mask`, сетевой адрес подходит. Кандидатами-
+/// будильниками остаются только онлайн-хосты (`devices_for_owner`).
+fn add_wake_device_ifaces(
+    ifaces: &mut HashMap<String, Vec<NetIface>>,
+    rows: &[crate::db::WakeDeviceRow],
+) {
+    for row in rows {
+        if let (true, Some(mac)) = (row.kind == "manual", row.mac.as_ref()) {
+            ifaces.insert(
+                row.wake_id.clone(),
+                vec![NetIface {
+                    mac: mac.clone(),
+                    ipv4: row.network.clone(),
+                    prefix: row.prefix,
+                }],
+            );
+        }
+    }
+}
+
+/// D84: сети по сохранённым картам хостов владельца (имя для показа --
+/// alias, иначе name).
+fn owner_wake_networks(db: &Db, owner_id: &str) -> anyhow::Result<Vec<proto::signal::WakeNetwork>> {
+    let mut hosts = Vec::new();
+    for device in db.devices_for_owner(owner_id)? {
+        let shown = device.alias.clone().unwrap_or_else(|| device.name.clone());
+        hosts.push((shown, db.device_ifaces(&device.device_id)?));
+    }
+    Ok(wake::owner_networks(&hosts))
 }
 
 /// Слайс W: сохранённые карты всех устройств владельца.
@@ -1700,13 +1756,29 @@ async fn run_client(
                         continue;
                     }
                 };
-                if !devices.iter().any(|d| d.device_id == device_id) {
-                    send_error(&tx, "device not linked");
-                    continue;
-                }
-                if registry.host_presence(&device_id).is_some() {
-                    send_error(&tx, "device online");
-                    continue;
+                let wake_rows = match db.wake_devices_for_owner(&owner_id) {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        tracing::error!(?err, "failed to load wake devices");
+                        send_error(&tx, "internal error");
+                        continue;
+                    }
+                };
+                let wake_row = wake_rows.iter().find(|r| r.wake_id == device_id);
+                if let Some(row) = wake_row {
+                    if row.kind != "manual" {
+                        send_error(&tx, "device not wakeable");
+                        continue;
+                    }
+                } else {
+                    if !devices.iter().any(|d| d.device_id == device_id) {
+                        send_error(&tx, "device not linked");
+                        continue;
+                    }
+                    if registry.host_presence(&device_id).is_some() {
+                        send_error(&tx, "device online");
+                        continue;
+                    }
                 }
                 if !registry.wake_attempt_allowed(
                     &device_id,
@@ -1716,7 +1788,7 @@ async fn run_client(
                     send_error(&tx, "too many attempts");
                     continue;
                 }
-                let ifaces = match owner_ifaces(db, &devices) {
+                let mut ifaces = match owner_ifaces(db, &devices) {
                     Ok(ifaces) => ifaces,
                     Err(err) => {
                         tracing::error!(?err, "failed to load device interfaces");
@@ -1724,6 +1796,7 @@ async fn run_client(
                         continue;
                     }
                 };
+                add_wake_device_ifaces(&mut ifaces, &wake_rows);
                 let mut sent = 0u32;
                 for (waker_id, targets) in wakers_for(registry, &devices, &ifaces, &device_id) {
                     if let Some(waker_tx) = registry.host_tx(&waker_id) {
@@ -1742,10 +1815,133 @@ async fn run_client(
                     wakers: sent,
                 });
             }
+            SignalMessage::ListWakeNetworks => {
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                    continue;
+                };
+                match owner_wake_networks(db, &owner_id) {
+                    Ok(networks) => {
+                        let _ = tx.send(SignalMessage::WakeNetworks { networks });
+                    }
+                    Err(err) => {
+                        tracing::error!(?err, "failed to load wake networks");
+                        send_error(&tx, "internal error");
+                    }
+                }
+            }
+            SignalMessage::AddManualDevice {
+                name,
+                mac,
+                network,
+                prefix,
+            } => {
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                    continue;
+                };
+
+                let name = owners::truncate_chars(name.trim(), MAX_NAME_CHARS).to_string();
+                if name.is_empty() {
+                    send_error(&tx, "invalid name");
+                    continue;
+                }
+                let Some(mac) = wake::normalize_mac(&mac) else {
+                    send_error(&tx, "invalid mac");
+                    continue;
+                };
+                let networks = match owner_wake_networks(db, &owner_id) {
+                    Ok(networks) => networks,
+                    Err(err) => {
+                        tracing::error!(?err, "failed to load wake networks");
+                        send_error(&tx, "internal error");
+                        continue;
+                    }
+                };
+                if !networks
+                    .iter()
+                    .any(|n| n.network == network && n.prefix == prefix)
+                {
+                    send_error(&tx, "unknown network");
+                    continue;
+                }
+                let rows = match db.wake_devices_for_owner(&owner_id) {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        tracing::error!(?err, "failed to load wake devices");
+                        send_error(&tx, "internal error");
+                        continue;
+                    }
+                };
+                if rows
+                    .iter()
+                    .any(|r| r.kind == "manual" && r.mac.as_deref() == Some(mac.as_str()))
+                {
+                    send_error(&tx, "duplicate mac");
+                    continue;
+                }
+                if rows.len() >= wake::MAX_WAKE_DEVICES {
+                    send_error(&tx, "too many devices");
+                    continue;
+                }
+                if let Err(err) = db.insert_wake_device(
+                    &random_token(16),
+                    &owner_id,
+                    "manual",
+                    &name,
+                    Some(&mac),
+                    &network,
+                    prefix,
+                    ice::now_unix() as i64,
+                ) {
+                    tracing::error!(?err, "failed to insert manual device");
+                    send_error(&tx, "internal error");
+                    continue;
+                }
+                match device_entries_for_owner(db, registry, &owner_id) {
+                    Ok(devices) => {
+                        let _ = tx.send(SignalMessage::Devices { devices });
+                    }
+                    Err(err) => {
+                        tracing::error!(?err, "failed to load devices for owner");
+                        send_error(&tx, "internal error");
+                    }
+                }
+            }
             SignalMessage::RenameDevice { device_id, alias } => {
                 let Some(owner_id) = require_owner(db, &mut session, &tx) else {
                     continue;
                 };
+
+                match db.wake_devices_for_owner(&owner_id) {
+                    Ok(rows) if rows.iter().any(|r| r.wake_id == device_id) => {
+                        let name = alias
+                            .as_deref()
+                            .map(|a| owners::truncate_chars(a.trim(), MAX_NAME_CHARS))
+                            .filter(|a| !a.is_empty());
+                        if let Some(name) = name {
+                            if let Err(err) = db.rename_wake_device(&owner_id, &device_id, name) {
+                                tracing::error!(?err, "failed to rename wake device");
+                                send_error(&tx, "internal error");
+                                continue;
+                            }
+                        }
+                        match device_entries_for_owner(db, registry, &owner_id) {
+                            Ok(devices) => {
+                                let _ = tx.send(SignalMessage::Devices { devices });
+                            }
+                            Err(err) => {
+                                tracing::error!(?err, "failed to load devices for owner");
+                                send_error(&tx, "internal error");
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::error!(?err, "failed to load wake devices");
+                        send_error(&tx, "internal error");
+                        continue;
+                    }
+                }
 
                 let alias = alias
                     .as_deref()
@@ -1779,6 +1975,27 @@ async fn run_client(
                 let Some(owner_id) = require_owner(db, &mut session, &tx) else {
                     continue;
                 };
+
+                match db.delete_wake_device(&owner_id, &device_id) {
+                    Ok(true) => {
+                        match device_entries_for_owner(db, registry, &owner_id) {
+                            Ok(devices) => {
+                                let _ = tx.send(SignalMessage::Devices { devices });
+                            }
+                            Err(err) => {
+                                tracing::error!(?err, "failed to load devices for owner");
+                                send_error(&tx, "internal error");
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::error!(?err, "failed to delete wake device");
+                        send_error(&tx, "internal error");
+                        continue;
+                    }
+                }
 
                 match db.unlink_device(&owner_id, &device_id) {
                     Ok(true) => match device_entries_for_owner(db, registry, &owner_id) {

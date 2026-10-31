@@ -4,10 +4,13 @@
 
 use std::net::Ipv4Addr;
 
-use proto::signal::{NetIface, WakeTarget};
+use proto::signal::{NetIface, WakeNetwork, WakeTarget};
 
 /// Сколько карт принимаем от одного хоста.
 pub const MAX_IFACES: usize = 8;
+
+/// Сколько ручных устройств и роутеров (`wake_devices`) у одного владельца.
+pub const MAX_WAKE_DEVICES: usize = 32;
 
 /// Минимальный интервал между попытками включить одно устройство.
 pub const WAKE_COOLDOWN_SECS: u64 = 10;
@@ -127,6 +130,38 @@ pub fn select_wakers(
         }
     }
     result
+}
+
+/// D84: уникальные сети (адрес сети + префикс) по картам хостов владельца.
+/// `hosts` -- (имя для показа, карты). `label` -- имена хостов в сети без
+/// дублей через `, `; порядок сетей и имён -- по первому появлению.
+pub fn owner_networks(hosts: &[(String, Vec<NetIface>)]) -> Vec<WakeNetwork> {
+    let mut out: Vec<WakeNetwork> = Vec::new();
+    for (name, ifaces) in hosts {
+        for iface in ifaces {
+            let Some((net, prefix, _)) = network(iface) else {
+                continue;
+            };
+            let net = Ipv4Addr::from(net).to_string();
+            match out
+                .iter_mut()
+                .find(|n| n.network == net && n.prefix == prefix)
+            {
+                Some(existing) => {
+                    if !existing.label.split(", ").any(|l| l == name) {
+                        existing.label.push_str(", ");
+                        existing.label.push_str(name);
+                    }
+                }
+                None => out.push(WakeNetwork {
+                    network: net,
+                    prefix,
+                    label: name.clone(),
+                }),
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -271,5 +306,41 @@ mod tests {
         );
         assert_eq!(r[1].0, "w2");
         assert_eq!(r[1].1[0].mac, "aa:aa:aa:aa:aa:03");
+    }
+
+    #[test]
+    fn owner_networks_dedups_and_keeps_first_seen_order() {
+        let hosts = vec![
+            (
+                "PC".to_string(),
+                vec![
+                    iface("aa:aa:aa:aa:aa:01", "192.168.88.10", 24),
+                    iface("aa:aa:aa:aa:aa:02", "192.168.88.11", 24),
+                    iface("aa:aa:aa:aa:aa:03", "10.0.0.5", 8),
+                ],
+            ),
+            (
+                "Mac".to_string(),
+                vec![
+                    iface("bb:bb:bb:bb:bb:01", "10.1.2.3", 8),
+                    iface("bb:bb:bb:bb:bb:02", "192.168.88.20", 24),
+                    iface("bb:bb:bb:bb:bb:03", "192.168.88.20", 16),
+                ],
+            ),
+        ];
+        let nets = owner_networks(&hosts);
+        let got: Vec<(&str, u8, &str)> = nets
+            .iter()
+            .map(|n| (n.network.as_str(), n.prefix, n.label.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("192.168.88.0", 24, "PC, Mac"),
+                ("10.0.0.0", 8, "PC, Mac"),
+                ("192.168.0.0", 16, "Mac"),
+            ]
+        );
+        assert!(owner_networks(&[]).is_empty());
     }
 }

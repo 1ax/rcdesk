@@ -21,7 +21,7 @@ use rusqlite::{Connection, OptionalExtension};
 /// Schema version this binary expects (`PRAGMA user_version`). Bump this
 /// and extend `migrate` when the schema changes; `migrate` itself must stay
 /// idempotent (safe to run against an already-migrated database).
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Сколько секунд владелец без устройств и passkey может не появляться,
 /// прежде чем `prune_empty_owners` его удалит (долг D53).
@@ -62,6 +62,18 @@ pub struct OwnedDevice {
     pub alias: Option<String>,
     pub added_at: i64,
     pub last_seen_at: i64,
+}
+
+/// Строка `wake_devices` (D84/D85): ручное устройство или роутер-будильник.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WakeDeviceRow {
+    pub wake_id: String,
+    pub kind: String,
+    pub name: String,
+    pub mac: Option<String>,
+    pub network: String,
+    pub prefix: u8,
+    pub created_at: i64,
 }
 
 /// Сколько секунд хранится запись журнала сеансов (`prune_sessions`).
@@ -1004,6 +1016,78 @@ impl Db {
         Ok(changed > 0)
     }
 
+    /// D84: добавляет «ручное» устройство Wake-on-LAN (kind `manual`, без
+    /// токена). Роутеры (`router`) заводит D85.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_wake_device(
+        &self,
+        wake_id: &str,
+        owner_id: &str,
+        kind: &str,
+        name: &str,
+        mac: Option<&str>,
+        network: &str,
+        prefix: u8,
+        now: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "INSERT INTO wake_devices (wake_id, owner_id, kind, name, mac, network, prefix, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (wake_id, owner_id, kind, name, mac, network, prefix, now),
+        )?;
+        Ok(())
+    }
+
+    /// D84: ручные устройства и роутеры владельца, по `created_at`.
+    pub fn wake_devices_for_owner(&self, owner_id: &str) -> anyhow::Result<Vec<WakeDeviceRow>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT wake_id, kind, name, mac, network, prefix, created_at
+             FROM wake_devices WHERE owner_id = ?1
+             ORDER BY created_at, wake_id",
+        )?;
+        let rows = stmt
+            .query_map([owner_id], |row| {
+                Ok(WakeDeviceRow {
+                    wake_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    name: row.get(2)?,
+                    mac: row.get(3)?,
+                    network: row.get(4)?,
+                    prefix: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Returns `false` if the owner has no such wake device.
+    pub fn rename_wake_device(
+        &self,
+        owner_id: &str,
+        wake_id: &str,
+        name: &str,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE wake_devices SET name = ?1 WHERE owner_id = ?2 AND wake_id = ?3",
+            (name, owner_id, wake_id),
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Returns `false` if the owner has no such wake device.
+    pub fn delete_wake_device(&self, owner_id: &str, wake_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let changed = conn.execute(
+            "DELETE FROM wake_devices WHERE owner_id = ?1 AND wake_id = ?2",
+            (owner_id, wake_id),
+        )?;
+        Ok(changed > 0)
+    }
+
     /// D34: все владельцы, к которым привязано устройство.
     pub fn owners_of_device(&self, device_id: &str) -> anyhow::Result<Vec<String>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
@@ -1059,7 +1143,7 @@ fn configure(conn: &Connection) -> anyhow::Result<()> {
 }
 
 /// Полная схема v6.
-const SCHEMA_V6: &str = "CREATE TABLE IF NOT EXISTS devices (
+const SCHEMA_V7: &str = "CREATE TABLE IF NOT EXISTS devices (
             device_id    TEXT PRIMARY KEY,
             secret_hash  TEXT NOT NULL,
             name         TEXT NOT NULL,
@@ -1129,14 +1213,27 @@ const SCHEMA_V6: &str = "CREATE TABLE IF NOT EXISTS devices (
             ipv4      TEXT NOT NULL,
             prefix    INTEGER NOT NULL
          );
-         CREATE INDEX IF NOT EXISTS device_ifaces_device_id ON device_ifaces(device_id);";
+         CREATE INDEX IF NOT EXISTS device_ifaces_device_id ON device_ifaces(device_id);
+         CREATE TABLE IF NOT EXISTS wake_devices (
+            wake_id    TEXT PRIMARY KEY,
+            owner_id   TEXT NOT NULL REFERENCES owners(owner_id) ON DELETE CASCADE,
+            kind       TEXT NOT NULL CHECK (kind IN ('manual','router')),
+            name       TEXT NOT NULL,
+            mac        TEXT,
+            network    TEXT NOT NULL,
+            prefix     INTEGER NOT NULL,
+            token_hash TEXT UNIQUE,
+            created_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS wake_devices_owner_id ON wake_devices(owner_id);";
 
-/// Приводит базу к `SCHEMA_VERSION`: версия 0 — сразу полная схема v6,
+/// Приводит базу к `SCHEMA_VERSION`: версия 0 — сразу полная схема v7,
 /// версия 1 — цепочка v1 -> v2 (токен из `owners` переезжает в
 /// `owner_tokens`) -> v3 -> v4, версия 2 — v2 -> v3 (passkey) -> v4,
 /// версия 3 — v3 -> v4 (учётные записи «почта + пароль»), версия 4 —
 /// v4 -> v5 (журнал сеансов), версия 5 — v5 -> v6 (сетевые карты
-/// устройств для Wake-on-LAN). Идемпотентна: на актуальной базе — no-op.
+/// устройств для Wake-on-LAN), версия 6 — v6 -> v7 (ручные устройства и
+/// роутеры-будильники, `wake_devices`). Идемпотентна: на актуальной базе — no-op.
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version >= SCHEMA_VERSION {
@@ -1144,7 +1241,7 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
     }
 
     if version == 0 {
-        conn.execute_batch(SCHEMA_V6)?;
+        conn.execute_batch(SCHEMA_V7)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         return Ok(());
     }
@@ -1161,7 +1258,34 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
     if version <= 4 {
         migrate_v4_to_v5(conn)?;
     }
-    migrate_v5_to_v6(conn)
+    if version <= 5 {
+        migrate_v5_to_v6(conn)?;
+    }
+    migrate_v6_to_v7(conn)
+}
+
+/// v6 -> v7 (D84/D85): таблица `wake_devices` («ручные» устройства для
+/// Wake-on-LAN и роутеры-будильники), каскадно чистится вместе с владельцем.
+/// Одна транзакция.
+fn migrate_v6_to_v7(conn: &Connection) -> anyhow::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE wake_devices (
+            wake_id    TEXT PRIMARY KEY,
+            owner_id   TEXT NOT NULL REFERENCES owners(owner_id) ON DELETE CASCADE,
+            kind       TEXT NOT NULL CHECK (kind IN ('manual','router')),
+            name       TEXT NOT NULL,
+            mac        TEXT,
+            network    TEXT NOT NULL,
+            prefix     INTEGER NOT NULL,
+            token_hash TEXT UNIQUE,
+            created_at INTEGER NOT NULL
+         );
+         CREATE INDEX wake_devices_owner_id ON wake_devices(owner_id);",
+    )?;
+    tx.pragma_update(None, "user_version", 7)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// v5 -> v6 (слайс W): таблица `device_ifaces` (сетевые карты хоста для
@@ -1486,13 +1610,13 @@ mod tests {
     }
 
     #[test]
-    fn fresh_db_has_user_version_six() {
+    fn fresh_db_has_user_version_seven() {
         let db = Db::in_memory().expect("open in-memory db");
         let conn = db.conn.lock().expect("db mutex poisoned");
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read user_version");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 
     #[test]
@@ -1653,7 +1777,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let fk: i64 = conn
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .expect("fk");
@@ -1736,7 +1860,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -1796,7 +1920,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -1858,7 +1982,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -1900,7 +2024,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -1919,6 +2043,101 @@ mod tests {
                 .expect("delete device");
         }
         assert!(db.device_ifaces("dev1").expect("get").is_empty());
+    }
+
+    #[test]
+    fn migration_v6_to_v7_adds_wake_devices_and_cascades() {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.pragma_update(None, "foreign_keys", true).expect("fk");
+        conn.execute_batch(
+            "CREATE TABLE owners (
+                owner_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL);
+             INSERT INTO owners VALUES ('o1', 1);
+             PRAGMA user_version = 6;",
+        )
+        .expect("build v6 database");
+
+        migrate(&conn).expect("migrate v6 -> v7");
+        migrate(&conn).expect("re-run migration is a no-op");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 7);
+
+        let db = Db {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        db.insert_wake_device(
+            "w1",
+            "o1",
+            "manual",
+            "NAS",
+            Some("aa:bb:cc:dd:ee:01"),
+            "192.168.1.0",
+            24,
+            5,
+        )
+        .expect("insert");
+        assert_eq!(db.wake_devices_for_owner("o1").expect("list").len(), 1);
+        {
+            let conn = db.conn.lock().expect("db mutex poisoned");
+            conn.execute("DELETE FROM owners WHERE owner_id = 'o1'", [])
+                .expect("delete owner");
+        }
+        assert!(db.wake_devices_for_owner("o1").expect("list").is_empty());
+    }
+
+    #[test]
+    fn wake_devices_insert_list_rename_delete_are_owner_scoped() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("o1", 1).expect("owner");
+        db.insert_owner("o2", 1).expect("owner");
+        db.insert_wake_device(
+            "w2",
+            "o1",
+            "manual",
+            "B",
+            Some("aa:bb:cc:dd:ee:02"),
+            "10.0.0.0",
+            8,
+            20,
+        )
+        .expect("insert");
+        db.insert_wake_device(
+            "w1",
+            "o1",
+            "manual",
+            "A",
+            Some("aa:bb:cc:dd:ee:01"),
+            "192.168.1.0",
+            24,
+            10,
+        )
+        .expect("insert");
+        let rows = db.wake_devices_for_owner("o1").expect("list");
+        assert_eq!(
+            rows.iter().map(|r| r.wake_id.as_str()).collect::<Vec<_>>(),
+            vec!["w1", "w2"]
+        );
+        assert_eq!(rows[0].kind, "manual");
+        assert_eq!(rows[0].mac.as_deref(), Some("aa:bb:cc:dd:ee:01"));
+        assert_eq!(
+            (rows[0].network.as_str(), rows[0].prefix),
+            ("192.168.1.0", 24)
+        );
+        assert!(db.wake_devices_for_owner("o2").expect("list").is_empty());
+
+        assert!(!db.rename_wake_device("o2", "w1", "X").expect("rename"));
+        assert!(db.rename_wake_device("o1", "w1", "NAS").expect("rename"));
+        assert_eq!(
+            db.wake_devices_for_owner("o1").expect("list")[0].name,
+            "NAS"
+        );
+
+        assert!(!db.delete_wake_device("o2", "w1").expect("delete"));
+        assert!(db.delete_wake_device("o1", "w1").expect("delete"));
+        assert!(!db.delete_wake_device("o1", "w1").expect("delete"));
+        assert_eq!(db.wake_devices_for_owner("o1").expect("list").len(), 1);
     }
 
     #[test]

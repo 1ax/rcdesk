@@ -14,7 +14,7 @@ import {
 } from "./wake";
 
 function entry(over: Partial<DeviceEntry> = {}): DeviceEntry {
-  return { device_id: "d1", name: "PC", online: false, can_wake: true, ...over } as DeviceEntry;
+  return { device_id: "d1", name: "PC", online: false, can_wake: true, kind: "host", ...over } as DeviceEntry;
 }
 
 describe("formatElapsed", () => {

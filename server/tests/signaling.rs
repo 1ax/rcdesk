@@ -3966,3 +3966,183 @@ async fn wake_old_host_without_ifaces_is_no_waker_and_keeps_target_ifaces() {
     ));
     assert_eq!(db.device_ifaces(&target_id).expect("ifaces").len(), 1);
 }
+
+// ---------------------------------------------------------------------
+// D84: «ручные» устройства Wake-on-LAN
+// ---------------------------------------------------------------------
+
+async fn add_manual(ws: &mut WsStream, name: &str, mac: &str, network: &str, prefix: u8) {
+    send(
+        ws,
+        &SignalMessage::AddManualDevice {
+            name: name.to_string(),
+            mac: mac.to_string(),
+            network: network.to_string(),
+            prefix,
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn list_wake_networks_returns_network_with_host_name() {
+    let url = spawn_server().await;
+    let mut owner = wake_owner(&url).await;
+    let (_host, _, _) = wake_host(
+        &url,
+        &mut owner,
+        None,
+        vec![nic("aa:00:00:00:00:01", "192.168.88.10", 24)],
+    )
+    .await;
+    send(&mut owner, &SignalMessage::ListWakeNetworks).await;
+    match recv(&mut owner).await {
+        SignalMessage::WakeNetworks { networks } => assert_eq!(
+            networks,
+            vec![proto::signal::WakeNetwork {
+                network: "192.168.88.0".to_string(),
+                prefix: 24,
+                label: "Wake Host".to_string(),
+            }]
+        ),
+        other => panic!("expected wake_networks, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn manual_device_is_listed_wakeable_and_woken_by_host() {
+    let url = spawn_server().await;
+    let mut owner = wake_owner(&url).await;
+    let (mut waker, _, _) = wake_host(
+        &url,
+        &mut owner,
+        None,
+        vec![nic("aa:00:00:00:00:01", "192.168.88.10", 24)],
+    )
+    .await;
+    add_manual(
+        &mut owner,
+        "  NAS  ",
+        "AA-BB-CC-DD-EE-01",
+        "192.168.88.0",
+        24,
+    )
+    .await;
+    let devices = recv_devices(&mut owner).await;
+    let manual = devices
+        .iter()
+        .find(|d| d.kind == proto::signal::DeviceKind::Manual)
+        .expect("manual entry");
+    assert_eq!(manual.name, "NAS");
+    assert!(!manual.online);
+    assert!(manual.can_wake);
+    let manual_id = manual.device_id.clone();
+
+    send(
+        &mut owner,
+        &SignalMessage::WakeDevice {
+            device_id: manual_id.clone(),
+        },
+    )
+    .await;
+    match recv(&mut waker).await {
+        SignalMessage::SendWake { targets } => assert_eq!(
+            targets,
+            vec![proto::signal::WakeTarget {
+                mac: "aa:bb:cc:dd:ee:01".to_string(),
+                broadcast: "192.168.88.255".to_string(),
+            }]
+        ),
+        other => panic!("expected send_wake, got {other:?}"),
+    }
+    assert_eq!(
+        recv(&mut owner).await,
+        SignalMessage::WakeSent {
+            device_id: manual_id.clone(),
+            wakers: 1
+        }
+    );
+
+    // Переименование и забывание.
+    send(
+        &mut owner,
+        &SignalMessage::RenameDevice {
+            device_id: manual_id.clone(),
+            alias: Some("Backup NAS".to_string()),
+        },
+    )
+    .await;
+    let devices = recv_devices(&mut owner).await;
+    assert_eq!(entry(&devices, &manual_id).name, "Backup NAS");
+
+    send(
+        &mut owner,
+        &SignalMessage::ForgetDevice {
+            device_id: manual_id.clone(),
+        },
+    )
+    .await;
+    let devices = recv_devices(&mut owner).await;
+    assert!(devices.iter().all(|d| d.device_id != manual_id));
+}
+
+#[tokio::test]
+async fn add_manual_device_rejects_bad_input() {
+    let url = spawn_server().await;
+    let mut owner = wake_owner(&url).await;
+    let (_host, _, _) = wake_host(
+        &url,
+        &mut owner,
+        None,
+        vec![nic("aa:00:00:00:00:01", "192.168.88.10", 24)],
+    )
+    .await;
+    add_manual(&mut owner, "   ", "aa:bb:cc:dd:ee:01", "192.168.88.0", 24).await;
+    expect_error(&mut owner, "invalid name").await;
+    add_manual(&mut owner, "NAS", "not-a-mac", "192.168.88.0", 24).await;
+    expect_error(&mut owner, "invalid mac").await;
+    add_manual(&mut owner, "NAS", "aa:bb:cc:dd:ee:01", "10.0.0.0", 24).await;
+    expect_error(&mut owner, "unknown network").await;
+    add_manual(&mut owner, "NAS", "aa:bb:cc:dd:ee:01", "192.168.88.0", 16).await;
+    expect_error(&mut owner, "unknown network").await;
+
+    add_manual(&mut owner, "NAS", "aa:bb:cc:dd:ee:01", "192.168.88.0", 24).await;
+    let _ = recv_devices(&mut owner).await;
+    add_manual(&mut owner, "NAS 2", "AA:BB:CC:DD:EE:01", "192.168.88.0", 24).await;
+    expect_error(&mut owner, "duplicate mac").await;
+}
+
+#[tokio::test]
+async fn manual_device_without_online_waker_gives_no_waker_error() {
+    let url = spawn_server().await;
+    let mut owner = wake_owner(&url).await;
+    let (host, host_id, _) = wake_host(
+        &url,
+        &mut owner,
+        None,
+        vec![nic("aa:00:00:00:00:01", "192.168.88.10", 24)],
+    )
+    .await;
+    add_manual(&mut owner, "NAS", "aa:bb:cc:dd:ee:01", "192.168.88.0", 24).await;
+    let devices = recv_devices(&mut owner).await;
+    let manual_id = devices
+        .iter()
+        .find(|d| d.kind == proto::signal::DeviceKind::Manual)
+        .expect("manual")
+        .device_id
+        .clone();
+    drop(host);
+    let devices = wait_devices(&mut owner, |d| {
+        d.iter().any(|e| e.device_id == host_id && !e.online)
+    })
+    .await;
+    assert!(!entry(&devices, &manual_id).can_wake);
+    send(
+        &mut owner,
+        &SignalMessage::WakeDevice {
+            device_id: manual_id,
+        },
+    )
+    .await;
+    expect_error(&mut owner, "no waker online").await;
+}
