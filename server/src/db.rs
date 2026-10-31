@@ -917,6 +917,7 @@ impl Db {
              WHERE NOT EXISTS (SELECT 1 FROM ownership WHERE ownership.owner_id = owners.owner_id)
                AND NOT EXISTS (SELECT 1 FROM passkeys WHERE passkeys.owner_id = owners.owner_id)
                AND NOT EXISTS (SELECT 1 FROM accounts WHERE accounts.owner_id = owners.owner_id)
+               AND NOT EXISTS (SELECT 1 FROM wake_devices WHERE wake_devices.owner_id = owners.owner_id)
                AND COALESCE(
                        (SELECT MAX(last_used_at) FROM owner_tokens
                         WHERE owner_tokens.owner_id = owners.owner_id),
@@ -1037,6 +1038,54 @@ impl Db {
             (wake_id, owner_id, kind, name, mac, network, prefix, now),
         )?;
         Ok(())
+    }
+
+    /// D85: добавляет роутер-будильник (kind `router`, mac NULL) с хешем токена.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_router_waker(
+        &self,
+        wake_id: &str,
+        owner_id: &str,
+        name: &str,
+        network: &str,
+        prefix: u8,
+        token_hash: &str,
+        now: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "INSERT INTO wake_devices (wake_id, owner_id, kind, name, mac, network, prefix, token_hash, created_at)
+             VALUES (?1, ?2, 'router', ?3, NULL, ?4, ?5, ?6, ?7)",
+            (wake_id, owner_id, name, network, prefix, token_hash, now),
+        )?;
+        Ok(())
+    }
+
+    /// D85: роутер по хешу токена и id его владельца (только kind `router`).
+    pub fn wake_device_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> anyhow::Result<Option<(WakeDeviceRow, String)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT wake_id, kind, name, mac, network, prefix, created_at, owner_id
+             FROM wake_devices WHERE token_hash = ?1 AND kind = 'router'",
+        )?;
+        let mut rows = stmt.query_map([token_hash], |row| {
+            Ok((
+                WakeDeviceRow {
+                    wake_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    name: row.get(2)?,
+                    mac: row.get(3)?,
+                    network: row.get(4)?,
+                    prefix: row.get(5)?,
+                    created_at: row.get(6)?,
+                },
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        Ok(rows.next().transpose()?)
     }
 
     /// D84: ручные устройства и роутеры владельца, по `created_at`.
@@ -2085,6 +2134,48 @@ mod tests {
                 .expect("delete owner");
         }
         assert!(db.wake_devices_for_owner("o1").expect("list").is_empty());
+    }
+
+    #[test]
+    fn router_waker_is_found_by_token_hash_only_for_routers() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("o1", 1).expect("owner");
+        db.insert_router_waker("r1", "o1", "MikroTik", "192.168.88.0", 24, "h1", 5)
+            .expect("insert router");
+        db.insert_wake_device(
+            "m1",
+            "o1",
+            "manual",
+            "NAS",
+            Some("aa:bb:cc:dd:ee:01"),
+            "192.168.88.0",
+            24,
+            6,
+        )
+        .expect("insert manual");
+        let (row, owner) = db
+            .wake_device_by_token_hash("h1")
+            .expect("query")
+            .expect("found");
+        assert_eq!(owner, "o1");
+        assert_eq!(row.wake_id, "r1");
+        assert_eq!(row.kind, "router");
+        assert_eq!(row.mac, None);
+        assert!(db
+            .wake_device_by_token_hash("nope")
+            .expect("query")
+            .is_none());
+    }
+
+    #[test]
+    fn prune_empty_owners_keeps_owner_with_wake_devices() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("o1", 1).expect("owner");
+        db.insert_owner("o2", 1).expect("owner");
+        db.insert_router_waker("r1", "o1", "MikroTik", "192.168.88.0", 24, "h1", 5)
+            .expect("insert router");
+        assert_eq!(db.prune_empty_owners(10_000, 1_000).expect("prune"), 1);
+        assert_eq!(db.wake_devices_for_owner("o1").expect("list").len(), 1);
     }
 
     #[test]

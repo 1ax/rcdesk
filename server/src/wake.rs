@@ -238,6 +238,17 @@ mod tests {
     }
 
     #[test]
+    fn router_candidate_with_empty_mac_matches_by_network_only() {
+        let router = vec![("r".to_string(), vec![iface("", "192.168.88.0", 24)])];
+        let r = select_wakers(&[iface(MAC, "192.168.88.77", 24)], &router);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0, "r");
+        assert_eq!(r[0].1[0].mac, MAC);
+        assert!(select_wakers(&[iface(MAC, "192.168.89.77", 24)], &router).is_empty());
+        assert!(select_wakers(&[iface(MAC, "192.168.88.77", 16)], &router).is_empty());
+    }
+
+    #[test]
     fn broadcast_for_24_and_22() {
         let c = vec![(
             "w".to_string(),

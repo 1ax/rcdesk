@@ -89,7 +89,7 @@ pub fn authenticate(
 /// computationally infeasible to reverse; a salt or a slow KDF (bcrypt/
 /// argon2, meant to blunt guessing of a *low*-entropy human password) would
 /// add cost without adding real protection here.
-fn random_secret() -> String {
+pub(crate) fn random_secret() -> String {
     random_token(SECRET_LEN)
 }
 

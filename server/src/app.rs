@@ -39,6 +39,9 @@ pub const EMAIL_CODE_REFILL: Duration = Duration::from_secs(600);
 /// (слайс 3.8a).
 pub const LOGIN_BURST: u32 = 10;
 pub const LOGIN_REFILL: Duration = Duration::from_secs(60);
+/// Опросов `/wake/poll` с одного IP в burst (D85): роутер ходит раз в ~10 с.
+pub const ROUTER_POLL_BURST: u32 = 30;
+pub const ROUTER_POLL_REFILL: Duration = Duration::from_secs(2);
 
 /// Серверный keepalive (B3): Ping раз в `ping_interval`, закрытие соединения,
 /// если `read_timeout` не пришло ни одного кадра (текст, Ping, Pong — любой).
@@ -90,6 +93,8 @@ pub struct AppState {
     pub email_code_limiter: IpLimiter,
     /// Per-IP limit on wrong passwords / email codes; spent by failures.
     pub login_limiter: IpLimiter,
+    /// Per-IP limit on `/wake/poll` requests of router wakers (D85).
+    pub router_poll_limiter: IpLimiter,
     /// Режим «LAN-хаб» (D47): аккаунтов, passkey и почты нет; клиент узнаёт
     /// об этом из `Authenticated.lan_hub` и прячет их UI.
     pub lan_hub: bool,
@@ -234,6 +239,7 @@ fn build_app(
     Router::new()
         .route("/healthz", get(healthz))
         .route("/ws", get(ws_handler))
+        .route("/wake/poll", get(crate::router_waker::wake_poll))
         .with_state(AppState {
             registry,
             ice,
@@ -248,6 +254,7 @@ fn build_app(
             email_codes: EmailCodes::new(),
             email_code_limiter: IpLimiter::new(EMAIL_CODE_BURST, EMAIL_CODE_REFILL),
             login_limiter: IpLimiter::new(LOGIN_BURST, LOGIN_REFILL),
+            router_poll_limiter: IpLimiter::new(ROUTER_POLL_BURST, ROUTER_POLL_REFILL),
             lan_hub,
             admin_emails: Arc::new(admin_emails),
         })

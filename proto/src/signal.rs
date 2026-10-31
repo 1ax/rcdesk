@@ -543,6 +543,16 @@ pub enum SignalMessage {
         network: String,
         prefix: u8,
     },
+    /// client -> server (D85): добавить роутер-будильник в одной из сетей
+    /// `WakeNetworks`. Ответ: `RouterWakerAdded`, затем `Devices`, или `Error`.
+    AddRouterWaker {
+        name: String,
+        network: String,
+        prefix: u8,
+    },
+    /// server -> client (D85): роутер добавлен; `token` показывается ОДИН раз
+    /// (на сервере хранится только хеш).
+    RouterWakerAdded { device_id: String, token: String },
     /// client -> server: переименовать своё устройство (`alias = None` —
     /// снять переименование). В ответ сервер шлёт обновлённый `Devices`.
     RenameDevice {
@@ -1347,6 +1357,38 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<SignalMessage>(&json).expect("deserialize"),
             add
+        );
+    }
+
+    #[test]
+    fn router_waker_messages_round_trip_with_snake_case_tags() {
+        let add = SignalMessage::AddRouterWaker {
+            name: "MikroTik".to_string(),
+            network: "192.168.88.0".to_string(),
+            prefix: 24,
+        };
+        let json = serde_json::to_string(&add).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"add_router_waker","name":"MikroTik","network":"192.168.88.0","prefix":24}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SignalMessage>(&json).expect("deserialize"),
+            add
+        );
+
+        let added = SignalMessage::RouterWakerAdded {
+            device_id: "w1".to_string(),
+            token: "secret".to_string(),
+        };
+        let json = serde_json::to_string(&added).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"router_waker_added","device_id":"w1","token":"secret"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SignalMessage>(&json).expect("deserialize"),
+            added
         );
     }
 

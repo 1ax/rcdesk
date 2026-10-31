@@ -618,6 +618,7 @@ fn device_entries_for_owner(
     let wake_rows = db.wake_devices_for_owner(owner_id)?;
     let mut ifaces = owner_ifaces(db, &devices)?;
     add_wake_device_ifaces(&mut ifaces, &wake_rows);
+    let now = Instant::now();
     let mut entries: Vec<DeviceEntry> = devices
         .iter()
         .map(|device| {
@@ -630,21 +631,32 @@ fn device_entries_for_owner(
                 busy: presence == Some(true),
                 last_seen_at: device.last_seen_at,
                 can_wake: presence.is_none()
-                    && !wakers_for(registry, &devices, &ifaces, &device.device_id).is_empty(),
+                    && (!wakers_for(registry, &devices, &ifaces, &device.device_id).is_empty()
+                        || !routers_for(registry, &wake_rows, &ifaces, &device.device_id, now)
+                            .is_empty()),
                 kind: DeviceKind::Host,
             }
         })
         .collect();
     for row in &wake_rows {
         let manual = row.kind == "manual";
+        let can_wake = manual
+            && (!wakers_for(registry, &devices, &ifaces, &row.wake_id).is_empty()
+                || !routers_for(registry, &wake_rows, &ifaces, &row.wake_id, now).is_empty());
         entries.push(DeviceEntry {
             device_id: row.wake_id.clone(),
             name: row.name.clone(),
             alias: None,
-            online: false,
+            online: !manual && registry.router_online(&row.wake_id, now),
             busy: false,
-            last_seen_at: row.created_at,
-            can_wake: manual && !wakers_for(registry, &devices, &ifaces, &row.wake_id).is_empty(),
+            last_seen_at: if manual {
+                row.created_at
+            } else {
+                registry
+                    .router_last_poll_unix(&row.wake_id)
+                    .unwrap_or(row.created_at)
+            },
+            can_wake,
             kind: if manual {
                 DeviceKind::Manual
             } else {
@@ -728,6 +740,41 @@ fn wakers_for(
     wake::select_wakers(target_ifaces, &candidates)
 }
 
+/// D85: онлайн-роутеры владельца, чья сеть совпадает с сетью карт цели.
+/// Роутер подаётся кандидатом `select_wakers` с одной картой
+/// `{mac: "", ipv4: network, prefix}`: `select_wakers` читает у кандидата только
+/// адрес и префикс (mac кандидата не используется), а сетевой адрес сам
+/// является валидным `ip & mask`. Возвращает (wake_id роутера, MAC целей).
+fn routers_for(
+    registry: &Registry,
+    wake_rows: &[crate::db::WakeDeviceRow],
+    ifaces: &HashMap<String, Vec<NetIface>>,
+    target_id: &str,
+    now: Instant,
+) -> Vec<(String, Vec<String>)> {
+    let Some(target_ifaces) = ifaces.get(target_id).filter(|i| !i.is_empty()) else {
+        return Vec::new();
+    };
+    let candidates: Vec<(String, Vec<NetIface>)> = wake_rows
+        .iter()
+        .filter(|r| r.kind == "router" && registry.router_online(&r.wake_id, now))
+        .map(|r| {
+            (
+                r.wake_id.clone(),
+                vec![NetIface {
+                    mac: String::new(),
+                    ipv4: r.network.clone(),
+                    prefix: r.prefix,
+                }],
+            )
+        })
+        .collect();
+    wake::select_wakers(target_ifaces, &candidates)
+        .into_iter()
+        .map(|(id, targets)| (id, targets.into_iter().map(|t| t.mac).collect()))
+        .collect()
+}
+
 /// D34: присутствие или занятость устройства сменились -- каждому владельцу
 /// устройства, у которого есть открытые клиентские соединения, шлём свежий
 /// `Devices` (список собирается один раз на владельца). Ошибки БД только
@@ -741,20 +788,26 @@ fn notify_device_owners(db: &Db, registry: &Registry, device_id: &str) {
         }
     };
     for owner_id in owners {
-        let watchers = registry.owner_watchers(&owner_id);
-        if watchers.is_empty() {
-            continue;
-        }
-        match device_entries_for_owner(db, registry, &owner_id) {
-            Ok(devices) => {
-                for watcher in watchers {
-                    let _ = watcher.send(SignalMessage::Devices {
-                        devices: devices.clone(),
-                    });
-                }
+        notify_owner(db, registry, &owner_id);
+    }
+}
+
+/// Шлёт свежий `Devices` всем открытым клиентским соединениям владельца
+/// (список собирается один раз). Ошибки БД только логируются.
+pub(crate) fn notify_owner(db: &Db, registry: &Registry, owner_id: &str) {
+    let watchers = registry.owner_watchers(owner_id);
+    if watchers.is_empty() {
+        return;
+    }
+    match device_entries_for_owner(db, registry, owner_id) {
+        Ok(devices) => {
+            for watcher in watchers {
+                let _ = watcher.send(SignalMessage::Devices {
+                    devices: devices.clone(),
+                });
             }
-            Err(err) => tracing::warn!(?err, "failed to build devices for presence push"),
         }
+        Err(err) => tracing::warn!(?err, "failed to build devices for presence push"),
     }
 }
 
@@ -1805,6 +1858,12 @@ async fn run_client(
                         }
                     }
                 }
+                let now = Instant::now();
+                for (router_id, macs) in routers_for(registry, &wake_rows, &ifaces, &device_id, now)
+                {
+                    registry.enqueue_router_wake(&router_id, &macs, now);
+                    sent += 1;
+                }
                 if sent == 0 {
                     send_error(&tx, "no waker online");
                     continue;
@@ -1906,6 +1965,73 @@ async fn run_client(
                     }
                 }
             }
+            SignalMessage::AddRouterWaker {
+                name,
+                network,
+                prefix,
+            } => {
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                    continue;
+                };
+
+                let name = owners::truncate_chars(name.trim(), MAX_NAME_CHARS).to_string();
+                if name.is_empty() {
+                    send_error(&tx, "invalid name");
+                    continue;
+                }
+                let networks = match owner_wake_networks(db, &owner_id) {
+                    Ok(networks) => networks,
+                    Err(err) => {
+                        tracing::error!(?err, "failed to load wake networks");
+                        send_error(&tx, "internal error");
+                        continue;
+                    }
+                };
+                if !networks
+                    .iter()
+                    .any(|n| n.network == network && n.prefix == prefix)
+                {
+                    send_error(&tx, "unknown network");
+                    continue;
+                }
+                let count = match db.wake_devices_for_owner(&owner_id) {
+                    Ok(rows) => rows.len(),
+                    Err(err) => {
+                        tracing::error!(?err, "failed to load wake devices");
+                        send_error(&tx, "internal error");
+                        continue;
+                    }
+                };
+                if count >= wake::MAX_WAKE_DEVICES {
+                    send_error(&tx, "too many devices");
+                    continue;
+                }
+                let device_id = random_token(16);
+                let token = crate::devices::random_secret();
+                if let Err(err) = db.insert_router_waker(
+                    &device_id,
+                    &owner_id,
+                    &name,
+                    &network,
+                    prefix,
+                    &crate::devices::hash_secret(&token),
+                    ice::now_unix() as i64,
+                ) {
+                    tracing::error!(?err, "failed to insert router waker");
+                    send_error(&tx, "internal error");
+                    continue;
+                }
+                let _ = tx.send(SignalMessage::RouterWakerAdded { device_id, token });
+                match device_entries_for_owner(db, registry, &owner_id) {
+                    Ok(devices) => {
+                        let _ = tx.send(SignalMessage::Devices { devices });
+                    }
+                    Err(err) => {
+                        tracing::error!(?err, "failed to load devices for owner");
+                        send_error(&tx, "internal error");
+                    }
+                }
+            }
             SignalMessage::RenameDevice { device_id, alias } => {
                 let Some(owner_id) = require_owner(db, &mut session, &tx) else {
                     continue;
@@ -1978,6 +2104,7 @@ async fn run_client(
 
                 match db.delete_wake_device(&owner_id, &device_id) {
                     Ok(true) => {
+                        registry.forget_router(&device_id);
                         match device_entries_for_owner(db, registry, &owner_id) {
                             Ok(devices) => {
                                 let _ = tx.send(SignalMessage::Devices { devices });

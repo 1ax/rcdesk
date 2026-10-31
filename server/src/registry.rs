@@ -173,7 +173,16 @@ struct Inner {
     /// Слайс W: когда в последний раз пытались включить устройство
     /// (ограничение частоты `WakeDevice`).
     wake_attempts: HashMap<String, Instant>,
+    /// D85: последний опрос роутера-будильника (монотонное и unix-время).
+    router_polls: HashMap<String, (Instant, i64)>,
+    /// D85: MAC, ожидающие выдачи роутеру при следующем опросе.
+    router_queue: HashMap<String, Vec<(String, Instant)>>,
 }
+
+/// D85: роутер онлайн, если опрашивал не дольше этого назад.
+pub const ROUTER_ONLINE_SECS: u64 = 30;
+/// D85: сколько живёт MAC в очереди роутера.
+pub const ROUTER_QUEUE_TTL_SECS: u64 = 60;
 
 #[derive(Clone, Default)]
 pub struct Registry {
@@ -542,6 +551,76 @@ impl Registry {
         true
     }
 
+    /// D85: запоминает опрос роутера. `true`, если до этого он был не онлайн
+    /// (впервые или прошлый опрос старше `ROUTER_ONLINE_SECS`).
+    pub fn router_polled(&self, wake_id: &str, now: Instant) -> bool {
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut inner = self.inner.lock().expect("registry mutex poisoned");
+        let was_online = inner
+            .router_polls
+            .get(wake_id)
+            .is_some_and(|(at, _)| Self::fresh(*at, now));
+        inner.router_polls.insert(wake_id.to_string(), (now, unix));
+        !was_online
+    }
+
+    fn fresh(polled_at: Instant, now: Instant) -> bool {
+        now.saturating_duration_since(polled_at) < Duration::from_secs(ROUTER_ONLINE_SECS)
+    }
+
+    /// D85: опрос роутера не старше `ROUTER_ONLINE_SECS`.
+    pub fn router_online(&self, wake_id: &str, now: Instant) -> bool {
+        let inner = self.inner.lock().expect("registry mutex poisoned");
+        inner
+            .router_polls
+            .get(wake_id)
+            .is_some_and(|(at, _)| Self::fresh(*at, now))
+    }
+
+    /// D85: unix-время последнего опроса роутера (для `last_seen_at`).
+    pub fn router_last_poll_unix(&self, wake_id: &str) -> Option<i64> {
+        let inner = self.inner.lock().expect("registry mutex poisoned");
+        inner.router_polls.get(wake_id).map(|(_, unix)| *unix)
+    }
+
+    /// D85: ставит MAC в очередь роутера (без дублей среди живых записей).
+    pub fn enqueue_router_wake(&self, wake_id: &str, macs: &[String], now: Instant) {
+        let ttl = Duration::from_secs(ROUTER_QUEUE_TTL_SECS);
+        let mut inner = self.inner.lock().expect("registry mutex poisoned");
+        let queue = inner.router_queue.entry(wake_id.to_string()).or_default();
+        queue.retain(|(_, at)| now.saturating_duration_since(*at) < ttl);
+        for mac in macs {
+            if !queue.iter().any(|(m, _)| m == mac) {
+                queue.push((mac.clone(), now));
+            }
+        }
+    }
+
+    /// D85: отдаёт и чистит очередь роутера; записи старше
+    /// `ROUTER_QUEUE_TTL_SECS` отбрасываются.
+    pub fn drain_router_wakes(&self, wake_id: &str, now: Instant) -> Vec<String> {
+        let ttl = Duration::from_secs(ROUTER_QUEUE_TTL_SECS);
+        let mut inner = self.inner.lock().expect("registry mutex poisoned");
+        inner
+            .router_queue
+            .remove(wake_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, at)| now.saturating_duration_since(*at) < ttl)
+            .map(|(mac, _)| mac)
+            .collect()
+    }
+
+    /// D85: забывает опрос и очередь удалённого роутера.
+    pub fn forget_router(&self, wake_id: &str) {
+        let mut inner = self.inner.lock().expect("registry mutex poisoned");
+        inner.router_polls.remove(wake_id);
+        inner.router_queue.remove(wake_id);
+    }
+
     /// Looks up the client tx for a session, validating that `host_id` is
     /// currently the host of `session_id`. The extra `s.host_id == host_id`
     /// filter (slice 3.2a/D35) matters once `register_host` can leave a
@@ -743,6 +822,55 @@ mod tests {
         assert!(!registry.wake_attempt_allowed("d1", t0 + Duration::from_secs(9), cd));
         assert!(registry.wake_attempt_allowed("d2", t0 + Duration::from_secs(9), cd));
         assert!(registry.wake_attempt_allowed("d1", t0 + Duration::from_secs(10), cd));
+    }
+
+    #[test]
+    fn router_online_threshold_and_first_poll_flag() {
+        let registry = Registry::new();
+        let t0 = Instant::now();
+        assert!(!registry.router_online("r", t0));
+        assert!(registry.router_last_poll_unix("r").is_none());
+        assert!(registry.router_polled("r", t0), "first poll is a change");
+        assert!(registry.router_last_poll_unix("r").is_some());
+        assert!(registry.router_online("r", t0 + Duration::from_secs(29)));
+        assert!(!registry.router_online("r", t0 + Duration::from_secs(30)));
+        assert!(!registry.router_polled("r", t0 + Duration::from_secs(10)));
+        assert!(!registry.router_polled("r", t0 + Duration::from_secs(25)));
+        assert!(
+            registry.router_polled("r", t0 + Duration::from_secs(60)),
+            "stale poll means it was offline"
+        );
+    }
+
+    #[test]
+    fn router_queue_dedups_expires_drains_and_forgets() {
+        let registry = Registry::new();
+        let t0 = Instant::now();
+        let m1 = "aa:bb:cc:dd:ee:01".to_string();
+        let m2 = "aa:bb:cc:dd:ee:02".to_string();
+        registry.enqueue_router_wake("r", &[m1.clone(), m1.clone()], t0);
+        registry.enqueue_router_wake("r", &[m1.clone(), m2.clone()], t0 + Duration::from_secs(1));
+        assert_eq!(
+            registry.drain_router_wakes("r", t0 + Duration::from_secs(2)),
+            vec![m1.clone(), m2.clone()]
+        );
+        assert!(registry
+            .drain_router_wakes("r", t0 + Duration::from_secs(3))
+            .is_empty());
+
+        registry.enqueue_router_wake("r", std::slice::from_ref(&m1), t0);
+        registry.enqueue_router_wake("r", std::slice::from_ref(&m2), t0 + Duration::from_secs(50));
+        assert_eq!(
+            registry.drain_router_wakes("r", t0 + Duration::from_secs(61)),
+            vec![m2.clone()],
+            "entry older than TTL is dropped"
+        );
+
+        registry.enqueue_router_wake("r", &[m1], t0);
+        registry.router_polled("r", t0);
+        registry.forget_router("r");
+        assert!(registry.drain_router_wakes("r", t0).is_empty());
+        assert!(!registry.router_online("r", t0));
     }
 
     #[test]

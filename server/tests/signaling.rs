@@ -4146,3 +4146,208 @@ async fn manual_device_without_online_waker_gives_no_waker_error() {
     .await;
     expect_error(&mut owner, "no waker online").await;
 }
+
+// ---------------------------------------------------------------------
+// D85: роутер-будильник (GET /wake/poll)
+// ---------------------------------------------------------------------
+
+/// Простой HTTP/1.1 GET по сырому TCP (отдельного HTTP-клиента в
+/// dev-зависимостях нет). Возвращает (статус, заголовки, тело).
+async fn http_get(ws_url: &str, path: &str, bearer: Option<&str>) -> (u16, String, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = ws_url
+        .strip_prefix("ws://")
+        .and_then(|rest| rest.split('/').next())
+        .expect("ws url");
+    let mut stream = TcpStream::connect(addr).await.expect("tcp connect");
+    let auth = bearer
+        .map(|t| format!("Authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Connection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    let mut raw = String::new();
+    timeout(RECV_TIMEOUT, stream.read_to_string(&mut raw))
+        .await
+        .expect("read timed out")
+        .expect("read response");
+    let (head, body) = raw.split_once("\r\n\r\n").expect("http response");
+    let status = head
+        .split(' ')
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .expect("status");
+    (status, head.to_ascii_lowercase(), body.to_string())
+}
+
+async fn add_router(ws: &mut WsStream, name: &str, network: &str, prefix: u8) -> (String, String) {
+    send(
+        ws,
+        &SignalMessage::AddRouterWaker {
+            name: name.to_string(),
+            network: network.to_string(),
+            prefix,
+        },
+    )
+    .await;
+    match recv(ws).await {
+        SignalMessage::RouterWakerAdded { device_id, token } => (device_id, token),
+        other => panic!("expected router_waker_added, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn add_router_waker_rejects_bad_input_and_lists_offline_router() {
+    let url = spawn_server().await;
+    let mut owner = wake_owner(&url).await;
+    let (_host, _, _) = wake_host(
+        &url,
+        &mut owner,
+        None,
+        vec![nic("aa:00:00:00:00:01", "192.168.88.10", 24)],
+    )
+    .await;
+    send(
+        &mut owner,
+        &SignalMessage::AddRouterWaker {
+            name: "  ".to_string(),
+            network: "192.168.88.0".to_string(),
+            prefix: 24,
+        },
+    )
+    .await;
+    expect_error(&mut owner, "invalid name").await;
+    send(
+        &mut owner,
+        &SignalMessage::AddRouterWaker {
+            name: "R".to_string(),
+            network: "10.0.0.0".to_string(),
+            prefix: 24,
+        },
+    )
+    .await;
+    expect_error(&mut owner, "unknown network").await;
+
+    let (router_id, token) = add_router(&mut owner, "MikroTik", "192.168.88.0", 24).await;
+    assert!(!token.is_empty());
+    let devices = recv_devices(&mut owner).await;
+    let router = entry(&devices, &router_id);
+    assert_eq!(router.kind, proto::signal::DeviceKind::Router);
+    assert_eq!(router.name, "MikroTik");
+    assert!(!router.online && !router.can_wake);
+
+    send(
+        &mut owner,
+        &SignalMessage::WakeDevice {
+            device_id: router_id,
+        },
+    )
+    .await;
+    expect_error(&mut owner, "device not wakeable").await;
+}
+
+#[tokio::test]
+async fn wake_poll_rejects_missing_and_foreign_tokens() {
+    let url = spawn_server().await;
+    let (status, _, body) = http_get(&url, "/wake/poll", None).await;
+    assert_eq!((status, body.as_str()), (401, ""));
+    let (status, _, body) = http_get(&url, "/wake/poll", Some("nope")).await;
+    assert_eq!((status, body.as_str()), (401, ""));
+}
+
+#[tokio::test]
+async fn router_poll_delivers_macs_of_manual_and_host_targets_once() {
+    let url = spawn_server().await;
+    let mut owner = wake_owner(&url).await;
+    let (host, host_id, _) = wake_host(
+        &url,
+        &mut owner,
+        None,
+        vec![nic("aa:00:00:00:00:01", "192.168.88.10", 24)],
+    )
+    .await;
+    let (router_id, token) = add_router(&mut owner, "MikroTik", "192.168.88.0", 24).await;
+    let _ = recv_devices(&mut owner).await;
+    add_manual(&mut owner, "NAS", "AA-BB-CC-DD-EE-01", "192.168.88.0", 24).await;
+    let devices = recv_devices(&mut owner).await;
+    let manual_id = devices
+        .iter()
+        .find(|d| d.kind == proto::signal::DeviceKind::Manual)
+        .expect("manual")
+        .device_id
+        .clone();
+
+    // Хост уходит офлайн: онлайн-будильников нет, роутер ещё не опрашивал.
+    drop(host);
+    let devices = wait_devices(&mut owner, |d| {
+        d.iter().any(|e| e.device_id == host_id && !e.online)
+    })
+    .await;
+    assert!(!entry(&devices, &manual_id).can_wake);
+    assert!(!entry(&devices, &host_id).can_wake);
+
+    // Первый опрос: пустой ответ и push с онлайн-роутером.
+    let (status, head, body) = http_get(&url, "/wake/poll", Some(&token)).await;
+    assert_eq!((status, body.as_str()), (200, ""));
+    assert!(head.contains("text/plain; charset=utf-8"));
+    assert!(head.contains("cache-control: no-store"));
+    let devices = wait_devices(&mut owner, |d| {
+        d.iter().any(|e| e.device_id == router_id && e.online)
+    })
+    .await;
+    assert!(entry(&devices, &manual_id).can_wake);
+    assert!(entry(&devices, &host_id).can_wake);
+    assert!(!entry(&devices, &router_id).can_wake);
+
+    send(
+        &mut owner,
+        &SignalMessage::WakeDevice {
+            device_id: manual_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv(&mut owner).await,
+        SignalMessage::WakeSent {
+            device_id: manual_id,
+            wakers: 1
+        }
+    );
+    let (status, _, body) = http_get(&url, "/wake/poll", Some(&token)).await;
+    assert_eq!((status, body.as_str()), (200, "aa:bb:cc:dd:ee:01"));
+    let (status, _, body) = http_get(&url, "/wake/poll", Some(&token)).await;
+    assert_eq!((status, body.as_str()), (200, ""));
+
+    // Выключенный хост с картой в той же сети тоже ставится в очередь.
+    send(
+        &mut owner,
+        &SignalMessage::WakeDevice {
+            device_id: host_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv(&mut owner).await,
+        SignalMessage::WakeSent {
+            device_id: host_id,
+            wakers: 1
+        }
+    );
+    let (_, _, body) = http_get(&url, "/wake/poll", Some(&token)).await;
+    assert_eq!(body, "aa:00:00:00:00:01");
+
+    // Забытый роутер больше не авторизуется.
+    send(
+        &mut owner,
+        &SignalMessage::ForgetDevice {
+            device_id: router_id.clone(),
+        },
+    )
+    .await;
+    let devices = recv_devices(&mut owner).await;
+    assert!(devices.iter().all(|d| d.device_id != router_id));
+    let (status, _, body) = http_get(&url, "/wake/poll", Some(&token)).await;
+    assert_eq!((status, body.as_str()), (401, ""));
+}
