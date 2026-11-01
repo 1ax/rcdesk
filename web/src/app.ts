@@ -1702,7 +1702,19 @@ export function mount(root: Element | null): void {
       row.className = "wake-add-row";
       row.appendChild(copyBtn);
       row.appendChild(doneBtn);
-      wakeAddPanelEl.append(note, tabs, pre, row, copyStatus);
+      wakeAddPanelEl.append(note, tabs);
+      if (panel.script === "mikrotik") {
+        // D85a: RouterOS 7.17+ often ships in device-mode home, where the
+        // scheduler and /tool fetch are forbidden and the import fails.
+        const modeNote = document.createElement("p");
+        modeNote.className = "hint";
+        modeNote.textContent =
+          "Нужен режим устройства advanced: /system device-mode print должен показать " +
+          "scheduler: yes и fetch: yes. Иначе — /system device-mode update mode=advanced " +
+          "и в течение 5 минут коротко нажать кнопку на роутере.";
+        wakeAddPanelEl.appendChild(modeNote);
+      }
+      wakeAddPanelEl.append(pre, row, copyStatus);
       return;
     }
 
