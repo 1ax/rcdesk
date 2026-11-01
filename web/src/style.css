@@ -22,7 +22,11 @@ body {
 
 body {
   margin: 0;
-  background: var(--bg);
+  /* Еле заметный градиент вместо сплошного фона: в Chrome на macOS 27.2
+   * большое однотонное тёмное поле в активном окне заставляет мерцать строку
+   * меню и Dock (Safari — нет; градиент/шум — нет). `fixed` — один тайл на
+   * окно, без швов на длинных страницах (админка). */
+  background: var(--bg) linear-gradient(180deg, var(--bg), #111318) fixed;
   color: var(--text);
   font-family:
     -apple-system,
