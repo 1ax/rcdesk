@@ -33,7 +33,8 @@ export function formatElapsed(ms: number): string {
 }
 
 const TIMEOUT_STATUS =
-  "Не включился за 3 мин. Нужен кабель (не Wi-Fi) и Wake-on-LAN в BIOS и драйвере сетевой карты; Mac из выключенного состояния по сети не включается";
+  "Не включился за 3 мин. Mac по сети просыпается только из сна — выключенный Mac так не включить. " +
+  "Windows: нужен кабель (не Wi-Fi) и Wake-on-LAN в BIOS и драйвере сетевой карты";
 
 /** What the device row shows for `entry` given its wake state (if any). */
 export function wakeView(
