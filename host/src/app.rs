@@ -539,7 +539,42 @@ pub async fn run_agent(
     let mut slot = SessionSlot::new();
     loop {
         let _ = status.send(AgentStatus::Connecting);
-        let device = device_store.load();
+        let device = match device_store.load() {
+            crate::device::DeviceLoad::Present(credentials) => Some(credentials),
+            crate::device::DeviceLoad::Missing => None,
+            crate::device::DeviceLoad::Corrupt(err) => {
+                tracing::warn!(
+                    error = %err,
+                    path = %device_store.path().display(),
+                    "device credentials file is corrupt, keeping it as .bak and registering as a new device"
+                );
+                if let Err(err) = device_store.move_aside() {
+                    tracing::warn!(
+                        error = %err,
+                        path = %device_store.path().display(),
+                        "failed to move the corrupt device credentials file aside"
+                    );
+                }
+                None
+            }
+            crate::device::DeviceLoad::Unreadable(err) => {
+                // Registering without credentials would make the server issue
+                // a new identity and `save()` would overwrite a file that may
+                // be fine -- wait and retry like a lost connection instead.
+                let retry_in = backoff.current();
+                tracing::warn!(
+                    error = %err,
+                    path = %device_store.path().display(),
+                    ?retry_in,
+                    "device credentials file unreadable, not registering as a new device; retrying"
+                );
+                let _ = status.send(AgentStatus::Connecting);
+                slot.run_while_offline(ctx, &mut commands, tokio::time::sleep(retry_in))
+                    .await;
+                backoff.advance();
+                continue;
+            }
+        };
         // Slice 3.2a/D35: if a session survived from before this connect
         // attempt (the slot's own `run_while_offline`, just above this
         // loop's body, keeps it alive across the gap), report it in
@@ -994,6 +1029,113 @@ mod tests {
         let _ = std::fs::remove_dir_all(&device_dir);
     }
 
+    /// A corrupt `device.json` is kept as `.bak` and the host registers as a
+    /// new device.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_agent_moves_a_corrupt_device_file_aside_and_registers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}/ws");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            respond_with_registered(&mut ws, "111111", None).await;
+            std::future::pending::<()>().await;
+        });
+
+        let ctx = crate::signaling::test_ctx();
+        let (device_store, device_dir) = scratch_device_store("corrupt-aside");
+        std::fs::create_dir_all(&device_dir).unwrap();
+        std::fs::write(device_store.path(), b"not json at all").unwrap();
+        let (status_tx, mut status_rx) = watch::channel(AgentStatus::Connecting);
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let agent = tokio::spawn(async move {
+            let _ = run_agent(
+                &ctx,
+                &url,
+                "test-host",
+                ReconnectPolicy::default(),
+                Keepalive::default(),
+                &device_store,
+                status_tx,
+                cmd_rx,
+            )
+            .await;
+        });
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    next_status(&mut status_rx).await,
+                    AgentStatus::Registered { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for registration");
+        assert_eq!(
+            std::fs::read(device_dir.join("device.json.bak")).unwrap(),
+            b"not json at all"
+        );
+
+        agent.abort();
+        let _ = std::fs::remove_dir_all(&device_dir);
+    }
+
+    /// An unreadable `device.json` must NOT lead to a registration as a new
+    /// device: the fake server must see no connection at all.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_agent_does_not_register_when_device_file_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}/ws");
+
+        let ctx = crate::signaling::test_ctx();
+        let (device_store, device_dir) = scratch_device_store("unreadable");
+        std::fs::create_dir_all(&device_dir).unwrap();
+        device_store
+            .save(&proto::signal::DeviceCredentials {
+                device_id: "dev-1".to_string(),
+                secret: "secret".to_string(),
+            })
+            .unwrap();
+        let path = device_store.path().to_path_buf();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            // Running as root: the mode is not enforced, nothing to test.
+            let _ = std::fs::remove_dir_all(&device_dir);
+            return;
+        }
+
+        let (status_tx, _status_rx) = watch::channel(AgentStatus::Connecting);
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let agent = tokio::spawn(async move {
+            let _ = run_agent(
+                &ctx,
+                &url,
+                "test-host",
+                ReconnectPolicy::default(),
+                Keepalive::default(),
+                &device_store,
+                status_tx,
+                cmd_rx,
+            )
+            .await;
+        });
+
+        let accepted = timeout(Duration::from_millis(700), listener.accept()).await;
+        assert!(accepted.is_err(), "no connection may be attempted");
+
+        agent.abort();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let _ = std::fs::remove_dir_all(&device_dir);
+    }
+
     /// Slice 3.1c: a first registration whose `Registered` carries freshly
     /// issued device credentials must have them saved to `device_store`'s
     /// file before the caller can observe `AgentStatus::Registered` (see
@@ -1053,7 +1195,10 @@ mod tests {
 
         agent.abort();
 
-        let loaded = crate::device::DeviceStore::new(&device_dir).load();
+        let loaded = match crate::device::DeviceStore::new(&device_dir).load() {
+            crate::device::DeviceLoad::Present(credentials) => Some(credentials),
+            _ => None,
+        };
         assert_eq!(loaded, Some(issued));
 
         let _ = std::fs::remove_dir_all(&device_dir);
@@ -1236,7 +1381,10 @@ mod tests {
 
         agent.abort();
 
-        let loaded = crate::device::DeviceStore::new(&device_dir).load();
+        let loaded = match crate::device::DeviceStore::new(&device_dir).load() {
+            crate::device::DeviceLoad::Present(credentials) => Some(credentials),
+            _ => None,
+        };
         assert_eq!(
             loaded,
             Some(new_creds),

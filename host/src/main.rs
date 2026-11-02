@@ -634,7 +634,7 @@ fn run_password(action: PasswordAction) -> anyhow::Result<()> {
             println!("Хост применит его при следующем подключении -- перезапуск агента не нужен.");
         }
         PasswordAction::Clear => {
-            let had_password = store.load().is_some();
+            let had_password = !matches!(store.load(), access::AccessLoad::Missing);
             store.clear().map_err(admin_hint)?;
             if had_password {
                 println!("Пароль снят");
@@ -642,13 +642,16 @@ fn run_password(action: PasswordAction) -> anyhow::Result<()> {
                 println!("Пароль не был задан");
             }
         }
-        PasswordAction::Status => {
-            if store.load().is_some() {
+        PasswordAction::Status => match store.load() {
+            access::AccessLoad::Present(_) => {
                 println!("Пароль: задан ({})", store.path().display());
-            } else {
-                println!("Пароль: не задан");
             }
-        }
+            access::AccessLoad::Missing => println!("Пароль: не задан"),
+            access::AccessLoad::Unusable(err) => {
+                eprintln!("access record unreadable: {err:#}");
+                std::process::exit(1);
+            }
+        },
     }
     Ok(())
 }

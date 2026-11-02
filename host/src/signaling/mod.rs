@@ -1686,7 +1686,21 @@ async fn handle_signal_message(
             // previous joining peer was in the middle of.
             *pending_auth = None;
 
-            if ctx.access_store.load().is_some() {
+            let access = ctx.access_store.load();
+            if let crate::access::AccessLoad::Unusable(err) = &access {
+                // Fail-closed: a password may be set but can't be read, so
+                // starting an unauthenticated session would be wrong.
+                tracing::error!(
+                    %err,
+                    path = %ctx.access_store.path().display(),
+                    "access record unreadable, refusing session"
+                );
+                let _ = out_tx.send(SignalMessage::Bye {
+                    session_id,
+                    reason: None,
+                });
+                *pending_auth = None;
+            } else if matches!(access, crate::access::AccessLoad::Present(_)) {
                 let generation = next_auth_generation();
                 *pending_auth = Some(PendingAuth {
                     session_id: session_id.clone(),
@@ -1864,13 +1878,28 @@ async fn handle_signal_message(
             // Re-read rather than reuse anything cached from `PeerJoined`:
             // the owner may have cleared the password since (`password
             // clear`), and this must reflect that right away.
-            let Some(record) = ctx.access_store.load() else {
-                tracing::warn!("password file disappeared mid-auth");
-                let _ = out_tx.send(SignalMessage::AuthFailed {
-                    session_id,
-                    retry_after_secs: None,
-                });
-                return;
+            let record = match ctx.access_store.load() {
+                crate::access::AccessLoad::Present(record) => record,
+                crate::access::AccessLoad::Missing => {
+                    tracing::warn!("password file disappeared mid-auth");
+                    let _ = out_tx.send(SignalMessage::AuthFailed {
+                        session_id,
+                        retry_after_secs: None,
+                    });
+                    return;
+                }
+                crate::access::AccessLoad::Unusable(err) => {
+                    tracing::error!(
+                        %err,
+                        path = %ctx.access_store.path().display(),
+                        "access record unreadable mid-auth, refusing"
+                    );
+                    let _ = out_tx.send(SignalMessage::AuthFailed {
+                        session_id,
+                        retry_after_secs: None,
+                    });
+                    return;
+                }
             };
 
             let request_bytes = match BASE64_URL_SAFE_NO_PAD.decode(&payload) {
@@ -3889,7 +3918,7 @@ pub(crate) fn test_ctx() -> HostContext {
         // Slice 3.2c: a fresh, per-test scratch directory under the system
         // temp dir that's never written to here, mirroring
         // `access::tests::scratch_dir`/`app::tests::scratch_device_store` --
-        // no file at this path means `access_store.load()` is `None`, i.e.
+        // no file at this path means `access_store.load()` is `Missing`, i.e.
         // "no password set", so every existing test built on `test_ctx()`
         // keeps behaving exactly as before this slice.
         access_store: crate::access::AccessStore::new(&std::env::temp_dir().join(format!(
@@ -4847,6 +4876,67 @@ mod tests {
         );
         assert!(active.is_none());
         assert!(pending_auth.is_some());
+    }
+
+    /// Fail-closed: an unreadable/corrupt `access.json` must not be treated
+    /// as "no password" -- the session is refused with `Bye`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_joined_with_unreadable_access_record_sends_bye_and_starts_nothing() {
+        let mut ctx = test_ctx();
+        let dir = std::env::temp_dir().join(format!(
+            "rcdesk-host-signaling-test-ctx-corrupt-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let store = crate::access::AccessStore::new(&dir);
+        std::fs::write(store.path(), b"not json at all").expect("write corrupt record");
+        ctx.access_store = store;
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut active: Option<ActiveSession> = None;
+        let mut current_session_id: Option<String> = None;
+        let mut pending_auth: Option<PendingAuth> = None;
+        let mut auth_failures = 0u32;
+        let mut auth_locked_until: Option<Instant> = None;
+        let (status_tx, _status_rx) = watch::channel(AgentStatus::Connecting);
+
+        handle_signal_message(
+            SignalMessage::PeerJoined {
+                session_id: "sess-1".to_string(),
+                ice_servers: vec![],
+            },
+            &ctx,
+            &[],
+            "111111",
+            &status_tx,
+            &out_tx,
+            event_tx,
+            &mut active,
+            &mut current_session_id,
+            &mut pending_auth,
+            &mut auth_failures,
+            &mut auth_locked_until,
+        )
+        .await;
+
+        assert_eq!(
+            out_rx.try_recv().expect("expected Bye"),
+            SignalMessage::Bye {
+                session_id: "sess-1".to_string(),
+                reason: None,
+            }
+        );
+        assert!(
+            out_rx.try_recv().is_err(),
+            "neither AuthRequired nor Offer may follow"
+        );
+        assert!(active.is_none());
+        assert!(pending_auth.is_none());
+        assert_eq!(current_session_id, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Slice 3.2c: a full, real OPAQUE login (client side via `opaque_ke`

@@ -183,6 +183,17 @@ impl TryFrom<AccessRecordFile> for AccessRecord {
     }
 }
 
+/// Result of [`AccessStore::load`]. `Unusable` is distinct from `Missing` on
+/// purpose (fail-closed): see `AccessStore::load`.
+// No `Debug`: `AccessRecord` deliberately has none.
+pub enum AccessLoad {
+    /// No file: no password set.
+    Missing,
+    Present(AccessRecord),
+    /// The file exists (or can't be proven absent) but can't be used.
+    Unusable(anyhow::Error),
+}
+
 /// The `access.json` file in the agent's data directory (the same
 /// directory as `device.json` -- `agent::paths::data_dir()`). Absent means
 /// "no password set", the default state.
@@ -212,21 +223,26 @@ impl AccessStore {
         &self.path
     }
 
-    /// The saved record, or `None` when there isn't a usable one: the file
-    /// doesn't exist, isn't readable, or isn't the JSON this store writes.
-    /// A corrupt file is deliberately `None` plus a `tracing::warn!` rather
-    /// than an `Err`, matching `device::DeviceStore::load`.
-    pub fn load(&self) -> Option<AccessRecord> {
+    /// Reads the saved record. Fail-closed: only a missing file means "no
+    /// password set" ([`AccessLoad::Missing`]). Any other failure -- the file
+    /// can't be read (permissions, an antivirus sharing violation), isn't
+    /// the JSON this store writes, or has invalid base64 -- is
+    /// [`AccessLoad::Unusable`], and callers must refuse sessions rather than
+    /// treat it as "no password": otherwise a transient read error would let
+    /// anyone with the PIN into a password-protected host.
+    pub fn load(&self) -> AccessLoad {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return AccessLoad::Missing,
             Err(err) => {
                 tracing::warn!(
                     path = %self.path.display(),
                     error = %err,
-                    "failed to read access record file, treating as no password set"
+                    "failed to read access record file, refusing sessions until fixed"
                 );
-                return None;
+                return AccessLoad::Unusable(
+                    anyhow::Error::new(err).context("failed to read access record file"),
+                );
             }
         };
         let file = match serde_json::from_slice::<AccessRecordFile>(&bytes) {
@@ -235,20 +251,24 @@ impl AccessStore {
                 tracing::warn!(
                     path = %self.path.display(),
                     error = %err,
-                    "access record file is not valid JSON, treating as no password set"
+                    "access record file is not valid JSON, refusing sessions until fixed"
                 );
-                return None;
+                return AccessLoad::Unusable(
+                    anyhow::Error::new(err).context("access record file is not valid JSON"),
+                );
             }
         };
         match AccessRecord::try_from(file) {
-            Ok(record) => Some(record),
+            Ok(record) => AccessLoad::Present(record),
             Err(err) => {
                 tracing::warn!(
                     path = %self.path.display(),
                     error = %err,
-                    "access record file has invalid base64, treating as no password set"
+                    "access record file has invalid base64, refusing sessions until fixed"
                 );
-                None
+                AccessLoad::Unusable(
+                    anyhow::Error::new(err).context("access record file has invalid base64"),
+                )
             }
         }
     }
@@ -512,24 +532,80 @@ mod tests {
         let record = register("correct horse battery staple").unwrap();
 
         store.save(&record).unwrap();
-        assert_eq!(store.load(), Some(record));
+        match store.load() {
+            AccessLoad::Present(loaded) => assert!(loaded == record),
+            _ => panic!("expected Present"),
+        }
 
         store.clear().unwrap();
-        assert_eq!(store.load(), None);
+        assert!(matches!(store.load(), AccessLoad::Missing));
         store.clear().unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn load_with_garbage_instead_of_json_returns_none() {
+    fn load_missing_is_missing() {
+        let dir = scratch_dir("missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AccessStore::new(&dir);
+
+        assert!(matches!(store.load(), AccessLoad::Missing));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_corrupt_json_is_unusable() {
         let dir = scratch_dir("garbage");
         std::fs::create_dir_all(&dir).unwrap();
         let store = AccessStore::new(&dir);
         std::fs::write(store.path(), b"not json at all").unwrap();
 
-        assert_eq!(store.load(), None);
+        assert!(matches!(store.load(), AccessLoad::Unusable(_)));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_invalid_base64_is_unusable() {
+        let dir = scratch_dir("bad-b64");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AccessStore::new(&dir);
+        std::fs::write(
+            store.path(),
+            br#"{"server_setup":"!!!","registration":"!!!"}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(store.load(), AccessLoad::Unusable(_)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unix only: `chmod 000` makes the read fail with `PermissionDenied`.
+    /// Skipped when running as root (root ignores the mode bits).
+    #[cfg(unix)]
+    #[test]
+    fn load_unreadable_is_unusable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("unreadable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = AccessStore::new(&dir);
+        store
+            .save(&register("correct horse battery staple").unwrap())
+            .unwrap();
+        std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        if std::fs::read(store.path()).is_ok() {
+            // Running as root: the mode is not enforced, nothing to test.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(matches!(store.load(), AccessLoad::Unusable(_)));
+
+        std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

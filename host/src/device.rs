@@ -64,6 +64,17 @@ pub struct DeviceStore {
     mode: u32,
 }
 
+/// Result of [`DeviceStore::load`].
+#[derive(Debug)]
+pub enum DeviceLoad {
+    Missing,
+    Present(DeviceCredentials),
+    /// The file exists but isn't valid credentials JSON.
+    Corrupt(anyhow::Error),
+    /// The file couldn't be read (not `NotFound`).
+    Unreadable(std::io::Error),
+}
+
 impl DeviceStore {
     /// `dir/device.json`.
     pub fn new(dir: &Path) -> Self {
@@ -110,34 +121,24 @@ impl DeviceStore {
         &self.path
     }
 
-    /// The saved credentials, or `None` when there aren't any usable ones:
-    /// the file doesn't exist, isn't readable, or isn't the JSON this store
-    /// writes. A corrupt file is deliberately `None` plus a `tracing::warn!`
-    /// rather than an `Err` -- the host must be able to just register afresh
-    /// (see `app::run_agent`), not crash because of a damaged cache file.
-    pub fn load(&self) -> Option<DeviceCredentials> {
+    /// Reads the saved credentials, telling apart the cases the caller must
+    /// treat differently: no file ([`DeviceLoad::Missing`]), a file that is
+    /// not the JSON this store writes ([`DeviceLoad::Corrupt`] -- safe to move
+    /// aside and register afresh), and a file that can't be read at all
+    /// ([`DeviceLoad::Unreadable`] -- permissions, an antivirus sharing
+    /// violation; registering anew would overwrite credentials that may be
+    /// fine, so the caller must retry later instead).
+    pub fn load(&self) -> DeviceLoad {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(err) => {
-                tracing::warn!(
-                    path = %self.path.display(),
-                    error = %err,
-                    "failed to read device credentials file, registering as a new device"
-                );
-                return None;
-            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return DeviceLoad::Missing,
+            Err(err) => return DeviceLoad::Unreadable(err),
         };
         match serde_json::from_slice::<DeviceCredentials>(&bytes) {
-            Ok(credentials) => Some(credentials),
-            Err(err) => {
-                tracing::warn!(
-                    path = %self.path.display(),
-                    error = %err,
-                    "device credentials file is not valid JSON, registering as a new device"
-                );
-                None
-            }
+            Ok(credentials) => DeviceLoad::Present(credentials),
+            Err(err) => DeviceLoad::Corrupt(
+                anyhow::Error::new(err).context("device credentials file is not valid JSON"),
+            ),
         }
     }
 
@@ -156,6 +157,12 @@ impl DeviceStore {
     /// absence is not an error -- there's nothing to forget on a device that
     /// never had (or already lost) saved credentials.
     pub fn forget(&self) -> anyhow::Result<()> {
+        self.move_aside()
+    }
+
+    /// Same as [`Self::forget`]: renames the file to `.bak`. Named for the
+    /// corrupt-file case, where the point is to keep the damaged file.
+    pub fn move_aside(&self) -> anyhow::Result<()> {
         let mut bak = self.path.clone().into_os_string();
         bak.push(".bak");
         match std::fs::rename(&self.path, PathBuf::from(bak)) {
@@ -202,29 +209,29 @@ mod tests {
         };
 
         store.save(&credentials).unwrap();
-        assert_eq!(store.load(), Some(credentials));
+        assert!(matches!(store.load(), DeviceLoad::Present(c) if c == credentials));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn load_in_an_empty_directory_returns_none() {
+    fn load_in_an_empty_directory_is_missing() {
         let dir = scratch_dir("empty");
         let store = DeviceStore::new(&dir);
 
-        assert_eq!(store.load(), None);
+        assert!(matches!(store.load(), DeviceLoad::Missing));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn load_with_garbage_instead_of_json_returns_none_and_keeps_the_file() {
+    fn load_with_garbage_instead_of_json_is_corrupt_and_keeps_the_file() {
         let dir = scratch_dir("garbage");
         std::fs::create_dir_all(&dir).unwrap();
         let store = DeviceStore::new(&dir);
         std::fs::write(store.path(), b"not json at all").unwrap();
 
-        assert_eq!(store.load(), None);
+        assert!(matches!(store.load(), DeviceLoad::Corrupt(_)));
         assert!(
             store.path().exists(),
             "a corrupt file must not be deleted by load()"
@@ -269,10 +276,10 @@ mod tests {
         let local = DeviceStore::for_server(&dir, "ws://127.0.0.1:8100/ws");
 
         prod.save(&creds("prod")).unwrap();
-        assert_eq!(local.load(), None);
+        assert!(matches!(local.load(), DeviceLoad::Missing));
         local.save(&creds("local")).unwrap();
-        assert_eq!(prod.load(), Some(creds("prod")));
-        assert_eq!(local.load(), Some(creds("local")));
+        assert!(matches!(prod.load(), DeviceLoad::Present(c) if c == creds("prod")));
+        assert!(matches!(local.load(), DeviceLoad::Present(c) if c == creds("local")));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -292,6 +299,48 @@ mod tests {
         );
 
         store.forget().unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_distinguishes_missing_corrupt_unreadable() {
+        let dir = scratch_dir("distinguish");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = DeviceStore::new(&dir);
+        assert!(matches!(store.load(), DeviceLoad::Missing));
+
+        std::fs::write(store.path(), b"not json at all").unwrap();
+        assert!(matches!(store.load(), DeviceLoad::Corrupt(_)));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Root ignores the mode bits: then there is nothing to check.
+            if std::fs::read(store.path()).is_err() {
+                assert!(matches!(store.load(), DeviceLoad::Unreadable(_)));
+            }
+            std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn move_aside_keeps_bak() {
+        let dir = scratch_dir("move-aside");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = DeviceStore::new(&dir);
+        std::fs::write(store.path(), b"not json at all").unwrap();
+
+        store.move_aside().unwrap();
+        assert!(!store.path().exists());
+        assert_eq!(
+            std::fs::read(dir.join("device.json.bak")).unwrap(),
+            b"not json at all"
+        );
+        assert!(matches!(store.load(), DeviceLoad::Missing));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
