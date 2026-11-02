@@ -7,6 +7,9 @@
   --muted: #8b909c;
   --accent: #4f8cff;
   --accent-hover: #6ea0ff;
+  /* UI-5: фон кнопки под белый текст (≈4,6:1); --accent остаётся для рамок/ссылок. */
+  --accent-bg: #2f6fe0;
+  --accent-bg-hover: #3d7bea;
   --danger: #e0554f;
   --ok: #4caf7d;
 }
@@ -95,13 +98,13 @@ body {
   font-weight: 600;
   border: none;
   border-radius: 8px;
-  background: var(--accent);
+  background: var(--accent-bg);
   color: #fff;
   cursor: pointer;
 }
 
 .btn:hover:not(:disabled) {
-  background: var(--accent-hover);
+  background: var(--accent-bg-hover);
 }
 
 .btn:disabled {
@@ -194,12 +197,19 @@ body {
 .device-actions {
   flex: 1 1 100%;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
 }
 
-.device-actions .device-connect {
-  flex: 1;
+.device-actions .device-connect,
+.device-actions .device-wake {
+  flex: 1 1 160px;
+}
+
+.device-actions .device-rename,
+.device-actions .device-forget {
+  flex: 0 0 auto;
 }
 
 .device-actions .btn,
@@ -552,7 +562,47 @@ body {
   margin-top: 0;
 }
 
+/* UI-3: "Ещё" exists only on a phone; see the max-width block below. */
+.bar-more-btn {
+  display: none;
+}
+
+@media (pointer: coarse) {
+  .session-bar .btn,
+  .device-actions .btn,
+  .device-actions .btn-secondary,
+  .stats-toggle,
+  .cmd-as-ctrl-toggle,
+  .soft-keys button {
+    min-height: 44px;
+  }
+
+  .stats-toggle input,
+  .cmd-as-ctrl-toggle input {
+    width: 20px;
+    height: 20px;
+  }
+
+  .soft-keys .btn {
+    line-height: 1;
+  }
+}
+
 @media (max-width: 600px) {
+  .build-badge {
+    font-size: 10px;
+    opacity: 0.5;
+  }
+
+  .bar-more-btn {
+    display: inline-block;
+  }
+
+  /* Secondary controls are folded behind "Ещё" (`.session-bar--expanded`). */
+  .session-bar:not(.session-bar--expanded) .bar-secondary {
+    display: none;
+  }
+
   .session-bar .btn {
     padding: 6px 8px;
     font-size: 12px;
@@ -639,7 +689,7 @@ body {
 
 /* Slice 4.2c3: the "Шторка" button while the curtain is on. */
 .btn.curtain-btn.is-active {
-  background: var(--accent);
+  background: var(--accent-bg);
   color: #fff;
 }
 
@@ -708,7 +758,7 @@ body {
 
 .build-badge {
   position: fixed;
-  left: 10px;
+  right: 10px;
   bottom: 8px;
   font-size: 11px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -809,7 +859,7 @@ body {
   outline: 2px solid var(--accent);
 }
 .soft-keys .is-locked {
-  background: var(--accent);
+  background: var(--accent-bg);
   color: #fff;
 }
 .soft-input {

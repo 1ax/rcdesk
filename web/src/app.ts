@@ -10,6 +10,7 @@
 
 import { ctrlAltDelMessage, ctrlAltDelVisible } from "./ctrlAltDel";
 import "./style.css";
+import { trapFocus } from "./focusTrap";
 import { SignalingClient } from "./signaling";
 import { PeerSession, toRtcIceServers } from "./session";
 import { summarizeStats, takeSnapshot } from "./stats";
@@ -370,10 +371,10 @@ export function mount(root: Element | null): void {
             <button id="login-open-btn" class="btn">Войти</button>
             <button id="signup-open-btn" class="btn btn-secondary">Создать аккаунт</button>
             <button id="passkey-login-btn" class="link-btn">Войти с passkey</button>
-            <p class="hint">Тогда список компьютеров откроется в любом браузере</p>
+            <p class="hint">Войдите, чтобы список компьютеров был доступен в любом браузере</p>
           </div>
           <button id="account-open-btn" class="btn btn-secondary" hidden>Аккаунт</button>
-          <p id="account-status" class="hint account-status"></p>
+          <p id="account-status" class="hint account-status" role="status" aria-live="polite"></p>
         </div>
         <div class="devices" id="devices" hidden>
           <h2>Мои компьютеры</h2>
@@ -394,9 +395,10 @@ export function mount(root: Element | null): void {
           maxlength="6"
           placeholder="000000"
           autocomplete="one-time-code"
+          aria-label="PIN хоста"
         />
         <button id="connect-btn" class="btn">Подключиться</button>
-        <p id="pin-status" class="hint"></p>${downloadBlockHtml()}
+        <p id="pin-status" class="hint" role="status" aria-live="polite"></p>${downloadBlockHtml()}
       </div>
       <div class="card account-card" id="account-card" hidden>
         <h1>Аккаунт</h1>
@@ -418,16 +420,16 @@ export function mount(root: Element | null): void {
         <a id="admin-link" class="btn btn-secondary" href="/admin.html" hidden>Админка</a>
         <button id="sign-out-btn" class="btn btn-secondary account-danger-btn">Выйти</button>
         <p id="sign-out-hint" class="hint"></p>
-        <p id="account-card-status" class="hint account-status"></p>
+        <p id="account-card-status" class="hint account-status" role="status" aria-live="polite"></p>
         <button id="account-back-btn" class="btn btn-secondary">Назад</button>
       </div>
       <div class="card account-card" id="auth-card" hidden>
         <h1 id="ea-title">Вход</h1>
         <form id="ea-login-form" class="ea-form" novalidate>
           <input id="ea-login-email" class="text-input" type="email" name="email"
-            autocomplete="username" placeholder="Почта" autocapitalize="off" spellcheck="false" />
+            autocomplete="username" placeholder="Почта" aria-label="Почта" autocapitalize="off" spellcheck="false" />
           <input id="ea-login-password" class="text-input" type="password" name="password"
-            autocomplete="current-password" placeholder="Пароль" />
+            autocomplete="current-password" placeholder="Пароль" aria-label="Пароль" />
           <button id="ea-login-submit" type="submit" class="btn">Войти</button>
           <button id="ea-forgot-btn" type="button" class="link-btn">Забыли пароль?</button>
           <button id="ea-signup-btn" type="button" class="link-btn">Создать аккаунт</button>
@@ -435,7 +437,7 @@ export function mount(root: Element | null): void {
         </form>
         <form id="ea-request-form" class="ea-form" novalidate>
           <input id="ea-request-email" class="text-input" type="email" name="email"
-            autocomplete="username" placeholder="Почта" autocapitalize="off" spellcheck="false" />
+            autocomplete="username" placeholder="Почта" aria-label="Почта" autocapitalize="off" spellcheck="false" />
           <button id="ea-request-submit" type="submit" class="btn">Получить код</button>
           <button id="ea-to-login-btn" type="button" class="link-btn">У меня уже есть аккаунт</button>
           <button id="ea-passkey-save-btn" type="button" class="link-btn">или сохранить через passkey</button>
@@ -443,29 +445,29 @@ export function mount(root: Element | null): void {
         <form id="ea-confirm-form" class="ea-form" novalidate>
           <p id="ea-sent-text" class="hint ea-sent"></p>
           <input id="ea-code" class="text-input" type="text" name="code" inputmode="numeric"
-            pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" placeholder="Код из письма" />
+            pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" placeholder="Код из письма" aria-label="Код из письма" />
           <input id="ea-new-password" class="text-input" type="password" name="new-password"
-            autocomplete="new-password" placeholder="Новый пароль (8–128 символов)" />
+            autocomplete="new-password" placeholder="Новый пароль (8–128 символов)" aria-label="Новый пароль" />
           <button id="ea-confirm-submit" type="submit" class="btn">Готово</button>
           <button id="ea-resend-btn" type="button" class="link-btn">Отправить код ещё раз</button>
           <button id="ea-change-email-btn" type="button" class="link-btn">${FIX_ADDRESS_LABEL}</button>
         </form>
-        <p id="ea-status" class="hint account-status"></p>
+        <p id="ea-status" class="hint account-status" role="status" aria-live="polite"></p>
         <button id="ea-back-btn" class="btn btn-secondary">Назад</button>
       </div>
     </div>
     <div class="session-screen" id="session-screen" hidden>
       <div class="session-bar" id="session-bar">
         <div class="session-bar-left">
-          <label class="stats-toggle" title="Показывать статистику видеопотока">
+          <label class="stats-toggle bar-secondary" title="Показывать статистику видеопотока">
             <input type="checkbox" id="stats-checkbox" />
             Статистика
           </label>
-          <label class="stats-toggle" title="Синхронизировать буфер обмена с хостом в обе стороны">
+          <label class="stats-toggle bar-secondary" title="Синхронизировать буфер обмена с хостом в обе стороны">
             <input type="checkbox" id="clipboard-sync-checkbox" />
             Буфер обмена
           </label>
-          <button id="clipboard-push-btn" class="btn btn-secondary" title="Отправить буфер телефона на хост" hidden>Буфер →</button>
+          <button id="clipboard-push-btn" class="btn btn-secondary bar-secondary" title="Отправить буфер телефона на хост" hidden>Буфер →</button>
           <span class="overlay" id="stats-overlay" hidden></span>
         </div>
         <div class="controls">
@@ -477,14 +479,14 @@ export function mount(root: Element | null): void {
             <span id="download-status-text" class="file-status-text"></span>
             <button id="download-cancel-btn" class="btn btn-secondary" title="Отменить скачивание" aria-label="Отменить скачивание">✕</button>
           </span>
-          <button id="file-fetch-btn" class="btn btn-secondary" hidden>Скачать</button>
-          <button id="file-send-btn" class="btn btn-secondary" hidden>Отправить файлы</button>
+          <button id="file-fetch-btn" class="btn btn-secondary bar-secondary" hidden>Скачать</button>
+          <button id="file-send-btn" class="btn btn-secondary bar-secondary" hidden>Отправить файлы</button>
           <input id="file-input" type="file" multiple hidden />
-          <button id="folder-send-btn" class="btn btn-secondary" hidden>Отправить папку</button>
+          <button id="folder-send-btn" class="btn btn-secondary bar-secondary" hidden>Отправить папку</button>
           <input id="folder-input" type="file" webkitdirectory multiple hidden />
-          <select id="display-select" class="display-select" hidden></select>
-          <select id="quality-select" class="quality-select" title="Качество"></select>
-          <label id="cmd-as-ctrl-label" class="cmd-as-ctrl-toggle" hidden>
+          <select id="display-select" class="display-select bar-secondary" aria-label="Дисплей" hidden></select>
+          <select id="quality-select" class="quality-select bar-secondary" title="Качество" aria-label="Качество"></select>
+          <label id="cmd-as-ctrl-label" class="cmd-as-ctrl-toggle bar-secondary" hidden>
             <input type="checkbox" id="cmd-as-ctrl-checkbox" />
             <span id="cmd-as-ctrl-text">Cmd как Ctrl</span>
           </label>
@@ -492,15 +494,15 @@ export function mount(root: Element | null): void {
           <span id="input-blocked" class="status input-blocked" hidden></span>
           <span id="host-outdated" class="status host-outdated" hidden>
             <span id="host-outdated-text"></span>
-            <button id="host-update-btn" class="btn btn-secondary" hidden>Обновить хост</button>
+            <button id="host-update-btn" class="btn btn-secondary bar-secondary" hidden>Обновить хост</button>
           </span>
           <span id="curtain-status" class="status curtain-status" hidden></span>
-          <span id="clipboard-note" class="status clipboard-note" hidden></span>
+          <span id="clipboard-note" class="status clipboard-note" role="status" aria-live="polite" hidden></span>
           <span id="fullscreen-note" class="status fullscreen-note" hidden></span>
-          <span id="session-status" class="status"></span>
+          <span id="session-status" class="status" role="status" aria-live="polite"></span>
           <button
             id="curtain-btn"
-            class="btn btn-secondary curtain-btn"
+            class="btn btn-secondary curtain-btn bar-secondary"
             title="Скрыть экран Mac от тех, кто рядом с ним; при отключении Mac заблокируется"
             aria-pressed="false"
             hidden
@@ -509,7 +511,7 @@ export function mount(root: Element | null): void {
           </button>
           <button
             id="layout-btn"
-            class="btn btn-secondary layout-btn"
+            class="btn btn-secondary layout-btn bar-secondary"
             title="Раскладка на удалённом компьютере — нажмите или Alt+Shift"
             hidden
           >
@@ -517,7 +519,7 @@ export function mount(root: Element | null): void {
           </button>
           <button
             id="ctrl-alt-del-btn"
-            class="btn btn-secondary"
+            class="btn btn-secondary bar-secondary"
             title="Отправить Ctrl+Alt+Del (экран безопасности Windows)"
             hidden
           >
@@ -527,6 +529,12 @@ export function mount(root: Element | null): void {
           <button id="touch-mode-btn" class="btn btn-secondary" title="Режим касаний" hidden></button>
           <button id="fullscreen-btn" class="btn btn-secondary" hidden>На весь экран</button>
           <button id="disconnect-btn" class="btn btn-secondary">Отключиться</button>
+          <button
+            id="bar-more-btn"
+            class="btn btn-secondary bar-more-btn"
+            aria-expanded="false"
+            aria-controls="session-bar"
+          >Ещё</button>
           <button
             id="bar-collapse-btn"
             class="btn btn-secondary bar-collapse-btn"
@@ -544,23 +552,24 @@ export function mount(root: Element | null): void {
       ></button>
       <div class="session-video">
         <div class="zoom-layer" id="zoom-layer">
-          <video id="video" autoplay playsinline muted></video>
+          <video id="video" autoplay playsinline muted aria-label="Экран удалённого компьютера"></video>
           <img id="touch-cursor" class="touch-cursor" alt="" hidden />
         </div>
-        <div class="connection-banner" id="connection-banner" hidden></div>
+        <div class="connection-banner" id="connection-banner" role="alert" hidden></div>
         <div class="file-drop-hint" id="file-drop-hint" hidden>Отпустите, чтобы отправить на хост</div>
       </div>
-      <div class="auth-dialog" id="auth-dialog" hidden>
+      <div class="auth-dialog" id="auth-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-dialog-title" hidden>
         <div class="auth-dialog-card">
-          <h2>Пароль доступа к хосту</h2>
+          <h2 id="auth-dialog-title">Пароль доступа к хосту</h2>
           <p class="auth-dialog-host" id="auth-host-name"></p>
           <input
             id="auth-password"
             class="auth-password-input"
             type="password"
             autocomplete="current-password"
+            aria-label="Пароль доступа к хосту"
           />
-          <p id="auth-status" class="hint"></p>
+          <p id="auth-status" class="hint" role="status" aria-live="polite"></p>
           <div class="auth-dialog-actions">
             <button id="auth-submit" class="btn">Подключиться</button>
             <button id="auth-cancel" class="btn btn-secondary">Отмена</button>
@@ -1534,6 +1543,7 @@ export function mount(root: Element | null): void {
     for (const entry of sorted) {
       const li = document.createElement("li");
       li.className = "device-item";
+      li.dataset.deviceId = entry.device_id;
 
       if (renamingDeviceId === entry.device_id) {
         const input = document.createElement("input");
@@ -1851,9 +1861,43 @@ export function mount(root: Element | null): void {
       if (!active && wakeTimer !== undefined) {
         clearInterval(wakeTimer);
         wakeTimer = undefined;
+        // The wake window closed: the row's buttons change, rebuild once.
+        renderDeviceList();
+        return;
       }
-      renderDeviceList();
+      updateWakeRows();
     }, 1000);
+  }
+
+  /** W-6: the 1 s tick patches only the status text and the wake button of
+   * the rows in place (by `data-device-id`), so clicks and focus survive. A
+   * structural change (the wake button appears/disappears) falls back to a
+   * full `renderDeviceList()`. */
+  function updateWakeRows(): void {
+    const now = Date.now();
+    const nowSecs = Math.floor(now / 1000);
+    for (const li of deviceListEl.querySelectorAll<HTMLLIElement>("li[data-device-id]")) {
+      const id = li.dataset.deviceId;
+      const entry = devices.find((d) => d.device_id === id);
+      if (entry === undefined) {
+        renderDeviceList();
+        return;
+      }
+      const statusEl = li.querySelector<HTMLElement>(".device-status");
+      if (statusEl === null) continue; // rename row
+      const wake = wakeStatusFor(wakeState, entry, now);
+      const wakeBtn = li.querySelector<HTMLButtonElement>(".device-wake");
+      const wantsWake = (entry.kind === "host" || entry.kind === "manual") && wake.view.showButton;
+      if ((wakeBtn !== null) !== wantsWake) {
+        renderDeviceList();
+        return;
+      }
+      statusEl.textContent = wake.status ?? deviceStatusLabel(entry, nowSecs);
+      if (wakeBtn !== null) {
+        wakeBtn.textContent = wake.view.buttonLabel;
+        wakeBtn.disabled = connectionLost || wake.view.buttonDisabled;
+      }
+    }
   }
 
   /** Sends the renamed alias (or `null` to clear it, when blank after
@@ -3088,6 +3132,7 @@ export function mount(root: Element | null): void {
       });
     }
     stopSessionResources();
+    setSessionStatus("disconnected");
     updateConnectionBanner();
     // Unlike before this slice, the signaling connection itself is *not*
     // closed or discarded here -- it's one long-lived connection for the
@@ -3551,7 +3596,7 @@ export function mount(root: Element | null): void {
       signaling.send({ type: "bye", session_id: offerSessionId });
       setSessionStatus("error");
       teardown(
-        "Хост требует пароль, но подтверждения не было: возможна подмена соединения. Если пароль на хосте снят — удалите устройство из списка и привяжите заново по PIN",
+        "Хост требует пароль, подтверждения не было — возможна подмена. Удалите устройство из списка и привяжите заново по PIN",
       );
       return;
     }
@@ -3945,6 +3990,21 @@ export function mount(root: Element | null): void {
   // Slice 3.5g: collapses the session bar to its thin handle strip, which
   // becomes the only layout element left above the video -- not a pixel of
   // the remote screen is covered either way.
+  // UI-3: on a phone the secondary controls live behind "Ещё" (collapsed by
+  // default, not persisted); on desktop the button is hidden by CSS.
+  const barMoreBtn = root.querySelector<HTMLButtonElement>("#bar-more-btn")!;
+  barMoreBtn.addEventListener("click", () => {
+    const expanded = sessionBarEl.classList.toggle("session-bar--expanded");
+    barMoreBtn.setAttribute("aria-expanded", String(expanded));
+    barMoreBtn.textContent = expanded ? "Меньше" : "Ещё";
+  });
+
+  // UI-4: keep Tab inside the password dialog while it is open.
+  authDialog.addEventListener("keydown", (event) => {
+    if (authDialog.hidden) return;
+    trapFocus(authDialog, event);
+  });
+
   barCollapseBtn.addEventListener("click", () => {
     applyBarCollapsed(true);
     focusVideoUnlessTyping();
