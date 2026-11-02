@@ -1673,15 +1673,6 @@ async fn handle_signal_message(
             session_id,
             ice_servers,
         } => {
-            if let Some(old) = active.take() {
-                tracing::info!("new PeerJoined while a session was active; closing the old one");
-                old.shutdown_reporting(out_tx, current_session_id.as_deref())
-                    .await;
-                let _ = status.send(AgentStatus::Registered {
-                    pin: pin.to_string(),
-                });
-            }
-            *current_session_id = None;
             // Slice 3.2c: a new `PeerJoined` supersedes any login the
             // previous joining peer was in the middle of.
             *pending_auth = None;
@@ -1723,6 +1714,10 @@ async fn handle_signal_message(
                         .await;
                 });
             } else {
+                // No password: nothing to prove, the newcomer replaces the
+                // running session right away. (With a password the old
+                // session lives on until the newcomer's `PakeFinish`.)
+                supersede_active_session(active, current_session_id, pin, status, out_tx).await;
                 begin_session(
                     ctx,
                     session_id,
@@ -1975,6 +1970,7 @@ async fn handle_signal_message(
                         .take()
                         .expect("checked Some via matches_pending above");
                     tracing::info!(%session_id, "client authenticated");
+                    supersede_active_session(active, current_session_id, pin, status, out_tx).await;
                     begin_session(
                         ctx,
                         session_id,
@@ -2028,6 +2024,26 @@ async fn handle_signal_message(
     }
 }
 
+/// Closes the running session (if any) because a new client takes over:
+/// no password set, or the newcomer just passed the login (audit M-11).
+async fn supersede_active_session(
+    active: &mut Option<ActiveSession>,
+    current_session_id: &mut Option<String>,
+    pin: &str,
+    status: &watch::Sender<AgentStatus>,
+    out_tx: &mpsc::UnboundedSender<SignalMessage>,
+) {
+    if let Some(old) = active.take() {
+        tracing::info!("new client takes over while a session was active; closing the old one");
+        old.shutdown_reporting(out_tx, current_session_id.as_deref())
+            .await;
+        let _ = status.send(AgentStatus::Registered {
+            pin: pin.to_string(),
+        });
+    }
+    *current_session_id = None;
+}
+
 /// Starts the actual `PeerSession`/video pipeline and offers it to the
 /// client (slice 3.2c): factored out of `handle_signal_message`'s
 /// `PeerJoined` arm so it can be called either right away (no access
@@ -2068,15 +2084,7 @@ async fn begin_session(
                             tracing::warn!(
                                 "offer sdp has no dtls fingerprint, refusing to start session"
                             );
-                            parts.video.stop();
-                            parts.cursor_task.abort();
-                            if let Some(task) = parts.clipboard_task {
-                                task.abort();
-                            }
-                            if let Some(task) = parts.elevation_task {
-                                task.abort();
-                            }
-                            parts.files_task.abort();
+                            parts.abort().await;
                             let _ = out_tx.send(SignalMessage::Bye {
                                 session_id,
                                 reason: None,
@@ -2129,14 +2137,7 @@ async fn begin_session(
             }
             Err(err) => {
                 tracing::warn!(?err, "failed to create offer");
-                parts.video.stop();
-                parts.cursor_task.abort();
-                if let Some(task) = parts.clipboard_task {
-                    task.abort();
-                }
-                if let Some(task) = parts.elevation_task {
-                    task.abort();
-                }
+                parts.abort().await;
                 let _ = out_tx.send(SignalMessage::Bye {
                     session_id,
                     reason: None,
@@ -3118,6 +3119,24 @@ struct SessionParts {
     _display_wake: std::sync::Mutex<Box<dyn Send>>,
 }
 
+impl SessionParts {
+    /// Tears down a session that was started but never became active:
+    /// stops the pipeline and background tasks, then closes the peer
+    /// (webrtc-rs does not close a `PeerConnection` on `Drop`).
+    async fn abort(self) {
+        self.video.stop();
+        self.cursor_task.abort();
+        if let Some(task) = self.clipboard_task {
+            task.abort();
+        }
+        if let Some(task) = self.elevation_task {
+            task.abort();
+        }
+        self.files_task.abort();
+        self.peer.close().await;
+    }
+}
+
 /// Combines one session's ICE credentials with the extra `--stun` servers
 /// baked into `HostContext::session` at startup, in the order the client has
 /// always used: server-provided first, then CLI overrides.
@@ -3290,186 +3309,206 @@ async fn start_session_with_display_wait(
         ..ctx.session.clone()
     };
     let peer = PeerSession::new(session_config, events, Arc::clone(&ctx.runtime)).await?;
-    // Called once per session: every `VideoPipeline` (including ones built
-    // later by `switch_display`) feeds frames into the same `video_tx`/
-    // `video_rx` pair and shares `keyframe_flag` -- see their doc comments.
-    peer.start_video(video_rx, Arc::clone(&keyframe_flag));
+    // webrtc-rs does not close a `PeerConnection` on `Drop` (the UDP socket and
+    // ICE tasks live on), so any failure after `PeerSession::new` closes it
+    // explicitly (audit M-2).
+    let started: anyhow::Result<SessionParts> = async {
+        // Called once per session: every `VideoPipeline` (including ones built
+        // later by `switch_display`) feeds frames into the same `video_tx`/
+        // `video_rx` pair and shares `keyframe_flag` -- see their doc comments.
+        peer.start_video(video_rx, Arc::clone(&keyframe_flag));
 
-    // Шторка могла остаться от прошлого сеанса: исключаем её окна из захвата.
-    let curtain_windows = ctx.curtain.as_ref().map(|c| c.shown()).unwrap_or_default();
-    let video = VideoPipeline::start(
-        ctx,
-        start_display,
-        Arc::clone(&peer),
-        video_tx.clone(),
-        Arc::clone(&keyframe_flag),
-        0,
-        Arc::clone(&pipeline_generation),
-        &curtain_windows,
-    )
-    .await?;
+        // Шторка могла остаться от прошлого сеанса: исключаем её окна из захвата.
+        let curtain_windows = ctx.curtain.as_ref().map(|c| c.shown()).unwrap_or_default();
+        let video = VideoPipeline::start(
+            ctx,
+            start_display,
+            Arc::clone(&peer),
+            video_tx.clone(),
+            Arc::clone(&keyframe_flag),
+            0,
+            Arc::clone(&pipeline_generation),
+            &curtain_windows,
+        )
+        .await?;
 
-    // A failed injector (e.g. missing the macOS Accessibility permission, or
-    // `serve --no-input`) must not take the whole session down -- fall back
-    // to a `NoopInjector` and tell the client it's view-only (slice 2.5a,
-    // debt D26) instead of erroring out of `start_session`.
-    let (injector, input_available, input_reason): (Box<dyn Injector>, bool, Option<String>) =
-        match (ctx.build_injector)() {
-            Ok(injector) => (injector, true, None),
-            Err(err) => {
-                tracing::warn!(error = %err, "input unavailable, session is view-only");
-                (
-                    Box::new(NoopInjector::new()) as Box<dyn Injector>,
-                    false,
-                    Some(err.to_string()),
-                )
+        // A failed injector (e.g. missing the macOS Accessibility permission, or
+        // `serve --no-input`) must not take the whole session down -- fall back
+        // to a `NoopInjector` and tell the client it's view-only (slice 2.5a,
+        // debt D26) instead of erroring out of `start_session`.
+        let (injector, input_available, input_reason): (Box<dyn Injector>, bool, Option<String>) =
+            match (ctx.build_injector)() {
+                Ok(injector) => (injector, true, None),
+                Err(err) => {
+                    tracing::warn!(error = %err, "input unavailable, session is view-only");
+                    (
+                        Box::new(NoopInjector::new()) as Box<dyn Injector>,
+                        false,
+                        Some(err.to_string()),
+                    )
+                }
+            };
+        let router = InputRouter::new(injector);
+        router.set_capture_rect(crate::input::CaptureRect::from(&video.display));
+
+        // The watcher's background thread is polled by this task, not directly
+        // by `ActiveSession` -- see `ActiveSession::cursor_task`'s doc comment
+        // for why (`CursorWatcher` implements `Drop`, so its `rx` field can't be
+        // moved out to live separately from the rest of the struct). The first
+        // state a fresh watcher reads always counts as a "change" (see
+        // `cursor::watch`'s doc comment), so this newly connected client gets
+        // the host's current cursor shape right away.
+        let cursor_source = (ctx.build_cursor_source)();
+        let mut cursor_watcher = cursor::watch(cursor_source, CURSOR_POLL_INTERVAL);
+        let cursor_peer = Arc::clone(&peer);
+        let cursor_task = tokio::spawn(async move {
+            while let Some(state) = cursor_watcher.rx.recv().await {
+                let msg = cursor_state_to_control(state);
+                if let Err(err) = cursor_peer.send_control(&msg).await {
+                    tracing::warn!(?err, "failed to send cursor control message");
+                }
             }
+            // `rx` only closes when the watcher's thread is gone. On an orderly
+            // shutdown this task is aborted first (`ActiveSession::shutdown`),
+            // so reaching this line means the thread died mid-session (slice A
+            // of the 2026-10-13 audit: a panic is logged by the hook in
+            // `agent::logging`, but nothing said the session lost its cursor).
+            tracing::warn!("cursor watcher thread exited, cursor shape updates stop for this session");
+        });
+
+        // The `file` channel gets its own task (slice 3.4a), fed by the
+        // transport's dedicated mpsc rather than `handle_session_event`. A
+        // disabled or folder-less session still runs the task so the client
+        // gets a clean `Abort { Disabled }` instead of silence.
+        // The download folder is resolved once, at session start. In machine
+        // mode (Windows helper under SYSTEM) it is the Downloads of the user
+        // logged on to the console session; if the session began on the logon
+        // screen, files stay disabled in it until the client reconnects.
+        // The same goes for whose rights file operations use (D61): in machine
+        // mode the logged-on user's, never SYSTEM's.
+        let (files_dir, files_user) = if ctx.files_enabled {
+            match crate::files::receive_dir(ctx.machine_mode)
+                .and_then(|dir| crate::files::receive_fs_user(ctx.machine_mode).map(|u| (dir, u)))
+            {
+                Ok((dir, user)) => (Some(dir), user),
+                Err(err) => {
+                    tracing::warn!(error = %err, "download folder unavailable, file transfer disabled");
+                    (None, crate::files::FsUser::current())
+                }
+            }
+        } else {
+            (None, crate::files::FsUser::current())
         };
-    let router = InputRouter::new(injector);
-    router.set_capture_rect(crate::input::CaptureRect::from(&video.display));
+        let files_enabled = files_dir.is_some();
+        // Copied-file offers travel from the clipboard watcher to the files task
+        // (slice 3.4c); without a clipboard the sender is simply dropped.
+        let (files_cmd_tx, files_cmd_rx) = mpsc::channel::<crate::files::FilesCommand>(8);
 
-    // The watcher's background thread is polled by this task, not directly
-    // by `ActiveSession` -- see `ActiveSession::cursor_task`'s doc comment
-    // for why (`CursorWatcher` implements `Drop`, so its `rx` field can't be
-    // moved out to live separately from the rest of the struct). The first
-    // state a fresh watcher reads always counts as a "change" (see
-    // `cursor::watch`'s doc comment), so this newly connected client gets
-    // the host's current cursor shape right away.
-    let cursor_source = (ctx.build_cursor_source)();
-    let mut cursor_watcher = cursor::watch(cursor_source, CURSOR_POLL_INTERVAL);
-    let cursor_peer = Arc::clone(&peer);
-    let cursor_task = tokio::spawn(async move {
-        while let Some(state) = cursor_watcher.rx.recv().await {
-            let msg = cursor_state_to_control(state);
-            if let Err(err) = cursor_peer.send_control(&msg).await {
-                tracing::warn!(?err, "failed to send cursor control message");
-            }
-        }
-        // `rx` only closes when the watcher's thread is gone. On an orderly
-        // shutdown this task is aborted first (`ActiveSession::shutdown`),
-        // so reaching this line means the thread died mid-session (slice A
-        // of the 2026-10-13 audit: a panic is logged by the hook in
-        // `agent::logging`, but nothing said the session lost its cursor).
-        tracing::warn!("cursor watcher thread exited, cursor shape updates stop for this session");
-    });
-
-    // The `file` channel gets its own task (slice 3.4a), fed by the
-    // transport's dedicated mpsc rather than `handle_session_event`. A
-    // disabled or folder-less session still runs the task so the client
-    // gets a clean `Abort { Disabled }` instead of silence.
-    // The download folder is resolved once, at session start. In machine
-    // mode (Windows helper under SYSTEM) it is the Downloads of the user
-    // logged on to the console session; if the session began on the logon
-    // screen, files stay disabled in it until the client reconnects.
-    // The same goes for whose rights file operations use (D61): in machine
-    // mode the logged-on user's, never SYSTEM's.
-    let (files_dir, files_user) = if ctx.files_enabled {
-        match crate::files::receive_dir(ctx.machine_mode)
-            .and_then(|dir| crate::files::receive_fs_user(ctx.machine_mode).map(|u| (dir, u)))
-        {
-            Ok((dir, user)) => (Some(dir), user),
-            Err(err) => {
-                tracing::warn!(error = %err, "download folder unavailable, file transfer disabled");
-                (None, crate::files::FsUser::current())
-            }
-        }
-    } else {
-        (None, crate::files::FsUser::current())
-    };
-    let files_enabled = files_dir.is_some();
-    // Copied-file offers travel from the clipboard watcher to the files task
-    // (slice 3.4c); without a clipboard the sender is simply dropped.
-    let (files_cmd_tx, files_cmd_rx) = mpsc::channel::<crate::files::FilesCommand>(8);
-
-    // A failed/absent clipboard builder must not take the session down
-    // either -- same lesson as the injector fallback above (debt D26): the
-    // session just runs without clipboard sync.
-    let (clipboard, clipboard_task) = match &ctx.build_clipboard {
-        Some(build_clipboard) => match build_clipboard() {
-            Ok(backend) => {
-                let mut clipboard_sync = ClipboardSync::new(backend);
-                clipboard_sync.set_files_enabled(files_enabled);
-                tracing::info!(files_enabled, "clipboard sync started");
-                let sync = Arc::new(Mutex::new(clipboard_sync));
-                let mut clipboard_watcher =
-                    clipboard::watch(Arc::clone(&sync), clipboard::CLIPBOARD_POLL_INTERVAL);
-                let clipboard_peer = Arc::clone(&peer);
-                let task = tokio::spawn(async move {
-                    while let Some(event) = clipboard_watcher.rx.recv().await {
-                        match event {
-                            ClipboardEvent::Text(text) => {
-                                let msg = ControlMessage::ClipboardText { text };
-                                if let Err(err) = clipboard_peer.send_control(&msg).await {
-                                    tracing::warn!(
-                                        ?err,
-                                        "failed to send clipboard control message"
-                                    );
+        // A failed/absent clipboard builder must not take the session down
+        // either -- same lesson as the injector fallback above (debt D26): the
+        // session just runs without clipboard sync.
+        let (clipboard, clipboard_task) = match &ctx.build_clipboard {
+            Some(build_clipboard) => match build_clipboard() {
+                Ok(backend) => {
+                    let mut clipboard_sync = ClipboardSync::new(backend);
+                    clipboard_sync.set_files_enabled(files_enabled);
+                    tracing::info!(files_enabled, "clipboard sync started");
+                    let sync = Arc::new(Mutex::new(clipboard_sync));
+                    let mut clipboard_watcher =
+                        clipboard::watch(Arc::clone(&sync), clipboard::CLIPBOARD_POLL_INTERVAL);
+                    let clipboard_peer = Arc::clone(&peer);
+                    let task = tokio::spawn(async move {
+                        while let Some(event) = clipboard_watcher.rx.recv().await {
+                            match event {
+                                ClipboardEvent::Text(text) => {
+                                    let msg = ControlMessage::ClipboardText { text };
+                                    if let Err(err) = clipboard_peer.send_control(&msg).await {
+                                        tracing::warn!(
+                                            ?err,
+                                            "failed to send clipboard control message"
+                                        );
+                                    }
+                                }
+                                ClipboardEvent::Files(paths) => {
+                                    let _ = files_cmd_tx.send(FilesCommand::Offer(paths)).await;
+                                }
+                                ClipboardEvent::NoFiles => {
+                                    let _ = files_cmd_tx.send(FilesCommand::Clear).await;
                                 }
                             }
-                            ClipboardEvent::Files(paths) => {
-                                let _ = files_cmd_tx.send(FilesCommand::Offer(paths)).await;
-                            }
-                            ClipboardEvent::NoFiles => {
-                                let _ = files_cmd_tx.send(FilesCommand::Clear).await;
-                            }
                         }
-                    }
-                    // Same reasoning as `cursor_task` above: only a dead
-                    // watcher thread closes `rx` while this task is alive.
-                    tracing::warn!(
-                        "clipboard watcher thread exited, clipboard sync stops for this session"
-                    );
-                });
-                (Some(sync), Some(task))
+                        // Same reasoning as `cursor_task` above: only a dead
+                        // watcher thread closes `rx` while this task is alive.
+                        tracing::warn!(
+                            "clipboard watcher thread exited, clipboard sync stops for this session"
+                        );
+                    });
+                    (Some(sync), Some(task))
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "clipboard sync unavailable, session runs without it");
+                    (None, None)
+                }
+            },
+            None => (None, None),
+        };
+
+        // Only worth watching when there's a real injector to worry about --
+        // a view-only session (`input_available == false`) already tells the
+        // client that up front via `InputStatus` and never attaches input at
+        // all, so a UIPI warning on top would be noise. Windows only: UIPI
+        // (and elevation generally) doesn't exist on macOS.
+        #[cfg(target_os = "windows")]
+        let elevation_task = input_available.then(|| spawn_elevation_watcher(Arc::clone(&peer)));
+        #[cfg(not(target_os = "windows"))]
+        let elevation_task: Option<tokio::task::JoinHandle<()>> = None;
+
+        let Some((file_channel, file_rx)) = peer.take_file_channel() else {
+            // Everything above is already running: tear it down here, the
+            // caller only closes the peer.
+            video.stop();
+            cursor_task.abort();
+            if let Some(task) = clipboard_task {
+                task.abort();
             }
-            Err(err) => {
-                tracing::warn!(error = %err, "clipboard sync unavailable, session runs without it");
-                (None, None)
+            if let Some(task) = elevation_task {
+                task.abort();
             }
-        },
-        None => (None, None),
-    };
+            anyhow::bail!("file channel already taken");
+        };
+        let files_task = tokio::spawn(crate::files::run(
+            Arc::new(file_channel) as Arc<dyn crate::files::FileChannel>,
+            file_rx,
+            files_dir,
+            files_user,
+            files_cmd_rx,
+        ));
 
-    // Only worth watching when there's a real injector to worry about --
-    // a view-only session (`input_available == false`) already tells the
-    // client that up front via `InputStatus` and never attaches input at
-    // all, so a UIPI warning on top would be noise. Windows only: UIPI
-    // (and elevation generally) doesn't exist on macOS.
-    #[cfg(target_os = "windows")]
-    let elevation_task = input_available.then(|| spawn_elevation_watcher(Arc::clone(&peer)));
-    #[cfg(not(target_os = "windows"))]
-    let elevation_task: Option<tokio::task::JoinHandle<()>> = None;
-
-    let (file_channel, file_rx) = peer
-        .take_file_channel()
-        .ok_or_else(|| anyhow::anyhow!("file channel already taken"))?;
-    let files_task = tokio::spawn(crate::files::run(
-        Arc::new(file_channel) as Arc<dyn crate::files::FileChannel>,
-        file_rx,
-        files_dir,
-        files_user,
-        files_cmd_rx,
-    ));
-
-    Ok(SessionParts {
-        peer,
-        video,
-        video_tx,
-        keyframe_flag,
-        pipeline_generation,
-        displays,
-        router,
-        cursor_task,
-        input_available,
-        input_reason,
-        clipboard,
-        clipboard_task,
-        elevation_task,
-        files_task,
-        files_enabled,
-        curtain_windows,
-        _display_wake: std::sync::Mutex::new(wake_guard),
-    })
+        Ok(SessionParts {
+            peer: Arc::clone(&peer),
+            video,
+            video_tx,
+            keyframe_flag,
+            pipeline_generation,
+            displays,
+            router,
+            cursor_task,
+            input_available,
+            input_reason,
+            clipboard,
+            clipboard_task,
+            elevation_task,
+            files_task,
+            files_enabled,
+            curtain_windows,
+            _display_wake: std::sync::Mutex::new(wake_guard),
+        })
+    }
+    .await;
+    if started.is_err() {
+        peer.close().await;
+    }
+    started
 }
 
 /// Number of adapt ticks (1 s each) per `StatsWindow` summary.
@@ -5979,6 +6018,200 @@ mod tests {
                 reason: None,
             }
         );
+    }
+
+    /// Состояние цикла сигналинга для тестов M-11 (вытеснение сеанса).
+    struct Slot {
+        out_tx: mpsc::UnboundedSender<SignalMessage>,
+        out_rx: mpsc::UnboundedReceiver<SignalMessage>,
+        event_tx: mpsc::Sender<SessionEvent>,
+        _event_rx: mpsc::Receiver<SessionEvent>,
+        status_tx: watch::Sender<AgentStatus>,
+        active: Option<ActiveSession>,
+        current_session_id: Option<String>,
+        pending_auth: Option<PendingAuth>,
+        auth_failures: u32,
+        auth_locked_until: Option<Instant>,
+    }
+
+    impl Slot {
+        fn new() -> Self {
+            let (out_tx, out_rx) = mpsc::unbounded_channel::<SignalMessage>();
+            let (event_tx, _event_rx) = mpsc::channel(64);
+            let (status_tx, _) = watch::channel(AgentStatus::Connecting);
+            Slot {
+                out_tx,
+                out_rx,
+                event_tx,
+                _event_rx,
+                status_tx,
+                active: None,
+                current_session_id: None,
+                pending_auth: None,
+                auth_failures: 0,
+                auth_locked_until: None,
+            }
+        }
+
+        async fn peer_joined(&mut self, ctx: &HostContext, session_id: &str) {
+            handle_signal_message(
+                SignalMessage::PeerJoined {
+                    session_id: session_id.to_string(),
+                    ice_servers: vec![],
+                },
+                ctx,
+                &[],
+                "111111",
+                &self.status_tx,
+                &self.out_tx,
+                self.event_tx.clone(),
+                &mut self.active,
+                &mut self.current_session_id,
+                &mut self.pending_auth,
+                &mut self.auth_failures,
+                &mut self.auth_locked_until,
+            )
+            .await;
+        }
+
+        fn drain(&mut self) -> Vec<SignalMessage> {
+            let mut all = Vec::new();
+            while let Ok(m) = self.out_rx.try_recv() {
+                all.push(m);
+            }
+            all
+        }
+    }
+
+    fn is_bye_for(msg: &SignalMessage, id: &str) -> bool {
+        matches!(msg, SignalMessage::Bye { session_id, .. } if session_id == id)
+    }
+
+    /// M-11: при заданном пароле новый `PeerJoined` не трогает работающий
+    /// сеанс -- он гасится только после успешного входа.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_joined_with_password_keeps_active_session_until_login() {
+        let mut ctx = test_ctx();
+        let mut slot = Slot::new();
+        slot.peer_joined(&ctx, "sess-1").await;
+        assert!(slot.active.is_some(), "first session must start");
+        slot.drain();
+        let old_tag = slot.active.as_ref().unwrap().session_tag;
+
+        ctx.access_store =
+            test_ctx_with_password("keeps-active", "correct horse battery staple").access_store;
+        slot.peer_joined(&ctx, "sess-2").await;
+
+        let msgs = slot.drain();
+        assert!(msgs.contains(&SignalMessage::AuthRequired {
+            session_id: "sess-2".to_string()
+        }));
+        assert!(
+            !msgs.iter().any(|m| is_bye_for(m, "sess-1")),
+            "old session must not get a Bye: {msgs:?}"
+        );
+        assert_eq!(slot.active.as_ref().unwrap().session_tag, old_tag);
+        assert!(!slot.active.as_ref().unwrap().peer.is_closed());
+        assert_eq!(slot.current_session_id.as_deref(), Some("sess-1"));
+        assert_eq!(
+            slot.pending_auth.as_ref().map(|p| p.session_id.as_str()),
+            Some("sess-2")
+        );
+
+        // `Bye` кандидата снимает только его ожидание.
+        handle_signal_message(
+            SignalMessage::Bye {
+                session_id: "sess-2".to_string(),
+                reason: None,
+            },
+            &ctx,
+            &[],
+            "111111",
+            &slot.status_tx,
+            &slot.out_tx,
+            slot.event_tx.clone(),
+            &mut slot.active,
+            &mut slot.current_session_id,
+            &mut slot.pending_auth,
+            &mut slot.auth_failures,
+            &mut slot.auth_locked_until,
+        )
+        .await;
+        assert!(slot.pending_auth.is_none());
+        assert!(slot.active.is_some());
+        assert_eq!(slot.current_session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auth_timeout_for_pending_login_leaves_active_session_alone() {
+        let mut ctx = test_ctx();
+        let mut slot = Slot::new();
+        slot.peer_joined(&ctx, "sess-1").await;
+        ctx.access_store =
+            test_ctx_with_password("timeout-active", "correct horse battery staple").access_store;
+        slot.peer_joined(&ctx, "sess-2").await;
+        slot.drain();
+        let generation = slot.pending_auth.as_ref().expect("armed").generation;
+
+        handle_session_event(
+            SessionEvent::AuthTimeout {
+                session_id: "sess-2".to_string(),
+                generation,
+            },
+            &ctx,
+            "111111",
+            &slot.status_tx,
+            &slot.out_tx,
+            &slot.event_tx,
+            &mut slot.active,
+            &mut slot.current_session_id,
+            &mut slot.pending_auth,
+        )
+        .await;
+
+        assert!(slot.pending_auth.is_none());
+        let msgs = slot.drain();
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(is_bye_for(&msgs[0], "sess-2"));
+        assert!(slot.active.is_some());
+        assert!(!slot.active.as_ref().unwrap().peer.is_closed());
+        assert_eq!(slot.current_session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_joined_without_password_supersedes_active_session() {
+        let ctx = test_ctx();
+        let mut slot = Slot::new();
+        slot.peer_joined(&ctx, "sess-1").await;
+        let old_tag = slot.active.as_ref().expect("first session").session_tag;
+        let old_peer = Arc::clone(&slot.active.as_ref().unwrap().peer);
+        slot.drain();
+
+        slot.peer_joined(&ctx, "sess-2").await;
+
+        assert!(old_peer.is_closed(), "old peer must be closed");
+        let new = slot.active.as_ref().expect("new session");
+        assert_ne!(new.session_tag, old_tag);
+        assert_eq!(slot.current_session_id.as_deref(), Some("sess-2"));
+        assert!(slot.drain().iter().any(
+            |m| matches!(m, SignalMessage::Offer { session_id, .. } if session_id == "sess-2")
+        ));
+    }
+
+    /// M-2: `SessionParts::abort` закрывает `PeerConnection`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_parts_abort_closes_peer() {
+        let ctx = test_ctx();
+        let (events_tx, _events_rx) = mpsc::channel(64);
+        let parts = start_session(&ctx, &[], events_tx)
+            .await
+            .expect("session must start");
+        let peer = Arc::clone(&parts.peer);
+        assert!(!peer.is_closed());
+
+        parts.abort().await;
+
+        assert!(peer.is_closed());
     }
 
     /// `InputMessage::ClipboardText` arriving on the `input` channel must be

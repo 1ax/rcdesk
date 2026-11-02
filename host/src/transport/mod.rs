@@ -509,6 +509,8 @@ pub struct PeerSession {
     /// This session's unique tag (fix to slice 3.5b) -- see
     /// `SessionEvent::ConnectionState`'s doc comment.
     tag: u64,
+    /// Set by `close`; see `is_closed`.
+    closed: AtomicBool,
 }
 
 /// One end of the selected ICE candidate pair, for the `agent.log` path line.
@@ -859,6 +861,7 @@ impl PeerSession {
             file_channel,
             file_rx: std::sync::Mutex::new(Some(file_rx)),
             tag,
+            closed: AtomicBool::new(false),
         });
 
         Ok(session)
@@ -933,8 +936,14 @@ impl PeerSession {
         Ok(())
     }
 
+    /// Whether `close` has been called on this session.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     /// Closes the underlying peer connection.
     pub async fn close(&self) {
+        self.closed.store(true, Ordering::Release);
         if let Err(err) = self.pc.close().await {
             tracing::warn!(?err, "error closing peer connection");
         }
