@@ -16,9 +16,10 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{GENERIC_ALL, HANDLE};
 use windows::Win32::System::StationsAndDesktops::{
-    CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
+    CloseDesktop, GetThreadDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop,
     DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, HDESK, UOI_NAME,
 };
+use windows::Win32::System::Threading::GetCurrentThreadId;
 
 /// Минимальный интервал между проверками входного рабочего стола на поток.
 const CHECK_INTERVAL: Duration = Duration::from_millis(100);
@@ -44,6 +45,26 @@ struct ThreadState {
     name: Option<String>,
     /// Открытый хендл этого рабочего стола; держим, пока поток к нему привязан.
     hdesk: Option<HDESK>,
+    /// Рабочий стол потока до нашего первого `SetThreadDesktop`. Хендл принадлежит
+    /// системе (MSDN: `GetThreadDesktop` закрывать не нужно); нужен для отвязки в `Drop`.
+    original: Option<HDESK>,
+}
+
+impl Drop for ThreadState {
+    /// Выполняется при завершении потока (деструктор `thread_local!`): закрывает
+    /// последний открытый хендл, иначе он утекает на каждый поток.
+    fn drop(&mut self) {
+        let Some(hdesk) = self.hdesk.take() else {
+            return;
+        };
+        // MSDN: `CloseDesktop` не закрывает рабочий стол, который использует
+        // поток, поэтому сначала возвращаем поток на исходный стол (ошибку игнорируем).
+        if let Some(original) = self.original {
+            // Safety: `original` -- хендл, выданный системой для этого же потока.
+            let _ = unsafe { SetThreadDesktop(original) };
+        }
+        close(hdesk);
+    }
 }
 
 thread_local! {
@@ -53,6 +74,7 @@ thread_local! {
             last_warn: None,
             name: None,
             hdesk: None,
+            original: None,
         })
     };
 }
@@ -126,6 +148,12 @@ fn try_switch(st: &mut ThreadState) -> Result<bool, String> {
     if !desktop_changed(st.name.as_deref(), &name) {
         close(hdesk);
         return Ok(false);
+    }
+    if st.original.is_none() {
+        // Safety: id текущего потока; при ошибке/нулевом хендле остаётся `None`.
+        st.original = unsafe { GetThreadDesktop(GetCurrentThreadId()) }
+            .ok()
+            .filter(|h| !h.is_invalid());
     }
     // Safety: `hdesk` -- только что открытый валидный хендл рабочего стола.
     if let Err(err) = unsafe { SetThreadDesktop(hdesk) } {
