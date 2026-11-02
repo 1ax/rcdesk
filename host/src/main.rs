@@ -305,6 +305,9 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(rcdesk_host::agent::paths::data_dir),
                 rcdesk_host::settings::DEV_SERVER,
             );
+            if let Err(err) = rcdesk_host::settings::check_server_url(&server) {
+                anyhow::bail!("{err}");
+            }
             let opts = ServeOptions {
                 server,
                 name,

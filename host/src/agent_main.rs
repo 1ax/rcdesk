@@ -160,6 +160,10 @@ mod imp {
             &machine_dir,
             rcdesk_host::device::DEFAULT_SERVER,
         );
+        if let Err(err) = rcdesk_host::settings::check_server_url(&server) {
+            tracing::error!(%server, error = %err, "недопустимый адрес сервера, агент не стартует");
+            std::process::exit(1);
+        }
         let device_store = DeviceStore::for_server(&machine_dir, &server).shared();
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -393,6 +397,10 @@ mod imp {
             &state_dir,
             rcdesk_host::device::DEFAULT_SERVER,
         );
+        if let Err(err) = rcdesk_host::settings::check_server_url(&server) {
+            tracing::error!(%server, error = %err, "недопустимый адрес сервера, агент не стартует");
+            std::process::exit(1);
+        }
         let device_store = DeviceStore::for_server(&state_dir, &server);
         #[cfg(target_os = "macos")]
         let device_store = if full_mode {

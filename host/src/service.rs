@@ -53,7 +53,7 @@ pub fn validate_server(server: &str) -> Result<(), String> {
             "адрес сервера не должен содержать пробелов и кавычек: {server}"
         ));
     }
-    Ok(())
+    crate::settings::check_server_url(server)
 }
 
 /// `"<exe>" service run [--server <server>]` -- binpath службы. Без явного

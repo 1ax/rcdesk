@@ -2427,12 +2427,10 @@ async fn handle_session_event(
                 } else {
                     match serde_json::from_slice::<proto::input::InputMessage>(&data) {
                         // `ClipboardText` is never routed through
-                        // `InputRouter` like every other input message:
-                        // `handle_session_event` (this function) processes
-                        // one channel event at a time, so applying it here,
-                        // synchronously, guarantees the host's clipboard is
-                        // updated before the very next event (e.g. a Cmd+V
-                        // `Key`) reaches the router (slice 2.5b). Never
+                        // `InputRouter` like every other input message
+                        // (slice 2.5b); it is applied on a blocking-pool
+                        // thread so a busy clipboard watcher cannot stall
+                        // this loop (M-7). Never
                         // logged with its text -- length only (privacy).
                         Ok(proto::input::InputMessage::ClipboardText { text }) => {
                             if label == "pointer" {
@@ -2442,7 +2440,7 @@ async fn handle_session_event(
                                     "clipboard_text on the unordered pointer channel, ignoring"
                                 );
                             } else if let Some(active) = active.as_ref() {
-                                apply_remote_clipboard_text(active.clipboard.as_ref(), &text);
+                                apply_remote_clipboard_text(active.clipboard.clone(), text);
                             }
                         }
                         Ok(msg) => {
@@ -2681,16 +2679,19 @@ async fn handle_session_event(
 }
 
 /// Applies an incoming `InputMessage::ClipboardText` (client -> host) to the
-/// session's clipboard, if clipboard sync is available for it -- see the
-/// call site in `handle_session_event` for why this happens synchronously
-/// rather than through `InputRouter`. `clipboard` is `None` when
+/// session's clipboard, if clipboard sync is available for it. The mutex is
+/// also held by the clipboard watcher thread during `poll()` (on Windows up
+/// to ~1 s), so the work runs on `spawn_blocking` and is not awaited: the
+/// signaling loop must not stall (M-7). `clipboard` is `None` when
 /// `HostContext::build_clipboard` was `None` (`serve --no-clipboard`) or the
 /// builder failed for this session; `text` is never logged (privacy).
-fn apply_remote_clipboard_text(clipboard: Option<&Arc<Mutex<ClipboardSync>>>, text: &str) {
+fn apply_remote_clipboard_text(clipboard: Option<Arc<Mutex<ClipboardSync>>>, text: String) {
     match clipboard {
         Some(sync) => {
-            let mut sync = sync.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            sync.apply_remote(text);
+            drop(tokio::task::spawn_blocking(move || {
+                let mut sync = sync.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                sync.apply_remote(&text);
+            }));
         }
         None => {
             tracing::debug!(
@@ -6276,6 +6277,13 @@ mod tests {
         )
         .await;
 
+        // Applied on the blocking pool (M-7): wait for it to land.
+        for _ in 0..200 {
+            if !fake_clipboard.set_calls().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(fake_clipboard.set_calls(), vec!["from client".to_string()]);
 
         if let Some(active) = active.take() {

@@ -43,6 +43,47 @@ pub fn resolve_server(flag: Option<String>, dir: &Path, default: &str) -> String
     default.to_string()
 }
 
+/// Проверка адреса сервера (M-4): `wss://` -- всегда; `ws://` -- только для
+/// loopback (иначе PIN и секрет устройства идут открытым текстом). Запрет
+/// снимает `RCDESK_ALLOW_PLAIN_WS=1` (доверенная dev-сеть).
+pub fn check_server_url(url: &str) -> Result<(), String> {
+    let allow = std::env::var("RCDESK_ALLOW_PLAIN_WS").is_ok_and(|v| v == "1");
+    let result = check_server_url_with(url, allow);
+    if allow && url.starts_with("ws://") && check_server_url_with(url, false).is_err() {
+        tracing::warn!(%url, "RCDESK_ALLOW_PLAIN_WS=1: незашифрованный ws:// разрешён");
+    }
+    result
+}
+
+/// [`check_server_url`] с явным признаком разрешения plain `ws://`.
+pub fn check_server_url_with(url: &str, allow_plain: bool) -> Result<(), String> {
+    if url.starts_with("wss://") {
+        return Ok(());
+    }
+    let Some(rest) = url.strip_prefix("ws://") else {
+        return Err(format!(
+            "unsupported server URL scheme (got {url}); use wss://"
+        ));
+    };
+    if allow_plain {
+        return Ok(());
+    }
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        // `[::1]:8080` -> `::1`
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    if matches!(host, "127.0.0.1" | "localhost" | "::1") {
+        Ok(())
+    } else {
+        Err(format!(
+            "plain ws:// is only allowed for loopback (got {url}); use wss:// or set RCDESK_ALLOW_PLAIN_WS=1 for a trusted dev network"
+        ))
+    }
+}
+
 /// Читает и разбирает `dir/settings.json`; `None`, если файла нет, он не
 /// читается или не разбирается (последние два случая -- с предупреждением).
 fn load(dir: &Path) -> Option<Settings> {
@@ -97,6 +138,46 @@ mod tests {
 
     fn write(dir: &Path, content: &str) {
         std::fs::write(dir.join(SETTINGS_FILE), content).unwrap();
+    }
+
+    #[test]
+    fn check_server_url_accepts_wss_and_loopback_ws() {
+        for url in [
+            "wss://rcdesk.app/ws",
+            "wss://10.0.0.5:8443/ws",
+            "ws://127.0.0.1:8080/ws",
+            "ws://localhost/ws",
+            "ws://localhost:1",
+            "ws://[::1]:8080/ws",
+        ] {
+            assert!(check_server_url_with(url, false).is_ok(), "{url}");
+        }
+    }
+
+    #[test]
+    fn check_server_url_rejects_plain_ws_for_lan_host() {
+        for url in [
+            "ws://1.2.3.4/ws",
+            "ws://192.168.1.5:8080/ws",
+            "ws://hub.lan/ws",
+        ] {
+            let err = check_server_url_with(url, false).unwrap_err();
+            assert!(err.contains("RCDESK_ALLOW_PLAIN_WS"), "{err}");
+            assert!(check_server_url_with(url, true).is_ok(), "{url}");
+        }
+    }
+
+    #[test]
+    fn check_server_url_rejects_other_schemes() {
+        for url in [
+            "http://127.0.0.1/ws",
+            "https://rcdesk.app/ws",
+            "rcdesk.app",
+            "",
+        ] {
+            assert!(check_server_url_with(url, false).is_err(), "{url}");
+            assert!(check_server_url_with(url, true).is_err(), "{url}");
+        }
     }
 
     #[test]

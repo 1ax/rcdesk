@@ -54,11 +54,21 @@ pub enum ByeReason {
 /// Постоянные креды устройства (слайс 3.1): сервер выдаёт их при первой
 /// регистрации, хост сохраняет у себя и предъявляет при каждой следующей,
 /// получая тот же `host_id` вместо нового случайного.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct DeviceCredentials {
     pub device_id: String,
     pub secret: String,
+}
+
+// Ручной `Debug`: секрет не должен попадать в логи (M-8).
+impl std::fmt::Debug for DeviceCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCredentials")
+            .field("device_id", &self.device_id)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Сетевая карта хоста (слайс W): нужна серверу, чтобы выбрать «будильник»
@@ -626,6 +636,17 @@ pub enum SignalMessage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn device_credentials_debug_hides_secret() {
+        let creds = super::DeviceCredentials {
+            device_id: "dev-123".to_string(),
+            secret: "s3cr3t-value".to_string(),
+        };
+        let text = format!("{creds:?}");
+        assert!(text.contains("dev-123"));
+        assert!(!text.contains("s3cr3t-value"));
+    }
+
     use super::*;
 
     #[test]
