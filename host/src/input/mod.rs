@@ -895,7 +895,10 @@ mod tests {
         let router = InputRouter::new(Box::new(injector));
         let held = gate.lock().unwrap();
         let mut saw_full = false;
-        for i in 0..(INPUT_QUEUE_CAPACITY + 2) {
+        // The worker may already have pulled two messages (one via `recv`,
+        // one into `pending` by `coalesce_pointer_move`) before stalling on
+        // the gate, so overshoot the capacity by more than that.
+        for i in 0..(INPUT_QUEUE_CAPACITY + 8) {
             // Alternate coordinates-free keys so nothing is coalesced.
             let msg = InputMessage::Key {
                 code: "KeyA".into(),
