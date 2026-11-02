@@ -150,6 +150,7 @@ import {
   recoveryExhausted,
   shouldAttemptRecovery,
 } from "./sessionRecovery";
+import { ConnectGuard } from "./connectGuard";
 import type { ConnectionBannerPhase } from "./sessionRecovery";
 import {
   authFailedPhase,
@@ -1170,6 +1171,10 @@ export function mount(root: Element | null): void {
   // attempt succeeds (slice 3.5a; the live WebRTC session, if any, is
   // untouched -- signaling is only needed to set one up).
   let connectionLost = false;
+  // Audit W-1/W-5/W-10: validates the `joined` answering our request.
+  const connectGuard = new ConnectGuard();
+  const CONNECT_RESPONSE_TIMEOUT_MS = RECOVERY_RESPONSE_TIMEOUT_MS; // 15 s
+  let connectResponseTimer: ReturnType<typeof setTimeout> | undefined;
   // Attempt counter for `scheduleReconnect`'s backoff (`reconnectBackoffMs`);
   // reset to 0 once `authenticated` confirms the reconnect worked.
   let reconnectAttempt = 0;
@@ -1567,14 +1572,14 @@ export function mount(root: Element | null): void {
       const connectRowBtn = document.createElement("button");
       connectRowBtn.className = "btn device-connect";
       connectRowBtn.textContent = "Подключиться";
-      connectRowBtn.disabled = connectionLost || !canConnect(entry);
+      connectRowBtn.disabled = connectionLost || connectGuard.pending || !canConnect(entry);
       connectRowBtn.addEventListener("click", () => {
         // Call play() inside this click handler (a user gesture), same
         // reasoning as `connectBtn`'s listener below (ARCHITECTURE.md §10).
         void video.play().catch(() => {
           // Expected: there's no source yet. The gesture is what matters.
         });
-        beginSession(() =>
+        beginSession(entry.device_id, () =>
           signaling.send({ type: "connect_device", device_id: entry.device_id }),
         );
       });
@@ -3025,6 +3030,7 @@ export function mount(root: Element | null): void {
     recoveryAttempt = 0;
     recoveryWaitingForSocket = false;
     deviceId = null;
+    settleConnect();
     // Slice 3.5c: a final end of session (unlike `handleSessionLost` starting
     // a recovery attempt, which leaves the session screen -- and fullscreen
     // -- up) shouldn't leave the tab stuck in fullscreen with the PIN/list
@@ -3070,6 +3076,7 @@ export function mount(root: Element | null): void {
       recoveryWaitingForSocket = true;
       return;
     }
+    connectGuard.request(deviceId);
     signaling.send({ type: "connect_device", device_id: deviceId });
     // Slice E1: no `joined`/`error` in time means the attempt is lost.
     clearRecoveryResponseTimer();
@@ -3139,10 +3146,37 @@ export function mount(root: Element | null): void {
    * inside the click that triggered it -- Safari requires that exact call
    * to happen inside the user gesture (ARCHITECTURE.md §10), so it can't be
    * moved in here. */
-  function beginSession(send: () => void): void {
+  function beginSession(expectedDeviceId: string | null, send: () => void): void {
     pinStatus.textContent = "";
     connectBtn.disabled = true;
+    connectGuard.request(expectedDeviceId);
+    for (const b of deviceListEl.querySelectorAll<HTMLButtonElement>(".device-connect")) {
+      b.disabled = true;
+    }
+    clearConnectResponseTimer();
+    connectResponseTimer = setTimeout(() => {
+      connectResponseTimer = undefined;
+      console.warn("connect request timed out");
+      settleConnect();
+      connectBtn.disabled = connectionLost;
+      pinStatus.textContent = "Сервер не ответил — попробуйте ещё раз";
+    }, CONNECT_RESPONSE_TIMEOUT_MS);
     send();
+  }
+
+  function clearConnectResponseTimer(): void {
+    if (connectResponseTimer !== undefined) {
+      clearTimeout(connectResponseTimer);
+      connectResponseTimer = undefined;
+    }
+  }
+
+  /** The awaited `joined`/`error` will not come (or came): drop the guard
+   * request and timer, re-enable the device-row buttons. */
+  function settleConnect(): void {
+    clearConnectResponseTimer();
+    connectGuard.cancel();
+    renderDeviceList();
   }
 
   // The `joined`/`offer`/`ice`/`bye`/`error` subscriptions below used to be
@@ -3227,6 +3261,28 @@ export function mount(root: Element | null): void {
   });
 
   signaling.on("joined", (msg) => {
+    const verdict = connectGuard.onJoined(msg.device_id);
+    if (verdict === "unexpected") {
+      console.warn("unexpected joined, ignoring");
+      signaling.send({ type: "bye", session_id: msg.session_id });
+      return;
+    }
+    if (verdict === "mismatch") {
+      console.warn("joined for a different device than requested");
+      signaling.send({ type: "bye", session_id: msg.session_id });
+      clearConnectResponseTimer();
+      if (recovering) {
+        clearRecoveryResponseTimer();
+        teardown("Сервер вернул не то устройство — подключение отклонено");
+      } else {
+        connectBtn.disabled = connectionLost;
+        pinStatus.textContent = "Сервер вернул не то устройство — подключение отклонено";
+        renderDeviceList();
+      }
+      return;
+    }
+    clearConnectResponseTimer();
+    renderDeviceList();
     // Slice E1: a `joined` while a session is still live must not leak the
     // old `RTCPeerConnection`/channels -- close them before anything else.
     if (session !== null) {
@@ -3581,6 +3637,7 @@ export function mount(root: Element | null): void {
       // the specific server message isn't surfaced per-attempt, only the
       // attempt count (the banner/status already show that).
       console.warn("recovery attempt failed", msg.message);
+      connectGuard.cancel();
       clearRecoveryResponseTimer();
       scheduleRecoveryAttempt();
       return;
@@ -3616,7 +3673,7 @@ export function mount(root: Element | null): void {
       // already on.
       pinStatus.textContent = signalErrorLabel(msg.message);
       connectBtn.disabled = connectionLost;
-      renderDeviceList();
+      settleConnect();
       return;
     }
     setSessionStatus("error");
@@ -3691,7 +3748,7 @@ export function mount(root: Element | null): void {
       // Expected: there's no source yet. The gesture is what matters.
     });
 
-    beginSession(() => signaling.send({ type: "join", pin }));
+    beginSession(null, () => signaling.send({ type: "join", pin }));
   });
 
   disconnectBtn.addEventListener("click", () => {
