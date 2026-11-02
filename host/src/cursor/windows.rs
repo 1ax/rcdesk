@@ -89,7 +89,12 @@ impl CursorSource for WinCursorSource {
         }
 
         let result = if !icon_info.hbmColor.is_invalid() {
-            self.color_cursor_image(icon_info.hbmColor, icon_info.xHotspot, icon_info.yHotspot)
+            self.color_cursor_image(
+                icon_info.hbmColor,
+                icon_info.hbmMask,
+                icon_info.xHotspot,
+                icon_info.yHotspot,
+            )
         } else {
             self.mono_cursor_image(icon_info.hbmMask, icon_info.xHotspot, icon_info.yHotspot)
         };
@@ -117,6 +122,7 @@ impl WinCursorSource {
     fn color_cursor_image(
         &self,
         hbm: HBITMAP,
+        hbm_mask: HBITMAP,
         hotspot_x: u32,
         hotspot_y: u32,
     ) -> Option<CursorState> {
@@ -191,6 +197,12 @@ impl WinCursorSource {
             px.swap(0, 2);
         }
 
+        // V-7: all-zero alpha means a legacy cursor without a real alpha
+        // channel; take transparency from the AND mask instead.
+        if buf.as_chunks::<4>().0.iter().all(|px| px[3] == 0) {
+            self.apply_mask_alpha(hbm_mask, width, height, &mut buf);
+        }
+
         Some(CursorState::Shape(CursorImage {
             width: width as u32,
             height: height as u32,
@@ -199,6 +211,97 @@ impl WinCursorSource {
             scale: 1.0,
             rgba: buf,
         }))
+    }
+
+    /// Reads the first `rows` scanlines of a 1bpp mask bitmap as a top-down
+    /// DIB. Returns the bytes and the row stride (rows are padded to 4-byte
+    /// boundaries). `None` (already logged) when the read fails.
+    fn read_mask_bits(&self, hbm_mask: HBITMAP, width: i32, rows: i32) -> Option<(Vec<u8>, usize)> {
+        let header = BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -rows,
+            biPlanes: 1,
+            biBitCount: 1,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+        let mut bitmap_info = BITMAPINFO {
+            bmiHeader: header,
+            ..Default::default()
+        };
+
+        // 1bpp DIB rows are padded to 4-byte (32-bit) boundaries.
+        let stride = (width as u32).div_ceil(32) as usize * 4;
+        let mut buf = vec![0u8; stride * rows as usize];
+
+        // Safety: `hdc` is a freshly created memory DC, `hbm_mask` a valid
+        // bitmap, `buf` sized for exactly `rows` scanlines of `stride`
+        // bytes (1bpp) each, matching `bitmap_info`.
+        let hdc = unsafe { CreateCompatibleDC(None) };
+        if hdc.is_invalid() {
+            self.log_failure("CreateCompatibleDC");
+            return None;
+        }
+        let lines = unsafe {
+            GetDIBits(
+                hdc,
+                hbm_mask,
+                0,
+                rows as u32,
+                Some(buf.as_mut_ptr().cast()),
+                &mut bitmap_info,
+                DIB_RGB_COLORS,
+            )
+        };
+        // Safety: `hdc` was created above and is not used again.
+        unsafe {
+            let _ = DeleteDC(hdc);
+        }
+        if lines == 0 {
+            self.log_failure("GetDIBits(hbmMask)");
+            return None;
+        }
+        Some((buf, stride))
+    }
+
+    /// V-7: legacy colour cursors (e.g. converted 24-bit ones) come back
+    /// from the 32bpp DIB with an all-zero alpha channel, which would render
+    /// fully transparent. Rebuilds alpha from the AND mask (bit 1 =
+    /// transparent). For colour cursors the mask is just the AND part
+    /// (`height` rows); if it reports `2 * height`, the top half is used.
+    /// Leaves `rgba` untouched if the mask can't be read.
+    fn apply_mask_alpha(&self, hbm_mask: HBITMAP, width: i32, height: i32, rgba: &mut [u8]) {
+        if hbm_mask.is_invalid() {
+            return;
+        }
+        let mut bmp = BITMAP::default();
+        // Safety: `hbm_mask` is a valid bitmap handle from `GetIconInfo`,
+        // `bmp` a correctly-sized out-parameter.
+        let written = unsafe {
+            GetObjectW(
+                hbm_mask.into(),
+                size_of::<BITMAP>() as i32,
+                Some(std::ptr::addr_of_mut!(bmp).cast()),
+            )
+        };
+        if written == 0 {
+            self.log_failure("GetObjectW(hbmMask) for alpha");
+            return;
+        }
+        if bmp.bmBitsPixel != 1 || bmp.bmWidth < width || bmp.bmHeight < height {
+            self.log_failure("hbmMask unusable for alpha");
+            return;
+        }
+        let Some((mask, stride)) = self.read_mask_bits(hbm_mask, width, height) else {
+            return;
+        };
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let and_bit = (mask[y * stride + x / 8] >> (7 - (x % 8))) & 1 == 1;
+                rgba[(y * width as usize + x) * 4 + 3] = if and_bit { 0 } else { 255 };
+            }
+        }
     }
 
     /// Legacy monochrome cursors (`hbmColor` null): `hbmMask` packs an AND
@@ -234,48 +337,7 @@ impl WinCursorSource {
         }
         let height = mask_height / 2;
 
-        let header = BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width,
-            biHeight: -mask_height,
-            biPlanes: 1,
-            biBitCount: 1,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        };
-        let mut bitmap_info = BITMAPINFO {
-            bmiHeader: header,
-            ..Default::default()
-        };
-
-        // 1bpp DIB rows are padded to 4-byte (32-bit) boundaries.
-        let stride = (width as u32).div_ceil(32) as usize * 4;
-        let mut buf = vec![0u8; stride * mask_height as usize];
-
-        // Safety: see `color_cursor_image` -- same reasoning, 1bpp here.
-        let hdc = unsafe { CreateCompatibleDC(None) };
-        if hdc.is_invalid() {
-            self.log_failure("CreateCompatibleDC");
-            return None;
-        }
-        let lines = unsafe {
-            GetDIBits(
-                hdc,
-                hbm_mask,
-                0,
-                mask_height as u32,
-                Some(buf.as_mut_ptr().cast()),
-                &mut bitmap_info,
-                DIB_RGB_COLORS,
-            )
-        };
-        unsafe {
-            let _ = DeleteDC(hdc);
-        }
-        if lines == 0 {
-            self.log_failure("GetDIBits(hbmMask)");
-            return None;
-        }
+        let (buf, stride) = self.read_mask_bits(hbm_mask, width, mask_height)?;
 
         let bit_at = |x: usize, y: usize| -> bool {
             let byte = buf[y * stride + x / 8];

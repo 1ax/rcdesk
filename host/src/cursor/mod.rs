@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TrySendError};
 
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -129,6 +129,35 @@ pub fn watch(source: Box<dyn CursorSource>, period: Duration) -> CursorWatcher {
     }
 }
 
+/// Applies the outcome of `try_send` to the dedup state. Returns `false`
+/// when the receiver is gone and the loop should stop (V-7).
+fn after_send(
+    result: Result<(), TrySendError<CursorState>>,
+    state: CursorState,
+    last: &mut Option<CursorState>,
+) -> bool {
+    match result {
+        Ok(()) => {
+            *last = Some(state);
+            true
+        }
+        // Channel full: leave `last` untouched so the next poll retries
+        // instead of losing this shape for good.
+        Err(TrySendError::Full(_)) => true,
+        Err(TrySendError::Closed(_)) => false,
+    }
+}
+
+/// True the first time a given oversized (width, height) is seen: one
+/// warning per size instead of one per poll.
+fn should_warn_too_large(warned: &mut Option<(u32, u32)>, width: u32, height: u32) -> bool {
+    if *warned == Some((width, height)) {
+        return false;
+    }
+    *warned = Some((width, height));
+    true
+}
+
 fn watch_loop(
     mut source: Box<dyn CursorSource>,
     period: Duration,
@@ -136,25 +165,27 @@ fn watch_loop(
     stop: &AtomicBool,
 ) {
     let mut last: Option<CursorState> = None;
+    let mut warned_too_large: Option<(u32, u32)> = None;
     while !stop.load(Ordering::Relaxed) {
         if let Some(state) = source.current() {
             if let CursorState::Shape(image) = &state {
                 if image.width > MAX_CURSOR_DIMENSION || image.height > MAX_CURSOR_DIMENSION {
-                    tracing::warn!(
-                        width = image.width,
-                        height = image.height,
-                        "cursor image too large for a CSS cursor, skipping"
-                    );
+                    if should_warn_too_large(&mut warned_too_large, image.width, image.height) {
+                        tracing::warn!(
+                            width = image.width,
+                            height = image.height,
+                            "cursor image too large for a CSS cursor, skipping"
+                        );
+                    }
                     thread::sleep(period);
                     continue;
                 }
             }
             if last.as_ref() != Some(&state) {
-                // Best-effort: a full channel means the consumer is behind
-                // and will catch up on the next change (see `watch`'s doc
-                // comment).
-                let _ = tx.try_send(state.clone());
-                last = Some(state);
+                let result = tx.try_send(state.clone());
+                if !after_send(result, state, &mut last) {
+                    return;
+                }
             }
         }
         thread::sleep(period);
@@ -276,6 +307,41 @@ mod tests {
         let received = recv_n(&mut watcher.rx, 1);
         assert_eq!(received, vec![shape]);
         assert_no_more(&mut watcher.rx);
+    }
+
+    #[test]
+    fn after_send_ok_records_last() {
+        let mut last = None;
+        assert!(after_send(Ok(()), CursorState::Hidden, &mut last));
+        assert_eq!(last, Some(CursorState::Hidden));
+    }
+
+    #[test]
+    fn full_channel_keeps_shape_for_retry() {
+        let mut last = None;
+        let err = TrySendError::Full(CursorState::Hidden);
+        assert!(after_send(Err(err), CursorState::Hidden, &mut last));
+        assert_eq!(
+            last, None,
+            "last must not be updated so the send is retried"
+        );
+    }
+
+    #[test]
+    fn closed_channel_stops_the_loop() {
+        let mut last = None;
+        let err = TrySendError::Closed(CursorState::Hidden);
+        assert!(!after_send(Err(err), CursorState::Hidden, &mut last));
+        assert_eq!(last, None);
+    }
+
+    #[test]
+    fn too_large_warning_is_logged_once_per_size() {
+        let mut warned = None;
+        assert!(should_warn_too_large(&mut warned, 256, 40));
+        assert!(!should_warn_too_large(&mut warned, 256, 40));
+        assert!(should_warn_too_large(&mut warned, 300, 40));
+        assert!(!should_warn_too_large(&mut warned, 300, 40));
     }
 
     #[test]
