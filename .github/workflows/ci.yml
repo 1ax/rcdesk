@@ -40,7 +40,7 @@ jobs:
             exit 1
           fi
           for c in rtc-sctp rtc-turn scap; do
-            cargo tree -i "$c" --locked --target all | head -1 | grep -q "vendor/$c)" \
+            cargo tree -i "$c" --locked --target all | head -1 | grep -qE "vendor[/\\\\]$c\)" \
               || { echo "ошибка: $c собирается не из vendor/$c" >&2; exit 1; }
           done
       - name: cargo fmt --all --check
