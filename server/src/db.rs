@@ -21,7 +21,7 @@ use rusqlite::{Connection, OptionalExtension};
 /// Schema version this binary expects (`PRAGMA user_version`). Bump this
 /// and extend `migrate` when the schema changes; `migrate` itself must stay
 /// idempotent (safe to run against an already-migrated database).
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// Сколько секунд владелец без устройств и passkey может не появляться,
 /// прежде чем `prune_empty_owners` его удалит (долг D53).
@@ -62,6 +62,8 @@ pub struct OwnedDevice {
     pub alias: Option<String>,
     pub added_at: i64,
     pub last_seen_at: i64,
+    /// D92: ОС хоста (`"macos"|"windows"|"other"`), `None` — неизвестна.
+    pub host_os: Option<String>,
 }
 
 /// Строка `wake_devices` (D84/D85): ручное устройство или роутер-будильник.
@@ -257,6 +259,30 @@ impl Db {
             (version, device_id),
         )?;
         Ok(changed > 0)
+    }
+
+    /// D92: записывает ОС хоста (строка serde `HostOs`) в `devices.host_os`.
+    /// Возвращает `false`, если устройства нет.
+    pub fn set_host_os(&self, device_id: &str, os: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE devices SET host_os = ?1 WHERE device_id = ?2",
+            (os, device_id),
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// D92: ОС хоста из `devices.host_os`.
+    pub fn host_os(&self, device_id: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let v = conn
+            .query_row(
+                "SELECT host_os FROM devices WHERE device_id = ?1",
+                [device_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(v.flatten())
     }
 
     /// Слайс W: заменяет набор сетевых карт устройства целиком (одна
@@ -1153,7 +1179,7 @@ impl Db {
     pub fn devices_for_owner(&self, owner_id: &str) -> anyhow::Result<Vec<OwnedDevice>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT d.device_id, d.name, o.alias, o.added_at, d.last_seen_at
+            "SELECT d.device_id, d.name, o.alias, o.added_at, d.last_seen_at, d.host_os
              FROM ownership o
              JOIN devices d ON d.device_id = o.device_id
              WHERE o.owner_id = ?1
@@ -1167,6 +1193,7 @@ impl Db {
                     alias: row.get(2)?,
                     added_at: row.get(3)?,
                     last_seen_at: row.get(4)?,
+                    host_os: row.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1191,14 +1218,15 @@ fn configure(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Полная схема v6.
-const SCHEMA_V7: &str = "CREATE TABLE IF NOT EXISTS devices (
+/// Полная схема v8.
+const SCHEMA_V8: &str = "CREATE TABLE IF NOT EXISTS devices (
             device_id    TEXT PRIMARY KEY,
             secret_hash  TEXT NOT NULL,
             name         TEXT NOT NULL,
             created_at   INTEGER NOT NULL,
             last_seen_at INTEGER NOT NULL,
-            host_version TEXT
+            host_version TEXT,
+            host_os      TEXT
          );
          CREATE TABLE IF NOT EXISTS owners (
             owner_id         TEXT PRIMARY KEY,
@@ -1276,13 +1304,14 @@ const SCHEMA_V7: &str = "CREATE TABLE IF NOT EXISTS devices (
          );
          CREATE INDEX IF NOT EXISTS wake_devices_owner_id ON wake_devices(owner_id);";
 
-/// Приводит базу к `SCHEMA_VERSION`: версия 0 — сразу полная схема v7,
+/// Приводит базу к `SCHEMA_VERSION`: версия 0 — сразу полная схема v8,
 /// версия 1 — цепочка v1 -> v2 (токен из `owners` переезжает в
 /// `owner_tokens`) -> v3 -> v4, версия 2 — v2 -> v3 (passkey) -> v4,
 /// версия 3 — v3 -> v4 (учётные записи «почта + пароль»), версия 4 —
 /// v4 -> v5 (журнал сеансов), версия 5 — v5 -> v6 (сетевые карты
 /// устройств для Wake-on-LAN), версия 6 — v6 -> v7 (ручные устройства и
-/// роутеры-будильники, `wake_devices`). Идемпотентна: на актуальной базе — no-op.
+/// роутеры-будильники, `wake_devices`), версия 7 — v7 -> v8 (D92,
+/// `devices.host_os`). Идемпотентна: на актуальной базе — no-op.
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version >= SCHEMA_VERSION {
@@ -1290,7 +1319,7 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
     }
 
     if version == 0 {
-        conn.execute_batch(SCHEMA_V7)?;
+        conn.execute_batch(SCHEMA_V8)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         return Ok(());
     }
@@ -1310,7 +1339,20 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
     if version <= 5 {
         migrate_v5_to_v6(conn)?;
     }
-    migrate_v6_to_v7(conn)
+    if version <= 6 {
+        migrate_v6_to_v7(conn)?;
+    }
+    migrate_v7_to_v8(conn)
+}
+
+/// v7 -> v8 (D92): `devices.host_os` -- ОС хоста из его регистрации.
+/// Одна транзакция.
+fn migrate_v7_to_v8(conn: &Connection) -> anyhow::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("ALTER TABLE devices ADD COLUMN host_os TEXT;")?;
+    tx.pragma_update(None, "user_version", 8)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// v6 -> v7 (D84/D85): таблица `wake_devices` («ручные» устройства для
@@ -1659,13 +1701,13 @@ mod tests {
     }
 
     #[test]
-    fn fresh_db_has_user_version_seven() {
+    fn fresh_db_has_user_version_eight() {
         let db = Db::in_memory().expect("open in-memory db");
         let conn = db.conn.lock().expect("db mutex poisoned");
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read user_version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
@@ -1826,7 +1868,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let fk: i64 = conn
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .expect("fk");
@@ -1909,7 +1951,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -1969,7 +2011,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -2031,7 +2073,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -2073,7 +2115,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -2102,6 +2144,10 @@ mod tests {
             "CREATE TABLE owners (
                 owner_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL);
              INSERT INTO owners VALUES ('o1', 1);
+             CREATE TABLE devices (
+                device_id TEXT PRIMARY KEY, secret_hash TEXT NOT NULL,
+                name TEXT NOT NULL, created_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL, host_version TEXT);
              PRAGMA user_version = 6;",
         )
         .expect("build v6 database");
@@ -2111,7 +2157,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -2399,6 +2445,45 @@ mod tests {
                 .as_deref(),
             Some("acc")
         );
+    }
+
+    #[test]
+    fn set_host_os_round_trips_and_unknown_device_is_false() {
+        let db = Db::in_memory().expect("open in-memory db");
+        assert!(!db.set_host_os("nope", "windows").expect("set"));
+        db.insert_device("dev1", "h", "PC", 1).expect("device");
+        assert_eq!(db.host_os("dev1").expect("get"), None);
+        assert!(db.set_host_os("dev1", "windows").expect("set"));
+        assert_eq!(db.host_os("dev1").expect("get").as_deref(), Some("windows"));
+    }
+
+    #[test]
+    fn migration_v7_to_v8_adds_host_os() {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.pragma_update(None, "foreign_keys", true).expect("fk");
+        conn.execute_batch(
+            "CREATE TABLE devices (
+                device_id TEXT PRIMARY KEY, secret_hash TEXT NOT NULL,
+                name TEXT NOT NULL, created_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL, host_version TEXT);
+             INSERT INTO devices VALUES ('dev1', 'h', 'PC', 1, 1, NULL);
+             PRAGMA user_version = 7;",
+        )
+        .expect("build v7 database");
+
+        migrate(&conn).expect("migrate v7 -> v8");
+        migrate(&conn).expect("re-run migration is a no-op");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 8);
+
+        let db = Db {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        assert_eq!(db.host_os("dev1").expect("get"), None);
+        assert!(db.set_host_os("dev1", "macos").expect("set"));
+        assert_eq!(db.host_os("dev1").expect("get").as_deref(), Some("macos"));
     }
 
     #[test]
@@ -2756,6 +2841,7 @@ mod tests {
                     alias: None,
                     added_at: 200,
                     last_seen_at: 100,
+                    host_os: None,
                 },
                 OwnedDevice {
                     device_id: "dev1".to_string(),
@@ -2763,6 +2849,7 @@ mod tests {
                     alias: None,
                     added_at: 300,
                     last_seen_at: 999,
+                    host_os: None,
                 },
             ]
         );

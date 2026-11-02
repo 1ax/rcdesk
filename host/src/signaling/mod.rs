@@ -623,6 +623,8 @@ impl SignalingClient {
                 // Слайс W: карты перечисляются при каждой (пере)регистрации --
                 // адрес мог смениться.
                 ifaces: crate::wake::local_ifaces(),
+                // D92: ОС хоста для списка устройств и подсказок клиента.
+                os: Some(crate::platform::host_os()),
             },
         )
         .await?;

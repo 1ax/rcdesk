@@ -125,6 +125,11 @@ pub struct DeviceEntry {
     /// -> `Host`.
     #[serde(default)]
     pub kind: DeviceKind,
+    /// D92: ОС хоста из последней регистрации; `None` -- неизвестна (старый
+    /// хост, ручное устройство, роутер). `#[serde(default)]`: старый сервер
+    /// поля не шлёт.
+    #[serde(default)]
+    pub os: Option<crate::control::HostOs>,
 }
 
 /// Снимок админского кабинета (A3).
@@ -317,6 +322,10 @@ pub enum SignalMessage {
         /// старый хост шлёт без поля (= пусто, сохранённое не трогаем).
         #[serde(default)]
         ifaces: Vec<NetIface>,
+        /// D92: ОС хоста (сервер хранит её для списка устройств и подсказок
+        /// клиента). `#[serde(default)]`: старый хост поля не шлёт = `None`.
+        #[serde(default)]
+        os: Option<crate::control::HostOs>,
     },
     /// server -> host. `device` carries freshly issued credentials (slice
     /// 3.1) only on a host's very first registration; on a successful
@@ -762,6 +771,7 @@ mod tests {
                 session_id: None,
                 pin_rotation: false,
                 ifaces: Vec::new(),
+                os: None,
             }
         );
     }
@@ -774,6 +784,7 @@ mod tests {
             session_id: Some("sess-live".to_string()),
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         };
 
         let json = serde_json::to_string(&host_register).expect("serialize");
@@ -794,6 +805,7 @@ mod tests {
                 session_id: None,
                 pin_rotation: false,
                 ifaces: Vec::new(),
+                os: None,
             }
         );
     }
@@ -837,6 +849,7 @@ mod tests {
                 last_seen_at: 1234,
                 can_wake: true,
                 kind: DeviceKind::Host,
+                os: None,
             }],
             lan_hub: true,
         };
@@ -1301,6 +1314,7 @@ mod tests {
                 ipv4: "192.168.1.10".to_string(),
                 prefix: 24,
             }],
+            os: Some(crate::control::HostOs::Macos),
         };
         let json = serde_json::to_string(&reg).expect("serialize");
         let back: SignalMessage = serde_json::from_str(&json).expect("deserialize");
@@ -1314,6 +1328,28 @@ mod tests {
             SignalMessage::HostRegister { ifaces, .. } => assert!(ifaces.is_empty()),
             other => panic!("expected HostRegister, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn host_register_os_defaults_to_none_and_parses_wire_value() {
+        use crate::control::HostOs;
+        let json = r#"{"type":"host_register","name":"PC"}"#;
+        match serde_json::from_str::<SignalMessage>(json).expect("deserialize") {
+            SignalMessage::HostRegister { os, .. } => assert_eq!(os, None),
+            other => panic!("expected HostRegister, got {other:?}"),
+        }
+        let json = r#"{"type":"host_register","name":"PC","os":"windows"}"#;
+        match serde_json::from_str::<SignalMessage>(json).expect("deserialize") {
+            SignalMessage::HostRegister { os, .. } => assert_eq!(os, Some(HostOs::Windows)),
+            other => panic!("expected HostRegister, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_entry_without_os_field_deserializes_to_none() {
+        let json = r#"{"device_id":"d","name":"n","alias":null,"online":true,"busy":false,"last_seen_at":1}"#;
+        let entry: DeviceEntry = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(entry.os, None);
     }
 
     #[test]

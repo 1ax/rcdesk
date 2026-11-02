@@ -51,6 +51,21 @@ describe("wakeView", () => {
     expect(v.status).toContain("Не включился за 3 мин");
   });
 
+  it("timed out hint depends on host OS (D92)", () => {
+    const at = (over: Partial<DeviceEntry>) =>
+      wakeView(entry(over), { startedMs: 0 }, WAKE_TIMEOUT_MS).status;
+    expect(at({ os: "macos" })).toBe(
+      "Не включился за 3 мин. Mac по сети просыпается только из сна — выключенный Mac так не включить",
+    );
+    expect(at({ os: "windows" })).toBe(
+      "Не включился за 3 мин. Нужен кабель (не Wi-Fi) и Wake-on-LAN в BIOS и драйвере сетевой карты",
+    );
+    for (const generic of [at({ os: "other" }), at({ os: null }), at({})]) {
+      expect(generic).toContain("Mac по сети просыпается только из сна");
+      expect(generic).toContain("Windows: нужен кабель");
+    }
+  });
+
   it("timed out without can_wake: no button", () => {
     const v = wakeView(entry({ can_wake: false }), { startedMs: 0 }, WAKE_TIMEOUT_MS);
     expect(v.showButton).toBe(false);

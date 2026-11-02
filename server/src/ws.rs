@@ -15,6 +15,7 @@ use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
+use proto::control::HostOs;
 use proto::signal::{
     BrowserEntry, DeviceEntry, DeviceKind, EmailCodePurpose, NetIface, Role, SignalMessage,
 };
@@ -302,7 +303,7 @@ async fn run_host(
     version: String,
     read_timeout: Duration,
 ) {
-    let (name, device, session_id, pin_rotation, ifaces) =
+    let (name, device, session_id, pin_rotation, ifaces, os) =
         match next_message(stream, &tx, read_timeout).await {
             Some(SignalMessage::HostRegister {
                 name,
@@ -310,7 +311,8 @@ async fn run_host(
                 session_id,
                 pin_rotation,
                 ifaces,
-            }) => (name, device, session_id, pin_rotation, ifaces),
+                os,
+            }) => (name, device, session_id, pin_rotation, ifaces, os),
             Some(_) => {
                 let _ = tx.send(SignalMessage::Error {
                     message: "expected host_register".to_string(),
@@ -367,6 +369,12 @@ async fn run_host(
         db.set_host_version(&host_id, owners::truncate_chars(&version, MAX_NAME_CHARS))
     {
         tracing::error!(?err, "failed to record host version");
+    }
+    // D92: ОС хоста; `None` (старый хост) прежнее значение не стирает.
+    if let Some(os) = os {
+        if let Err(err) = db.set_host_os(&host_id, host_os_to_str(os)) {
+            tracing::error!(?err, "failed to record host os");
+        }
     }
     // Слайс W: пустой список (старый хост или не смог перечислить карты) не
     // стирает сохранённые; непустой -- валидируется и заменяет набор целиком.
@@ -604,6 +612,25 @@ async fn run_host(
     notify_device_owners(db, registry, &host_id);
 }
 
+/// D92: `HostOs` -> строка serde для `devices.host_os`.
+fn host_os_to_str(os: HostOs) -> &'static str {
+    match os {
+        HostOs::Macos => "macos",
+        HostOs::Windows => "windows",
+        HostOs::Other => "other",
+    }
+}
+
+/// D92: обратный разбор; неизвестная строка -> `None`.
+fn host_os_from_str(s: &str) -> Option<HostOs> {
+    match s {
+        "macos" => Some(HostOs::Macos),
+        "windows" => Some(HostOs::Windows),
+        "other" => Some(HostOs::Other),
+        _ => None,
+    }
+}
+
 /// Builds the `DeviceEntry` list for `Authenticated`/`Devices`: the owner's
 /// linked devices from the persistent store, each combined with its
 /// sign-in-memory presence from the registry. One place for this so the
@@ -635,6 +662,7 @@ fn device_entries_for_owner(
                         || !routers_for(registry, &wake_rows, &ifaces, &device.device_id, now)
                             .is_empty()),
                 kind: DeviceKind::Host,
+                os: device.host_os.as_deref().and_then(host_os_from_str),
             }
         })
         .collect();
@@ -662,6 +690,7 @@ fn device_entries_for_owner(
             } else {
                 DeviceKind::Router
             },
+            os: None,
         });
     }
     Ok(entries)

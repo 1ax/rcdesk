@@ -247,6 +247,7 @@ async fn host_and_joined_client(url: &str) -> (WsStream, WsStream, String, Strin
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -284,6 +285,7 @@ async fn host_registers_and_receives_six_digit_pin() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -320,6 +322,7 @@ async fn client_join_succeeds_and_host_is_notified() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -607,6 +610,7 @@ async fn register_plain_host(url: &str) -> (WsStream, String) {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -715,6 +719,7 @@ async fn host_without_device_credentials_is_issued_fresh_ones() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -746,6 +751,7 @@ async fn reconnecting_with_issued_credentials_reuses_host_id() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -770,6 +776,7 @@ async fn reconnecting_with_issued_credentials_reuses_host_id() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -802,6 +809,7 @@ async fn reconnecting_with_wrong_secret_is_rejected() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -826,6 +834,7 @@ async fn reconnecting_with_wrong_secret_is_rejected() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -855,6 +864,7 @@ async fn reconnecting_with_unknown_device_id_is_rejected() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -884,6 +894,7 @@ async fn re_registering_same_device_displaces_old_connection_without_bye_to_its_
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -923,6 +934,7 @@ async fn re_registering_same_device_displaces_old_connection_without_bye_to_its_
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -1004,6 +1016,7 @@ async fn joining_by_pin_after_client_auth_links_device_to_owner() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -1060,6 +1073,7 @@ async fn connect_device_starts_a_session_for_a_linked_device() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -1167,6 +1181,7 @@ async fn connect_device_for_offline_device_returns_error() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -1261,6 +1276,7 @@ async fn rename_device_updates_alias_and_forget_device_removes_it() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -1329,6 +1345,7 @@ async fn bye_for_unknown_session_from_host_or_client_is_a_silent_no_op() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -1379,6 +1396,7 @@ async fn host_reconnect_with_live_session_id_marks_device_busy_until_bye() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -1440,6 +1458,7 @@ async fn host_reconnect_with_live_session_id_marks_device_busy_until_bye() {
             session_id: Some("s-live".to_string()),
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -1526,6 +1545,7 @@ async fn wrong_pin_attempts_are_rate_limited_per_ip() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -1607,6 +1627,7 @@ async fn second_connection_with_same_token_shares_devices_and_lists_one_browser(
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -1995,6 +2016,7 @@ async fn host_name_and_alias_are_truncated_to_64_chars() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -2138,6 +2160,7 @@ async fn register_host_as(
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -2211,6 +2234,7 @@ async fn registered_has_only_stun_but_joined_and_peer_joined_have_turn() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -2288,6 +2312,7 @@ async fn silent_peer_is_disconnected_after_read_timeout() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -2339,6 +2364,7 @@ async fn register_host_with_rotation(url: &str, pin_rotation: bool) -> (WsStream
             session_id: None,
             pin_rotation,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -3293,6 +3319,7 @@ async fn session_log_records_join_stats_and_bye() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -3559,6 +3586,7 @@ async fn host_linked_to_connected_owner(
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -3685,6 +3713,7 @@ async fn wake_host(
             session_id: None,
             pin_rotation: false,
             ifaces,
+            os: None,
         },
     )
     .await;
@@ -3957,6 +3986,7 @@ async fn wake_old_host_without_ifaces_is_no_waker_and_keeps_target_ifaces() {
             session_id: None,
             pin_rotation: false,
             ifaces: Vec::new(),
+            os: None,
         },
     )
     .await;
@@ -3965,6 +3995,72 @@ async fn wake_old_host_without_ifaces_is_no_waker_and_keeps_target_ifaces() {
         SignalMessage::Registered { .. }
     ));
     assert_eq!(db.device_ifaces(&target_id).expect("ifaces").len(), 1);
+}
+
+/// D92: ОС хоста из `HostRegister` видна владельцу в списке устройств;
+/// повторная регистрация без `os` прежнее значение не стирает.
+#[tokio::test]
+async fn host_os_is_stored_listed_and_kept_by_registration_without_os() {
+    use proto::control::HostOs;
+    let (url, db) = spawn_server_with_db().await;
+    let mut owner = wake_owner(&url).await;
+    let (host, host_id, creds) = wake_host(&url, &mut owner, None, Vec::new()).await;
+    assert_eq!(db.host_os(&host_id).expect("os"), None);
+    drop(host);
+
+    let mut win = connect(&url).await;
+    hello(&mut win, Role::Host).await;
+    send(
+        &mut win,
+        &SignalMessage::HostRegister {
+            name: "Wake Host".to_string(),
+            device: Some(creds.clone()),
+            session_id: None,
+            pin_rotation: false,
+            ifaces: Vec::new(),
+            os: Some(HostOs::Windows),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut win).await,
+        SignalMessage::Registered { .. }
+    ));
+    let devices = wait_devices(&mut owner, |d| {
+        d.iter()
+            .any(|e| e.device_id == host_id && e.online && e.os.is_some())
+    })
+    .await;
+    assert_eq!(entry(&devices, &host_id).os, Some(HostOs::Windows));
+    drop(win);
+
+    let mut old = connect(&url).await;
+    hello(&mut old, Role::Host).await;
+    send(
+        &mut old,
+        &SignalMessage::HostRegister {
+            name: "Wake Host".to_string(),
+            device: Some(creds),
+            session_id: None,
+            pin_rotation: false,
+            ifaces: Vec::new(),
+            os: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut old).await,
+        SignalMessage::Registered { .. }
+    ));
+    assert_eq!(
+        db.host_os(&host_id).expect("os").as_deref(),
+        Some("windows")
+    );
+    let devices = wait_devices(&mut owner, |d| {
+        d.iter().any(|e| e.device_id == host_id && e.online)
+    })
+    .await;
+    assert_eq!(entry(&devices, &host_id).os, Some(HostOs::Windows));
 }
 
 // ---------------------------------------------------------------------

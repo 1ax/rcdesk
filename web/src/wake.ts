@@ -32,9 +32,22 @@ export function formatElapsed(ms: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-const TIMEOUT_STATUS =
+const TIMEOUT_STATUS_GENERIC =
   "Не включился за 3 мин. Mac по сети просыпается только из сна — выключенный Mac так не включить. " +
   "Windows: нужен кабель (не Wi-Fi) и Wake-on-LAN в BIOS и драйвере сетевой карты";
+
+/** D92: timeout hint by host OS; unknown OS (`other`, `null`, absent field,
+ * an older server) keeps the generic text. */
+function timeoutStatus(entry: DeviceEntry): string {
+  switch (entry.os) {
+    case "macos":
+      return "Не включился за 3 мин. Mac по сети просыпается только из сна — выключенный Mac так не включить";
+    case "windows":
+      return "Не включился за 3 мин. Нужен кабель (не Wi-Fi) и Wake-on-LAN в BIOS и драйвере сетевой карты";
+    default:
+      return TIMEOUT_STATUS_GENERIC;
+  }
+}
 
 /** What the device row shows for `entry` given its wake state (if any). */
 export function wakeView(
@@ -75,7 +88,7 @@ export function wakeView(
       showButton: entry.can_wake,
       buttonDisabled: false,
       buttonLabel: "Включить",
-      status: TIMEOUT_STATUS,
+      status: timeoutStatus(entry),
     };
   }
   return {

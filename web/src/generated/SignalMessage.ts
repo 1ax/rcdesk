@@ -5,6 +5,7 @@ import type { ByeReason } from "./ByeReason";
 import type { DeviceCredentials } from "./DeviceCredentials";
 import type { DeviceEntry } from "./DeviceEntry";
 import type { EmailCodePurpose } from "./EmailCodePurpose";
+import type { HostOs } from "./HostOs";
 import type { IceCandidate } from "./IceCandidate";
 import type { IceServer } from "./IceServer";
 import type { NetIface } from "./NetIface";
@@ -24,7 +25,12 @@ pin_rotation: boolean,
  * Слайс W: сетевые карты хоста для Wake-on-LAN. `#[serde(default)]`:
  * старый хост шлёт без поля (= пусто, сохранённое не трогаем).
  */
-ifaces: Array<NetIface>, } | { "type": "registered", host_id: string, pin: string, ice_servers: Array<IceServer>, device: DeviceCredentials | null, } | { "type": "pin_changed", pin: string, } | { "type": "join", pin: string, } | { "type": "joined", session_id: string, host_name: string, ice_servers: Array<IceServer>, device_id: string | null, } | { "type": "peer_joined", session_id: string, ice_servers: Array<IceServer>, } | { "type": "offer", session_id: string, sdp: string, auth: string | null, } | { "type": "answer", session_id: string, sdp: string, auth: string | null, } | { "type": "ice", session_id: string, candidate: IceCandidate, } | { "type": "bye", session_id: string, reason?: ByeReason | null, } | { "type": "client_auth", token: string | null, } | { "type": "authenticated", token: string, devices: Array<DeviceEntry>, 
+ifaces: Array<NetIface>, 
+/**
+ * D92: ОС хоста (сервер хранит её для списка устройств и подсказок
+ * клиента). `#[serde(default)]`: старый хост поля не шлёт = `None`.
+ */
+os: HostOs | null, } | { "type": "registered", host_id: string, pin: string, ice_servers: Array<IceServer>, device: DeviceCredentials | null, } | { "type": "pin_changed", pin: string, } | { "type": "join", pin: string, } | { "type": "joined", session_id: string, host_name: string, ice_servers: Array<IceServer>, device_id: string | null, } | { "type": "peer_joined", session_id: string, ice_servers: Array<IceServer>, } | { "type": "offer", session_id: string, sdp: string, auth: string | null, } | { "type": "answer", session_id: string, sdp: string, auth: string | null, } | { "type": "ice", session_id: string, candidate: IceCandidate, } | { "type": "bye", session_id: string, reason?: ByeReason | null, } | { "type": "client_auth", token: string | null, } | { "type": "authenticated", token: string, devices: Array<DeviceEntry>, 
 /**
  * server -> client (D47): сервер — LAN-хаб: аккаунтов, passkey и
  * почты нет, клиент прячет их UI. `#[serde(default)]`: старый сервер
