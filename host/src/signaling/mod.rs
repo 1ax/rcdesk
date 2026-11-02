@@ -3330,16 +3330,20 @@ async fn start_session_with_display_wait(
     // mode (Windows helper under SYSTEM) it is the Downloads of the user
     // logged on to the console session; if the session began on the logon
     // screen, files stay disabled in it until the client reconnects.
-    let files_dir = if ctx.files_enabled {
-        match crate::files::receive_dir(ctx.machine_mode) {
-            Ok(dir) => Some(dir),
+    // The same goes for whose rights file operations use (D61): in machine
+    // mode the logged-on user's, never SYSTEM's.
+    let (files_dir, files_user) = if ctx.files_enabled {
+        match crate::files::receive_dir(ctx.machine_mode)
+            .and_then(|dir| crate::files::receive_fs_user(ctx.machine_mode).map(|u| (dir, u)))
+        {
+            Ok((dir, user)) => (Some(dir), user),
             Err(err) => {
                 tracing::warn!(error = %err, "download folder unavailable, file transfer disabled");
-                None
+                (None, crate::files::FsUser::current())
             }
         }
     } else {
-        None
+        (None, crate::files::FsUser::current())
     };
     let files_enabled = files_dir.is_some();
     // Copied-file offers travel from the clipboard watcher to the files task
@@ -3412,6 +3416,7 @@ async fn start_session_with_display_wait(
         Arc::new(file_channel) as Arc<dyn crate::files::FileChannel>,
         file_rx,
         files_dir,
+        files_user,
         files_cmd_rx,
     ));
 

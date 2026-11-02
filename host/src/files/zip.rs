@@ -9,6 +9,9 @@
 //! No ZIP64: the limits below keep every field within 32/16 bits.
 //!
 //! Platform-independent: only `std` (plus tokio for async file reads).
+//!
+//! Rights (D61): `walk` uses `std::fs` directly and must be called inside
+//! `FsUser::run/blocking`; `ZipStream` opens files through its `FsUser`.
 
 use std::fs;
 use std::io;
@@ -17,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncReadExt;
 
-use super::CHUNK_BYTES;
+use super::{FsUser, CHUNK_BYTES};
 
 /// Largest archive offered (same as the client's download limit).
 pub const MAX_ZIP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -328,11 +331,13 @@ pub struct ZipStream {
     /// Generated small parts not yet handed out; `head[head_pos..]` is live.
     head: Vec<u8>,
     head_pos: usize,
+    /// Whose rights open the files.
+    user: FsUser,
 }
 
 impl ZipStream {
     /// `manifest` must not be overflowed.
-    pub fn new(manifest: Manifest) -> io::Result<Self> {
+    pub fn new(manifest: Manifest, user: FsUser) -> io::Result<Self> {
         if manifest.overflow {
             return Err(io::Error::other("folder too large for zip"));
         }
@@ -346,6 +351,7 @@ impl ZipStream {
             crcs: Vec::with_capacity(n),
             head: Vec::new(),
             head_pos: 0,
+            user,
         })
     }
 
@@ -412,11 +418,18 @@ impl ZipStream {
         let is_file = matches!(e.kind, Kind::File { .. });
         // Open first: a file that vanished aborts before any header is out.
         let file = if size > 0 {
-            let f = tokio::fs::File::open(&e.path).await?;
-            if !f.metadata().await?.is_file() {
-                return Err(io::Error::other("not a regular file"));
-            }
-            Some(f)
+            let path = e.path.clone();
+            let f = self
+                .user
+                .blocking(move || {
+                    let f = fs::File::open(&path)?;
+                    if !f.metadata()?.is_file() {
+                        return Err(io::Error::other("not a regular file"));
+                    }
+                    Ok(f)
+                })
+                .await?;
+            Some(tokio::fs::File::from_std(f))
         } else {
             None
         };
@@ -549,7 +562,7 @@ mod tests {
     }
 
     async fn collect(m: Manifest) -> io::Result<(Vec<u8>, usize)> {
-        let mut s = ZipStream::new(m)?;
+        let mut s = ZipStream::new(m, FsUser::current())?;
         let mut all = Vec::new();
         let mut chunks = 0;
         while let Some(c) = s.next_chunk().await? {
@@ -685,7 +698,7 @@ mod tests {
         let m = walk_with_limit(&root, 1000).unwrap();
         assert!(m.is_overflow());
         assert_eq!(m.zip_size(), 1001);
-        assert!(ZipStream::new(m).is_err());
+        assert!(ZipStream::new(m, FsUser::current()).is_err());
         let ok = walk_with_limit(&root, MAX_ZIP_BYTES).unwrap();
         assert!(!ok.is_overflow());
         let _ = fs::remove_dir_all(&base);

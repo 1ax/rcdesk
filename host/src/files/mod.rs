@@ -56,6 +56,127 @@ mod zip;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+/// The area in which path-based file system operations run on behalf of a
+/// user (D61). On Windows in machine mode it impersonates the logged-on user
+/// (`files::windows`); in tests it counts or refuses calls.
+pub trait UserScope: Send + Sync {
+    /// Runs `f` synchronously on the current thread inside the user's area
+    /// and restores the thread afterwards. If the area cannot be entered it
+    /// returns an error and does NOT call `f`.
+    fn scope(&self, f: &mut dyn FnMut()) -> std::io::Result<()>;
+}
+
+/// Whose rights file system operations by path use (D61). The default is the
+/// current process (no impersonation). In Windows machine mode the helper is
+/// SYSTEM, so every operation by path (open, create, rename, remove, list,
+/// stat) must run under the logged-on user's token: otherwise a redirected
+/// "Downloads" or a junction would let SYSTEM write, or read, anywhere.
+/// Impersonation is per thread, so such operations run via [`FsUser::run`]
+/// (current thread) or [`FsUser::blocking`] (`spawn_blocking`), never through
+/// `tokio::fs`. Operations on an already opened handle need no wrapper: the
+/// rights were checked at open time.
+#[derive(Clone, Default)]
+pub struct FsUser(Option<Arc<dyn UserScope>>);
+
+impl FsUser {
+    /// The current process, no impersonation.
+    pub fn current() -> Self {
+        Self(None)
+    }
+
+    /// A user area given by `scope`.
+    #[cfg(any(windows, test))]
+    pub(crate) fn from_scope(scope: Arc<dyn UserScope>) -> Self {
+        Self(Some(scope))
+    }
+
+    /// Runs `f` on the current thread under the user's rights. Fail closed:
+    /// if the area cannot be entered, `f` is not called and an error is
+    /// returned. Do not call `await` inside `f`.
+    fn run<T>(&self, f: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+        let Some(scope) = &self.0 else {
+            return f();
+        };
+        let mut f = Some(f);
+        let mut out: Option<std::io::Result<T>> = None;
+        scope.scope(&mut || {
+            if let Some(f) = f.take() {
+                out = Some(f());
+            }
+        })?;
+        out.unwrap_or_else(|| {
+            Err(std::io::Error::other(
+                "user scope did not run the operation",
+            ))
+        })
+    }
+
+    /// [`FsUser::run`] on the blocking pool.
+    async fn blocking<T: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+    ) -> std::io::Result<T> {
+        let user = self.clone();
+        tokio::task::spawn_blocking(move || user.run(f))
+            .await
+            .map_err(std::io::Error::other)?
+    }
+}
+
+/// Which user's rights the file channel uses. `machine_mode` on Windows (the
+/// helper runs as SYSTEM) means the logged-on console user; an error means
+/// nobody is logged on. Otherwise the current process.
+pub fn receive_fs_user(machine_mode: bool) -> anyhow::Result<FsUser> {
+    #[cfg(target_os = "windows")]
+    {
+        if machine_mode {
+            return windows::console_user_fs();
+        }
+    }
+    let _ = machine_mode;
+    Ok(FsUser::current())
+}
+
+/// Test areas: a counter of entered scopes, optionally refusing them all.
+#[cfg(test)]
+pub(crate) struct CountingScope {
+    pub(crate) entered: std::sync::atomic::AtomicUsize,
+    refuse: bool,
+}
+
+#[cfg(test)]
+impl CountingScope {
+    pub(crate) fn user(refuse: bool) -> (FsUser, Arc<CountingScope>) {
+        let scope = Arc::new(CountingScope {
+            entered: std::sync::atomic::AtomicUsize::new(0),
+            refuse,
+        });
+        (
+            FsUser::from_scope(Arc::clone(&scope) as Arc<dyn UserScope>),
+            scope,
+        )
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.entered.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl UserScope for CountingScope {
+    fn scope(&self, f: &mut dyn FnMut()) -> std::io::Result<()> {
+        if self.refuse {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "test scope refuses",
+            ));
+        }
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        f();
+        Ok(())
+    }
+}
+
 /// Extension of the in-progress file next to the final one.
 const PART_SUFFIX: &str = ".rcdesk-part";
 
@@ -274,6 +395,7 @@ fn with_suffix(name: &str, n: u32) -> String {
 /// result is dropped, whose `Drop` removes both files. Doing this with several
 /// awaited `tokio::fs` calls would leak files created in between.
 async fn create_unique(
+    user: &FsUser,
     dir: &Path,
     name: &str,
     id: u32,
@@ -281,12 +403,15 @@ async fn create_unique(
 ) -> std::io::Result<ActiveReceive> {
     let dir = dir.to_path_buf();
     let name = name.to_string();
-    tokio::task::spawn_blocking(move || create_unique_blocking(&dir, &name, id, size))
+    let inner_user = user.clone();
+    user.blocking(move || create_unique_blocking(&inner_user, &dir, &name, id, size))
         .await
-        .map_err(std::io::Error::other)?
 }
 
+/// Runs INSIDE `FsUser::run` (the caller's scope): uses `std::fs` directly
+/// and must not enter the scope again.
 fn create_unique_blocking(
+    user: &FsUser,
     dir: &Path,
     name: &str,
     id: u32,
@@ -321,10 +446,14 @@ fn create_unique_blocking(
                     final_path,
                     final_name: candidate,
                     finished: false,
+                    user: user.clone(),
                 })
             }
             Err(e) => {
-                remove_with_retry(vec![final_path.clone()]);
+                // Already inside the user's scope: remove directly, retry
+                // (under the user again) only what is left.
+                let left = remove_now(vec![final_path.clone()]);
+                retry_in_background(user.clone(), left);
                 if e.kind() == std::io::ErrorKind::AlreadyExists {
                     continue;
                 }
@@ -354,10 +483,18 @@ fn split_dir(dir: &str) -> Option<Vec<String>> {
 
 /// Creates a fresh directory `name` in `parent`, trying `name (1)`, ... when
 /// taken. `create_dir` (not `_all`) fails with `AlreadyExists` atomically.
-async fn create_unique_dir(parent: &Path, name: &str) -> std::io::Result<PathBuf> {
+async fn create_unique_dir(user: &FsUser, parent: &Path, name: &str) -> std::io::Result<PathBuf> {
+    let parent = parent.to_path_buf();
+    let name = name.to_string();
+    user.blocking(move || create_unique_dir_blocking(&parent, &name))
+        .await
+}
+
+/// Runs inside `FsUser::run`.
+fn create_unique_dir_blocking(parent: &Path, name: &str) -> std::io::Result<PathBuf> {
     for n in 0..10_000u32 {
         let path = parent.join(with_suffix(name, n));
-        match tokio::fs::create_dir(&path).await {
+        match std::fs::create_dir(&path) {
             Ok(()) => return Ok(path),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -381,6 +518,8 @@ struct ActiveReceive {
     final_path: PathBuf,
     final_name: String,
     finished: bool,
+    /// Whose rights removed files need (`Drop`).
+    user: FsUser,
 }
 
 impl Drop for ActiveReceive {
@@ -389,7 +528,10 @@ impl Drop for ActiveReceive {
             // Close the handle first (an open file cannot be removed on
             // Windows).
             self.file.take();
-            remove_with_retry(vec![self.part_path.clone(), self.final_path.clone()]);
+            remove_with_retry(
+                &self.user,
+                vec![self.part_path.clone(), self.final_path.clone()],
+            );
         }
     }
 }
@@ -427,19 +569,47 @@ fn remove_retry_delay(attempt: u32) -> Duration {
 /// and `DeleteFile` fails with a sharing violation until it lets go -- the
 /// part file and placeholder would then stay in Downloads forever. A plain
 /// thread, not a tokio task: `Drop` may run during runtime shutdown.
-fn remove_with_retry(paths: Vec<PathBuf>) {
-    let try_remove = |path: &PathBuf| match std::fs::remove_file(path) {
+fn remove_with_retry(user: &FsUser, paths: Vec<PathBuf>) {
+    let left = match user.run(move || Ok(remove_now(paths))) {
+        Ok(left) => left,
+        Err(err) => {
+            // Fail closed: without the user's rights nothing is touched.
+            tracing::warn!(?err, "cannot remove files of an aborted transfer");
+            return;
+        }
+    };
+    retry_in_background(user.clone(), left);
+}
+
+/// One removal attempt, directly with `std::fs` (the caller is already in the
+/// user's scope). Returns the paths that are still there.
+fn remove_now(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.into_iter().filter(|p| !try_remove(p)).collect()
+}
+
+fn try_remove(path: &PathBuf) -> bool {
+    match std::fs::remove_file(path) {
         Ok(()) => true,
         Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-    };
-    let mut left: Vec<PathBuf> = paths.into_iter().filter(|p| !try_remove(p)).collect();
+    }
+}
+
+/// Retries `left` on a background thread, each attempt under `user`.
+fn retry_in_background(user: FsUser, mut left: Vec<PathBuf>) {
     if left.is_empty() {
         return;
     }
     std::thread::spawn(move || {
         for attempt in 0..REMOVE_RETRIES {
             std::thread::sleep(remove_retry_delay(attempt));
-            left.retain(|p| !try_remove(p));
+            let still = user.run(|| Ok(remove_now(std::mem::take(&mut left))));
+            match still {
+                Ok(rest) => left = rest,
+                Err(err) => {
+                    tracing::warn!(?err, "cannot remove files of an aborted transfer");
+                    return;
+                }
+            }
             if left.is_empty() {
                 return;
             }
@@ -455,6 +625,8 @@ struct Receiver {
     /// folder could be determined).
     dir: Option<PathBuf>,
     active: Option<ActiveReceive>,
+    /// Whose rights every operation by path uses.
+    user: FsUser,
     /// Uploaded folders of this session: client folder number -> the root
     /// directory chosen for it on disk (slice 3.4e).
     folders: HashMap<u32, PathBuf>,
@@ -522,7 +694,7 @@ impl Receiver {
         let root = match self.folders.get(&folder) {
             Some(root) => root.clone(),
             None => {
-                let root = create_unique_dir(base, &components[0]).await?;
+                let root = create_unique_dir(&self.user, base, &components[0]).await?;
                 self.folders.insert(folder, root.clone());
                 root
             }
@@ -538,7 +710,10 @@ impl Receiver {
                 "folder path escapes the download directory",
             ));
         }
-        tokio::fs::create_dir_all(&target).await?;
+        let to_create = target.clone();
+        self.user
+            .blocking(move || std::fs::create_dir_all(&to_create))
+            .await?;
         Ok(target)
     }
 
@@ -569,9 +744,14 @@ impl Receiver {
             return;
         };
         let clean = sanitize_file_name(&name);
-        let created = match tokio::fs::create_dir_all(&dir).await {
+        let base = dir.clone();
+        let made = self
+            .user
+            .blocking(move || std::fs::create_dir_all(&base))
+            .await;
+        let created = match made {
             Ok(()) => match self.target_dir(&dir, folder, rel_dir.as_deref()).await {
-                Ok(target) => create_unique(&target, &clean, id, size).await,
+                Ok(target) => create_unique(&self.user, &target, &clean, id, size).await,
                 Err(e) => Err(e),
             },
             Err(e) => Err(e),
@@ -646,7 +826,13 @@ impl Receiver {
             None => Ok(()),
         };
         let renamed = match flushed {
-            Ok(()) => tokio::fs::rename(&active.part_path, &active.final_path).await,
+            Ok(()) => {
+                let (from, to) = (active.part_path.clone(), active.final_path.clone());
+                active
+                    .user
+                    .blocking(move || std::fs::rename(&from, &to))
+                    .await
+            }
             Err(e) => Err(e),
         };
         match renamed {
@@ -709,6 +895,8 @@ struct Downloader {
     /// Next download file id, shared with the running download task.
     next_file_id: Arc<AtomicU32>,
     sending: Option<Outgoing>,
+    /// Whose rights every operation by path uses.
+    user: FsUser,
 }
 
 async fn send_msg(channel: &dyn FileChannel, msg: &FileMessage) -> anyhow::Result<()> {
@@ -723,8 +911,9 @@ fn file_name_of(path: &Path) -> String {
 }
 
 impl Downloader {
-    fn new(channel: Arc<dyn FileChannel>) -> Self {
+    fn new(channel: Arc<dyn FileChannel>, user: FsUser) -> Self {
         Self {
+            user,
             channel,
             list: None,
             next_list_id: 1,
@@ -765,7 +954,12 @@ impl Downloader {
         // Folders are offered now (as zip); the protocol field stays 0.
         let skipped_folders = 0u32;
         for path in paths {
-            match tokio::fs::metadata(&path).await {
+            let stat_path = path.clone();
+            match self
+                .user
+                .blocking(move || std::fs::metadata(&stat_path))
+                .await
+            {
                 Ok(meta) if meta.is_file() => entries.push(OfferEntry {
                     name: file_name_of(&path),
                     size: meta.len(),
@@ -774,18 +968,15 @@ impl Downloader {
                 }),
                 Ok(meta) if meta.is_dir() => {
                     let root = path.clone();
-                    match tokio::task::spawn_blocking(move || zip::walk(&root)).await {
-                        Ok(Ok(manifest)) => entries.push(OfferEntry {
+                    match self.user.blocking(move || zip::walk(&root)).await {
+                        Ok(manifest) => entries.push(OfferEntry {
                             name: format!("{}.zip", file_name_of(&path)),
                             size: manifest.zip_size(),
                             path,
                             kind: EntryKind::Folder,
                         }),
-                        Ok(Err(err)) => {
-                            tracing::warn!(path = %path.display(), ?err, "cannot walk folder, skipping")
-                        }
                         Err(err) => {
-                            tracing::warn!(path = %path.display(), ?err, "folder walk failed, skipping")
+                            tracing::warn!(path = %path.display(), ?err, "cannot walk folder, skipping")
                         }
                     }
                 }
@@ -865,6 +1056,7 @@ impl Downloader {
         let cancel = Arc::new(AtomicBool::new(false));
         let handle = tokio::spawn(send_files(
             Arc::clone(&self.channel),
+            self.user.clone(),
             entries,
             Arc::clone(&self.next_file_id),
             Arc::clone(&cancel),
@@ -892,6 +1084,7 @@ impl Downloader {
 /// cancelled or the channel fails.
 async fn send_files(
     channel: Arc<dyn FileChannel>,
+    user: FsUser,
     entries: Vec<OfferEntry>,
     next_file_id: Arc<AtomicU32>,
     cancel: Arc<AtomicBool>,
@@ -902,7 +1095,7 @@ async fn send_files(
             return;
         }
         let id = next_file_id.fetch_add(1, Ordering::Relaxed);
-        match send_one(channel.as_ref(), id, &entry, &cancel, request).await {
+        match send_one(channel.as_ref(), &user, id, &entry, &cancel, request).await {
             Ok(()) => {}
             Err(err) => {
                 tracing::debug!(?err, id, "download stopped, channel failed");
@@ -916,23 +1109,27 @@ async fn send_files(
 /// problem is reported to the client with `Abort { Io }` and is `Ok`.
 async fn send_one(
     channel: &dyn FileChannel,
+    user: &FsUser,
     id: u32,
     entry: &OfferEntry,
     cancel: &AtomicBool,
     request: Option<u32>,
 ) -> anyhow::Result<()> {
     if entry.kind == EntryKind::Folder {
-        return send_folder(channel, id, entry, cancel, request).await;
+        return send_folder(channel, user, id, entry, cancel, request).await;
     }
-    let opened = async {
-        let file = tokio::fs::File::open(&entry.path).await?;
-        let meta = file.metadata().await?;
-        if !meta.is_file() {
-            return Err(std::io::Error::other("not a regular file"));
-        }
-        Ok((file, meta.len()))
-    }
-    .await;
+    let open_path = entry.path.clone();
+    let opened = user
+        .blocking(move || {
+            let file = std::fs::File::open(&open_path)?;
+            let meta = file.metadata()?;
+            if !meta.is_file() {
+                return Err(std::io::Error::other("not a regular file"));
+            }
+            Ok((file, meta.len()))
+        })
+        .await
+        .map(|(file, len)| (tokio::fs::File::from_std(file), len));
     let (mut file, size) = match opened {
         Ok(v) => v,
         Err(err) => {
@@ -1012,20 +1209,17 @@ async fn send_one(
 /// from the offered one). Same error/cancel contract as `send_one`.
 async fn send_folder(
     channel: &dyn FileChannel,
+    user: &FsUser,
     id: u32,
     entry: &OfferEntry,
     cancel: &AtomicBool,
     request: Option<u32>,
 ) -> anyhow::Result<()> {
     let root = entry.path.clone();
-    let manifest = match tokio::task::spawn_blocking(move || zip::walk(&root)).await {
-        Ok(Ok(m)) => Some(m),
-        Ok(Err(err)) => {
-            tracing::debug!(path = %entry.path.display(), ?err, "cannot walk folder for download");
-            None
-        }
+    let manifest = match user.blocking(move || zip::walk(&root)).await {
+        Ok(m) => Some(m),
         Err(err) => {
-            tracing::debug!(?err, "folder walk task failed");
+            tracing::debug!(path = %entry.path.display(), ?err, "cannot walk folder for download");
             None
         }
     };
@@ -1062,7 +1256,7 @@ async fn send_folder(
         },
     )
     .await?;
-    let mut stream = match zip::ZipStream::new(manifest) {
+    let mut stream = match zip::ZipStream::new(manifest, user.clone()) {
         Ok(s) => s,
         Err(err) => {
             tracing::debug!(?err, id, "folder too large for download");
@@ -1136,18 +1330,23 @@ impl Session {
 /// transfer is cleaned up and a running download stopped. `dir` is the
 /// receive folder, or `None` when file transfer is disabled -- every `Start`
 /// is then answered with `Abort { Disabled }` and nothing is created.
+/// `user` is whose rights every file operation by path uses (D61).
 /// `commands` carries the clipboard watcher's file offers (host -> client);
 /// when it closes the task keeps serving the channel.
 pub async fn run(
     channel: Arc<dyn FileChannel>,
     mut rx: mpsc::Receiver<FileChannelMessage>,
     dir: Option<PathBuf>,
+    user: FsUser,
     mut commands: mpsc::Receiver<FilesCommand>,
 ) {
     if let Some(dir) = dir.clone() {
         // Fire and forget: the sweep must not delay the session start.
-        drop(tokio::task::spawn_blocking(move || {
-            sweep_stale_parts(&dir, STALE_PART_AGE)
+        let sweep_user = user.clone();
+        drop(tokio::spawn(async move {
+            let _ = sweep_user
+                .blocking(move || Ok(sweep_stale_parts(&dir, STALE_PART_AGE)))
+                .await;
         }));
     }
     let mut session = Session {
@@ -1155,9 +1354,10 @@ pub async fn run(
             channel: Arc::clone(&channel),
             dir,
             active: None,
+            user: user.clone(),
             folders: HashMap::new(),
         },
-        downloader: Downloader::new(channel),
+        downloader: Downloader::new(channel, user),
     };
     let mut commands_open = true;
     loop {
@@ -1387,10 +1587,18 @@ mod tests {
         session: Session,
         fake: Arc<FakeChannel>,
         dir: PathBuf,
+        user: FsUser,
+        scope: Arc<CountingScope>,
     }
 
     impl Harness {
         fn new(enabled: bool) -> Self {
+            Self::with_scope(enabled, false)
+        }
+
+        /// `refuse`: the user's area can never be entered (fail closed).
+        fn with_scope(enabled: bool, refuse: bool) -> Self {
+            let (user, scope) = CountingScope::user(refuse);
             let dir = scratch_dir();
             let fake = Arc::new(FakeChannel {
                 sent: Mutex::new(vec![]),
@@ -1402,11 +1610,18 @@ mod tests {
                     channel: Arc::clone(&channel),
                     dir: enabled.then(|| dir.clone()),
                     active: None,
+                    user: user.clone(),
                     folders: HashMap::new(),
                 },
-                downloader: Downloader::new(channel),
+                downloader: Downloader::new(channel, user.clone()),
             };
-            Self { session, fake, dir }
+            Self {
+                session,
+                fake,
+                dir,
+                user,
+                scope,
+            }
         }
 
         async fn feed(&mut self, msgs: Vec<FileChannelMessage>) {
@@ -1655,9 +1870,10 @@ mod tests {
                 channel: Arc::clone(&channel),
                 dir: Some(dir.clone()),
                 active: None,
+                user: FsUser::current(),
                 folders: HashMap::new(),
             },
-            downloader: Downloader::new(channel),
+            downloader: Downloader::new(channel, FsUser::current()),
         };
         let dirs = ["../x", "/etc", "C:\\Windows", "a/../../b", ".."];
         for (i, d) in dirs.iter().enumerate() {
@@ -1892,6 +2108,7 @@ mod tests {
             Arc::clone(&h.fake) as Arc<dyn FileChannel>,
             rx,
             Some(dir.clone()),
+            h.user.clone(),
             cmd_rx,
         ));
         tx.send(start(1, "a.bin", 10)).await.unwrap();
@@ -1919,6 +2136,7 @@ mod tests {
             Arc::clone(&h.fake) as Arc<dyn FileChannel>,
             rx,
             Some(dir.clone()),
+            h.user.clone(),
             cmd_rx,
         ));
         tx.send(start(1, "a.bin", 10)).await.unwrap();
@@ -1948,7 +2166,7 @@ mod tests {
         for i in 0..20 {
             let _ = tokio::time::timeout(
                 std::time::Duration::from_micros(1),
-                create_unique(&h.dir, &format!("a{i}.bin"), 1, 10),
+                create_unique(&h.user, &h.dir, &format!("a{i}.bin"), 1, 10),
             )
             .await;
         }
@@ -2373,6 +2591,100 @@ mod tests {
         assert_eq!(starts, 1);
     }
 
+    // ---- D61: every operation by path goes through `FsUser` ----
+
+    #[tokio::test]
+    async fn upload_goes_through_fs_user_including_rename() {
+        let mut h = Harness::new(true);
+        h.feed(vec![start(1, "a.txt", 3), chunk(b"abc")]).await;
+        let before_end = h.scope.count();
+        assert!(before_end > 0, "creating the files must enter the scope");
+        h.feed(vec![text(&FileMessage::End { id: 1 })]).await;
+        assert!(
+            h.scope.count() > before_end,
+            "the final rename must enter the scope"
+        );
+        assert_eq!(h.files(), vec!["a.txt".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn aborted_upload_is_removed_through_fs_user() {
+        let mut h = Harness::new(true);
+        h.feed(vec![start(1, "a.bin", 10), chunk(b"abc")]).await;
+        let before = h.scope.count();
+        h.feed(vec![text(&FileMessage::Abort {
+            id: 1,
+            reason: AbortReason::Cancelled,
+        })])
+        .await;
+        assert!(h.files().is_empty());
+        assert!(
+            h.scope.count() > before,
+            "removing the files must enter the scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn folder_upload_goes_through_fs_user() {
+        let mut h = Harness::new(true);
+        upload_in(&mut h, 1, "a.txt", Some(1), Some("Фото/2024")).await;
+        // create_dir_all + create_unique_dir + target dirs + create_unique +
+        // rename: well above a single scope.
+        assert!(h.scope.count() >= 4, "count {}", h.scope.count());
+        assert!(h.dir.join("Фото/2024/a.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn download_of_file_and_folder_goes_through_fs_user() {
+        let mut h = Harness::new(true);
+        let file = put(&h, "a.txt", b"hello");
+        let folder = h.dir.join("sub");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("x.txt"), b"xyz").unwrap();
+        h.command(FilesCommand::Offer(vec![file, folder])).await;
+        // metadata of both + walk of the folder.
+        let after_offer = h.scope.count();
+        assert!(after_offer >= 3, "count {after_offer}");
+        h.feed(vec![fetch(1)]).await;
+        h.wait_download_done().await;
+        // open of the file + walk + open of x.txt in the zip.
+        assert!(
+            h.scope.count() >= after_offer + 3,
+            "count {} after offer {after_offer}",
+            h.scope.count()
+        );
+        let ends = h
+            .sent()
+            .iter()
+            .filter(|m| matches!(m, FileMessage::End { .. }))
+            .count();
+        assert_eq!(ends, 2);
+    }
+
+    #[tokio::test]
+    async fn refusing_fs_user_fails_closed() {
+        let mut h = Harness::with_scope(true, true);
+        h.feed(vec![start(1, "a.txt", 3), chunk(b"abc")]).await;
+        assert_eq!(
+            h.sent(),
+            vec![FileMessage::Abort {
+                id: 1,
+                reason: AbortReason::Io
+            }]
+        );
+        assert!(!h.dir.exists(), "nothing may be created on disk");
+        // The offer side: files exist on disk, yet nothing is offered.
+        let file = h.dir.parent().unwrap().join(format!(
+            "{}-offered.txt",
+            h.dir.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&file, b"secret").unwrap();
+        h.command(FilesCommand::Offer(vec![file.clone()])).await;
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(h.sent().len(), 1, "no Offer may be sent: {:?}", h.sent());
+        assert_eq!(h.scope.count(), 0);
+    }
+
     #[tokio::test]
     async fn run_serves_commands_and_channel_together() {
         let h = Harness::new(true);
@@ -2383,6 +2695,7 @@ mod tests {
             Arc::clone(&h.fake) as Arc<dyn FileChannel>,
             rx,
             Some(h.dir.join("recv")),
+            h.user.clone(),
             cmd_rx,
         ));
         cmd_tx.send(FilesCommand::Offer(vec![a])).await.unwrap();
