@@ -15,7 +15,7 @@ use proto::signal::IceServer;
 type HmacSha1 = Hmac<Sha1>;
 
 const DEFAULT_STUN_URLS: &str = "stun:stun.l.google.com:19302";
-const DEFAULT_TURN_TTL_SECS: u64 = 86400;
+const DEFAULT_TURN_TTL_SECS: u64 = 7200;
 
 /// Current time as a Unix timestamp, for `IceConfig::ice_servers`'s
 /// `now_unix` argument. `unwrap_or_default()` rather than `unwrap()`: a

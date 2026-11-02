@@ -9,6 +9,16 @@ use rcdesk_server::registry::Registry;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // S-12: паника в задаче tokio отравляет std-мьютексы реестра/БД
+    // (`expect("... poisoned")` повсюду): `/healthz` отдаёт 503, но
+    // `restart: unless-stopped` на unhealthy контейнер не реагирует. Поэтому
+    // любая паника = abort, и Docker перезапускает процесс.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        prev_hook(info);
+        std::process::abort();
+    }));
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

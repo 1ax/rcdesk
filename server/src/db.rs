@@ -894,7 +894,9 @@ impl Db {
     /// Сливает анонимного владельца `from` (браузер без аккаунта) в
     /// аккаунт `to`: привязки устройств переезжают к `to` (`alias` и
     /// `added_at` сохраняются, уже привязанные к `to` остаются как были),
-    /// затем строка `from` удаляется целиком (его токены уходят каскадом).
+    /// ручные устройства и роутеры-будильники (`wake_devices`) тоже
+    /// переезжают к `to` (токен роутера сохраняется), затем строка `from`
+    /// удаляется целиком (его токены уходят каскадом).
     /// Одна транзакция. Ничего не делает и возвращает `false`, если
     /// `from == to` или у `from` есть passkey (он сам аккаунт).
     pub fn merge_anonymous_owner(&self, from: &str, to: &str) -> anyhow::Result<bool> {
@@ -920,6 +922,13 @@ impl Db {
         tx.execute("DELETE FROM ownership WHERE owner_id = ?1", [from])?;
         tx.execute(
             "UPDATE sessions SET owner_id = ?2 WHERE owner_id = ?1",
+            (from, to),
+        )?;
+        // S-3: без переноса `ON DELETE CASCADE` ниже снёс бы ручные устройства
+        // и роутеры-будильники анонима. Лимит `MAX_WAKE_DEVICES` при слиянии не
+        // применяется: он ограничивает именно добавление.
+        tx.execute(
+            "UPDATE wake_devices SET owner_id = ?2 WHERE owner_id = ?1",
             (from, to),
         )?;
         tx.execute("DELETE FROM owners WHERE owner_id = ?1", [from])?;
@@ -1314,7 +1323,12 @@ const SCHEMA_V8: &str = "CREATE TABLE IF NOT EXISTS devices (
 /// `devices.host_os`). Идемпотентна: на актуальной базе — no-op.
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version >= SCHEMA_VERSION {
+    if version > SCHEMA_VERSION {
+        return Err(anyhow::anyhow!(
+            "database schema v{version} is newer than this binary supports (v{SCHEMA_VERSION}); refusing to open"
+        ));
+    }
+    if version == SCHEMA_VERSION {
         return Ok(());
     }
 
@@ -2759,6 +2773,73 @@ mod tests {
                 ("dev2", Some("From B"), 99),
             ]
         );
+    }
+
+    #[test]
+    fn merge_anonymous_owner_moves_wake_devices() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("a", 1).expect("owner");
+        db.insert_owner("b", 1).expect("owner");
+        db.insert_wake_device(
+            "m1",
+            "a",
+            "manual",
+            "NAS",
+            Some("aa:bb:cc:dd:ee:01"),
+            "192.168.88.0",
+            24,
+            5,
+        )
+        .expect("manual from");
+        db.insert_router_waker("r1", "a", "MikroTik", "192.168.88.0", 24, "hash-r1", 6)
+            .expect("router from");
+        db.insert_wake_device(
+            "m2",
+            "b",
+            "manual",
+            "PC",
+            Some("aa:bb:cc:dd:ee:02"),
+            "192.168.1.0",
+            24,
+            7,
+        )
+        .expect("manual to");
+
+        assert!(db.merge_anonymous_owner("a", "b").expect("merge"));
+
+        let ids: Vec<String> = db
+            .wake_devices_for_owner("b")
+            .expect("list b")
+            .into_iter()
+            .map(|w| w.wake_id)
+            .collect();
+        assert_eq!(ids, vec!["m1", "r1", "m2"]);
+        let (row, owner) = db
+            .wake_device_by_token_hash("hash-r1")
+            .expect("query")
+            .expect("router kept its token");
+        assert_eq!(row.wake_id, "r1");
+        assert_eq!(owner, "b");
+        assert!(db.wake_devices_for_owner("a").expect("list a").is_empty());
+    }
+
+    #[test]
+    fn migrate_refuses_newer_schema() {
+        let dir = std::env::temp_dir().join(format!(
+            "rcdesk-newer-schema-test-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("rcdesk.db");
+        {
+            let conn = Connection::open(&path).expect("open raw");
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                .expect("set version");
+        }
+        let err = Db::open(&path).err().expect("must refuse newer schema");
+        assert!(err.to_string().contains("newer"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
