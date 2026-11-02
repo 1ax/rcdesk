@@ -655,8 +655,9 @@ fn free_space_bytes(path: &Path) -> std::io::Result<u64> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
-        use windows::core::PCWSTR;
-        use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        // `::windows` -- крейт, не подмодуль `files::windows` (CI windows-latest).
+        use ::windows::core::PCWSTR;
+        use ::windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut avail = 0u64;
         // Safety: `wide` is NUL-terminated and outlives the call; `avail` is
