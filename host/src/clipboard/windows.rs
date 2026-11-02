@@ -396,13 +396,31 @@ impl ClipboardBackend for WinClipboardBackend {
         let dir: &Path = self.agent_files_dir.as_deref()?;
         // Safety: no preconditions -- a plain Win32 query.
         let seq = unsafe { GetClipboardSequenceNumber() };
-        match agent_files::wait_for_seq(dir, u64::from(seq), AGENT_FILES_TIMEOUT, AGENT_FILES_STEP)
-        {
-            Some(list) => {
+        // M-6 / D61: the handoff file lives in the console user's
+        // %LOCALAPPDATA%, so SYSTEM must read it under that user's rights.
+        // No console user means no files in this session: do not read.
+        let user = match crate::files::receive_fs_user(true) {
+            Ok(user) => user,
+            Err(err) => {
+                tracing::debug!(?err, "no console user, not reading the agent file list");
+                return None;
+            }
+        };
+        let seq64 = u64::from(seq);
+        let waited = user.run(|| {
+            Ok(agent_files::wait_for_seq(
+                dir,
+                seq64,
+                AGENT_FILES_TIMEOUT,
+                AGENT_FILES_STEP,
+            ))
+        });
+        match waited {
+            Ok(Some(list)) => {
                 tracing::info!(count = list.len(), "clipboard file list read from agent");
                 Some(list)
             }
-            None => {
+            Ok(None) | Err(_) => {
                 tracing::info!(seq, "no file list from agent for this clipboard change");
                 None
             }

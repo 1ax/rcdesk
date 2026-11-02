@@ -93,7 +93,7 @@ impl FsUser {
     /// Runs `f` on the current thread under the user's rights. Fail closed:
     /// if the area cannot be entered, `f` is not called and an error is
     /// returned. Do not call `await` inside `f`.
-    fn run<T>(&self, f: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+    pub(crate) fn run<T>(&self, f: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
         let Some(scope) = &self.0 else {
             return f();
         };
@@ -618,6 +618,85 @@ fn retry_in_background(user: FsUser, mut left: Vec<PathBuf>) {
     });
 }
 
+/// Largest single file the host accepts from a client (M-5). Larger
+/// announced sizes are refused with `Abort(Protocol)`.
+const MAX_RECEIVE_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// Sum of announced sizes of all files received in one session (M-5).
+const MAX_RECEIVE_SESSION_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// Uploaded folders per session; each one creates a directory (M-5).
+const MAX_RECEIVE_FOLDERS: usize = 256;
+/// Received files per session (M-5).
+const MAX_RECEIVE_FILES: u32 = 50_000;
+/// Free space that must remain on the volume after a received file (M-5).
+const FREE_SPACE_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Free bytes available to the calling user on the volume holding `path`
+/// (quota-aware: `f_bavail` on Unix, `GetDiskFreeSpaceExW` caller-available
+/// bytes on Windows). Run it inside [`FsUser::run`] so the quota is the
+/// user's, not SYSTEM's.
+fn free_space_bytes(path: &Path) -> std::io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let mut st = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+        // Safety: `c` is a valid NUL-terminated path and `st` is a writable
+        // statvfs-sized buffer; it is read only after a zero return.
+        let rc = unsafe { libc::statvfs(c.as_ptr(), st.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Safety: statvfs returned 0, so the struct is initialised.
+        let st = unsafe { st.assume_init() };
+        #[allow(clippy::unnecessary_cast)]
+        Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut avail = 0u64;
+        // Safety: `wide` is NUL-terminated and outlives the call; `avail` is
+        // a valid out-pointer, the other two out-parameters are optional.
+        unsafe {
+            GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&raw mut avail), None, None)
+                .map_err(std::io::Error::other)?;
+        }
+        Ok(avail)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+}
+
+/// Per-session receive limits and what has been used so far (M-5).
+struct ReceiveBudget {
+    max_file_bytes: u64,
+    max_session_bytes: u64,
+    max_folders: usize,
+    max_files: u32,
+    bytes: u64,
+    files: u32,
+}
+
+impl Default for ReceiveBudget {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: MAX_RECEIVE_FILE_BYTES,
+            max_session_bytes: MAX_RECEIVE_SESSION_BYTES,
+            max_folders: MAX_RECEIVE_FOLDERS,
+            max_files: MAX_RECEIVE_FILES,
+            bytes: 0,
+            files: 0,
+        }
+    }
+}
+
 /// Receiving side of the `file` channel for one session.
 struct Receiver {
     channel: Arc<dyn FileChannel>,
@@ -630,6 +709,8 @@ struct Receiver {
     /// Uploaded folders of this session: client folder number -> the root
     /// directory chosen for it on disk (slice 3.4e).
     folders: HashMap<u32, PathBuf>,
+    /// Session limits and usage (M-5).
+    budget: ReceiveBudget,
 }
 
 impl Receiver {
@@ -717,6 +798,29 @@ impl Receiver {
         Ok(target)
     }
 
+    /// Which session limit (M-5) an incoming `Start` would break, if any.
+    fn limit_exceeded(&self, size: u64, folder: Option<u32>) -> Option<&'static str> {
+        let b = &self.budget;
+        if size > b.max_file_bytes {
+            return Some("file too large");
+        }
+        if b.bytes
+            .checked_add(size)
+            .is_none_or(|t| t > b.max_session_bytes)
+        {
+            return Some("session byte budget");
+        }
+        if b.files >= b.max_files {
+            return Some("file count");
+        }
+        if let Some(f) = folder {
+            if !self.folders.contains_key(&f) && self.folders.len() >= b.max_folders {
+                return Some("folder count");
+            }
+        }
+        None
+    }
+
     async fn on_start(
         &mut self,
         id: u32,
@@ -743,12 +847,45 @@ impl Receiver {
             .await;
             return;
         };
+        if let Some(why) = self.limit_exceeded(size, folder) {
+            tracing::warn!(id, size, why, "incoming file refused: receive limit");
+            self.send(&FileMessage::Abort {
+                id,
+                reason: AbortReason::Protocol,
+            })
+            .await;
+            return;
+        }
         let clean = sanitize_file_name(&name);
         let base = dir.clone();
         let made = self
             .user
-            .blocking(move || std::fs::create_dir_all(&base))
+            .blocking(move || {
+                std::fs::create_dir_all(&base)?;
+                Ok(free_space_bytes(&base))
+            })
             .await;
+        match &made {
+            Ok(Ok(free)) if size.saturating_add(FREE_SPACE_RESERVE_BYTES) > *free => {
+                tracing::warn!(
+                    id,
+                    size,
+                    free,
+                    "incoming file refused: not enough free space"
+                );
+                self.send(&FileMessage::Abort {
+                    id,
+                    reason: AbortReason::Io,
+                })
+                .await;
+                return;
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(?err, "cannot query free space, accepting the file anyway");
+            }
+            _ => {}
+        }
+        let made = made.map(|_| ());
         let created = match made {
             Ok(()) => match self.target_dir(&dir, folder, rel_dir.as_deref()).await {
                 Ok(target) => create_unique(&self.user, &target, &clean, id, size).await,
@@ -758,6 +895,8 @@ impl Receiver {
         };
         match created {
             Ok(active) => {
+                self.budget.files += 1;
+                self.budget.bytes = self.budget.bytes.saturating_add(size);
                 tracing::debug!(id, name = %active.final_name, size, "file receive started");
                 self.active = Some(active);
             }
@@ -781,7 +920,8 @@ impl Receiver {
             return;
         };
         let id = active.id;
-        if active.written + data.len() as u64 > active.size {
+        let new_written = active.written.checked_add(data.len() as u64);
+        if new_written.is_none_or(|w| w > active.size) {
             tracing::warn!(id, "file chunk exceeds announced size");
             self.abort(id, AbortReason::Protocol).await;
             return;
@@ -1356,6 +1496,7 @@ pub async fn run(
             active: None,
             user: user.clone(),
             folders: HashMap::new(),
+            budget: ReceiveBudget::default(),
         },
         downloader: Downloader::new(channel, user),
     };
@@ -1612,6 +1753,7 @@ mod tests {
                     active: None,
                     user: user.clone(),
                     folders: HashMap::new(),
+                    budget: ReceiveBudget::default(),
                 },
                 downloader: Downloader::new(channel, user.clone()),
             };
@@ -1872,6 +2014,7 @@ mod tests {
                 active: None,
                 user: FsUser::current(),
                 folders: HashMap::new(),
+                budget: ReceiveBudget::default(),
             },
             downloader: Downloader::new(channel, FsUser::current()),
         };
@@ -2061,6 +2204,93 @@ mod tests {
         .await;
         assert!(h.files().is_empty());
         assert!(h.sent().is_empty());
+    }
+
+    fn aborts(h: &Harness) -> Vec<(u32, AbortReason)> {
+        h.sent()
+            .into_iter()
+            .filter_map(|m| match m {
+                FileMessage::Abort { id, reason } => Some((id, reason)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn start_over_max_file_size_is_aborted() {
+        let mut h = Harness::new(true);
+        h.session.receiver.budget.max_file_bytes = 100;
+        h.feed(vec![start(1, "big.bin", 101)]).await;
+        assert_eq!(aborts(&h), vec![(1, AbortReason::Protocol)]);
+        assert!(h.files().is_empty());
+        h.feed(vec![start(2, "ok.bin", 100)]).await;
+        assert_eq!(aborts(&h).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_byte_budget_is_enforced() {
+        let mut h = Harness::new(true);
+        h.session.receiver.budget.max_session_bytes = 10;
+        h.feed(vec![
+            start(1, "a.bin", 6),
+            chunk(b"aaaaaa"),
+            text(&FileMessage::End { id: 1 }),
+            start(2, "b.bin", 5),
+        ])
+        .await;
+        assert_eq!(aborts(&h), vec![(2, AbortReason::Protocol)]);
+        h.feed(vec![start(3, "c.bin", 4)]).await;
+        assert_eq!(aborts(&h).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn folder_count_limit_is_enforced() {
+        let mut h = Harness::new(true);
+        h.session.receiver.budget.max_folders = 2;
+        let in_folder = |id: u32, folder: u32| {
+            text(&FileMessage::Start {
+                id,
+                name: "f.txt".into(),
+                size: 0,
+                folder: Some(folder),
+                dir: Some(format!("root{folder}")),
+                fetch: None,
+            })
+        };
+        let end = |id: u32| text(&FileMessage::End { id });
+        h.feed(vec![
+            in_folder(1, 1),
+            end(1),
+            in_folder(2, 2),
+            end(2),
+            in_folder(3, 3),
+        ])
+        .await;
+        assert_eq!(aborts(&h), vec![(3, AbortReason::Protocol)]);
+        // An already known folder still accepts files.
+        h.feed(vec![in_folder(4, 1), end(4)]).await;
+        assert_eq!(aborts(&h).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn file_count_limit_is_enforced() {
+        let mut h = Harness::new(true);
+        h.session.receiver.budget.max_files = 2;
+        h.feed(vec![
+            start(1, "a", 0),
+            text(&FileMessage::End { id: 1 }),
+            start(2, "b", 0),
+            text(&FileMessage::End { id: 2 }),
+            start(3, "c", 0),
+        ])
+        .await;
+        assert_eq!(aborts(&h), vec![(3, AbortReason::Protocol)]);
+    }
+
+    #[test]
+    fn free_space_bytes_reports_positive_for_temp_dir() {
+        let free = free_space_bytes(&std::env::temp_dir()).unwrap();
+        assert!(free > 0);
     }
 
     #[tokio::test]

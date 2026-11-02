@@ -180,6 +180,9 @@ windows = { version = "0.61", features = [
     # GetTickCount64 (platform::windows::service, D91) -- аптайм системы:
     # при загрузке значок поднимает HKLM Run, служба его не запускает.
     "Win32_System_SystemInformation",
+    # GetDiskFreeSpaceExW (files::free_space_bytes, M-5) -- free space check
+    # before accepting an uploaded file.
+    "Win32_Storage_FileSystem",
 ] }
 # Буфер обмена (2.5b): текст только, default-features=false drops the
 # `image-data` feature (image crate, extra objc2-core-graphics on macOS).

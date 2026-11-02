@@ -27,6 +27,9 @@ use serde::{Deserialize, Serialize};
 /// Name of the handoff file inside the user's rcdesk data directory.
 pub const AGENT_FILES_FILE: &str = "clipboard-files.json";
 
+/// Largest handoff file [`read_agent_files`] reads (M-6).
+pub const MAX_AGENT_FILES_BYTES: u64 = 1024 * 1024;
+
 /// The file list the agent saw on the clipboard at counter value `seq`
 /// (empty `paths`: no files there).
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -45,7 +48,15 @@ pub fn write_agent_files(dir: &Path, files: &AgentFiles) -> io::Result<()> {
 
 /// Reads the handoff file; `None` when it is missing or not valid JSON.
 pub fn read_agent_files(dir: &Path) -> Option<AgentFiles> {
-    let bytes = std::fs::read(dir.join(AGENT_FILES_FILE)).ok()?;
+    let path = dir.join(AGENT_FILES_FILE);
+    // M-6: the file is writable by the user while the reader may be SYSTEM,
+    // so never read an unbounded amount.
+    let len = std::fs::metadata(&path).ok()?.len();
+    if len > MAX_AGENT_FILES_BYTES {
+        tracing::debug!(len, "agent file list too large, ignoring");
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -94,6 +105,17 @@ mod tests {
             seq,
             paths: vec![PathBuf::from("a.txt"), PathBuf::from("b/c.txt")],
         }
+    }
+
+    #[test]
+    fn read_agent_files_rejects_oversized_file() {
+        let dir = tmp("oversized");
+        write_agent_files(&dir, &sample(1)).unwrap();
+        assert!(read_agent_files(&dir).is_some());
+        let big = vec![b' '; MAX_AGENT_FILES_BYTES as usize + 1];
+        std::fs::write(dir.join(AGENT_FILES_FILE), big).unwrap();
+        assert!(read_agent_files(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     const SHORT: Duration = Duration::from_millis(50);
