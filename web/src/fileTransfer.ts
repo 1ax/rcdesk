@@ -156,7 +156,15 @@ export class FileSender {
     const cur = this.current;
     if (cur && cur.outcome === null) {
       cur.outcome = "cancelled";
-      if (!this.closed) this.sendJson({ type: "abort", id: cur.id, reason: "cancelled" });
+      // `closed` is only set by the `close` event; the channel may already be
+      // dead (Chrome sleep), where `send` throws `InvalidStateError`.
+      if (!this.closed && this.channel.readyState === "open") {
+        try {
+          this.sendJson({ type: "abort", id: cur.id, reason: "cancelled" });
+        } catch {
+          // Channel already gone.
+        }
+      }
     }
     this.wake();
   }

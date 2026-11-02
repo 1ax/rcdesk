@@ -210,6 +210,18 @@ describe("FileSender", () => {
     expect(ev.done).toBe(1);
   });
 
+  it("cancelAll does not throw when the channel is already closed", async () => {
+    const { ch, sender } = setup(4);
+    ch.bufferedAmount = BUFFER_HIGH_BYTES + 1;
+    sender.enqueue([fakeFile("a", 8)]);
+    await flush();
+    ch.readyState = "closed";
+    ch.send = () => {
+      throw new Error("InvalidStateError");
+    };
+    expect(() => sender.cancelAll()).not.toThrow();
+  });
+
   it("cancelAll after end was sent still aborts", async () => {
     const { ch, sender } = setup(4);
     sender.enqueue([fakeFile("a", 4), fakeFile("b", 4)]);

@@ -248,6 +248,13 @@ const SIGNAL_ERROR_LABELS: Record<string, string> = {
   "not authenticated": "Не удалось подтвердить вход — обновите страницу",
   "too many attempts": "Слишком много неверных PIN — подождите минуту и попробуйте снова",
   "internal error": "Внутренняя ошибка сервера — попробуйте ещё раз",
+  "unknown device": "Устройство неизвестно серверу — обновите список",
+  "invalid device credentials": "Сервер отверг учётные данные устройства",
+  "not in session": "Сеанс уже завершён",
+  "unexpected message": "Сервер не понял сообщение клиента",
+  "expected hello": "Сервер не понял сообщение клиента",
+  "too many messages": "Слишком много запросов — подождите и обновите страницу",
+  forbidden: "Нет прав",
   "replaced by a new connection": "Вы вошли с этим аккаунтом в другой вкладке — эта отключена",
 };
 
@@ -1871,7 +1878,7 @@ export function mount(root: Element | null): void {
   document.addEventListener("click", (event) => {
     if (confirmingForgetId === null) return;
     const target = event.target as Element | null;
-    if (target?.closest(`.device-forget[data-device-id="${confirmingForgetId}"]`)) return;
+    if (target?.closest(`.device-forget[data-device-id="${CSS.escape(confirmingForgetId)}"]`)) return;
     confirmingForgetId = null;
     renderDeviceList();
   });
@@ -2385,16 +2392,32 @@ export function mount(root: Element | null): void {
    * successful one is detected in the `authenticated` handler, which resets
    * `reconnectAttempt` back to 0. Only the signaling connection is affected
    * -- an already-live WebRTC session doesn't need it and is left running. */
+  function reconnectSignaling(): void {
+    signaling.connect(signalUrl());
+    const storage = ownerStorage();
+    signaling.send({ type: "client_auth", token: storage ? loadOwnerToken(storage) : null });
+  }
+
   function scheduleReconnect(): void {
     stopReconnectTimer();
     reconnectAttempt += 1;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = undefined;
-      signaling.connect(signalUrl());
-      const storage = ownerStorage();
-      signaling.send({ type: "client_auth", token: storage ? loadOwnerToken(storage) : null });
+      reconnectSignaling();
     }, reconnectBackoffMs(reconnectAttempt));
   }
+
+  // W-12: when the network comes back or the tab becomes visible while a
+  // backoff wait is pending, reconnect immediately (`reconnectAttempt` kept).
+  function reconnectIfWaiting(): void {
+    if (reconnectTimer === undefined) return;
+    stopReconnectTimer();
+    reconnectSignaling();
+  }
+  window.addEventListener("online", reconnectIfWaiting);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") reconnectIfWaiting();
+  });
 
   /** Fallback poll of the device list every `DEVICE_LIST_INTERVAL_MS` while
    * the PIN/list screen is showing. The main update is the server's push of
@@ -2937,7 +2960,11 @@ export function mount(root: Element | null): void {
     wakeLock.disable();
     stopStatsLoop();
     stopPingLoop();
-    detachInput?.();
+    try {
+      detachInput?.();
+    } catch (err) {
+      console.warn("[rcdesk] input detach failed", err);
+    }
     detachInput = null;
     inputChannel = null;
     pointerChannel = null;
@@ -2959,14 +2986,24 @@ export function mount(root: Element | null): void {
     renderLayoutBtn(null);
     ctrlAltDelAvailable = false;
     renderCtrlAltDelBtn();
+    // A throw in one external call must not skip the rest (a dead channel
+    // after Chrome sleep would otherwise leave `session`/`video` alive).
     if (fileSender) {
-      fileSender.cancelAll();
-      fileSender.dispose();
+      try {
+        fileSender.cancelAll();
+        fileSender.dispose();
+      } catch (err) {
+        console.warn("[rcdesk] file sender cleanup failed", err);
+      }
       fileSender = null;
     }
     if (fileReceiver) {
-      fileReceiver.cancel();
-      fileReceiver.dispose();
+      try {
+        fileReceiver.cancel();
+        fileReceiver.dispose();
+      } catch (err) {
+        console.warn("[rcdesk] file receiver cleanup failed", err);
+      }
       fileReceiver = null;
     }
     filesEnabled = false;
@@ -2982,14 +3019,22 @@ export function mount(root: Element | null): void {
     hostUpdateAvailable = false;
     hostUpdateBtn.hidden = true;
     hostUpdateBtn.disabled = false;
-    detachClipboardBridge();
+    try {
+      detachClipboardBridge();
+    } catch (err) {
+      console.warn("[rcdesk] clipboard bridge detach failed", err);
+    }
     if (clipboardNoteTimer !== undefined) {
       clearTimeout(clipboardNoteTimer);
       clipboardNoteTimer = undefined;
     }
     clipboardNoteEl.hidden = true;
     clipboardNoteEl.textContent = "";
-    session?.close();
+    try {
+      session?.close();
+    } catch (err) {
+      console.warn("[rcdesk] session close failed", err);
+    }
     session = null;
     sessionId = null;
     prevSnapshot = undefined;
@@ -3421,7 +3466,21 @@ export function mount(root: Element | null): void {
     const password = authPassword;
     const requestSessionId = sessionId;
     void (async () => {
-      const result = await opaqueClient.finishLogin(state, msg.payload, password);
+      let result: Awaited<ReturnType<typeof opaqueClient.finishLogin>>;
+      try {
+        result = await opaqueClient.finishLogin(state, msg.payload, password);
+      } catch (err) {
+        // Internal failure (e.g. the WASM module failed to load) -- not a
+        // wrong password.
+        console.error("OPAQUE finishLogin failed", err);
+        if (sessionId !== requestSessionId) return;
+        resetAuthAttempt();
+        authPhase = { kind: "prompt", message: "Ошибка проверки пароля — попробуйте ещё раз" };
+        authPasswordInput.value = "";
+        renderAuthDialog();
+        authPasswordInput.focus();
+        return;
+      }
       if (sessionId !== requestSessionId) return;
       if (result === null) {
         resetAuthAttempt();
@@ -3734,7 +3793,7 @@ export function mount(root: Element | null): void {
   const storage = ownerStorage();
   signaling.send({ type: "client_auth", token: storage ? loadOwnerToken(storage) : null });
 
-  connectBtn.addEventListener("click", () => {
+  function submitPin(): void {
     const pin = pinInput.value.trim();
     if (!/^\d{6}$/.test(pin)) {
       pinStatus.textContent = "Введите 6-значный PIN";
@@ -3749,6 +3808,13 @@ export function mount(root: Element | null): void {
     });
 
     beginSession(null, () => signaling.send({ type: "join", pin }));
+  }
+
+  connectBtn.addEventListener("click", submitPin);
+  pinInput.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    submitPin();
   });
 
   disconnectBtn.addEventListener("click", () => {
