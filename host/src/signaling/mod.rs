@@ -1220,6 +1220,10 @@ struct ActiveSession {
     /// which -- per `InputRouter`'s own `Drop` impl -- releases any
     /// keys/buttons the session left held.
     router: InputRouter,
+    /// When the last "input events dropped" warning was logged (throttle).
+    last_input_drop_warn: Option<Instant>,
+    /// Input events dropped (rate limit / full queue) since that warning.
+    input_dropped: u64,
     /// The task that reads cursor-shape changes and forwards them over
     /// `control` (see `start_session`). It owns the session's
     /// `cursor::CursorWatcher` itself: `CursorWatcher` implements `Drop` to
@@ -2129,6 +2133,8 @@ async fn begin_session(
                     pipeline_generation: parts.pipeline_generation,
                     displays: parts.displays,
                     router: parts.router,
+                    last_input_drop_warn: None,
+                    input_dropped: 0,
                     cursor_task: parts.cursor_task,
                     input_available: parts.input_available,
                     input_reason: parts.input_reason,
@@ -2464,9 +2470,31 @@ async fn handle_session_event(
                             }
                         }
                         Ok(msg) => {
-                            if let Some(active) = active.as_ref() {
-                                if active.router.sender().send(msg).is_err() {
-                                    tracing::warn!(label, "input router is no longer running");
+                            if let Some(active) = active.as_mut() {
+                                match active.router.push(msg) {
+                                    Ok(()) => {}
+                                    Err(crate::input::PushError::Closed) => {
+                                        tracing::warn!(label, "input router is no longer running");
+                                    }
+                                    Err(err) => {
+                                        // Throttled: at most one warning per second
+                                        // per session, with a count of what was dropped.
+                                        active.input_dropped += 1;
+                                        let now = Instant::now();
+                                        let due = active.last_input_drop_warn.is_none_or(|t| {
+                                            now.duration_since(t) >= Duration::from_secs(1)
+                                        });
+                                        if due {
+                                            tracing::warn!(
+                                                label,
+                                                ?err,
+                                                dropped = active.input_dropped,
+                                                "input events dropped"
+                                            );
+                                            active.input_dropped = 0;
+                                            active.last_input_drop_warn = Some(now);
+                                        }
+                                    }
                                 }
                             }
                         }

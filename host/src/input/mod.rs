@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use proto::input::{InputMessage, PointerButton};
 
@@ -184,7 +185,13 @@ fn apply(
         InputMessage::Wheel { dx, dy, x, y } => {
             let (px, py) = to_pixel(*x, *y, rect);
             injector.pointer_move(px, py);
-            injector.wheel(dx.round() as i32, dy.round() as i32);
+            // enigo takes i32; a huge client-supplied value would mean a long
+            // scroll loop or garbage, so each axis is clamped.
+            let step = MAX_WHEEL_STEP as f64;
+            injector.wheel(
+                dx.round().clamp(-step, step) as i32,
+                dy.round().clamp(-step, step) as i32,
+            );
         }
         InputMessage::Key { code, pressed } => match keymap::to_keycode(code) {
             Some(keycode) => {
@@ -265,6 +272,72 @@ fn coalesce_pointer_move(
     latest
 }
 
+/// Capacity of the router's queue: a buffer for a burst. When it overflows,
+/// events are dropped -- the client is sending faster than the host injects.
+const INPUT_QUEUE_CAPACITY: usize = 256;
+/// Event token bucket size. Pointer at 120 Hz + keys + wheel, with headroom.
+const INPUT_BURST: u32 = 600;
+/// Event token bucket refill rate (events per second), see `INPUT_BURST`.
+const INPUT_REFILL_PER_SEC: u32 = 300;
+/// `Text` payload bytes bucket size.
+const TEXT_BURST_BYTES: u32 = 16 * 1024;
+/// `Text` payload bytes bucket refill rate (bytes per second).
+const TEXT_REFILL_BYTES_PER_SEC: u32 = 4 * 1024;
+/// Largest per-axis wheel step passed to the injector.
+const MAX_WHEEL_STEP: i32 = 100;
+/// How long `Drop` waits for the router thread before detaching it.
+const ROUTER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Why `InputRouter::push` did not enqueue a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushError {
+    /// The queue is saturated; the message was dropped.
+    Full,
+    /// The router thread is gone.
+    Closed,
+    /// The rate limit was exceeded; the message was dropped.
+    RateLimited,
+}
+
+/// A plain token bucket; time is passed in explicitly so it is testable.
+struct TokenBucket {
+    tokens: f64,
+    capacity: f64,
+    refill_per_sec: f64,
+    last: Instant,
+}
+
+impl TokenBucket {
+    fn new(capacity: u32, refill_per_sec: u32, now: Instant) -> Self {
+        Self {
+            tokens: f64::from(capacity),
+            capacity: f64::from(capacity),
+            refill_per_sec: f64::from(refill_per_sec),
+            last: now,
+        }
+    }
+
+    /// Refills for the time elapsed up to `now`, then takes `n` tokens if
+    /// available (all or nothing).
+    fn take(&mut self, n: u32, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = self.last.max(now);
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        let need = f64::from(n);
+        if self.tokens >= need {
+            self.tokens -= need;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+struct RateLimiter {
+    events: TokenBucket,
+    text_bytes: TokenBucket,
+}
+
 /// Owns the dedicated thread that turns queued `InputMessage`s into
 /// `Injector` calls.
 pub struct InputRouter {
@@ -274,7 +347,8 @@ pub struct InputRouter {
     // assumes nobody keeps a `sender()` clone alive past the router itself
     // (the signaling layer only ever holds one transiently, for the
     // duration of a single `send` call -- see `crate::signaling`).
-    sender: Option<std_mpsc::Sender<InputMessage>>,
+    sender: Option<std_mpsc::SyncSender<InputMessage>>,
+    limiter: Mutex<RateLimiter>,
     thread: Option<thread::JoinHandle<()>>,
     /// The currently captured display's rectangle, read fresh by
     /// `router_loop` on every message. Shared (rather than passed once at
@@ -293,11 +367,16 @@ impl InputRouter {
             width: w,
             height: h,
         }));
-        let (tx, rx) = std_mpsc::channel::<InputMessage>();
+        let (tx, rx) = std_mpsc::sync_channel::<InputMessage>(INPUT_QUEUE_CAPACITY);
+        let now = Instant::now();
         let thread_rect = Arc::clone(&capture_rect);
         let thread = thread::spawn(move || router_loop(injector, rx, thread_rect));
         InputRouter {
             sender: Some(tx),
+            limiter: Mutex::new(RateLimiter {
+                events: TokenBucket::new(INPUT_BURST, INPUT_REFILL_PER_SEC, now),
+                text_bytes: TokenBucket::new(TEXT_BURST_BYTES, TEXT_REFILL_BYTES_PER_SEC, now),
+            }),
             thread: Some(thread),
             capture_rect,
         }
@@ -316,11 +395,38 @@ impl InputRouter {
     /// A sender for feeding messages to the router's worker thread. Cheap to
     /// call repeatedly -- cloning an `mpsc::Sender` is cheap -- so callers
     /// aren't expected to hold onto the result.
-    pub fn sender(&self) -> std_mpsc::Sender<InputMessage> {
+    pub fn sender(&self) -> std_mpsc::SyncSender<InputMessage> {
         self.sender
             .as_ref()
             .expect("sender is only taken in Drop, after which InputRouter is gone")
             .clone()
+    }
+
+    /// Production entry point: rate-limits, then enqueues without blocking.
+    /// `ReleaseAll` is never rate-limited (releasing must always be possible),
+    /// though it can still hit a full queue.
+    pub fn push(&self, msg: InputMessage) -> Result<(), PushError> {
+        if !matches!(msg, InputMessage::ReleaseAll) {
+            let now = Instant::now();
+            let mut limiter = self
+                .limiter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !limiter.events.take(1, now) {
+                return Err(PushError::RateLimited);
+            }
+            if let InputMessage::Text { text } = &msg {
+                let bytes = u32::try_from(text.len()).unwrap_or(u32::MAX);
+                if !limiter.text_bytes.take(bytes, now) {
+                    return Err(PushError::RateLimited);
+                }
+            }
+        }
+        let sender = self.sender.as_ref().ok_or(PushError::Closed)?;
+        sender.try_send(msg).map_err(|err| match err {
+            std_mpsc::TrySendError::Full(_) => PushError::Full,
+            std_mpsc::TrySendError::Disconnected(_) => PushError::Closed,
+        })
     }
 }
 
@@ -332,7 +438,15 @@ impl Drop for InputRouter {
         // everything still held, and its loop exits.
         self.sender.take();
         if let Some(handle) = self.thread.take() {
-            let _ = handle.join();
+            let started = Instant::now();
+            while !handle.is_finished() && started.elapsed() < ROUTER_JOIN_TIMEOUT {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                tracing::warn!("input router thread did not exit in time, detaching");
+            }
         }
     }
 }
@@ -704,5 +818,94 @@ mod tests {
             TEST_RECT,
         );
         assert_eq!(*calls.lock().unwrap(), vec![Call::Text("x".to_string())]);
+    }
+
+    #[test]
+    fn token_bucket_refills_over_time() {
+        let t0 = Instant::now();
+        let mut bucket = TokenBucket::new(INPUT_BURST, INPUT_REFILL_PER_SEC, t0);
+        assert!(bucket.take(600, t0));
+        assert!(!bucket.take(1, t0));
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(bucket.take(300, t1));
+        assert!(!bucket.take(1, t1));
+    }
+
+    #[test]
+    fn push_rate_limits_after_burst() {
+        let (injector, _calls, _gate) = FakeInjector::new((1000, 500));
+        let router = InputRouter::new(Box::new(injector));
+        // No refill, so wall-clock time cannot make the outcome flaky.
+        router.limiter.lock().unwrap().events.refill_per_sec = 0.0;
+        // `Full` still spends a token, so only `RateLimited` is a failure here.
+        for i in 0..INPUT_BURST {
+            let r = router.push(InputMessage::PointerMove { x: 0.1, y: 0.1 });
+            assert_ne!(r, Err(PushError::RateLimited), "at {i}");
+            assert_ne!(r, Err(PushError::Closed), "at {i}");
+        }
+        assert_eq!(
+            router.push(InputMessage::PointerMove { x: 0.1, y: 0.1 }),
+            Err(PushError::RateLimited)
+        );
+        let mut r = router.push(InputMessage::ReleaseAll);
+        while r == Err(PushError::Full) {
+            std::thread::sleep(Duration::from_millis(1));
+            r = router.push(InputMessage::ReleaseAll);
+        }
+        assert_eq!(r, Ok(()));
+    }
+
+    #[test]
+    fn push_text_is_byte_limited() {
+        let (injector, _calls, _gate) = FakeInjector::new((1000, 500));
+        let router = InputRouter::new(Box::new(injector));
+        router.limiter.lock().unwrap().text_bytes.refill_per_sec = 0.0;
+        let text = "a".repeat(4096);
+        for _ in 0..4 {
+            assert_eq!(
+                router.push(InputMessage::Text { text: text.clone() }),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            router.push(InputMessage::Text { text }),
+            Err(PushError::RateLimited)
+        );
+    }
+
+    #[test]
+    fn wheel_is_clamped() {
+        let (injector, calls, _gate) = FakeInjector::new((1000, 500));
+        let router = InputRouter::new(Box::new(injector));
+        router
+            .push(InputMessage::Wheel {
+                dx: 1e9,
+                dy: -1e9,
+                x: 0.5,
+                y: 0.5,
+            })
+            .unwrap();
+        wait_for_calls(&calls, 2); // pointer_move + wheel
+        assert_eq!(calls.lock().unwrap().last(), Some(&Call::Wheel(100, -100)));
+    }
+
+    #[test]
+    fn push_reports_full_when_queue_is_saturated() {
+        let (injector, _calls, gate) = FakeInjector::new((1000, 500));
+        let router = InputRouter::new(Box::new(injector));
+        let held = gate.lock().unwrap();
+        let mut saw_full = false;
+        for i in 0..(INPUT_QUEUE_CAPACITY + 2) {
+            // Alternate coordinates-free keys so nothing is coalesced.
+            let msg = InputMessage::Key {
+                code: "KeyA".into(),
+                pressed: i % 2 == 0,
+            };
+            if router.push(msg) == Err(PushError::Full) {
+                saw_full = true;
+            }
+        }
+        assert!(saw_full);
+        drop(held);
     }
 }
