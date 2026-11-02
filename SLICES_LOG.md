@@ -14,6 +14,24 @@
 **2026-11-02 (20:45 МСК): НОЧНОЙ РЕЖИМ (слово владельца): коммит/push разрешены, стоп на 90 % лимита +
 `ScheduleWakeup`, COMPAX после 23:00 не включать. План: B → C (веб) → D (CI) → E (мобильный UI) → F/G если успею.**
 
+**2026-11-02 (21:45 МСК): слайсы C (веб), D (CI), E (мобильный UI) — СДЕЛАНЫ в коде; B — фикс Windows-сборки.**
+- B: CI `wip/b-host` упал на windows-latest — `use windows::core` внутри `files/mod.rs` резолвился в локальный
+  `pub mod windows`; фикс `4cb3392` (`::windows::`). Всё накопленное гоняется CI веткой `wip/night`.
+- C: `f0c1960` C1 (W-1 `ConnectGuard`: `joined.device_id` сверяется с запрошенным, иначе `bye`; W-5 поздний `joined`
+  → `bye`; W-10 таймаут 15 с на ответ и блокировка кнопок строк), `d5f6b77` C2 (W-2 `cancelAll`/уборка в try,
+  W-3 сбой OPAQUE → сообщение, UI-1 Enter в PIN, W-8 словарь, W-9 `CSS.escape`, W-12 реконнект по `online`).
+- D: `4e63ac9` (I-1 проверка патчей vendor + job `vendor-tests`, Dependabot ignore `rtc*`/`webrtc*`; I-3 `--locked`;
+  I-4 `git add -N`; I-5 verify подписи ключами `infra/release-pubkeys/*.pem`; I-2 `concurrency` + откат на прежний
+  образ при провале health-check, статика после контейнера; I-14 toolchain 1.98.1; I-6 README).
+- E: `4aae4d7` (UI-2 перенос кнопок строки, UI-3 «Ещё» на телефоне — панель 112 px вместо 206, тап-цели 44 px при
+  `pointer: coarse`, UI-4 `role`/`aria-label`/ловушка фокуса `focusTrap.ts`, UI-5 `--accent-bg #2f6fe0`, UI-6 тексты,
+  UI-7 плашка build справа, W-6 тикер по `data-device-id`, сброс статуса в `teardown`). Проверено Chromium на
+  локальном стенде 390×844 и 1280×800: Enter в PIN подключает, «Ещё» раскрывает/сворачивает (`aria-expanded`),
+  десктоп без изменений. Не сделано: «Только просмотр: отключено флагом --no-input» — текст с хоста, dev-флаг.
+- Гейты: web `Tests 574 passed (574)`, `check`/`build` чистые; Rust после фикса — fmt/clippy чисто локально.
+- Дальше: CI `wip/night` зелёный → push main (Deploy: веб + сервер + новые шаги CI); хост — выпуск 0.4.1 по слову.
+  F/G (видеопуть, замеры на COMPAX) — не начинал.
+
 **2026-11-02 (20:45 МСК): слайс B аудита (хост fail-closed) — СДЕЛАН в коде, ждёт CI Windows и слова «выпуск 0.4.1».**
 - Коммиты: `d796b19` B1 (H-1 `AccessLoad`, M-1 `DeviceLoad` + `.bak`/backoff), `7bb47dc` B3 (M-5 лимиты приёма и
   свободное место, M-6 `clipboard-files.json` через `FsUser` ≤ 1 МиБ, feature `Win32_Storage_FileSystem`),
