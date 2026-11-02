@@ -87,7 +87,7 @@ pub type BuildClipboard = Box<dyn Fn() -> anyhow::Result<Box<dyn ClipboardBacken
 /// См. `HostContext::build_source`. Вынесен в псевдоним (clippy
 /// `type_complexity`).
 pub type BuildSource =
-    Box<dyn Fn(u32, &[u32]) -> anyhow::Result<Box<dyn FrameSource>> + Send + Sync>;
+    Arc<dyn Fn(u32, &[u32]) -> anyhow::Result<Box<dyn FrameSource>> + Send + Sync>;
 
 /// Будит дисплей (слайс 4.6a) и возвращает guard, который держит ассерцию
 /// до своего `Drop`. Замыкание, а не прямой вызов `platform`, чтобы тесты и
@@ -131,7 +131,8 @@ pub struct HostContext {
     /// (slice 2.4), not just once per session. Второй аргумент -- CGWindowID
     /// окон, которые не захватывать (окна шторки, слайс 4.2c); пустой срез
     /// -- исключений нет. Действует только на macOS, остальные бэкенды его
-    /// игнорируют.
+    /// игнорируют. `Arc`, а не `Box`: `VideoPipeline::start` клонирует
+    /// замыкание в `spawn_blocking` (V-1).
     pub build_source: BuildSource,
     /// Шторка хоста (слайс 4.2c), если платформа её умеет; `None` --
     /// `SetCurtain` отвечает отказом, а `HostInfo.curtain_available` ложно.
@@ -971,22 +972,36 @@ impl VideoPipeline {
         current_generation: Arc<AtomicU64>,
         exclude_windows: &[u32],
     ) -> anyhow::Result<VideoPipeline> {
-        let source = (ctx.build_source)(display.id, exclude_windows)?;
-        let (width, height) = source.size();
         let fps = ctx.session.fps.max(1);
-
-        let encoder_cfg = EncoderConfig {
-            width,
-            height,
-            fps,
-            bitrate_kbps: ctx.bitrate_kbps,
-            // Periodic IDR is only a safety net; recovery after loss goes
-            // via PLI/FIR. Every 10 s it cost ~250 kbit/s and a burst of
-            // packets for nothing (audit 2026-10-13).
-            keyframe_interval_frames: fps * 60,
-            max_qp: ctx.max_qp,
-        };
-        let (encoder, encoder_kind) = build_encoder(ctx.encoder, encoder_cfg)?;
+        // V-1: сборка захвата и кодера (MFT/WGC на Win10 -- сотни мс, порой
+        // секунды) синхронная и не должна занимать tokio-воркер, на котором
+        // живёт сигналинг; уносим её в blocking-пул.
+        let build_source = Arc::clone(&ctx.build_source);
+        let encoder_choice = ctx.encoder;
+        let bitrate_kbps = ctx.bitrate_kbps;
+        let max_qp = ctx.max_qp;
+        let build_display_id = display.id;
+        let build_exclude = exclude_windows.to_vec();
+        let (source, width, height, encoder, encoder_kind) =
+            tokio::task::spawn_blocking(move || {
+                let source = build_source(build_display_id, &build_exclude)?;
+                let (width, height) = source.size();
+                let encoder_cfg = EncoderConfig {
+                    width,
+                    height,
+                    fps,
+                    bitrate_kbps,
+                    // Periodic IDR is only a safety net; recovery after loss
+                    // goes via PLI/FIR. Every 10 s it cost ~250 kbit/s and a
+                    // burst of packets for nothing (audit 2026-10-13).
+                    keyframe_interval_frames: fps * 60,
+                    max_qp,
+                };
+                let (encoder, encoder_kind) = build_encoder(encoder_choice, encoder_cfg)?;
+                anyhow::Ok((source, width, height, encoder, encoder_kind))
+            })
+            .await
+            .map_err(|err| anyhow::Error::new(err).context("video pipeline build task failed"))??;
         let display_id = display.id;
         let display_title = display.title.clone();
         tracing::info!(
@@ -1278,6 +1293,10 @@ struct ActiveSession {
     /// выключена. Передаётся в `build_source` при каждой пересборке
     /// конвейера (смена дисплея не должна выдать шторку в видео).
     curtain_windows: Vec<u32>,
+    /// Момент последней попытки `SelectDisplay` на другой дисплей (успешной
+    /// или нет) для rate-limit `DISPLAY_SWITCH_MIN_INTERVAL`; `None` -- ещё
+    /// не переключали.
+    last_display_switch: Option<std::time::Instant>,
     /// Guard пробуждения дисплея (слайс I7): держит и продлевает «активность
     /// пользователя» весь сеанс; отпускается при дропе `ActiveSession`.
     /// `Mutex` лишь делает поле `Sync` (`ActiveSession` держат через `.await`).
@@ -2122,6 +2141,7 @@ async fn begin_session(
                     quality_preset: QualityPreset::Auto,
                     curtain: ctx.curtain.clone(),
                     curtain_windows: parts.curtain_windows,
+                    last_display_switch: None,
                     _display_wake: parts._display_wake,
                     input_source: ctx.input_source.clone(),
                     input_source_task: ctx.input_source.clone().map(|switcher| {
@@ -2917,6 +2937,11 @@ fn displays_message(displays: &[DisplayInfo], current: u32) -> ControlMessage {
     }
 }
 
+/// Минимальный интервал между попытками переключить дисплей (`SelectDisplay`):
+/// каждая попытка пересобирает конвейер захвата и кодера, клиент не должен
+/// мочь делать это бесконечно часто. Считается по попыткам, успешным и нет.
+const DISPLAY_SWITCH_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Handles `ControlMessage::SelectDisplay { id }`: builds a fresh
 /// `VideoPipeline` for the requested display *before* stopping the current
 /// one, so a failure (unknown id, or the new pipeline fails to start) leaves
@@ -2947,6 +2972,15 @@ async fn switch_display(ctx: &HostContext, active: &mut ActiveSession, id: u32) 
         let _ = active.peer.send_control(&msg).await;
         return;
     }
+    if let Some(last) = active.last_display_switch {
+        if last.elapsed() < DISPLAY_SWITCH_MIN_INTERVAL {
+            tracing::warn!(id, "select_display rate-limited, keeping current display");
+            let msg = displays_message(&active.displays, active.video.display.id);
+            let _ = active.peer.send_control(&msg).await;
+            return;
+        }
+    }
+    active.last_display_switch = Some(std::time::Instant::now());
     let from = active.video.display.id;
     match replace_pipeline(ctx, active, display).await {
         Ok(()) => {
@@ -3937,7 +3971,7 @@ pub(crate) fn test_ctx() -> HostContext {
         adapt: false,
         max_qp: None,
         encoder: Some(EncoderKind::OpenH264),
-        build_source: Box::new(|id, _exclude| {
+        build_source: Arc::new(|id, _exclude| {
             Ok(Box::new(capture::synthetic::for_display(id, 30)?) as Box<dyn FrameSource>)
         }),
         curtain: None,
@@ -4726,7 +4760,7 @@ mod tests {
         }
 
         let mut ctx = test_ctx();
-        ctx.build_source = Box::new(|id, _exclude| {
+        ctx.build_source = Arc::new(|id, _exclude| {
             Ok(Box::new(DyingSource {
                 inner: Box::new(capture::synthetic::for_display(id, 30)?),
                 left: 3,
@@ -4810,7 +4844,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn peer_joined_sends_bye_when_session_start_fails() {
         let mut ctx = test_ctx();
-        ctx.build_source = Box::new(|_id, _exclude| anyhow::bail!("synthetic source failure"));
+        ctx.build_source = Arc::new(|_id, _exclude| anyhow::bail!("synthetic source failure"));
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<SignalMessage>();
         let (event_tx, _event_rx) = mpsc::channel(64);
         let mut active: Option<ActiveSession> = None;
@@ -6445,7 +6479,7 @@ mod tests {
             shown: Mutex::new(Vec::new()),
         }));
         let spy = Arc::clone(&calls);
-        ctx.build_source = Box::new(move |id, exclude| {
+        ctx.build_source = Arc::new(move |id, exclude| {
             spy.lock().unwrap().push((id, exclude.to_vec()));
             Ok(Box::new(capture::synthetic::for_display(id, 30)?) as Box<dyn FrameSource>)
         });
@@ -6570,7 +6604,7 @@ mod tests {
     async fn set_curtain_rolls_back_when_pipeline_restart_fails() {
         let (mut ctx, log, _calls) = curtain_ctx(vec![101], None);
         let (mut active, _out, _etx, _erx) = start_active_session(&ctx).await;
-        ctx.build_source = Box::new(|_id, _exclude| anyhow::bail!("restart failure"));
+        ctx.build_source = Arc::new(|_id, _exclude| anyhow::bail!("restart failure"));
 
         let reply = set_curtain(&ctx, &mut active, true).await;
 
@@ -6682,6 +6716,35 @@ mod tests {
         );
         // set_curtain + switch_display: two replacements -> generation 2.
         assert_eq!(active.pipeline_generation.load(Ordering::SeqCst), 2);
+        active.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn select_display_is_rate_limited_within_a_second() {
+        let (ctx, _log, calls) = curtain_ctx(vec![], None);
+        let (mut active, _out, _etx, _erx) = start_active_session(&ctx).await;
+        let first = active.video.display.id;
+        let other = capture::synthetic::list_displays()
+            .into_iter()
+            .find(|d| d.id != first)
+            .unwrap()
+            .id;
+        let base = calls.lock().unwrap().len();
+
+        switch_display(&ctx, &mut active, other).await;
+        assert_eq!(active.video.display.id, other);
+        assert_eq!(calls.lock().unwrap().len(), base + 1);
+
+        // Сразу обратно: лимит, конвейер не пересобирается.
+        switch_display(&ctx, &mut active, first).await;
+        assert_eq!(active.video.display.id, other);
+        assert_eq!(calls.lock().unwrap().len(), base + 1);
+
+        active.last_display_switch =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        switch_display(&ctx, &mut active, first).await;
+        assert_eq!(active.video.display.id, first);
+        assert_eq!(calls.lock().unwrap().len(), base + 2);
         active.shutdown().await;
     }
 

@@ -284,11 +284,11 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
         .ok_or_else(|| anyhow::anyhow!("no webrtc runtime available"))?;
 
     let build_source: BuildSource = if synthetic {
-        Box::new(move |id, _exclude| {
+        std::sync::Arc::new(move |id, _exclude| {
             Ok(Box::new(capture::synthetic::for_display(id, fps)?) as Box<dyn FrameSource>)
         })
     } else {
-        Box::new(move |id, exclude| build_screen_source(Some(id), fps, capture, exclude))
+        std::sync::Arc::new(move |id, exclude| build_screen_source(Some(id), fps, capture, exclude))
     };
 
     let list_displays: Box<dyn Fn() -> anyhow::Result<Vec<capture::DisplayInfo>> + Send + Sync> =
