@@ -899,10 +899,14 @@ mod tests {
         // one into `pending` by `coalesce_pointer_move`) before stalling on
         // the gate, so overshoot the capacity by more than that.
         for i in 0..(INPUT_QUEUE_CAPACITY + 8) {
-            // Alternate coordinates-free keys so nothing is coalesced.
-            let msg = InputMessage::Key {
-                code: "KeyA".into(),
+            // Button presses, not keys: only `PointerMove` is coalesced,
+            // and `Key` never reaches the injector on platforms without a
+            // keymap (Linux CI), so nothing would stall on the gate.
+            let msg = InputMessage::PointerButton {
+                button: PointerButton::Left,
                 pressed: i % 2 == 0,
+                x: 0.0,
+                y: 0.0,
             };
             if router.push(msg) == Err(PushError::Full) {
                 saw_full = true;
