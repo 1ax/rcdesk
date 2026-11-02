@@ -11,6 +11,24 @@
 > Всё, что НИЖЕ разделителя `---`, — append-only история. Архитектор при старте
 > чата читает сначала голову, в тело ныряет по ссылке на слайс.
 
+**2026-11-02 (20:45 МСК): НОЧНОЙ РЕЖИМ (слово владельца): коммит/push разрешены, стоп на 90 % лимита +
+`ScheduleWakeup`, COMPAX после 23:00 не включать. План: B → C (веб) → D (CI) → E (мобильный UI) → F/G если успею.**
+
+**2026-11-02 (20:45 МСК): слайс B аудита (хост fail-closed) — СДЕЛАН в коде, ждёт CI Windows и слова «выпуск 0.4.1».**
+- Коммиты: `d796b19` B1 (H-1 `AccessLoad`, M-1 `DeviceLoad` + `.bak`/backoff), `7bb47dc` B3 (M-5 лимиты приёма и
+  свободное место, M-6 `clipboard-files.json` через `FsUser` ≤ 1 МиБ, feature `Win32_Storage_FileSystem`),
+  `3defe0a` B2 (M-2 `SessionParts::abort` + `peer.close()` на всех ошибках старта, M-11 при пароле старый сеанс
+  живёт до `PakeFinish` нового), `93492a8` B4 (M-4 `ws://` только loopback / `RCDESK_ALLOW_PLAIN_WS=1`, M-7
+  `ClipboardText` в `spawn_blocking`, M-8 `Debug` без секрета; PIN в логе оставлен — решение).
+- Гейты (`93492a8`): fmt/clippy чистые; host `567 passed; 0 failed; 4 ignored` (+21), proto `112`, server `179` + `96`;
+  web `Tests 560 passed (560)`, build чистый. CI `wip/b-host` `41491615410` — ждёт (windows-latest).
+- Покрыто только кодом: ветки `Err` внутри `start_session_with_display_wait`; `PakeFinish` при живом старом сеансе
+  (нужен OPAQUE-клиент); Windows-имперсонация чтения `clipboard-files.json`.
+- **Риск выкладки:** хост с `ws://<LAN-адрес>` в `settings.json`/службе после 0.4.1 не стартует без
+  `RCDESK_ALLOW_PLAIN_WS=1` (у владельца везде `wss://rcdesk.app`, хаб — `ws://127.0.0.1`).
+- Живая проверка после выпуска: «Обновить хост» на COMPAX (до 23:00) → переподключение; сеанс с паролем не
+  проверить (пароль на хостах не задан).
+
 **2026-11-02 (20:05 МСК): слайс A аудита (сервер: DoS и слияние) — ЗАДЕПЛОЕН, nginx применён.**
 - Push `22d0dc2` (по слову владельца), Deploy `41485965476` зелёный (все гейты CI, включая windows-latest). Контейнер
   `sha-22d0dc2` healthy, `RCDESK_TURN_TTL_SECS=7200` внутри (архитектор поправил `~/app/.env` на VPS одной строкой с

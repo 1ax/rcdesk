@@ -139,6 +139,21 @@ keyframe. Старый pipeline останавливается через `spawn
 Ответ `invalid device credentials` файл НЕ трогает — это признак подделки или порчи,
 в лог идёт предупреждение с путём.
 
+**Слайс B аудита 2026-11-02 (хост fail-closed; H-1, M-1, M-2, M-4, M-5, M-6, M-7, M-8, M-11).**
+`AccessStore::load` → `AccessLoad {Missing, Present, Unusable}`: нечитаемый или битый `access.json` —
+отказ в сеансе (`Bye`, `error!`), а не «пароля нет». `DeviceStore::load` → `DeviceLoad {Missing, Present,
+Corrupt, Unreadable}`: битый `device.json` уходит в `.bak` перед новой регистрацией, нечитаемый — повтор с
+backoff без регистрации как новое устройство. `SessionParts::abort` закрывает `PeerSession` и задачи во всех
+ветках ошибки старта (раньше PeerConnection/UDP/ICE утекали на каждой неудачной попытке). `PeerJoined` при
+заданном пароле не гасит активный сеанс — старый живёт до успешного `PakeFinish` нового клиента (таймаут/отказ
+кандидата старый не трогают); без пароля — вытеснение, как прежде. Приём файлов: ≤ 16 ГиБ файл, ≤ 64 ГиБ
+и ≤ 50 000 файлов / ≤ 256 папок на сеанс, проверка свободного места (резерв 1 ГиБ, `statvfs` /
+`GetDiskFreeSpaceExW` под имперсонацией). `clipboard-files.json` SYSTEM-помощник читает под токеном
+консольного пользователя (`FsUser`) и не больше 1 МиБ. `ws://` принимается только для loopback
+(`settings::check_server_url`, `RCDESK_ALLOW_PLAIN_WS=1` для доверенной dev-сети); проверка на старте
+`serve`/агента и в `service install`. `ClipboardText` применяется в `spawn_blocking`. `DeviceCredentials` —
+ручной `Debug` без секрета. PIN в `agent.log` остаётся (решение: на нём держится эксплуатация).
+
 ### 4.2 Веб-клиент (`web/`)
 
 Одна страница. Подключается к сигнальному серверу по WSS, получает список хостов,
