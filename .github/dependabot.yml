@@ -14,6 +14,9 @@ updates:
       # Закреплён на =1.4.4: scap 0.0.8 ломается на 1.5+ (host/Cargo.toml,
       # долги D3/D5). Снять вместе с переходом на прямой windows-capture 2.x.
       - dependency-name: "windows-capture"
+      # До D72: патчи vendor (rtc-sctp, rtc-turn) привязаны к 0.20.5.
+      - dependency-name: "rtc*"
+      - dependency-name: "webrtc*"
     groups:
       cargo:
         patterns: ["*"]

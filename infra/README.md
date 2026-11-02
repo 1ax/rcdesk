@@ -249,6 +249,20 @@ Better Stack на `rcdesk.app`).
    `v<version>` на GitHub ещё нет, он сам ставит его на этот коммит, пушит и в том же прогоне
    собирает релиз. Push без смены версии релиз не создаёт — только деплой (`deploy.yml`).
 
+Тег ставится job'ом `version` до тестов: если гейты упали (флак), повторный push релиз
+не создаст (тег уже есть). Делать `gh run rerun <id> --failed`, затем одобрить окружение `release`.
+
+После подписи манифеста release.yml сверяет подпись боевыми открытыми ключами из
+`infra/release-pubkeys/*.pem` (те же два ключа, что `RELEASE_PUBLIC_KEYS` в
+`host/src/update_verify.rs`; `openssl pkeyutl -verify`). Если не подошёл ни один, релиз
+падает до публикации. При смене ключей в `update_verify.rs` обновить и PEM.
+
+CI проверяет, что патчи `vendor/` реально применяются: шаг «vendor patches are applied»
+падает на `Patch ... was not used` и если `rtc-sctp`/`rtc-turn`/`scap` собираются не из
+`vendor/`. Job `vendor-tests` гоняет тесты патчей (`cargo test --manifest-path
+vendor/rtc-sctp|rtc-turn/Cargo.toml --lib --locked`), которые вне workspace. Dependabot не
+обновляет `rtc*`/`webrtc*` до D72.
+
 Резервный путь — тег руками: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 
 При ручном теге workflow сначала проверяет (`infra/release-version-check.sh`), что тег совпадает

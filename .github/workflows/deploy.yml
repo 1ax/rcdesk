@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# Два push подряд не должны деплоить параллельно (гонка: прод мог бы откатиться
+# на старый sha). Прогон в очереди ждёт, идущий не отменяем.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
 jobs:
   # Гейт деплоя: переиспользуем CI как reusable workflow. build-push/build-web/
   # deploy зависят от него -- падение гейтов блокирует прод-деплой.
@@ -112,8 +118,6 @@ jobs:
           ssh $SSHOPTS "$SSH_USER@$SSH_HOST" 'mkdir -p ~/app'
           scp -i "$HOME/.ssh/deploy_key" -P "$SSH_PORT" -o StrictHostKeyChecking=yes \
             infra/docker-compose.prod.yml infra/traffic-monitor.sh infra/backup-db.sh "$SSH_USER@$SSH_HOST:~/app/"
-          scp -i "$HOME/.ssh/deploy_key" -P "$SSH_PORT" -o StrictHostKeyChecking=yes -r \
-            dist/. "$SSH_USER@$SSH_HOST:~/www/rcdesk.app/"
           # Тег образа этого коммита (docker/metadata-action type=sha: 7 символов).
           # Тег передаётся env-переменной удалённому sh, скрипт идёт через heredoc.
           TAG="sha-$(echo "$GITHUB_SHA" | cut -c1-7)"
@@ -125,6 +129,13 @@ jobs:
             C="docker compose -f docker-compose.prod.yml"
             export IMAGE_TAG
             export RCDESK_ADMIN_EMAILS
+            # Образ, который крутится сейчас (пусто при первом деплое) -- для отката.
+            PREV_IMAGE=""
+            PREV_CID=$($C ps -q server 2>/dev/null || true)
+            if [ -n "$PREV_CID" ]; then
+              PREV_IMAGE=$(docker inspect --format '{{.Config.Image}}' "$PREV_CID" 2>/dev/null || true)
+            fi
+            echo "previous image: ${PREV_IMAGE:-none}"
             $C pull
             $C up -d --remove-orphans
             for i in $(seq 1 10); do
@@ -132,5 +143,15 @@ jobs:
               if [ "$r" = "ok" ]; then echo "health OK"; exit 0; fi
               sleep 3
             done
-            echo "health check failed"; exit 1
+            echo "health check failed"
+            if [ -n "$PREV_IMAGE" ]; then
+              PREV_TAG="${PREV_IMAGE##*:}"
+              IMAGE_TAG="$PREV_TAG" $C up -d server
+              echo "rolled back to $PREV_IMAGE"
+            fi
+            exit 1
           REMOTE
+          # Статика -- только после успешной смены контейнера (при падении выше
+          # set -e прерывает скрипт до этого места).
+          scp -i "$HOME/.ssh/deploy_key" -P "$SSH_PORT" -o StrictHostKeyChecking=yes -r \
+            dist/. "$SSH_USER@$SSH_HOST:~/www/rcdesk.app/"

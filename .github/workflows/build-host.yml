@@ -63,11 +63,11 @@ jobs:
       # Собирает оба [[bin]] пакета rcdesk-host (rcdesk-host и rcdesk-agent) --
       # `cargo build -p <pkg>` без `--bin` строит все бинарники пакета, так
       # что `autostart status` ниже находит rcdesk-agent уже рядом (слайс 2.6d).
-      - run: cargo build --release -p rcdesk-host
+      - run: cargo build --locked --release -p rcdesk-host
       - name: Дымовая проверка -- бинарник запускается
         run: |
-          cargo run --release -p rcdesk-host -- --version
-          cargo run --release -p rcdesk-host -- autostart status
+          cargo run --locked --release -p rcdesk-host -- --version
+          cargo run --locked --release -p rcdesk-host -- autostart status
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: ${{ matrix.artifact }}

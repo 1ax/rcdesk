@@ -1,0 +1,1 @@
+Открытые ключи подписи манифеста обновления (ed25519, SPKI PEM). Получены из `RELEASE_PUBLIC_KEYS` в `host/src/update_verify.rs`: DER-префикс `302a300506032b6570032100` + 32 байта ключа, base64. Используются шагом сверки подписи в `.github/workflows/release.yml`. При смене ключей в `update_verify.rs` обновлять и эти файлы.

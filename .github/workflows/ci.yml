@@ -28,15 +28,30 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Патчи vendor/ (rtc-sctp, rtc-turn, scap) должны реально применяться:
+      # cargo при неподошедшем [patch] лишь пишет warning, CI остался бы зелёным.
+      - name: vendor patches are applied
+        shell: bash
+        run: |
+          cargo metadata --locked --format-version 1 >/dev/null 2>err.txt
+          cat err.txt
+          if grep -i "was not used" err.txt; then
+            echo "ошибка: [patch] из Cargo.toml не применён" >&2
+            exit 1
+          fi
+          for c in rtc-sctp rtc-turn scap; do
+            cargo tree -i "$c" --locked --target all | head -1 | grep -q "vendor/$c)" \
+              || { echo "ошибка: $c собирается не из vendor/$c" >&2; exit 1; }
+          done
       - name: cargo fmt --all --check
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all --check
       - name: cargo clippy --workspace --all-targets -- -D warnings
         if: matrix.os != 'windows-latest'
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: cargo test --workspace
         if: matrix.os != 'windows-latest'
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
       # rcdesk-server с фичами по умолчанию тянет OpenSSL (webauthn-rs) и
       # работает только на Linux: на Windows-раннере OpenSSL нет, поэтому
       # целиком сервер там не собираем. Без фич (`--no-default-features`, без
@@ -44,22 +59,38 @@ jobs:
       # подключит хост (LAN-хаб). Эту же конфигурацию гоняем и на Linux.
       - name: cargo clippy --workspace --exclude rcdesk-server (windows)
         if: matrix.os == 'windows-latest'
-        run: cargo clippy --workspace --exclude rcdesk-server --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --exclude rcdesk-server --all-targets -- -D warnings
       - name: cargo test --workspace --exclude rcdesk-server (windows)
         if: matrix.os == 'windows-latest'
-        run: cargo test --workspace --exclude rcdesk-server
+        run: cargo test --locked --workspace --exclude rcdesk-server
       - name: cargo clippy -p rcdesk-server --no-default-features (windows)
         if: matrix.os == 'windows-latest'
-        run: cargo clippy -p rcdesk-server --no-default-features --all-targets -- -D warnings
+        run: cargo clippy --locked -p rcdesk-server --no-default-features --all-targets -- -D warnings
       - name: cargo test -p rcdesk-server --no-default-features (windows)
         if: matrix.os == 'windows-latest'
-        run: cargo test -p rcdesk-server --no-default-features
+        run: cargo test --locked -p rcdesk-server --no-default-features
       - name: cargo clippy -p rcdesk-server --no-default-features
         if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy -p rcdesk-server --no-default-features --all-targets -- -D warnings
+        run: cargo clippy --locked -p rcdesk-server --no-default-features --all-targets -- -D warnings
       - name: cargo test -p rcdesk-server --no-default-features
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test -p rcdesk-server --no-default-features
+        run: cargo test --locked -p rcdesk-server --no-default-features
+
+  # Тесты патчей vendor/ (каталог вне workspace, в `cargo test --workspace` не входят).
+  vendor-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            vendor/rtc-sctp
+            vendor/rtc-turn
+      - name: cargo test vendor/rtc-sctp
+        run: cargo test --manifest-path vendor/rtc-sctp/Cargo.toml --lib --locked
+      - name: cargo test vendor/rtc-turn
+        run: cargo test --manifest-path vendor/rtc-turn/Cargo.toml --lib --locked
 
   proto-ts-sync:
     runs-on: ubuntu-latest
@@ -68,9 +99,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: cargo test -p rcdesk-proto
-        run: cargo test -p rcdesk-proto
+        run: cargo test --locked -p rcdesk-proto
       - name: check generated TS bindings match committed files
-        run: git diff --exit-code -- web/src/generated
+        run: |
+          git add -N web/src/generated
+          git diff --exit-code -- web/src/generated
 
   web:
     runs-on: ubuntu-latest

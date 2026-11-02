@@ -122,6 +122,23 @@ jobs:
           printf '%s\n' "$RELEASE_SIGN_KEY" > "$key_file"
           bash infra/release-manifest.sh "${RELEASE_TAG#v}" "$key_file" . \
             dist/setup/rcdesk-setup.exe dist/macos-pkg/rcdesk-macos.pkg
+      # Сверка подписи боевыми открытыми ключами (те же, что в update_verify.rs):
+      # неверный секрет RELEASE_SIGN_KEY не должен породить релиз, который хост отвергнет.
+      - name: Сверить подпись манифеста боевым ключом
+        run: |
+          ok=0
+          for pem in infra/release-pubkeys/*.pem; do
+            if openssl pkeyutl -verify -pubin -inkey "$pem" -rawin \
+                -in rcdesk-update.json -sigfile rcdesk-update.json.sig; then
+              echo "подпись подошла к $pem"
+              ok=1
+              break
+            fi
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "ошибка: подпись манифеста не подошла ни к одному ключу из infra/release-pubkeys" >&2
+            exit 1
+          fi
       - name: Создать релиз
         env:
           GH_TOKEN: ${{ github.token }}
