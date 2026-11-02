@@ -93,12 +93,28 @@ impl IpLimiter {
         bucket.updated = now;
     }
 
+    /// Returns one token to `ip`, capped at `burst`; no bucket -- no-op.
+    /// For "spent before an expensive check, the check passed -- the attempt
+    /// does not count".
+    pub fn refund_at(&self, ip: IpAddr, now: Instant) {
+        let mut buckets = self.buckets.lock().expect("ip limiter mutex poisoned");
+        let (burst, refill) = (self.burst, self.refill);
+        if let Some(bucket) = buckets.get_mut(&bucket_key(ip)) {
+            bucket.tokens = (bucket.tokens_at(now, burst, refill) + 1.0).min(burst as f64);
+            bucket.updated = now;
+        }
+    }
+
     pub fn check(&self, ip: IpAddr) -> bool {
         self.check_at(ip, Instant::now())
     }
 
     pub fn spend(&self, ip: IpAddr) {
         self.spend_at(ip, Instant::now());
+    }
+
+    pub fn refund(&self, ip: IpAddr) {
+        self.refund_at(ip, Instant::now());
     }
 
     #[cfg(test)]
@@ -160,6 +176,30 @@ mod tests {
 
     fn pin_limiter() -> IpLimiter {
         IpLimiter::new(PIN_BURST, PIN_REFILL)
+    }
+
+    #[test]
+    fn refund_restores_one_token_up_to_burst() {
+        let limiter = pin_limiter();
+        let now = Instant::now();
+        let a = ip(1);
+        limiter.spend_at(a, now);
+        limiter.spend_at(a, now);
+        for _ in 0..3 {
+            limiter.refund_at(a, now);
+        }
+        for _ in 0..PIN_BURST {
+            assert!(limiter.check_at(a, now));
+            limiter.spend_at(a, now);
+        }
+        assert!(!limiter.check_at(a, now));
+    }
+
+    #[test]
+    fn refund_on_unknown_ip_is_noop() {
+        let limiter = pin_limiter();
+        limiter.refund_at(ip(9), Instant::now());
+        assert_eq!(limiter.len(), 0);
     }
 
     fn ip(last: u8) -> IpAddr {

@@ -90,11 +90,38 @@ pub fn verify_dummy(password: &str) {
     let _ = verify_password(dummy_hash(), password);
 }
 
+/// Сколько хешей argon2 считается одновременно на весь процесс. Контейнер
+/// сервера -- 1 CPU и 256M, один хеш держит ~19 МиБ и десятки мс CPU; без
+/// ограничителя 50 соединений дали бы 50 параллельных хешей и OOM (аудит S-1).
+pub const ARGON2_MAX_PARALLEL: usize = 2;
+
+static ARGON2_GATE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+
+fn argon2_gate() -> &'static tokio::sync::Semaphore {
+    ARGON2_GATE.get_or_init(|| tokio::sync::Semaphore::new(ARGON2_MAX_PARALLEL))
+}
+
+/// Выполняет `f` в `spawn_blocking`, удерживая permit `ARGON2_GATE` от
+/// ожидания до завершения блокирующей задачи.
+async fn run_gated<T, F>(f: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let permit = argon2_gate()
+        .acquire()
+        .await
+        .map_err(|err| anyhow::anyhow!("argon2 gate closed: {err}"))?;
+    let result = tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|err| anyhow::anyhow!("argon2 task failed: {err}"));
+    drop(permit);
+    result
+}
+
 /// `hash_password` в `spawn_blocking`: argon2 -- десятки миллисекунд CPU.
 pub async fn hash_password_blocking(password: String) -> anyhow::Result<String> {
-    tokio::task::spawn_blocking(move || hash_password(&password))
-        .await
-        .map_err(|err| anyhow::anyhow!("hash task failed: {err}"))?
+    run_gated(move || hash_password(&password)).await?
 }
 
 /// `verify_password` в `spawn_blocking`. `hash = None` -- аккаунта нет:
@@ -103,7 +130,7 @@ pub async fn verify_password_blocking(
     hash: Option<String>,
     password: String,
 ) -> anyhow::Result<bool> {
-    tokio::task::spawn_blocking(move || match hash {
+    run_gated(move || match hash {
         Some(hash) => verify_password(&hash, &password),
         None => {
             verify_dummy(&password);
@@ -111,7 +138,6 @@ pub async fn verify_password_blocking(
         }
     })
     .await
-    .map_err(|err| anyhow::anyhow!("verify task failed: {err}"))
 }
 
 struct CodeEntry {
@@ -226,6 +252,42 @@ fn random_code() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn argon2_gate_limits_parallelism() {
+        let hash = hash_password("x").expect("hash");
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let (hash, running, peak) = (hash.clone(), running.clone(), peak.clone());
+            tasks.push(tokio::spawn(async move {
+                let ok = run_gated(move || {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    let ok = verify_password(&hash, "x");
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    ok
+                })
+                .await
+                .expect("gated");
+                assert!(ok);
+                // Семафор не превышает исходного числа permit'ов.
+                assert!(argon2_gate().available_permits() <= ARGON2_MAX_PARALLEL);
+            }));
+        }
+        // Публичная обёртка идёт через тот же затвор.
+        assert!(verify_password_blocking(Some(hash.clone()), "x".into())
+            .await
+            .expect("verify"));
+        for task in tasks {
+            task.await.expect("join");
+        }
+        assert!(peak.load(Ordering::SeqCst) >= 1);
+        assert!(peak.load(Ordering::SeqCst) <= ARGON2_MAX_PARALLEL);
+        assert_eq!(argon2_gate().available_permits(), ARGON2_MAX_PARALLEL);
+    }
 
     #[test]
     fn normalize_email_trims_and_lowercases() {

@@ -1306,6 +1306,9 @@ async fn handle_password_login(
         Some((account_id, hash)) => (Some(account_id), Some(hash)),
         None => (None, None),
     };
+    // S-1: токен списывается ДО дорогого argon2, иначе N параллельных
+    // соединений получат N хешей; успешная проверка токен возвращает.
+    deps.login_limiter.spend(ip);
     let verified = match accounts::verify_password_blocking(hash, password).await {
         Ok(verified) => verified,
         Err(err) => {
@@ -1315,10 +1318,10 @@ async fn handle_password_login(
         }
     };
     let Some(account_id) = account_id.filter(|_| verified) else {
-        deps.login_limiter.spend(ip);
         send_error(tx, "wrong email or password");
         return;
     };
+    deps.login_limiter.refund(ip);
     let now = ice::now_unix() as i64;
     match switch_to_account(db, session, &account_id, user_agent, now) {
         Ok(token) => {
@@ -1374,10 +1377,11 @@ async fn handle_email_change(
         send_error(tx, "same email");
         return;
     }
+    // S-1: токен списывается ДО дорогого argon2; успешная проверка возвращает его.
+    deps.login_limiter.spend(ip);
     match accounts::verify_password_blocking(Some(hash), password).await {
-        Ok(true) => {}
+        Ok(true) => deps.login_limiter.refund(ip),
         Ok(false) => {
-            deps.login_limiter.spend(ip);
             send_error(tx, "wrong password");
             return;
         }
