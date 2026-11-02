@@ -22,11 +22,11 @@ use proto::signal::{
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
-use tokio::time::{interval, timeout, MissedTickBehavior};
+use tokio::time::{interval, timeout, timeout_at, MissedTickBehavior};
 
 use crate::accounts::{self, EmailCodes};
 use crate::admin;
-use crate::app::AppState;
+use crate::app::{AppState, Liveness};
 use crate::db::{Db, SetEmailOutcome};
 use crate::devices::{self, DeviceAuth};
 use crate::ice::{self, IceConfig};
@@ -90,7 +90,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
     let (tx, mut rx, kill) = Tx::channel();
 
     let liveness = state.liveness;
-    let read_timeout = liveness.read_timeout;
     let mut writer = tokio::spawn(async move {
         let mut ping = interval(liveness.ping_interval);
         ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -157,8 +156,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
             admin_emails: &state.admin_emails,
         },
         info,
-        read_timeout,
-        liveness.pin_ttl,
+        liveness,
     )
     .await;
     tracing::info!("websocket connection closed");
@@ -172,6 +170,53 @@ async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
     }
 }
 
+/// Как долго `next_message` ждёт следующий кадр.
+enum ReadLimit {
+    /// Простой: любой кадр, включая Ping/Pong, сбрасывает таймер.
+    Idle(Duration),
+    /// Абсолютный срок (S-2): Ping/Pong его не продлевают, иначе соединение,
+    /// так и не приславшее `Hello`/регистрацию, жило бы вечно.
+    Deadline(Instant),
+}
+
+/// Максимум сообщений сигналинга в залпе на соединение (S-2).
+/// 100/10 в секунду: залп ICE-кандидатов — десятки сообщений, `SessionStats`
+/// идёт раз в 60 с, указатель мыши идёт по data channel, а не по сигналингу.
+pub const MESSAGE_BURST: u32 = 100;
+/// Пополнение бюджета сообщений, токенов в секунду.
+pub const MESSAGE_REFILL_PER_SEC: f64 = 10.0;
+
+/// Токен-бакет сообщений одного соединения: одно сообщение = 1 токен.
+struct MessageBudget {
+    burst: f64,
+    refill_per_sec: f64,
+    tokens: f64,
+    updated: Instant,
+}
+
+impl MessageBudget {
+    fn new(burst: u32, refill_per_sec: f64, now: Instant) -> Self {
+        Self {
+            burst: f64::from(burst),
+            refill_per_sec,
+            tokens: f64::from(burst),
+            updated: now,
+        }
+    }
+
+    fn take_at(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.updated).as_secs_f64();
+        self.updated = now;
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.burst);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Reads the next text frame and parses it as a `SignalMessage`. Returns
 /// `None` when the connection is over (closed, transport error) or the frame
 /// was invalid JSON / not text (an `Error` reply is sent for the latter).
@@ -182,16 +227,25 @@ async fn handle_socket(socket: WebSocket, state: AppState, info: ClientInfo) {
 async fn next_message(
     stream: &mut SplitStream<WebSocket>,
     tx: &Tx,
-    read_timeout: Duration,
+    limit: ReadLimit,
 ) -> Option<SignalMessage> {
     loop {
+        let read = async {
+            match limit {
+                ReadLimit::Idle(idle) => timeout(idle, stream.next()).await.map_err(|_| {
+                    tracing::warn!("no frames for {idle:?}, closing connection");
+                }),
+                ReadLimit::Deadline(deadline) => timeout_at(deadline.into(), stream.next())
+                    .await
+                    .map_err(|_| {
+                        tracing::warn!("handshake timeout, closing connection");
+                    }),
+            }
+        };
         let item = tokio::select! {
-            item = timeout(read_timeout, stream.next()) => match item {
+            item = read => match item {
                 Ok(item) => item,
-                Err(_) => {
-                    tracing::warn!("no frames for {read_timeout:?}, closing connection");
-                    return None;
-                }
+                Err(()) => return None,
             },
             _ = tx.killed() => {
                 tracing::info!(
@@ -241,10 +295,12 @@ async fn run_connection(
     webauthn: &SharedWebauthn,
     account_deps: AccountDeps<'_>,
     info: ClientInfo,
-    read_timeout: Duration,
-    pin_ttl: Duration,
+    liveness: Liveness,
 ) {
-    let (role, version) = match next_message(stream, &tx, read_timeout).await {
+    let pin_ttl = liveness.pin_ttl;
+    let hello_deadline = Instant::now() + liveness.hello_timeout;
+    let (role, version) = match next_message(stream, &tx, ReadLimit::Deadline(hello_deadline)).await
+    {
         Some(SignalMessage::Hello { role, version }) => (role, version),
         Some(_) => {
             let _ = tx.send(SignalMessage::Error {
@@ -266,7 +322,7 @@ async fn run_connection(
                 device_limiter,
                 info.ip,
                 version,
-                read_timeout,
+                liveness,
             )
             .await
         }
@@ -283,7 +339,7 @@ async fn run_connection(
                 webauthn,
                 account_deps,
                 info,
-                read_timeout,
+                liveness,
                 pin_ttl,
             )
             .await
@@ -301,10 +357,12 @@ async fn run_host(
     device_limiter: &IpLimiter,
     ip: IpAddr,
     version: String,
-    read_timeout: Duration,
+    liveness: Liveness,
 ) {
+    let read_timeout = liveness.read_timeout;
+    let register_deadline = Instant::now() + liveness.auth_timeout;
     let (name, device, session_id, pin_rotation, ifaces, os) =
-        match next_message(stream, &tx, read_timeout).await {
+        match next_message(stream, &tx, ReadLimit::Deadline(register_deadline)).await {
             Some(SignalMessage::HostRegister {
                 name,
                 device,
@@ -430,11 +488,23 @@ async fn run_host(
         device: issued_credentials,
     });
 
+    let mut budget = MessageBudget::new(
+        liveness.message_burst,
+        liveness.message_refill_per_sec,
+        Instant::now(),
+    );
     loop {
-        let msg = match next_message(stream, &tx, read_timeout).await {
+        let msg = match next_message(stream, &tx, ReadLimit::Idle(read_timeout)).await {
             Some(msg) => msg,
             None => break,
         };
+        if !budget.take_at(Instant::now()) {
+            tracing::warn!(%ip, "message flood, closing connection");
+            let _ = tx.send(SignalMessage::Error {
+                message: "too many messages".to_string(),
+            });
+            break;
+        }
 
         match msg {
             SignalMessage::Offer {
@@ -1439,10 +1509,18 @@ async fn run_client(
     webauthn: &SharedWebauthn,
     account_deps: AccountDeps<'_>,
     info: ClientInfo,
-    read_timeout: Duration,
+    liveness: Liveness,
     pin_ttl: Duration,
 ) {
     let ClientInfo { ip, user_agent } = info;
+    let read_timeout = liveness.read_timeout;
+    let first_deadline = Instant::now() + liveness.auth_timeout;
+    let mut first_message = true;
+    let mut budget = MessageBudget::new(
+        liveness.message_burst,
+        liveness.message_refill_per_sec,
+        Instant::now(),
+    );
     // The owner this connection has authenticated as (slice 3.1), if any --
     // `ClientAuth` is optional, so an older client that never sends it stays
     // fully compatible, just without device linking/listing.
@@ -1464,10 +1542,23 @@ async fn run_client(
             registry.watch_owner(&tx, current_owner_id.as_deref());
             watched_owner = current_owner_id;
         }
-        let msg = match next_message(stream, &tx, read_timeout).await {
+        let limit = if first_message {
+            ReadLimit::Deadline(first_deadline)
+        } else {
+            ReadLimit::Idle(read_timeout)
+        };
+        let msg = match next_message(stream, &tx, limit).await {
             Some(msg) => msg,
             None => break,
         };
+        first_message = false;
+        if !budget.take_at(Instant::now()) {
+            tracing::warn!(%ip, "message flood, closing connection");
+            let _ = tx.send(SignalMessage::Error {
+                message: "too many messages".to_string(),
+            });
+            break;
+        }
 
         match msg {
             SignalMessage::ClientAuth { token } => {
@@ -2390,6 +2481,21 @@ mod tests {
 
     fn peer() -> SocketAddr {
         "127.0.0.1:5555".parse().unwrap()
+    }
+
+    #[test]
+    fn message_budget_allows_burst_then_refills() {
+        let t0 = Instant::now();
+        let mut budget = MessageBudget::new(MESSAGE_BURST, MESSAGE_REFILL_PER_SEC, t0);
+        for _ in 0..MESSAGE_BURST {
+            assert!(budget.take_at(t0));
+        }
+        assert!(!budget.take_at(t0));
+        let t1 = t0 + Duration::from_secs(1);
+        for _ in 0..10 {
+            assert!(budget.take_at(t1));
+        }
+        assert!(!budget.take_at(t1));
     }
 
     #[test]

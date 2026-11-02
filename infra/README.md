@@ -92,6 +92,11 @@ cd ~/app && IMAGE_TAG=sha-<предыдущий> docker compose -f docker-compos
 Строки панели (`listen`, `ssl_certificate*`, `root`, `include`, логи) в нём как у панели;
 при перевыпуске сертификата пути к `.crt`/`.key` брать из живого файла.
 
+Зона лимита соединений (`limit_conn_zone`, S-2) живёт в отдельном файле
+`infra/nginx/rcdesk-limits.conf`: класть в `/etc/nginx/conf.d/rcdesk-limits.conf` (контекст
+`http`, FastPanel include-ит `conf.d/*.conf`; проверить `nginx -T | grep conf.d`) раньше, чем
+конфиг сайта, затем `nginx -t && systemctl reload nginx`.
+
 Применение (root): заменить файл целиком, затем
 
 ```bash

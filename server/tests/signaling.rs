@@ -2067,7 +2067,14 @@ async fn host_name_and_alias_are_truncated_to_64_chars() {
 // on the current-thread runtime it starved and the host itself got killed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_that_stops_reading_is_disconnected() {
-    let url = spawn_server().await;
+    // The test floods 600 messages from the host to overflow OUTBOUND_QUEUE
+    // (256); the default per-connection message budget (100) would cut the
+    // host off first, so raise it here.
+    let liveness = Liveness {
+        message_burst: 1000,
+        ..Default::default()
+    };
+    let url = spawn_server_with(IceConfig::from_env(), liveness).await;
     let (mut host, mut client, session_id, pin) = host_and_joined_client(&url).await;
 
     // The client does not read. The host floods it with large ICE candidates.
@@ -2476,6 +2483,113 @@ async fn join_keeps_pin_static_for_host_without_rotation() {
         SignalMessage::Joined { .. } => {}
         other => panic!("expected joined, got {other:?}"),
     }
+}
+
+// S-2: Ping does not extend the hello deadline.
+#[tokio::test]
+async fn connection_without_hello_is_closed_after_hello_timeout() {
+    let liveness = Liveness {
+        hello_timeout: Duration::from_millis(300),
+        ..Default::default()
+    };
+    let url = spawn_server_with(IceConfig::from_env(), liveness).await;
+    let mut ws = connect(&url).await;
+    let closed = timeout(Duration::from_millis(1500), async {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    if ws.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        return;
+                    }
+                }
+                item = ws.next() => match item {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                    Some(Ok(_)) => {}
+                },
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "connection must close despite Pings");
+}
+
+// S-2: a host that never registers is dropped after the auth timeout.
+#[tokio::test]
+async fn host_without_register_is_closed_after_auth_timeout() {
+    let liveness = Liveness {
+        auth_timeout: Duration::from_millis(300),
+        ..Default::default()
+    };
+    let url = spawn_server_with(IceConfig::from_env(), liveness).await;
+    let mut ws = connect(&url).await;
+    hello(&mut ws, Role::Host).await;
+    let closed = timeout(Duration::from_millis(1500), async {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    if ws.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        return;
+                    }
+                }
+                item = ws.next() => match item {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                    Some(Ok(_)) => {}
+                },
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "host must be closed despite Pings");
+}
+
+// S-2: after the first message the auth deadline gives way to the idle timeout.
+#[tokio::test]
+async fn client_first_message_resets_to_idle_timeout() {
+    let liveness = Liveness {
+        auth_timeout: Duration::from_millis(300),
+        read_timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let url = spawn_server_with(IceConfig::from_env(), liveness).await;
+    let mut ws = connect(&url).await;
+    hello(&mut ws, Role::Client).await;
+    client_auth(&mut ws, None).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    send(&mut ws, &SignalMessage::ListDevices).await;
+    match recv(&mut ws).await {
+        SignalMessage::Devices { .. } => {}
+        other => panic!("expected devices, got {other:?}"),
+    }
+}
+
+// S-2: a message flood on one connection is cut off.
+#[tokio::test]
+async fn message_flood_closes_connection() {
+    let url = spawn_server().await;
+    let mut ws = connect(&url).await;
+    hello(&mut ws, Role::Client).await;
+    for _ in 0..150 {
+        send(&mut ws, &SignalMessage::ListDevices).await;
+    }
+    let mut saw_flood_error = false;
+    let ended = timeout(TIMEOUT, async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(SignalMessage::Error { message }) = serde_json::from_str(&text) {
+                        if message == "too many messages" {
+                            saw_flood_error = true;
+                        }
+                    }
+                }
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "connection must close after the flood");
+    assert!(saw_flood_error, "expected Error{{too many messages}}");
 }
 
 // D44: an opted-in host's PIN is rotated by TTL, with `PinChanged`.

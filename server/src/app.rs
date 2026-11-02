@@ -53,6 +53,16 @@ pub struct Liveness {
     pub read_timeout: Duration,
     /// TTL PIN (D44): ротация только для хостов с `pin_rotation`.
     pub pin_ttl: Duration,
+    /// Срок на первый `Hello` с момента подключения (S-2). Абсолютный: Ping/Pong
+    /// его не продлевают.
+    pub hello_timeout: Duration,
+    /// Срок на `HostRegister` (хост) или первое сообщение клиента после `Hello`
+    /// (S-2). Абсолютный: Ping/Pong его не продлевают.
+    pub auth_timeout: Duration,
+    /// Залп бюджета сообщений сигналинга на соединение (S-2).
+    pub message_burst: u32,
+    /// Пополнение бюджета сообщений, токенов в секунду (S-2).
+    pub message_refill_per_sec: f64,
 }
 
 impl Default for Liveness {
@@ -61,6 +71,10 @@ impl Default for Liveness {
             ping_interval: Duration::from_secs(30),
             read_timeout: Duration::from_secs(90),
             pin_ttl: Duration::from_secs(600),
+            hello_timeout: Duration::from_secs(10),
+            auth_timeout: Duration::from_secs(60),
+            message_burst: crate::ws::MESSAGE_BURST,
+            message_refill_per_sec: crate::ws::MESSAGE_REFILL_PER_SEC,
         }
     }
 }
