@@ -106,6 +106,14 @@ for key in BACKUP_GPG_RECIPIENT BACKUP_HEARTBEAT_URL TRAFFIC_TG_BOT_TOKEN TRAFFI
   fi
 done
 if [[ -z "$BACKUP_IMAGE" ]]; then
+  # Аудит I-9: сначала образ работающего контейнера сервера (как PREV_IMAGE в
+  # deploy.yml); ошибки docker не валят скрипт -- дальше фолбэк на IMAGE_TAG.
+  server_cid="$(docker compose -f "$(dirname "$BACKUP_ENV_FILE")/docker-compose.prod.yml" ps -q server 2>/dev/null || true)"
+  if [[ -n "$server_cid" ]]; then
+    BACKUP_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$server_cid" 2>/dev/null || true)"
+  fi
+fi
+if [[ -z "$BACKUP_IMAGE" ]]; then
   image_tag="$(read_kv IMAGE_TAG "$BACKUP_ENV_FILE")"
   BACKUP_IMAGE="ghcr.io/1ax/rcdesk-server:${image_tag:-latest}"
 fi

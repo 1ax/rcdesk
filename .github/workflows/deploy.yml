@@ -140,7 +140,23 @@ jobs:
             $C up -d --remove-orphans
             for i in $(seq 1 10); do
               r=$(curl -s http://127.0.0.1:8100/healthz || true)
-              if [ "$r" = "ok" ]; then echo "health OK"; exit 0; fi
+              if [ "$r" = "ok" ]; then
+                echo "health OK"
+                # Аудит I-7: чистка диска VPS. Удаляем старые образы ТОЛЬКО
+                # ghcr.io/1ax/rcdesk-server (оставляя текущий и предыдущий теги
+                # и latest), затем висячие слои (prune без -a). Чужие образы
+                # (crewtally) не трогаем. Провал чистки деплой не валит.
+                (
+                  set +e
+                  KEEP="ghcr.io/1ax/rcdesk-server:$IMAGE_TAG ghcr.io/1ax/rcdesk-server:latest $PREV_IMAGE"
+                  for img in $(docker images ghcr.io/1ax/rcdesk-server --format '{{.Repository}}:{{.Tag}}'); do
+                    case " $KEEP " in *" $img "*) continue ;; esac
+                    docker rmi "$img" || true
+                  done
+                  docker image prune -f || true
+                ) || true
+                exit 0
+              fi
               sleep 3
             done
             echo "health check failed"
@@ -155,3 +171,8 @@ jobs:
           # set -e прерывает скрипт до этого места).
           scp -i "$HOME/.ssh/deploy_key" -P "$SSH_PORT" -o StrictHostKeyChecking=yes -r \
             dist/. "$SSH_USER@$SSH_HOST:~/www/rcdesk.app/"
+          # Аудит I-7: хэшированные файлы assets/ копятся от деплоя к деплою.
+          # scp без -p ставит свежий mtime всем залитым файлам, поэтому
+          # актуальные не старше 14 дней; удаляем остальные. Провал не валит деплой.
+          ssh $SSHOPTS "$SSH_USER@$SSH_HOST" \
+            'find ~/www/rcdesk.app/assets -type f -mtime +14 -delete' || true

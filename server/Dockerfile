@@ -1,7 +1,7 @@
 # Build context is the repository root (this is a Cargo workspace):
 #   docker build -f server/Dockerfile -t rcdesk-server .
 
-FROM rust:1-bookworm AS builder
+FROM rust:1.98.1-bookworm AS builder
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
@@ -27,7 +27,7 @@ RUN mkdir -p host/src && \
 
 RUN cargo build --release --locked -p rcdesk-server
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-20261027-slim
 # sqlite3 is needed by infra/backup-db.sh, which runs `.backup` via
 # `docker run --entrypoint sqlite3` from this very image -- no separate image
 # or network is required.

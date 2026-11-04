@@ -64,6 +64,10 @@ services:
         max-size: "10m"
         max-file: "3"
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
     command:
       - "--listening-port=3478"
       - "--realm=rcdesk.app"
@@ -83,6 +87,10 @@ services:
       # НЕ запрещать: когда обе стороны идут через релей, пир -- это relay-адрес
       # самого coturn, и ChannelBind получает 403 (проверено 2026-10-13).
       - "--no-tcp-relay"
+      # Аудит I-8: потолки полосы. 2500000 Б/с (~20 Мбит/с) на сеанс в каждую
+      # сторону при видео хоста <= 6 Мбит/с; 25000000 Б/с (~200 Мбит/с) на всё.
+      - "--max-bps=2500000"
+      - "--bps-capacity=25000000"
       - "--user-quota=8"
       - "--total-quota=200"
       - "--denied-peer-ip=0.0.0.0-0.255.255.255"
