@@ -47,6 +47,10 @@ pub use macos::fullmode;
 #[cfg(target_os = "macos")]
 pub use macos::input_source;
 
+/// Дешёвый опрос геометрии дисплеев (V-2): только macOS.
+#[cfg(target_os = "macos")]
+pub use macos::displays;
+
 /// Будит спящий дисплей при старте сеанса (4.6a). macOS -- реальная
 /// IOKit-ассерция, остальные платформы -- no-op guard (поведение не меняется).
 #[cfg(target_os = "macos")]

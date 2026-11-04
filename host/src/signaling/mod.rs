@@ -17,7 +17,7 @@
 //! (`SessionSlot::run_while_offline`) even while there's no connection to
 //! reconnect on.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -153,7 +153,14 @@ pub struct HostContext {
     /// `ControlMessage::SelectDisplay` ids (slice 2.4). `main.rs` supplies
     /// either `capture::list_displays` or the synthetic backend's fixed
     /// two-display list.
-    pub list_displays: Box<dyn Fn() -> anyhow::Result<Vec<DisplayInfo>> + Send + Sync>,
+    pub list_displays: Arc<dyn Fn() -> anyhow::Result<Vec<DisplayInfo>> + Send + Sync>,
+    /// V-2: дешёвый источник геометрии дисплеев для фонового опроса
+    /// (`spawn_display_poll`, раз в 2 с). Нужны только `id/x/y/width/height`.
+    /// На macOS -- CoreGraphics (`platform::displays::geometries`): `list_displays`
+    /// там идёт через ScreenCaptureKit (дорого, течёт без autorelease-пула на
+    /// потоках blocking-пула). На остальных платформах -- тот же список, что
+    /// `list_displays`.
+    pub poll_displays: Arc<dyn Fn() -> anyhow::Result<Vec<DisplayInfo>> + Send + Sync>,
     /// The display to capture at session start, from CLI `--display`.
     /// `None` means "use `capture::default_display` over `list_displays`'s
     /// result".
@@ -943,6 +950,9 @@ struct VideoPipeline {
     stop_tx: Option<oneshot::Sender<()>>,
     adapt_tx: Option<mpsc::UnboundedSender<Feedback>>,
     adapt_task: Option<JoinHandle<()>>,
+    /// V-2: watchdog зависания конвейера (`StallDetector`); умирает вместе с
+    /// конвейером (`stop` его abort-ит), работает и при `adapt == false`.
+    watchdog_task: JoinHandle<()>,
     /// Test-only escape hatch onto the pipeline's `RateControl` (slice
     /// 3.5e), so a test can observe `ControlMessage::SetQuality` actually
     /// reaching the adaptation controller (via `run_adapt_task`'s real
@@ -1043,6 +1053,7 @@ impl VideoPipeline {
         let frame_feedback_tx = adapt_tx.clone();
 
         let pipeline_stats = Arc::clone(&handle.stats);
+        let watchdog_task = spawn_pipeline_watchdog(Arc::clone(&pipeline_stats), Arc::clone(&peer));
         let failure_peer = Arc::clone(&peer);
         let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
@@ -1126,6 +1137,7 @@ impl VideoPipeline {
             stop_tx: Some(stop_tx),
             adapt_tx,
             adapt_task,
+            watchdog_task,
             #[cfg(test)]
             rate_control: rate_control_for_test,
         })
@@ -1142,6 +1154,7 @@ impl VideoPipeline {
         if let Some(task) = self.adapt_task {
             task.abort();
         }
+        self.watchdog_task.abort();
     }
 }
 
@@ -1305,6 +1318,16 @@ struct ActiveSession {
     /// или нет) для rate-limit `DISPLAY_SWITCH_MIN_INTERVAL`; `None` -- ещё
     /// не переключали.
     last_display_switch: Option<std::time::Instant>,
+    /// V-2: бюджет автоматических перезапусков конвейера после сбоя
+    /// (`VideoFailed`): не более `PIPELINE_RECOVERY_MAX` за
+    /// `PIPELINE_RECOVERY_WINDOW`, дальше сеанс заканчивается как раньше.
+    pipeline_recoveries: RecoveryBudget,
+    /// V-2: задача, раз в `DISPLAY_POLL_INTERVAL` шлющая
+    /// `SessionEvent::DisplayGeometryChanged`; abort в `shutdown`.
+    display_poll_task: tokio::task::JoinHandle<()>,
+    /// V-2: id дисплея текущего конвейера для `display_poll_task`;
+    /// обновляется в `replace_pipeline`.
+    display_poll_id: Arc<AtomicU32>,
     /// Guard пробуждения дисплея (слайс I7): держит и продлевает «активность
     /// пользователя» весь сеанс; отпускается при дропе `ActiveSession`.
     /// `Mutex` лишь делает поле `Sync` (`ActiveSession` держат через `.await`).
@@ -1485,6 +1508,7 @@ impl ActiveSession {
         self.peer.close().await;
         self.video.stop();
         self.cursor_task.abort();
+        self.display_poll_task.abort();
         if let Some(task) = self.clipboard_task {
             task.abort();
         }
@@ -2129,6 +2153,8 @@ async fn begin_session(
                 *current_session_id = Some(session_id);
                 let session_tag = parts.peer.tag();
                 let session_peer = Arc::clone(&parts.peer);
+                let poll_display = parts.video.display.clone();
+                let display_poll_id = Arc::new(AtomicU32::new(poll_display.id));
                 *active = Some(ActiveSession {
                     peer: parts.peer,
                     video: parts.video,
@@ -2152,6 +2178,16 @@ async fn begin_session(
                     curtain: ctx.curtain.clone(),
                     curtain_windows: parts.curtain_windows,
                     last_display_switch: None,
+                    pipeline_recoveries: RecoveryBudget::default(),
+                    display_poll_task: spawn_display_poll(
+                        session_peer.events(),
+                        session_tag,
+                        DISPLAY_POLL_INTERVAL,
+                        Arc::clone(&ctx.poll_displays),
+                        Arc::clone(&display_poll_id),
+                        poll_display,
+                    ),
+                    display_poll_id,
                     _display_wake: parts._display_wake,
                     input_source: ctx.input_source.clone(),
                     input_source_task: ctx.input_source.clone().map(|switcher| {
@@ -2423,7 +2459,20 @@ async fn handle_session_event(
                 );
             }
         }
+        SessionEvent::DisplayGeometryChanged { tag } => {
+            // V-2: опрос геометрии дисплея; чужой (вытесненный) сеанс -- молча.
+            if let Some(a) = active.as_mut().filter(|a| a.session_tag == tag) {
+                refresh_display_geometry(ctx, a).await;
+            }
+        }
         SessionEvent::VideoFailed { tag } => {
+            // V-2: сначала пробуем перезапустить конвейер (смена разрешения,
+            // сон, TDR), и только при исчерпанном бюджете/ошибке -- конец сеанса.
+            if let Some(a) = active.as_mut().filter(|a| a.session_tag == tag) {
+                if recover_pipeline(ctx, a).await {
+                    return;
+                }
+            }
             if active.as_ref().is_some_and(|a| a.session_tag == tag) {
                 if let Some(old) = active.take() {
                     tracing::warn!("video pipeline failed, ending session");
@@ -2969,6 +3018,272 @@ fn displays_message(displays: &[DisplayInfo], current: u32) -> ControlMessage {
     }
 }
 
+/// V-2: сколько раз за `PIPELINE_RECOVERY_WINDOW` можно перезапустить
+/// упавший конвейер, прежде чем сдаться и закончить сеанс.
+const PIPELINE_RECOVERY_MAX: usize = 3;
+/// V-2: окно подсчёта перезапусков для `PIPELINE_RECOVERY_MAX`.
+const PIPELINE_RECOVERY_WINDOW: Duration = Duration::from_secs(60);
+/// V-2: период опроса геометрии дисплея.
+const DISPLAY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// V-2: сколько `encoded` может стоять при растущем `captured`, прежде чем
+/// конвейер объявляется зависшим.
+const PIPELINE_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// V-2: минимальный прирост `captured` за время простоя `encoded`.
+const PIPELINE_STALL_MIN_CAPTURED: u64 = 10;
+
+/// V-2: скользящий бюджет автоматических перезапусков конвейера.
+#[derive(Debug, Default)]
+struct RecoveryBudget {
+    attempts: Vec<Instant>,
+}
+
+impl RecoveryBudget {
+    /// Пытается потратить одну попытку на момент `now`. `Some(n)` -- номер
+    /// попытки в текущем окне (1-based); `None` -- бюджет исчерпан.
+    fn try_acquire(&mut self, now: Instant) -> Option<usize> {
+        self.attempts
+            .retain(|t| now.saturating_duration_since(*t) < PIPELINE_RECOVERY_WINDOW);
+        if self.attempts.len() >= PIPELINE_RECOVERY_MAX {
+            return None;
+        }
+        self.attempts.push(now);
+        Some(self.attempts.len())
+    }
+}
+
+/// V-2: чистый детектор зависания конвейера: `captured` растёт, а `encoded`
+/// стоит дольше `PIPELINE_STALL_TIMEOUT`. Срабатывает один раз (до
+/// перезапуска конвейера, у которого свой детектор).
+#[derive(Debug)]
+struct StallDetector {
+    last_encoded: u64,
+    /// Момент, с которого `encoded` не менялся, и `captured` на тот момент.
+    stalled_since: Instant,
+    captured_at_stall: u64,
+    fired: bool,
+}
+
+impl StallDetector {
+    fn new(now: Instant, captured: u64, encoded: u64) -> Self {
+        Self {
+            last_encoded: encoded,
+            stalled_since: now,
+            captured_at_stall: captured,
+            fired: false,
+        }
+    }
+
+    /// Очередной замер счётчиков; `true` -- конвейер завис (однократно).
+    fn observe(&mut self, now: Instant, captured: u64, encoded: u64) -> bool {
+        if encoded != self.last_encoded {
+            self.last_encoded = encoded;
+            self.stalled_since = now;
+            self.captured_at_stall = captured;
+            return false;
+        }
+        if self.fired {
+            return false;
+        }
+        if now.saturating_duration_since(self.stalled_since) >= PIPELINE_STALL_TIMEOUT
+            && captured.saturating_sub(self.captured_at_stall) >= PIPELINE_STALL_MIN_CAPTURED
+        {
+            self.fired = true;
+            return true;
+        }
+        false
+    }
+}
+
+/// V-2: изменилась ли геометрия дисплея (размер или положение). `scale` в
+/// `DisplayInfo` нет: на Retina его смена видна как смена `width`/`height`
+/// захвата, а координаты ввода берутся из `x/y/width/height`.
+fn display_geometry_changed(a: &DisplayInfo, b: &DisplayInfo) -> bool {
+    (a.x, a.y, a.width, a.height) != (b.x, b.y, b.width, b.height)
+}
+
+/// V-2: watchdog конвейера -- раз в 2 с снимает `PipelineStats` и при
+/// зависании шлёт `VideoFailed` (путь восстановления). Живёт рядом с
+/// forward-задачей и не зависит от `adapt`; `VideoPipeline::stop` его abort-ит.
+fn spawn_pipeline_watchdog(
+    stats: Arc<crate::pipeline::PipelineStats>,
+    peer: Arc<PeerSession>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // Прогресс кодера -- `encoded + dropped`: при полном выходном канале
+        // кадры уходят в `dropped` (кодер жив, затор дальше), это не зависание.
+        let load = |s: &crate::pipeline::PipelineStats| {
+            (
+                s.captured.load(Ordering::Relaxed),
+                s.encoded
+                    .load(Ordering::Relaxed)
+                    .wrapping_add(s.dropped.load(Ordering::Relaxed)),
+            )
+        };
+        let (captured, encoded) = load(&stats);
+        let mut detector = StallDetector::new(Instant::now(), captured, encoded);
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + DISPLAY_POLL_INTERVAL,
+            DISPLAY_POLL_INTERVAL,
+        );
+        loop {
+            ticker.tick().await;
+            let (captured, encoded) = load(&stats);
+            if detector.observe(Instant::now(), captured, encoded) {
+                tracing::error!(captured, encoded, "video pipeline stalled");
+                let _ = peer
+                    .events()
+                    .send(SessionEvent::VideoFailed { tag: peer.tag() })
+                    .await;
+            }
+        }
+    })
+}
+
+/// V-2: чистый шаг опроса: если дисплей с `known.id` есть в `list` и его
+/// геометрия отличается от `known` -- возвращает его новое состояние. Дисплей
+/// пропал или не изменился -- `None`.
+fn geometry_poll_step(known: &DisplayInfo, list: &[DisplayInfo]) -> Option<DisplayInfo> {
+    list.iter()
+        .find(|d| d.id == known.id)
+        .filter(|d| display_geometry_changed(known, d))
+        .cloned()
+}
+
+/// V-2: задача сеанса: раз в `interval` зовёт `poll_displays` в
+/// `spawn_blocking` (на macOS -- дешёвый CoreGraphics, не ScreenCaptureKit) и при
+/// смене геометрии текущего дисплея шлёт `DisplayGeometryChanged`. Помнит
+/// последнюю известную геометрию, чтобы не слать событие повторно. `current_id`
+/// обновляет `replace_pipeline` (смена дисплея): тогда база берётся заново из
+/// списка без события. Первый тик -- через полный интервал. Ошибка списка или
+/// исчезнувший id -- тик пропускается.
+fn spawn_display_poll(
+    events: mpsc::Sender<SessionEvent>,
+    tag: u64,
+    interval: Duration,
+    poll_displays: Arc<dyn Fn() -> anyhow::Result<Vec<DisplayInfo>> + Send + Sync>,
+    current_id: Arc<AtomicU32>,
+    initial: DisplayInfo,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut known = initial;
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        loop {
+            ticker.tick().await;
+            let f = Arc::clone(&poll_displays);
+            let list = match tokio::task::spawn_blocking(move || f()).await {
+                Ok(Ok(list)) => list,
+                Ok(Err(err)) => {
+                    tracing::debug!(?err, "display poll: list_displays failed");
+                    continue;
+                }
+                Err(err) => {
+                    tracing::debug!(?err, "display poll: task failed");
+                    continue;
+                }
+            };
+            let id = current_id.load(Ordering::SeqCst);
+            if id != known.id {
+                // Конвейер переехал на другой дисплей: новая база без события.
+                if let Some(d) = list.iter().find(|d| d.id == id) {
+                    known = d.clone();
+                }
+                continue;
+            }
+            if let Some(fresh) = geometry_poll_step(&known, &list) {
+                known = fresh;
+                if events
+                    .send(SessionEvent::DisplayGeometryChanged { tag })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    })
+}
+
+/// V-2: перезапускает конвейер на актуальной геометрии дисплея того же `id`
+/// (если его уже нет -- на первом из списка). Общая часть восстановления
+/// после сбоя и реакции на смену геометрии. Старый конвейер останавливает
+/// `replace_pipeline` (`stop` безопасен для уже вышедшего: `send` в закрытый
+/// oneshot игнорируется, `abort` завершённой задачи -- no-op), обновляет
+/// `CaptureRect` роутера; здесь -- ещё `active.displays` и `Displays` клиенту.
+async fn restart_pipeline_on_fresh_display(
+    ctx: &HostContext,
+    active: &mut ActiveSession,
+) -> anyhow::Result<()> {
+    let list = (ctx.list_displays)()?;
+    let id = active.video.display.id;
+    let display = list
+        .iter()
+        .find(|d| d.id == id)
+        .or_else(|| list.first())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no displays available"))?;
+    replace_pipeline(ctx, active, display).await?;
+    active.displays = list;
+    let msg = displays_message(&active.displays, active.video.display.id);
+    let _ = active.peer.send_control(&msg).await;
+    Ok(())
+}
+
+/// V-2: реакция на `VideoFailed` -- `true`, если конвейер перезапущен и сеанс
+/// продолжается; `false` -- бюджет исчерпан или перезапуск не удался
+/// (вызывающий заканчивает сеанс `Bye { VideoFailed }`).
+async fn recover_pipeline(ctx: &HostContext, active: &mut ActiveSession) -> bool {
+    let Some(attempt) = active.pipeline_recoveries.try_acquire(Instant::now()) else {
+        tracing::warn!(
+            max = PIPELINE_RECOVERY_MAX,
+            "video pipeline recovery budget exhausted"
+        );
+        return false;
+    };
+    match restart_pipeline_on_fresh_display(ctx, active).await {
+        Ok(()) => {
+            tracing::warn!(
+                attempt,
+                width = active.video.display.width,
+                height = active.video.display.height,
+                "video pipeline failed, restarted"
+            );
+            true
+        }
+        Err(err) => {
+            tracing::warn!(?err, attempt, "video pipeline restart failed");
+            false
+        }
+    }
+}
+
+/// V-2: реакция на `DisplayGeometryChanged` -- пересобирает конвейер, если
+/// конвейер ещё стоит на старой геометрии. Бюджет восстановлений не тратит;
+/// при ошибке сеанс не заканчивает (старый конвейер продолжает).
+async fn refresh_display_geometry(ctx: &HostContext, active: &mut ActiveSession) {
+    let Ok(list) = (ctx.list_displays)() else {
+        return;
+    };
+    let current = &active.video.display;
+    let Some(fresh) = list.iter().find(|d| d.id == current.id) else {
+        return;
+    };
+    if !display_geometry_changed(current, fresh) {
+        return;
+    }
+    tracing::info!(
+        display_id = fresh.id,
+        width = fresh.width,
+        height = fresh.height,
+        "display geometry changed, restarting video pipeline"
+    );
+    if let Err(err) = restart_pipeline_on_fresh_display(ctx, active).await {
+        tracing::warn!(
+            ?err,
+            "display geometry restart failed, keeping current pipeline"
+        );
+    }
+}
+
 /// Минимальный интервал между попытками переключить дисплей (`SelectDisplay`):
 /// каждая попытка пересобирает конвейер захвата и кодера, клиент не должен
 /// мочь делать это бесконечно часто. Считается по попыткам, успешным и нет.
@@ -3091,6 +3406,10 @@ async fn replace_pipeline(
     active
         .router
         .set_capture_rect(crate::input::CaptureRect::from(&active.video.display));
+    // V-2: опрос геометрии должен следить за новым дисплеем.
+    active
+        .display_poll_id
+        .store(active.video.display.id, Ordering::SeqCst);
     Ok(())
 }
 
@@ -4036,7 +4355,8 @@ pub(crate) fn test_ctx() -> HostContext {
         curtain: None,
         input_source: None,
         wake_display: Box::new(|| Box::new(()) as Box<dyn Send>),
-        list_displays: Box::new(|| Ok(capture::synthetic::list_displays())),
+        list_displays: Arc::new(|| Ok(capture::synthetic::list_displays())),
+        poll_displays: Arc::new(|| Ok(capture::synthetic::list_displays())),
         display: None,
         build_injector: Box::new(|| {
             Ok(Box::new(crate::input::NoopInjector::new()) as Box<dyn Injector>)
@@ -4779,7 +5099,7 @@ mod tests {
     #[tokio::test]
     async fn empty_display_list_yields_bye_with_display_unavailable() {
         let mut ctx = test_ctx();
-        ctx.list_displays = Box::new(|| Ok(Vec::new()));
+        ctx.list_displays = Arc::new(|| Ok(Vec::new()));
         let (events_tx, _events_rx) = mpsc::channel(64);
 
         let err = start_session_with_display_wait(&ctx, &[], events_tx, Duration::from_millis(30))
@@ -4804,10 +5124,147 @@ mod tests {
         );
     }
 
-    /// D58: a capture source that dies mid-session ends the session with
-    /// `Bye { VideoFailed }` and returns the agent to `Registered`.
+    /// V-2: вычитывает исходящие сообщения и сообщает, был ли среди них `Bye`.
+    fn out_tx_has_bye(rx: &mut mpsc::UnboundedReceiver<SignalMessage>) -> bool {
+        let mut found = false;
+        while let Ok(msg) = rx.try_recv() {
+            found |= matches!(msg, SignalMessage::Bye { .. });
+        }
+        found
+    }
+
+    #[test]
+    fn recovery_budget_allows_max_attempts_per_window() {
+        let t0 = Instant::now();
+        let mut b = RecoveryBudget::default();
+        assert_eq!(b.try_acquire(t0), Some(1));
+        assert_eq!(b.try_acquire(t0 + Duration::from_secs(1)), Some(2));
+        assert_eq!(b.try_acquire(t0 + Duration::from_secs(2)), Some(3));
+        assert_eq!(b.try_acquire(t0 + Duration::from_secs(3)), None);
+        // Исчерпанный бюджет не тратит и не продлевает окно.
+        assert_eq!(b.try_acquire(t0 + Duration::from_secs(59)), None);
+    }
+
+    #[test]
+    fn recovery_budget_refills_as_window_slides() {
+        let t0 = Instant::now();
+        let mut b = RecoveryBudget::default();
+        for i in 0..PIPELINE_RECOVERY_MAX as u64 {
+            assert!(b.try_acquire(t0 + Duration::from_secs(i)).is_some());
+        }
+        // Первая попытка вышла из окна -- освободился один слот.
+        assert_eq!(
+            b.try_acquire(t0 + PIPELINE_RECOVERY_WINDOW),
+            Some(PIPELINE_RECOVERY_MAX)
+        );
+        assert_eq!(b.try_acquire(t0 + PIPELINE_RECOVERY_WINDOW), None);
+    }
+
+    #[test]
+    fn stall_detector_ignores_static_screen() {
+        let t0 = Instant::now();
+        let mut d = StallDetector::new(t0, 100, 100);
+        for s in (2..=60).step_by(2) {
+            assert!(!d.observe(t0 + Duration::from_secs(s), 100, 100));
+        }
+    }
+
+    #[test]
+    fn stall_detector_ignores_healthy_pipeline() {
+        let t0 = Instant::now();
+        let mut d = StallDetector::new(t0, 0, 0);
+        for s in (2..=60u64).step_by(2) {
+            assert!(!d.observe(t0 + Duration::from_secs(s), s * 30, s * 30));
+        }
+    }
+
+    #[test]
+    fn stall_detector_fires_once_when_encoder_stops_but_capture_runs() {
+        let t0 = Instant::now();
+        let mut d = StallDetector::new(t0, 0, 50);
+        let mut fired = Vec::new();
+        for s in (2..=30u64).step_by(2) {
+            if d.observe(t0 + Duration::from_secs(s), s * 30, 50) {
+                fired.push(s);
+            }
+        }
+        assert_eq!(fired, vec![10]);
+    }
+
+    #[test]
+    fn stall_detector_needs_enough_captured_frames() {
+        let t0 = Instant::now();
+        let mut d = StallDetector::new(t0, 0, 50);
+        // Захват почти не растёт (9 кадров за всё время) -- не зависание.
+        assert!(!d.observe(t0 + Duration::from_secs(12), 9, 50));
+        assert!(d.observe(t0 + Duration::from_secs(14), 10, 50));
+    }
+
+    #[test]
+    fn stall_detector_resets_when_encoder_moves() {
+        let t0 = Instant::now();
+        let mut d = StallDetector::new(t0, 0, 50);
+        assert!(!d.observe(t0 + Duration::from_secs(8), 240, 50));
+        assert!(!d.observe(t0 + Duration::from_secs(10), 300, 51));
+        assert!(!d.observe(t0 + Duration::from_secs(18), 540, 51));
+        assert!(d.observe(t0 + Duration::from_secs(20), 600, 51));
+    }
+
+    #[test]
+    fn geometry_poll_step_reports_only_real_changes() {
+        let mk = |id, w| DisplayInfo {
+            id,
+            title: String::new(),
+            x: 0,
+            y: 0,
+            width: w,
+            height: 1080,
+            primary: true,
+        };
+        let known = mk(1, 1920);
+        assert_eq!(
+            geometry_poll_step(&known, &[mk(2, 800), mk(1, 1280)]).map(|d| d.width),
+            Some(1280)
+        );
+        assert!(geometry_poll_step(&known, &[mk(1, 1920), mk(2, 800)]).is_none());
+        assert!(geometry_poll_step(&known, &[mk(2, 800)]).is_none());
+        assert!(geometry_poll_step(&known, &[]).is_none());
+    }
+
+    #[test]
+    fn display_geometry_changed_compares_size_and_position() {
+        let base = DisplayInfo {
+            id: 1,
+            title: "A".to_string(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary: true,
+        };
+        assert!(!display_geometry_changed(&base, &base.clone()));
+        let mut other = base.clone();
+        other.title = "B".to_string();
+        other.primary = false;
+        assert!(!display_geometry_changed(&base, &other));
+        for f in [
+            |d: &mut DisplayInfo| d.width = 1280,
+            |d: &mut DisplayInfo| d.height = 720,
+            |d: &mut DisplayInfo| d.x = -1920,
+            |d: &mut DisplayInfo| d.y = 10,
+        ] {
+            let mut moved = base.clone();
+            f(&mut moved);
+            assert!(display_geometry_changed(&base, &moved));
+        }
+    }
+
+    /// D58 + V-2: a capture source that dies mid-session first gets the
+    /// pipeline restarted (up to `PIPELINE_RECOVERY_MAX` times); only when the
+    /// budget is exhausted does the session end with `Bye { VideoFailed }` and
+    /// the agent return to `Registered`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn capture_failure_ends_the_session_with_video_failed() {
+    async fn capture_failure_restarts_pipeline_until_budget_is_exhausted() {
         struct DyingSource {
             inner: Box<dyn FrameSource>,
             left: u32,
@@ -4859,31 +5316,45 @@ mod tests {
         assert!(active.is_some(), "session must have started successfully");
         let tag = active.as_ref().unwrap().session_tag;
 
-        let failed = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match event_rx.recv().await {
-                    Some(SessionEvent::VideoFailed { tag }) => break Some(tag),
-                    Some(_) => continue,
-                    None => break None,
+        // V-2: каждый новый конвейер снова умирает через 3 кадра. Первые
+        // PIPELINE_RECOVERY_MAX сбоев -- перезапуск (сеанс жив), следующий --
+        // конец сеанса.
+        for attempt in 1..=PIPELINE_RECOVERY_MAX + 1 {
+            let failed = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match event_rx.recv().await {
+                        Some(SessionEvent::VideoFailed { tag }) => break Some(tag),
+                        Some(_) => continue,
+                        None => break None,
+                    }
                 }
-            }
-        })
-        .await
-        .expect("VideoFailed must arrive");
-        assert_eq!(failed, Some(tag));
+            })
+            .await
+            .expect("VideoFailed must arrive");
+            assert_eq!(failed, Some(tag));
 
-        handle_session_event(
-            SessionEvent::VideoFailed { tag },
-            &ctx,
-            "111111",
-            &status_tx,
-            &out_tx,
-            &event_tx,
-            &mut active,
-            &mut current_session_id,
-            &mut None,
-        )
-        .await;
+            handle_session_event(
+                SessionEvent::VideoFailed { tag },
+                &ctx,
+                "111111",
+                &status_tx,
+                &out_tx,
+                &event_tx,
+                &mut active,
+                &mut current_session_id,
+                &mut None,
+            )
+            .await;
+
+            if attempt <= PIPELINE_RECOVERY_MAX {
+                assert!(active.is_some(), "attempt {attempt}: session must survive");
+                assert_eq!(current_session_id.as_deref(), Some("sess-1"));
+                assert!(
+                    !out_tx_has_bye(&mut out_rx),
+                    "attempt {attempt}: no Bye while recovering"
+                );
+            }
+        }
 
         assert!(active.is_none());
         assert_eq!(current_session_id, None);

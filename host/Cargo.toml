@@ -281,6 +281,8 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "CGRemoteOperation",
     "CGWindowLevel",
     "CGDirectDisplay",
+    # V-2: `CGGetActiveDisplayList` (дешёвый опрос геометрии дисплеев).
+    "CGError",
     "CGSession",
 ] }
 # CVPixelBuffer: the image container VideoToolbox's compression session

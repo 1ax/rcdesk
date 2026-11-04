@@ -2,6 +2,7 @@ pub mod activity;
 pub mod autostart;
 pub mod curtain;
 pub mod display_wake;
+pub mod displays;
 pub mod event_loop;
 pub mod fullmode;
 pub mod input_source;

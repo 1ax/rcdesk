@@ -291,12 +291,25 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
         std::sync::Arc::new(move |id, exclude| build_screen_source(Some(id), fps, capture, exclude))
     };
 
-    let list_displays: Box<dyn Fn() -> anyhow::Result<Vec<capture::DisplayInfo>> + Send + Sync> =
-        if synthetic {
-            Box::new(|| Ok(capture::synthetic::list_displays()))
-        } else {
-            Box::new(|| Ok(capture::list_displays()?))
-        };
+    let list_displays: std::sync::Arc<
+        dyn Fn() -> anyhow::Result<Vec<capture::DisplayInfo>> + Send + Sync,
+    > = if synthetic {
+        std::sync::Arc::new(|| Ok(capture::synthetic::list_displays()))
+    } else {
+        std::sync::Arc::new(|| Ok(capture::list_displays()?))
+    };
+    // V-2: дешёвый источник для опроса геометрии. macOS: CoreGraphics (scap
+    // дорог и течёт без autorelease-пула); иначе тот же список.
+    #[cfg(target_os = "macos")]
+    let poll_displays: std::sync::Arc<
+        dyn Fn() -> anyhow::Result<Vec<capture::DisplayInfo>> + Send + Sync,
+    > = if synthetic {
+        std::sync::Arc::clone(&list_displays)
+    } else {
+        std::sync::Arc::new(|| Ok(crate::platform::displays::geometries()))
+    };
+    #[cfg(not(target_os = "macos"))]
+    let poll_displays = std::sync::Arc::clone(&list_displays);
 
     // Синтетика не будит экран машины (4.6a): no-op guard.
     let wake_display: WakeDisplay = if synthetic {
@@ -375,6 +388,7 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
         input_source,
         wake_display,
         list_displays,
+        poll_displays,
         display,
         build_injector,
         build_cursor_source: Box::new(build_real_cursor_source),

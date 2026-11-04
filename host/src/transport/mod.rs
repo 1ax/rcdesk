@@ -423,6 +423,10 @@ pub enum SessionEvent {
     /// `handle_session_event` can drop the event of a superseded session,
     /// like for `ConnectionState`.
     VideoFailed { tag: u64 },
+    /// V-2: фоновый опрос геометрии дисплея заметил, что размер или
+    /// положение дисплея, с которого идёт сеанс, изменились. `tag` -- как у
+    /// `VideoFailed`.
+    DisplayGeometryChanged { tag: u64 },
 }
 
 fn ice_candidate_from_rtc(c: RTCIceCandidateInit) -> proto::signal::IceCandidate {
