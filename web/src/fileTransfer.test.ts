@@ -6,6 +6,8 @@ import {
   FileSender,
   HOST_ID_BASE,
   MAX_DOWNLOAD_BYTES,
+  MAX_DOWNLOAD_BYTES_COARSE,
+  defaultMaxDownloadBytes,
   chooseChunkSize,
   downloadFailLabel,
   downloadFileName,
@@ -525,6 +527,31 @@ describe("FileReceiver", () => {
     expect(ev.errors).toEqual([["", "too_large"]]);
     ch.hostSays(offerMsg(2, [["a", MAX_DOWNLOAD_BYTES]]));
     expect(rx.fetch()).toBe(true);
+  });
+
+  it("W-7: coarse limit rejects 600 MiB, desktop limit accepts it", () => {
+    const mib = 1024 * 1024;
+    for (const [limit, accepted] of [
+      [MAX_DOWNLOAD_BYTES_COARSE, false],
+      [MAX_DOWNLOAD_BYTES, true],
+    ] as const) {
+      const ch = new FakeChannel() as FakeChannel & { binaryType?: string };
+      const errors: Array<[string, DownloadFailReason]> = [];
+      const rx = new FileReceiver(ch, {
+        maxDownloadBytes: () => limit,
+        onError: (n, r) => errors.push([n, r]),
+      });
+      ch.hostSays(offerMsg(1, [["big", 600 * mib]]));
+      expect(rx.fetch()).toBe(accepted);
+      expect(errors).toEqual(accepted ? [] : [["", "too_large"]]);
+    }
+    expect(MAX_DOWNLOAD_BYTES_COARSE).toBe(512 * mib);
+    expect(downloadFailLabel("too_large", MAX_DOWNLOAD_BYTES_COARSE)).toContain("512 МиБ");
+    expect(downloadFailLabel("too_large")).toContain("2 ГиБ");
+  });
+
+  it("W-7: defaultMaxDownloadBytes is 2 GiB without matchMedia", () => {
+    expect(defaultMaxDownloadBytes()).toBe(MAX_DOWNLOAD_BYTES);
   });
 
   it("aborts with protocol when start claims more than the offer (slice E4)", () => {

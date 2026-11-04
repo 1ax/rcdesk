@@ -27,6 +27,9 @@ export interface RTCPeerConnectionLike {
   sctp?: { maxMessageSize: number } | null;
 }
 
+/** W-4: cap on remote candidates queued before the offer is applied. */
+const MAX_PENDING_ICE = 200;
+
 export type RTCPeerConnectionFactory = (
   config: RTCConfiguration,
 ) => RTCPeerConnectionLike;
@@ -142,10 +145,27 @@ export class PeerSession {
     };
   }
 
+  /** W-4: remote candidates received before the offer was applied. */
+  private pendingIce: IceCandidate[] = [];
+  /** W-4: true once setRemoteDescription succeeded (own flag: the fake pc in
+   * tests has no `remoteDescription`). */
+  private remoteSet = false;
+
   /** Applies the host's offer, creates an answer, sets it as the local
    * description, and returns its SDP for the signaling layer to send back. */
   async acceptOffer(sdp: string): Promise<string> {
     await this.pc.setRemoteDescription({ type: "offer", sdp });
+    this.remoteSet = true;
+    // W-4: apply candidates that arrived before the remote description.
+    const queued = this.pendingIce;
+    this.pendingIce = [];
+    for (const c of queued) {
+      try {
+        await this.pc.addIceCandidate(iceCandidateToInit(c));
+      } catch (err) {
+        console.error("failed to add queued ICE candidate", err);
+      }
+    }
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
     if (!answer.sdp) {
@@ -156,6 +176,12 @@ export class PeerSession {
 
   /** Applies a remote ICE candidate received over signaling (trickle ICE). */
   async addRemoteIce(candidate: IceCandidate): Promise<void> {
+    // W-4: before setRemoteDescription addIceCandidate would fail; queue
+    // (bounded) and flush in acceptOffer.
+    if (!this.remoteSet) {
+      if (this.pendingIce.length < MAX_PENDING_ICE) this.pendingIce.push(candidate);
+      return;
+    }
     await this.pc.addIceCandidate(iceCandidateToInit(candidate));
   }
 

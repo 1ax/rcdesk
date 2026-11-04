@@ -164,6 +164,34 @@ function showInOverlay(overlay: HTMLImageElement, entry: CursorEntry): void {
   overlay.style.visibility = "visible";
 }
 
+/** W-11: sanity limits for a cursor shape from the host (the host itself
+ * never sends more than 128 px). Hotspot is in logical units (see
+ * `cursorCss`), so it is bounded by width/scale x height/scale. Returns
+ * false for an invalid shape; the `rgba` length is checked separately after
+ * decoding. */
+export function isValidCursorShape(m: {
+  width: number;
+  height: number;
+  hotspot_x: number;
+  hotspot_y: number;
+  scale: number;
+}): boolean {
+  const dim = (v: number): boolean => Number.isInteger(v) && v >= 1 && v <= 256;
+  if (!dim(m.width) || !dim(m.height)) return false;
+  if (!Number.isFinite(m.scale) || m.scale <= 0 || m.scale > 4) return false;
+  const inRange = (h: number, max: number): boolean => Number.isFinite(h) && h >= 0 && h <= max;
+  return inRange(m.hotspot_x, m.width / m.scale) && inRange(m.hotspot_y, m.height / m.scale);
+}
+
+/** W-11: warn once per rejected shape (keyed by its rgba string). */
+const warnedInvalid = new Set<string>();
+function rejectShape(key: string, why: string): void {
+  if (warnedInvalid.has(key)) return;
+  if (warnedInvalid.size >= MAX_CACHE_ENTRIES) warnedInvalid.clear();
+  warnedInvalid.add(key);
+  console.warn(`ignoring invalid cursor shape: ${why}`);
+}
+
 /** Applies one `control`-channel `ControlMessage` to `video`'s CSS cursor
  * (and, if given, to the touch-mode `overlay` image).
  * `ping`/`pong` are not cursor messages and are ignored here (see `app.ts`,
@@ -192,12 +220,27 @@ export function applyCursor(
   }
 
   const { width, height, hotspot_x, hotspot_y, scale, rgba } = msg;
+  if (!isValidCursorShape(msg)) {
+    rejectShape(rgba, "bad size, scale or hotspot");
+    return;
+  }
+  let pixels: Uint8ClampedArray<ArrayBuffer>;
+  try {
+    pixels = decodeRgba(rgba);
+  } catch {
+    rejectShape(rgba, "rgba is not valid base64");
+    return;
+  }
+  if (pixels.length !== width * height * 4) {
+    rejectShape(rgba, "rgba length mismatch");
+    return;
+  }
   const useImageSet = scale > 1 && supportsImageSet();
   const targetWidth = useImageSet ? width : Math.max(1, Math.round(width / scale));
   const targetHeight = useImageSet ? height : Math.max(1, Math.round(height / scale));
   const cssScale = useImageSet ? scale : 1;
 
-  renderToDataUrl(decodeRgba(rgba), width, height, targetWidth, targetHeight)
+  renderToDataUrl(pixels, width, height, targetWidth, targetHeight)
     .then((dataUrl) => {
       const entry: CursorEntry = {
         css: cursorCss(dataUrl, hotspot_x, hotspot_y, cssScale, useImageSet),

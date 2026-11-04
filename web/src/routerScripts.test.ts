@@ -37,3 +37,15 @@ describe.each([
     expect(s).toContain("«ORIGIN»");
   });
 });
+
+describe.each([
+  ["mikrotik", mikrotikScript],
+  ["openwrt", openwrtScript],
+])("W-15 %s token check", (_label, gen) => {
+  it("accepts [A-Za-z0-9_-] tokens", () => {
+    expect(() => gen("https://rcdesk.app", "aB3_-x", "n")).not.toThrow();
+  });
+  it.each(["", "a b", 'a"b', "a;b", "a\nb", "x".repeat(257)])("rejects %j", (t) => {
+    expect(() => gen("https://rcdesk.app", t, "n")).toThrow();
+  });
+});

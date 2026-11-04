@@ -66,6 +66,7 @@ describe("PeerSession.addRemoteIce", () => {
       return pc;
     });
 
+    await session.acceptOffer("v=0...offer"); // W-4: candidates need a remote description
     await session.addRemoteIce({
       candidate: "candidate:1 1 UDP 2130706431 10.0.0.1 12345 typ host",
       sdp_mid: "0",
@@ -204,5 +205,68 @@ describe("PeerSession onClosedUnexpectedly (D67c)", () => {
     pc.signalingState = "stable";
     pc.onsignalingstatechange?.();
     expect(onClosedUnexpectedly).not.toHaveBeenCalled();
+  });
+});
+
+describe("W-4 ICE candidates before the offer", () => {
+  const cand = (n: number) => ({
+    candidate: `candidate:${n}`,
+    sdp_mid: "0",
+    sdp_mline_index: 0,
+  });
+
+  it("queues until acceptOffer, then applies in order; later ones go straight through", async () => {
+    let pc!: FakePeerConnection;
+    const added: string[] = [];
+    const session = new PeerSession({ iceServers: [] }, {}, (_c) => {
+      pc = new FakePeerConnection();
+      pc.addIceCandidate = async (c) => {
+        added.push(c.candidate ?? "");
+      };
+      return pc;
+    });
+
+    await session.addRemoteIce(cand(1));
+    await session.addRemoteIce(cand(2));
+    expect(added).toEqual([]);
+
+    await session.acceptOffer("v=0...offer");
+    expect(added).toEqual(["candidate:1", "candidate:2"]);
+
+    await session.addRemoteIce(cand(3));
+    expect(added).toEqual(["candidate:1", "candidate:2", "candidate:3"]);
+  });
+
+  it("a failing queued candidate does not break acceptOffer or the rest", async () => {
+    const added: string[] = [];
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const session = new PeerSession({ iceServers: [] }, {}, (_c) => {
+      const pc = new FakePeerConnection();
+      pc.addIceCandidate = async (c) => {
+        if (c.candidate === "candidate:1") throw new Error("bad");
+        added.push(c.candidate ?? "");
+      };
+      return pc;
+    });
+    await session.addRemoteIce(cand(1));
+    await session.addRemoteIce(cand(2));
+    await expect(session.acceptOffer("o")).resolves.toBe("v=0...answer");
+    expect(added).toEqual(["candidate:2"]);
+    expect(err).toHaveBeenCalledTimes(1);
+    err.mockRestore();
+  });
+
+  it("caps the queue at 200", async () => {
+    const added: string[] = [];
+    const session = new PeerSession({ iceServers: [] }, {}, (_c) => {
+      const pc = new FakePeerConnection();
+      pc.addIceCandidate = async (c) => {
+        added.push(c.candidate ?? "");
+      };
+      return pc;
+    });
+    for (let i = 0; i < 250; i++) await session.addRemoteIce(cand(i));
+    await session.acceptOffer("o");
+    expect(added.length).toBe(200);
   });
 });

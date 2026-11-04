@@ -319,6 +319,27 @@ export const HOST_ID_BASE = 0x8000_0000;
 /** Largest total size of one download (it is assembled in browser memory). */
 export const MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024;
 
+/** W-7: download limit on touch devices (`pointer: coarse`) -- the file is
+ * assembled in memory and phones have far less of it. */
+export const MAX_DOWNLOAD_BYTES_COARSE = 512 * 1024 * 1024;
+
+/** W-7: the limit for this device: coarse pointer -> 512 MiB, else 2 GiB. */
+export function defaultMaxDownloadBytes(): number {
+  try {
+    if (typeof matchMedia === "function" && matchMedia("(pointer: coarse)").matches) {
+      return MAX_DOWNLOAD_BYTES_COARSE;
+    }
+  } catch {
+    // fall through to the desktop limit
+  }
+  return MAX_DOWNLOAD_BYTES;
+}
+
+function limitLabel(bytes: number): string {
+  const mib = 1024 * 1024;
+  return bytes >= 1024 * mib ? `${bytes / (1024 * mib)} ГиБ` : `${Math.round(bytes / mib)} МиБ`;
+}
+
 /** Why a download failed: a host `abort` reason, a local check, or close. */
 export type DownloadFailReason = AbortReason | "closed" | "too_large";
 
@@ -328,11 +349,18 @@ const DOWNLOAD_REASON_LABELS: Record<DownloadFailReason, string> = {
   io: "ошибка чтения файла на хосте",
   protocol: "нарушение протокола",
   closed: "соединение закрыто",
-  too_large: "слишком большой объём (лимит 2 ГиБ)",
+  too_large: "слишком большой объём",
 };
 
 /** Russian text for `reason`, shown in the "not downloaded" note. */
-export function downloadFailLabel(reason: DownloadFailReason): string {
+export function downloadFailLabel(
+  reason: DownloadFailReason,
+  limitBytes: number = MAX_DOWNLOAD_BYTES,
+): string {
+  if (reason === "too_large") {
+    // W-7: the limit depends on the device.
+    return `${DOWNLOAD_REASON_LABELS[reason]} (лимит ${limitLabel(limitBytes)})`;
+  }
   return DOWNLOAD_REASON_LABELS[reason];
 }
 
@@ -370,6 +398,8 @@ export function downloadFileName(name: string): string {
 }
 
 export interface FileReceiverCallbacks {
+  /** W-7: download size limit; defaults to `defaultMaxDownloadBytes()`. */
+  maxDownloadBytes?: () => number;
   /** The host offers `files` (empty with no folders: the offer is gone). */
   onOffer?: (files: OfferedFile[], skippedFolders: number) => void;
   onProgress?: (progress: FileProgress) => void;
@@ -427,7 +457,7 @@ export class FileReceiver {
     const offer = this.offer;
     if (!offer || offer.files.length === 0 || this.list) return false;
     const total = offer.files.reduce((sum, f) => sum + f.size, 0);
-    if (total > MAX_DOWNLOAD_BYTES) {
+    if (total > (this.cb.maxDownloadBytes ?? defaultMaxDownloadBytes)()) {
       this.cb.onError?.("", "too_large");
       return false;
     }
@@ -581,6 +611,7 @@ export class FileReceiver {
       return;
     }
     const blob = new Blob(cur.chunks);
+    cur.chunks = []; // W-7: release the buffers; the Blob holds the data now
     const name = cur.name;
     this.fileOver();
     this.cb.onFile?.(name, blob);

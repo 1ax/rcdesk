@@ -39,6 +39,7 @@ import {
   FileReceiver,
   FileSender,
   chooseChunkSize,
+  defaultMaxDownloadBytes,
   downloadFailLabel,
   downloadFileName,
   dragHasFiles,
@@ -1374,8 +1375,8 @@ export function mount(root: Element | null): void {
         downloadFailed = true;
         showClipboardNote(
           name === ""
-            ? `Не скачано: ${downloadFailLabel(reason)}`
-            : `Не скачано: ${name} — ${downloadFailLabel(reason)}`,
+            ? `Не скачано: ${downloadFailLabel(reason, defaultMaxDownloadBytes())}`
+            : `Не скачано: ${name} — ${downloadFailLabel(reason, defaultMaxDownloadBytes())}`,
         );
       },
       onDone: () => {
@@ -1676,7 +1677,12 @@ export function mount(root: Element | null): void {
         panel.script === "mikrotik"
           ? mikrotikScript(origin, panel.token, panel.name)
           : openwrtScript(origin, panel.token, panel.name);
-      pre.textContent = scriptText();
+      try {
+        pre.textContent = scriptText();
+      } catch {
+        // W-15: bad token format -- show a short message instead of crashing.
+        pre.textContent = "Не удалось собрать скрипт: неверный токен";
+      }
       for (const [id, label] of [
         ["mikrotik", "MikroTik"],
         ["openwrt", "OpenWrt"],

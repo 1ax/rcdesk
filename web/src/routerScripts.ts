@@ -68,10 +68,20 @@ chmod +x /etc/init.d/rcdesk-wake
 /etc/init.d/rcdesk-wake start
 `;
 
+/** W-15: the server issues [a-z0-9] tokens; refuse anything that could
+ * break out of the script text. */
+const TOKEN_RE = /^[A-Za-z0-9_-]{1,256}$/;
+
+function checkToken(token: string): void {
+  if (!TOKEN_RE.test(token)) throw new Error("invalid router token");
+}
+
 export function mikrotikScript(origin: string, token: string, name: string): string {
+  checkToken(token);
   return fill(MIKROTIK, origin, token, name);
 }
 
 export function openwrtScript(origin: string, token: string, name: string): string {
+  checkToken(token);
   return fill(OPENWRT, origin, token, name);
 }
