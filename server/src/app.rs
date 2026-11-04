@@ -115,6 +115,9 @@ pub struct AppState {
     /// Почты администраторов (A3): trim + lowercase, как в `accounts`. В
     /// LAN-хабе всегда пусто.
     pub admin_emails: Arc<Vec<String>>,
+    /// S-4/M-3: верить `X-Real-IP` (за nginx на проде). В LAN-хабе прокси
+    /// нет -- `false`, IP берётся только из сокета.
+    pub trust_proxy_headers: bool,
 }
 
 pub fn app(
@@ -271,6 +274,7 @@ fn build_app(
             router_poll_limiter: IpLimiter::new(ROUTER_POLL_BURST, ROUTER_POLL_REFILL),
             lan_hub,
             admin_emails: Arc::new(admin_emails),
+            trust_proxy_headers: !lan_hub,
         })
 }
 

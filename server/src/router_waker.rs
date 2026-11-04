@@ -26,7 +26,7 @@ pub async fn wake_poll(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let ip = client_ip(&headers, peer);
+    let ip = client_ip(&headers, peer, state.trust_proxy_headers);
     if !state.router_poll_limiter.check(ip) {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }

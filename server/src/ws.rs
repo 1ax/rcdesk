@@ -50,7 +50,12 @@ pub const MAX_NAME_CHARS: usize = 64;
 
 /// The client's IP: the first valid `X-Real-IP` value (the server sits behind
 /// nginx, so the socket peer is the proxy), otherwise the socket peer.
-pub fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+/// S-4/M-3: `trust_proxy_headers == false` (LAN-хаб, прокси нет) -- заголовок
+/// игнорируется, иначе любой клиент LAN подделал бы IP и обошёл ведро PIN.
+pub fn client_ip(headers: &HeaderMap, peer: SocketAddr, trust_proxy_headers: bool) -> IpAddr {
+    if !trust_proxy_headers {
+        return peer.ip();
+    }
     headers
         .get_all("x-real-ip")
         .iter()
@@ -73,7 +78,7 @@ pub async fn ws_handler(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let info = ClientInfo {
-        ip: client_ip(&headers, peer),
+        ip: client_ip(&headers, peer, state.trust_proxy_headers),
         user_agent: headers
             .get(axum::http::header::USER_AGENT)
             .and_then(|value| value.to_str().ok())
@@ -2554,7 +2559,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-real-ip", " 203.0.113.7 ".parse().unwrap());
         assert_eq!(
-            client_ip(&headers, peer()),
+            client_ip(&headers, peer(), true),
             "203.0.113.7".parse::<IpAddr>().unwrap()
         );
     }
@@ -2563,12 +2568,19 @@ mod tests {
     fn client_ip_falls_back_to_socket_on_garbage_header() {
         let mut headers = HeaderMap::new();
         headers.insert("x-real-ip", "not-an-ip".parse().unwrap());
-        assert_eq!(client_ip(&headers, peer()), peer().ip());
+        assert_eq!(client_ip(&headers, peer(), true), peer().ip());
     }
 
     #[test]
     fn client_ip_uses_socket_without_header() {
-        assert_eq!(client_ip(&HeaderMap::new(), peer()), peer().ip());
+        assert_eq!(client_ip(&HeaderMap::new(), peer(), true), peer().ip());
+    }
+
+    #[test]
+    fn client_ip_ignores_x_real_ip_without_trusted_proxy() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "203.0.113.7".parse().unwrap());
+        assert_eq!(client_ip(&headers, peer(), false), peer().ip());
     }
 
     fn anonymous_session(db: &Db, now: i64) -> (Option<ClientSession>, String, String) {
