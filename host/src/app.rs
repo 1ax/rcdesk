@@ -437,6 +437,38 @@ impl Default for ReconnectPolicy {
     }
 }
 
+/// Сколько подряд `UnknownDevice` нужно, чтобы забыть учётные данные.
+const UNKNOWN_FORGET_AFTER: u32 = 3;
+
+/// Что делать с очередным `UnknownDevice`.
+#[derive(Debug, PartialEq, Eq)]
+enum UnknownAction {
+    /// Ждать backoff и пробовать снова; число -- номер ответа в серии.
+    Wait(u32),
+    /// Порог достигнут: забыть учётные данные.
+    Forget,
+}
+
+/// Счётчик подряд идущих `UnknownDevice`.
+#[derive(Debug, Default)]
+struct UnknownStreak(u32);
+
+impl UnknownStreak {
+    fn record(&mut self) -> UnknownAction {
+        self.0 += 1;
+        if self.0 >= UNKNOWN_FORGET_AFTER {
+            self.0 = 0;
+            UnknownAction::Forget
+        } else {
+            UnknownAction::Wait(self.0)
+        }
+    }
+
+    fn reset(&mut self) {
+        self.0 = 0;
+    }
+}
+
 /// Mutable backoff state for one `run_agent` run. Kept as a small struct
 /// (rather than a bare `Duration` recomputed inline) so the doubling/cap/
 /// reset rules are unit-testable on their own, without going through
@@ -508,9 +540,12 @@ impl Backoff {
 /// recognize the saved credentials, e.g. its database was recreated) makes
 /// this loop forget them (the file is renamed to `*.bak`, not deleted -- see
 /// `DeviceStore::forget`) and retry immediately, skipping the backoff
-/// sleep/advance below entirely -- this isn't a lost connection, just a
-/// device the server no longer knows, so there's no reason to wait or to
-/// disturb the backoff state a real connection failure is tracking.
+/// sleep/advance below -- but only on the third `UnknownDevice` in a row
+/// (`UnknownStreak`): a single answer may be a transient server glitch
+/// (e.g. a half-restored database), and forgetting would drop the device
+/// out of the owner's cabinet. The first two go through the ordinary
+/// backoff; any other outcome (successful connect, other error) resets
+/// the streak.
 ///
 /// A `SessionSlot` (slice 3.5a) is created once, above the loop, and lives
 /// across every reconnect: an active session is peer-to-peer and outlives
@@ -537,6 +572,7 @@ pub async fn run_agent(
     let pin_store = crate::signaling::PinStore::for_device_store(device_store, server);
     let mut backoff = Backoff::new(policy);
     let mut slot = SessionSlot::new();
+    let mut unknown_streak = UnknownStreak::default();
     loop {
         let _ = status.send(AgentStatus::Connecting);
         let device = match device_store.load() {
@@ -590,6 +626,7 @@ pub async fn run_agent(
             .await;
         match connect_result {
             Ok(client) => {
+                unknown_streak.reset();
                 let pin = client.pin().to_string();
                 tracing::info!(
                     pin = %pin,
@@ -632,36 +669,50 @@ pub async fn run_agent(
                     });
                 }
             }
-            Err(ConnectError::UnknownDevice) => {
-                tracing::warn!(
-                    path = %device_store.path().display(),
-                    "the server does not know this device, registering as a new one; \
-                     the old credentials are kept next to the file as .bak"
-                );
-                match device_store.forget() {
-                    Ok(()) => {
-                        // Not a lost connection -- retry right away, without
-                        // waiting out or disturbing `backoff` (see this
-                        // function's doc comment). Safe from spinning only
-                        // because the credentials are now gone: the next
-                        // attempt registers without any, which the server
-                        // never answers with `unknown device`.
-                        continue;
-                    }
-                    Err(err) => {
-                        // The stale credentials are still on disk, so an
-                        // immediate retry would present them again and land
-                        // right back here -- fall through to the backoff
-                        // sleep instead of spinning.
-                        tracing::warn!(
-                            error = %err,
-                            path = %device_store.path().display(),
-                            "failed to remove stale device credentials file"
-                        );
+            Err(ConnectError::UnknownDevice) => match unknown_streak.record() {
+                UnknownAction::Wait(n) => {
+                    let retry_in = backoff.current();
+                    tracing::warn!(
+                        ?retry_in,
+                        "server does not know this device ({n}/{UNKNOWN_FORGET_AFTER}), \
+                         retrying before registering as new"
+                    );
+                    let _ = status.send(AgentStatus::Reconnecting {
+                        error: "server does not know this device".to_string(),
+                        retry_in,
+                    });
+                }
+                UnknownAction::Forget => {
+                    tracing::warn!(
+                        path = %device_store.path().display(),
+                        "the server does not know this device, registering as a new one; \
+                         the old credentials are kept next to the file as .bak"
+                    );
+                    match device_store.forget() {
+                        Ok(()) => {
+                            // Not a lost connection -- retry right away,
+                            // without waiting out or disturbing `backoff`.
+                            // Safe from spinning only because the
+                            // credentials are now gone: the next attempt
+                            // registers without any, which the server never
+                            // answers with `unknown device`.
+                            continue;
+                        }
+                        Err(err) => {
+                            // The stale credentials are still on disk, so an
+                            // immediate retry would land right back here --
+                            // fall through to the backoff sleep.
+                            tracing::warn!(
+                                error = %err,
+                                path = %device_store.path().display(),
+                                "failed to remove stale device credentials file"
+                            );
+                        }
                     }
                 }
-            }
+            },
             Err(ConnectError::Other(err)) => {
+                unknown_streak.reset();
                 let retry_in = backoff.current();
                 if err.to_string().contains("invalid device credentials") {
                     // Unlike `UnknownDevice`, this isn't forgotten
@@ -693,6 +744,27 @@ pub async fn run_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_streak_forgets_only_on_third_in_a_row() {
+        let mut s = UnknownStreak::default();
+        assert_eq!(s.record(), UnknownAction::Wait(1));
+        assert_eq!(s.record(), UnknownAction::Wait(2));
+        assert_eq!(s.record(), UnknownAction::Forget);
+        // После забывания серия начинается заново.
+        assert_eq!(s.record(), UnknownAction::Wait(1));
+    }
+
+    #[test]
+    fn unknown_streak_reset_restarts_the_count() {
+        let mut s = UnknownStreak::default();
+        assert_eq!(s.record(), UnknownAction::Wait(1));
+        assert_eq!(s.record(), UnknownAction::Wait(2));
+        s.reset();
+        assert_eq!(s.record(), UnknownAction::Wait(1));
+        assert_eq!(s.record(), UnknownAction::Wait(2));
+        assert_eq!(s.record(), UnknownAction::Forget);
+    }
 
     #[test]
     fn backoff_doubles_and_caps_at_max() {
@@ -1293,10 +1365,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&device_dir);
     }
 
-    /// Slice 3.1c: `Error { message: "unknown device" }` on the first
-    /// registration attempt must make `run_agent` forget the stale
-    /// credentials and retry right away (no backoff wait), ending up
-    /// registered again with whatever new credentials the server issues.
+    /// Slice 3.1c: `Error { message: "unknown device" }` three times in a row
+    /// must make `run_agent` forget the stale credentials and retry right
+    /// away (no backoff wait), ending up registered again with whatever new
+    /// credentials the server issues.
     #[tokio::test(flavor = "multi_thread")]
     async fn run_agent_forgets_credentials_and_reregisters_on_unknown_device() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1314,21 +1386,23 @@ mod tests {
         let new_creds_for_server = new_creds.clone();
 
         tokio::spawn(async move {
-            // First connection: the server no longer recognizes the saved
-            // (old) device.
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let _ = ws.next().await; // Hello
-            let _ = ws.next().await; // HostRegister (with the now-stale credentials)
-            let err = serde_json::to_string(&SignalMessage::Error {
-                message: "unknown device".to_string(),
-            })
-            .unwrap();
-            ws.send(Message::text(err)).await.unwrap();
-            drop(ws);
+            // Three connections in a row: the server no longer recognizes
+            // the saved (old) device. Only the third makes the agent forget.
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let _ = ws.next().await; // Hello
+                let _ = ws.next().await; // HostRegister (with the stale credentials)
+                let err = serde_json::to_string(&SignalMessage::Error {
+                    message: "unknown device".to_string(),
+                })
+                .unwrap();
+                ws.send(Message::text(err)).await.unwrap();
+                drop(ws);
+            }
 
-            // Second connection, immediately after (no backoff wait): a
-            // fresh registration, issuing new credentials.
+            // Fourth connection, immediately after the forget (no backoff
+            // wait): a fresh registration, issuing new credentials.
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             respond_with_registered(&mut ws, "222222", Some(new_creds_for_server)).await;
@@ -1339,13 +1413,11 @@ mod tests {
         let (device_store, device_dir) = scratch_device_store("unknown-device");
         device_store.save(&old).unwrap();
         let (status_tx, mut status_rx) = watch::channel(AgentStatus::Connecting);
-        // A generous policy: this test relies on the unknown-device retry
-        // skipping the backoff wait entirely, but keeps a real (non-zero)
-        // one so a regression that *does* wait would show up as a timeout
-        // rather than passing by accident.
+        // The first two unknown-device answers go through the ordinary
+        // backoff (short here); the forget itself must not wait.
         let policy = ReconnectPolicy {
-            initial: Duration::from_secs(5),
-            max: Duration::from_secs(5),
+            initial: Duration::from_millis(50),
+            max: Duration::from_millis(50),
         };
 
         let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();

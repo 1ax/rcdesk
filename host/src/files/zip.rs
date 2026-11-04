@@ -111,13 +111,14 @@ impl Entry {
     }
 
     /// Bytes this entry adds to the archive (local part + central record).
+    /// Saturates at `u64::MAX` instead of overflowing.
     fn archive_bytes(&self) -> u64 {
         let name = self.name.len() as u64;
         let local = match self.kind {
             Kind::Dir => 30 + name,
-            Kind::File { size } => 30 + name + size + 16,
+            Kind::File { size } => (30 + name).saturating_add(size).saturating_add(16),
         };
-        local + 46 + name
+        local.saturating_add(46 + name)
     }
 }
 
@@ -256,7 +257,10 @@ impl Manifest {
             tracing::debug!("entry name too long for zip, skipping");
             return true;
         }
-        let new_size = self.size + entry.archive_bytes();
+        let Some(new_size) = self.size.checked_add(entry.archive_bytes()) else {
+            self.overflow = true;
+            return false;
+        };
         if self.entries.len() + 1 > MAX_ENTRIES || new_size > self.limit {
             self.overflow = true;
             return false;
@@ -579,6 +583,29 @@ mod tests {
 
     fn u32_at(b: &[u8], i: usize) -> u32 {
         u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
+    }
+
+    #[test]
+    fn manifest_add_huge_size_overflows_without_panic() {
+        let mut m = Manifest {
+            entries: Vec::new(),
+            limit: u64::MAX,
+            overflow: false,
+            size: 100,
+        };
+        let entry = Entry {
+            name: "huge.bin".into(),
+            path: PathBuf::from("huge.bin"),
+            kind: Kind::File {
+                size: u64::MAX - 10,
+            },
+            dos_time: 0,
+            dos_date: DOS_EPOCH_DATE,
+        };
+        assert_eq!(entry.archive_bytes(), u64::MAX);
+        assert!(!m.add(entry));
+        assert!(m.overflow);
+        assert!(m.entries.is_empty());
     }
 
     #[test]

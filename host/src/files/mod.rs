@@ -335,6 +335,12 @@ fn trim_tail(s: &str) -> &str {
     s.trim_end_matches(['.', ' '])
 }
 
+/// Символы направления текста (RLO и родня): позволяют выдать
+/// `evil\u{202E}txt.exe` за `.txt`.
+fn is_bidi_format(c: char) -> bool {
+    matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{061C}')
+}
+
 /// Turns a file name received from the peer into one that is safe to create
 /// on any supported OS (same on all of them, so behavior does not depend on
 /// the host platform). See the 3.4a spec for the rules.
@@ -343,7 +349,10 @@ pub fn sanitize_file_name(raw: &str) -> String {
     let replaced: String = last
         .chars()
         .map(|c| {
-            if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+            if c.is_control()
+                || is_bidi_format(c)
+                || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+            {
                 '_'
             } else {
                 c
@@ -1556,6 +1565,16 @@ mod tests {
             ("console.txt".into(), "console.txt".into()),
             (".bashrc".into(), ".bashrc".into()),
             ("отчёт.pdf".into(), "отчёт.pdf".into()),
+            ("evil\u{202E}txt.exe".into(), "evil_txt.exe".into()),
+            (
+                "a\u{200E}b\u{200F}c\u{061C}d.txt".into(),
+                "a_b_c_d.txt".into(),
+            ),
+            ("x\u{202A}\u{202B}\u{202C}\u{202D}y".into(), "x____y".into()),
+            (
+                "p\u{2066}q\u{2067}r\u{2068}s\u{2069}t".into(),
+                "p_q_r_s_t".into(),
+            ),
         ];
         for (raw, expected) in cases {
             assert_eq!(sanitize_file_name(&raw), expected, "raw = {raw:?}");
