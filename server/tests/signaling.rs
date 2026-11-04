@@ -955,6 +955,86 @@ async fn re_registering_same_device_displaces_old_connection_without_bye_to_its_
     }
 }
 
+// S-8: после вытеснения старое соединение хоста закрывается сервером при
+// первом же его сообщении, и его Bye не доходит до клиента сеанса.
+#[tokio::test]
+async fn displaced_host_connection_is_closed_and_cannot_bye_the_session() {
+    let url = spawn_server().await;
+    let mut old = connect(&url).await;
+    hello(&mut old, Role::Host).await;
+    send(
+        &mut old,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: None,
+            session_id: None,
+            pin_rotation: false,
+            ifaces: Vec::new(),
+            os: None,
+        },
+    )
+    .await;
+    let (pin, credentials) = match recv(&mut old).await {
+        SignalMessage::Registered { pin, device, .. } => (pin, device.expect("credentials")),
+        other => panic!("expected registered, got {other:?}"),
+    };
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    send(&mut client, &SignalMessage::Join { pin }).await;
+    let session_id = match recv(&mut client).await {
+        SignalMessage::Joined { session_id, .. } => session_id,
+        other => panic!("expected joined, got {other:?}"),
+    };
+    match recv(&mut old).await {
+        SignalMessage::PeerJoined { .. } => {}
+        other => panic!("expected peer_joined, got {other:?}"),
+    }
+
+    let mut new = connect(&url).await;
+    hello(&mut new, Role::Host).await;
+    send(
+        &mut new,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: Some(credentials),
+            session_id: None,
+            pin_rotation: false,
+            ifaces: Vec::new(),
+            os: None,
+        },
+    )
+    .await;
+    match recv(&mut old).await {
+        SignalMessage::Error { message } => assert_eq!(message, "replaced by a new connection"),
+        other => panic!("expected error, got {other:?}"),
+    }
+    match recv(&mut new).await {
+        SignalMessage::Registered { .. } => {}
+        other => panic!("expected registered, got {other:?}"),
+    }
+
+    send(
+        &mut old,
+        &SignalMessage::Bye {
+            session_id,
+            reason: None,
+        },
+    )
+    .await;
+    // сервер закрывает старый сокет: до закрытия допустим только Close/None
+    loop {
+        match timeout(RECV_TIMEOUT, old.next())
+            .await
+            .expect("close timed out")
+        {
+            None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+            Some(Ok(other)) => panic!("expected close, got {other:?}"),
+        }
+    }
+    expect_silence(&mut client, SILENCE_TIMEOUT).await;
+}
+
 // (m) a client with no saved token sends ClientAuth{token: None} and gets
 // back a fresh, non-empty token with an empty device list.
 #[tokio::test]

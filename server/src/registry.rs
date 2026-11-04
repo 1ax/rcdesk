@@ -336,6 +336,16 @@ impl Registry {
         self.inner.lock().is_ok()
     }
 
+    /// S-8: `true`, если `tx` всё ещё владеет регистрацией `host_id`
+    /// (вытесненное повторной регистрацией соединение получает `false`).
+    pub fn is_current_host(&self, host_id: &str, tx: &Tx) -> bool {
+        let inner = self.inner.lock().expect("registry mutex poisoned");
+        inner
+            .hosts
+            .get(host_id)
+            .is_some_and(|host| host.tx.same_channel(tx))
+    }
+
     /// Removes a host on disconnect, but only if `tx` is still the
     /// connection that owns `host_id` (`same_channel`) -- a displaced
     /// connection's own disconnect (it was already removed from the
@@ -1179,6 +1189,32 @@ mod tests {
         assert!(registry
             .peer_tx_for_client(&session_id, &client_tx)
             .is_none());
+    }
+
+    #[test]
+    fn is_current_host_is_false_for_displaced_tx() {
+        let registry = Registry::new();
+        let (old_tx, _old_rx) = channel();
+        registry.register_host(
+            "host1".to_string(),
+            "host".to_string(),
+            old_tx.clone(),
+            None,
+            false,
+        );
+        assert!(registry.is_current_host("host1", &old_tx));
+        assert!(!registry.is_current_host("other", &old_tx));
+
+        let (new_tx, _new_rx) = channel();
+        registry.register_host(
+            "host1".to_string(),
+            "host".to_string(),
+            new_tx.clone(),
+            None,
+            false,
+        );
+        assert!(!registry.is_current_host("host1", &old_tx));
+        assert!(registry.is_current_host("host1", &new_tx));
     }
 
     #[test]

@@ -38,6 +38,20 @@ impl From<anyhow::Error> for PasskeyError {
     }
 }
 
+/// S-7: сколько passkey можно зарегистрировать одному владельцу.
+pub const MAX_PASSKEYS_PER_OWNER: usize = 20;
+
+/// S-7: отказ (`Rejected`), если у владельца уже `MAX_PASSKEYS_PER_OWNER`
+/// ключей. Живёт вне `imp`, чтобы работать и без фичи `passkeys`.
+pub fn ensure_passkey_capacity(db: &Db, owner_id: &str) -> Result<(), PasskeyError> {
+    if db.credential_ids_for_owner(owner_id)?.len() >= MAX_PASSKEYS_PER_OWNER {
+        return Err(PasskeyError::Rejected(format!(
+            "passkey limit reached ({MAX_PASSKEYS_PER_OWNER})"
+        )));
+    }
+    Ok(())
+}
+
 /// Без фичи `passkeys` (сборка для LAN-хаба, без OpenSSL) церемоний нет:
 /// все четыре вызова отвечают `Rejected("passkeys disabled")`, список passkey
 /// из SQLite читается как обычно.
@@ -466,4 +480,28 @@ pub fn passkey_entries(db: &Db, owner_id: &str) -> anyhow::Result<Vec<PasskeyEnt
             last_used_at: row.last_used_at,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    #[test]
+    fn passkey_capacity_is_limited_per_owner() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("o1", 1).expect("owner");
+        db.insert_owner("o2", 1).expect("owner");
+        for i in 0..MAX_PASSKEYS_PER_OWNER - 1 {
+            db.insert_passkey(&format!("p{i}"), "o1", &format!("c{i}"), "{}", "UA", 1)
+                .expect("insert");
+        }
+        assert!(ensure_passkey_capacity(&db, "o1").is_ok());
+        db.insert_passkey("last", "o1", "c-last", "{}", "UA", 1)
+            .expect("insert");
+        assert!(matches!(
+            ensure_passkey_capacity(&db, "o1"),
+            Err(PasskeyError::Rejected(_))
+        ));
+        assert!(ensure_passkey_capacity(&db, "o2").is_ok());
+    }
 }

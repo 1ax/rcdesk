@@ -505,6 +505,12 @@ async fn run_host(
             });
             break;
         }
+        // S-8: вытесненное новым соединением хоста больше ничего не шлёт
+        // в сеанс, который теперь принадлежит новому.
+        if !registry.is_current_host(&host_id, &tx) {
+            tracing::info!(host_id = %host_id, "displaced host connection closing");
+            break;
+        }
 
         match msg {
             SignalMessage::Offer {
@@ -1049,6 +1055,14 @@ fn send_passkeys(db: &Db, owner_id: &str, tx: &Tx) {
     }
 }
 
+/// S-7: сколько живёт начатая passkey-церемония до `Finish`.
+const PASSKEY_CEREMONY_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// S-7: церемония свежа, пока с её старта прошло меньше `PASSKEY_CEREMONY_TTL`.
+fn ceremony_fresh(started: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(started) < PASSKEY_CEREMONY_TTL
+}
+
 fn passkey_failed(tx: &Tx) {
     let _ = tx.send(SignalMessage::Error {
         message: "passkey failed".to_string(),
@@ -1527,8 +1541,10 @@ async fn run_client(
     let mut session: Option<ClientSession> = None;
     // Passkey ceremonies in flight on this connection (slice 3.7b): kept in
     // memory only, consumed by the matching `Finish`.
-    let mut passkey_registration: Option<PasskeyRegistration> = None;
-    let mut passkey_login: Option<DiscoverableAuthentication> = None;
+    // S-7: с владельцем и временем старта, чтобы Finish не жил вечно и не
+    // переходил к другому владельцу.
+    let mut passkey_registration: Option<(String, Instant, PasskeyRegistration)> = None;
+    let mut passkey_login: Option<(Instant, DiscoverableAuthentication)> = None;
     // D34: владелец, за которым соединение сейчас числится в registry
     // (получатель push-`Devices`).
     let mut watched_owner: Option<String> = None;
@@ -1687,9 +1703,17 @@ async fn run_client(
                 let Some(owner_id) = require_owner(db, &mut session, &tx) else {
                     continue;
                 };
+                // S-7: лимит числа ключей на владельца.
+                match passkeys::ensure_passkey_capacity(db, &owner_id) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        passkey_error(&tx, err);
+                        continue;
+                    }
+                }
                 match passkeys::register_start(webauthn, db, &owner_id) {
                     Ok((options, state)) => {
-                        passkey_registration = Some(state);
+                        passkey_registration = Some((owner_id.clone(), Instant::now(), state));
                         let _ = tx.send(SignalMessage::PasskeyRegisterOptions { options });
                     }
                     Err(err) => passkey_error(&tx, err),
@@ -1699,11 +1723,17 @@ async fn run_client(
                 let Some(owner_id) = require_owner(db, &mut session, &tx) else {
                     continue;
                 };
-                let Some(state) = passkey_registration.take() else {
+                let Some((started_owner, started, state)) = passkey_registration.take() else {
                     tracing::warn!("passkey register finish without start");
                     passkey_failed(&tx);
                     continue;
                 };
+                // S-7: чужой владелец или просроченная церемония.
+                if started_owner != owner_id || !ceremony_fresh(started, Instant::now()) {
+                    tracing::warn!("passkey register finish: owner mismatch or ceremony expired");
+                    passkey_failed(&tx);
+                    continue;
+                }
                 match passkeys::register_finish(
                     webauthn,
                     db,
@@ -1733,17 +1763,23 @@ async fn run_client(
             }
             SignalMessage::PasskeyLoginStart => match passkeys::login_start(webauthn) {
                 Ok((options, state)) => {
-                    passkey_login = Some(state);
+                    passkey_login = Some((Instant::now(), state));
                     let _ = tx.send(SignalMessage::PasskeyLoginOptions { options });
                 }
                 Err(err) => passkey_error(&tx, err),
             },
             SignalMessage::PasskeyLoginFinish { credential } => {
-                let Some(state) = passkey_login.take() else {
+                let Some((started, state)) = passkey_login.take() else {
                     tracing::warn!("passkey login finish without start");
                     passkey_failed(&tx);
                     continue;
                 };
+                // S-7: просроченная церемония входа.
+                if !ceremony_fresh(started, Instant::now()) {
+                    tracing::warn!("passkey login finish: ceremony expired");
+                    passkey_failed(&tx);
+                    continue;
+                }
                 let now = ice::now_unix() as i64;
                 let owner_id = match passkeys::login_finish(webauthn, db, state, &credential, now) {
                     Ok(owner_id) => owner_id,
@@ -2481,6 +2517,21 @@ mod tests {
 
     fn peer() -> SocketAddr {
         "127.0.0.1:5555".parse().unwrap()
+    }
+
+    #[test]
+    fn ceremony_fresh_respects_ttl() {
+        let t0 = Instant::now();
+        assert!(ceremony_fresh(t0, t0));
+        assert!(ceremony_fresh(
+            t0,
+            t0 + PASSKEY_CEREMONY_TTL - Duration::from_secs(1)
+        ));
+        assert!(!ceremony_fresh(t0, t0 + PASSKEY_CEREMONY_TTL));
+        assert!(!ceremony_fresh(
+            t0,
+            t0 + PASSKEY_CEREMONY_TTL + Duration::from_secs(1)
+        ));
     }
 
     #[test]
