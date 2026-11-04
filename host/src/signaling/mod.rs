@@ -59,6 +59,10 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// moves.
 const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(33);
 
+/// How often the cursor task retries a cursor message that `send_control`
+/// could not deliver because the `control` data channel was not open yet.
+const CURSOR_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
 /// How often the Windows foreground-window elevation watcher polls
 /// `platform::windows::elevation::foreground_input_blocked` (slice 2.6e).
 /// 1s: this is a warning banner, not a latency-sensitive path, and the
@@ -3419,16 +3423,36 @@ async fn start_session_with_display_wait(
         // for why (`CursorWatcher` implements `Drop`, so its `rx` field can't be
         // moved out to live separately from the rest of the struct). The first
         // state a fresh watcher reads always counts as a "change" (see
-        // `cursor::watch`'s doc comment), so this newly connected client gets
-        // the host's current cursor shape right away.
+        // `cursor::watch`'s doc comment), and the task below keeps retrying it
+        // while `send_control` returns `Ok(false)` (the `control` channel is
+        // not open yet), so this newly connected client gets the host's
+        // current cursor shape right away once the channel opens.
         let cursor_source = (ctx.build_cursor_source)();
         let mut cursor_watcher = cursor::watch(cursor_source, CURSOR_POLL_INTERVAL);
         let cursor_peer = Arc::clone(&peer);
         let cursor_task = tokio::spawn(async move {
-            while let Some(state) = cursor_watcher.rx.recv().await {
-                let msg = cursor_state_to_control(state);
-                if let Err(err) = cursor_peer.send_control(&msg).await {
-                    tracing::warn!(?err, "failed to send cursor control message");
+            // The last cursor message not yet delivered. `send_control` returns
+            // `Ok(false)` while the `control` channel is not open yet (the
+            // watcher's first poll happens at session start, before that), and
+            // the watcher will not resend a shape it already reported, so we
+            // retry the latest pending state until the channel accepts it.
+            let mut pending: Option<ControlMessage> = None;
+            loop {
+                if let Some(msg) = &pending {
+                    let result = cursor_peer.send_control(msg).await;
+                    if let Err(err) = &result {
+                        tracing::warn!(?err, "failed to send cursor control message");
+                    }
+                    if !cursor_send_keeps_pending(&result) {
+                        pending = None;
+                    }
+                }
+                tokio::select! {
+                    state = cursor_watcher.rx.recv() => match state {
+                        Some(state) => pending = Some(cursor_state_to_control(state)),
+                        None => break,
+                    },
+                    _ = tokio::time::sleep(CURSOR_RETRY_INTERVAL), if pending.is_some() => {}
                 }
             }
             // `rx` only closes when the watcher's thread is gone. On an orderly
@@ -3941,6 +3965,13 @@ async fn run_adapt_task(
 /// Converts a cursor-shape change into the wire message `send_control`
 /// sends, base64-encoding the raw RGBA bytes (see
 /// `proto::control::ControlMessage::CursorShape`'s doc comment).
+/// Whether a cursor message should stay pending after a send attempt:
+/// only `Ok(false)` (channel not open yet) is retried; `Ok(true)` is delivered
+/// and `Err` means a broken channel, which is not hammered.
+fn cursor_send_keeps_pending(result: &anyhow::Result<bool>) -> bool {
+    matches!(result, Ok(false))
+}
+
 fn cursor_state_to_control(state: CursorState) -> ControlMessage {
     match state {
         CursorState::Hidden => ControlMessage::CursorHidden,
@@ -4034,6 +4065,13 @@ pub(crate) fn test_ctx() -> HostContext {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cursor_send_keeps_pending_only_when_channel_not_open() {
+        assert!(!cursor_send_keeps_pending(&Ok(true)));
+        assert!(cursor_send_keeps_pending(&Ok(false)));
+        assert!(!cursor_send_keeps_pending(&Err(anyhow::anyhow!("boom"))));
+    }
+
     #[test]
     fn stats_window_summarises_every_five_ticks() {
         use std::sync::atomic::Ordering::Relaxed;

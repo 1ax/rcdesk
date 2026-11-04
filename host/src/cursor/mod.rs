@@ -90,9 +90,11 @@ const MAX_CURSOR_DIMENSION: u32 = 128;
 pub struct CursorWatcher {
     /// Every *change* in cursor state, most recent last. The first state a
     /// fresh watcher reads always counts as a change (there's no prior
-    /// state to compare against), so a newly connected client gets the
-    /// current shape immediately rather than waiting for the cursor to
-    /// actually move to a different shape.
+    /// state to compare against). Delivery is the consumer's job: the
+    /// watcher never resends a shape it already reported, so a consumer whose
+    /// transport is not ready yet (the `control` channel opens after session
+    /// start) must retry the latest state itself, see the cursor task in
+    /// `crate::signaling`.
     pub rx: mpsc::Receiver<CursorState>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
