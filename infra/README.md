@@ -12,8 +12,10 @@
 
 - `docker-compose.prod.yml` -- `server` (сигнальный сервер, `127.0.0.1:8100`)
   и `coturn` (host-сеть, `3478` + relay-диапазон `49152-65535`).
-  coturn ограничен: `denied-peer-ip` на внутренние адреса, квоты,
-  без TCP-relay; контейнеры идут с `cap_drop`, логи ротируются. Откат при
+  coturn ограничен: `denied-peer-ip` на внутренние адреса, квоты
+  (`--user-quota=8`, `--total-quota=200`), потолки полосы `--max-bps=2500000`
+  (~20 Мбит/с на сеанс в каждую сторону) и `--bps-capacity=25000000` (~200 Мбит/с
+  на весь coturn; аудит I-8), без TCP-relay (`--no-tcp-relay`); контейнеры идут с `cap_drop`, логи ротируются. Откат при
   проблеме с привязкой 3478 -- убрать `cap_drop`/`cap_add` у coturn и
   `docker compose up -d`.
 - `.env.prod.example` -- шаблон секретов; на сервере копируется в `.env`
@@ -53,6 +55,15 @@ docker compose -f docker-compose.prod.yml up -d
 ```
 
 Дальнейшие деплои автоматизирует workflow `deploy` (см. выше).
+
+### Очистка диска при деплое (аудит I-7)
+
+После успешного health-check деплой удаляет на VPS старые образы
+`ghcr.io/1ax/rcdesk-server`, кроме текущего тега, `latest` и предыдущего (он нужен для
+отката), затем `docker image prune -f` (висячие слои, без `-a`; чужие образы не трогаются).
+После заливки статики удаляются файлы `~/www/rcdesk.app/assets/` старше 14 дней
+(`find … -mtime +14 -delete`: `scp` без `-p` даёт залитым файлам свежий mtime, поэтому
+актуальные хэшированные файлы под удаление не попадают). Провал любой из чисток деплой не валит.
 
 ### Проверка
 
@@ -225,19 +236,18 @@ docker compose -f docker-compose.prod.yml start server
 
 ## Внешний мониторинг (Better Stack)
 
-Аккаунт владельца, настройка в дашборде, в репо не хранится. Три монитора:
+Аккаунт владельца, настройка в дашборде, в репо не хранится. Два монитора:
 
 1. Keyword-монитор `https://rcdesk.app/healthz`, интервал 3 мин, алерт «тело не
    содержит `ok`» -- ловит падение и деградацию (healthz делает `SELECT 1` и
    берёт мьютекс реестра).
-2. TCP-монитор `turn.rcdesk.app:3478` -- coturn лёг.
-3. Heartbeat «rcdesk backup», период 1 день, grace 2 ч; URL лежит в
+2. Heartbeat «rcdesk backup», период 1 день, grace 2 ч; URL лежит в
    `~/app/.env` как `BACKUP_HEARTBEAT_URL` (см. «Бэкап БД»).
 
 Канал -- email владельца (free-tier).
 
-Не покрыто и остаётся долгом: диск; сертификат (можно добавить SSL-монитор
-Better Stack на `rcdesk.app`).
+Не покрыто: coturn (TCP-монитор) и сертификат (SSL-монитор) -- требуют платного
+плана, не заводятся (решение владельца: ничего платного); диск -- долг.
 
 ## Релиз
 
@@ -250,7 +260,8 @@ Better Stack на `rcdesk.app`).
    собирает релиз. Push без смены версии релиз не создаёт — только деплой (`deploy.yml`).
 
 Тег ставится job'ом `version` до тестов: если гейты упали (флак), повторный push релиз
-не создаст (тег уже есть). Делать `gh run rerun <id> --failed`, затем одобрить окружение `release`.
+не создаст (тег уже есть). Делать `gh run rerun <id> --failed` (не новый push), затем одобрить
+окружение `release` (в Actions «Review deployments» или через API).
 
 После подписи манифеста release.yml сверяет подпись боевыми открытыми ключами из
 `infra/release-pubkeys/*.pem` (те же два ключа, что `RELEASE_PUBLIC_KEYS` в
@@ -267,13 +278,14 @@ vendor/rtc-sctp|rtc-turn/Cargo.toml --lib --locked`), которые вне work
 
 При ручном теге workflow сначала проверяет (`infra/release-version-check.sh`), что тег совпадает
 с `version` (при несовпадении релиз не создаётся); затем прогоняет гейты (CI) и
-собирает хост под Windows и macOS. В GitHub Releases попадают установщик
-`rcdesk-setup.exe` (Windows) и zip без установки: `rcdesk-windows-x64.zip`,
-`rcdesk-macos-arm64.zip`.
+собирает хост под Windows и macOS. Любой путь даёт один и тот же состав релиза в GitHub Releases:
+`rcdesk-macos.pkg` (установщик macOS, arm64), `rcdesk-setup.exe` (установщик Windows x64),
+zip без установки `rcdesk-windows-x64.zip` и `rcdesk-macos-arm64.zip`, а также
+`rcdesk-update.json` и `rcdesk-update.json.sig` (подписанный манифест обновления, ниже).
 
 ### Подпись манифеста обновления (D50b)
 
-Job `release` публикует `rcdesk-update.json` (версия и sha256 установщиков) и
+Job `release` публикует `rcdesk-update.json` (версия и sha256 установщиков `rcdesk-setup.exe` и `rcdesk-macos.pkg`) и
 `rcdesk-update.json.sig` — подпись ed25519 (`infra/release-manifest.sh`). Хост
 обновляется только по манифесту с подписью одного из ключей, открытые части которых
 зашиты в `host/src/update_verify.rs` (`RELEASE_PUBLIC_KEYS`, подпись проверяется каждым

@@ -1,7 +1,7 @@
 # rcdesk — Архитектура
 
 > Документ решений. Меняется только осознанно, с записью в SLICES_LOG.md.
-> Актуально на 2026-10-14 (слайс E).
+> Актуально на 2026-11-04 (описания структуры, инфраструктуры и версий сверены с кодом; решения — как записаны).
 
 ## 1. Цель и границы
 
@@ -44,26 +44,41 @@ fps, аппаратное кодирование. Ориентир — Chrome Re
 
 ```
 rcdesk/
-├── Cargo.toml            # workspace: proto, host, server
+├── Cargo.toml            # workspace: proto, host, server (vendor/ исключён, подключён через [patch.crates-io])
+├── rust-toolchain.toml   # пин компилятора (1.98.1)
 ├── proto/                # типы сообщений (serde + ts-rs), без логики
 ├── host/                 # хост-агент (бинарники rcdesk-host, rcdesk-agent)
+│   ├── build.rs          # вшивает web/dist в хаб, секция __cgpreloginapp, ресурсы Windows
+│   ├── tests/
 │   └── src/
-│       ├── main.rs       # CLI, конфиг, запуск (rcdesk-host)
+│       ├── main.rs       # CLI (rcdesk-host): serve, hub, bench, list-displays, autostart, password, service, fullmode
 │       ├── agent_main.rs # трей/меню-бар агент (rcdesk-agent, 2.6c)
-│       ├── agent/        # меню/иконка/разрешения/пути/лог/лок — кроссплатформенно, без UI-вызовов
+│       ├── lib.rs, app.rs, build_info.rs
+│       ├── agent/        # меню/иконка/разрешения/пути/лог/лок/автозапуск/viewer — без UI-вызовов
 │       ├── capture/      # трейт FrameSource + адаптеры scap, gdi (Windows), synthetic
-│       ├── encode/       # трейт Encoder + openh264 / videotoolbox / mediafoundation
+│       ├── encode/       # трейт Encoder + openh264 / videotoolbox / mediafoundation, convert
 │       ├── pipeline/     # capture → encode → RTP; пейсинг, пропуск кадров
+│       ├── adapt/        # контроллер битрейта/fps по REMB, потерям, перезаписи слота
 │       ├── transport/    # webrtc-rs: PeerConnection, треки, data channels
-│       ├── input/        # события ввода → enigo; раскладка клавиш
+│       ├── input/        # события ввода → enigo; раскладка клавиш (keymap)
+│       ├── clipboard/    # буфер обмена (текст, файлы), macos/windows
+│       ├── cursor/       # форма системного курсора, macos/windows
+│       ├── files/        # передача файлов, zip, windows
 │       ├── signaling/    # клиент WS к серверу
-│       └── platform/     # macos/{event_loop,activity}, windows/{keyboard,mouse,monitors,d3d,dpi,event_loop,power} — всё, что за cfg
+│       ├── hub/          # LAN-хаб (D47): HTTPS, сертификат, вшитый web/dist
+│       ├── access.rs, device.rs, settings.rs   # пароль доступа (OPAQUE), device.json, settings.json
+│       ├── curtain.rs, fullmode.rs, service.rs, input_source.rs, wake.rs   # полный режим, штора, Wake-on-LAN
+│       ├── update_check.rs, update_verify.rs, updater.rs   # обновление хоста, подпись манифеста
+│       ├── dtls_bind.rs, fsutil.rs, log_throttle.rs
+│       └── platform/     # macos/*, windows/*, unix_netifs.rs, other.rs — всё, что за cfg
 ├── server/               # сигнальный сервер (бинарник rcdesk-server)
 ├── web/                  # веб-клиент (Vite + TS)
 │   └── src/generated/    # TS-типы из proto (ts-rs), коммитятся
-├── infra/                # docker-compose, Caddyfile, coturn.conf, скрипты деплоя
-├── docs/                 # инструкции (установка хоста, разрешения, отладка)
-├── .github/workflows/    # ci.yml (гейты), release.yml (позже)
+├── installer/            # macos/ (build-pkg.sh → rcdesk-macos.pkg), windows/ (rcdesk.iss → rcdesk-setup.exe)
+├── vendor/               # патчи rtc-sctp, rtc-turn, scap (см. §14)
+├── infra/                # docker-compose.prod.yml, nginx/, скрипты деплоя/бэкапа/релиза, release-pubkeys/
+├── docs/                 # инструкции (запуск, установка хоста, WoL), аудиты
+├── .github/workflows/    # ci.yml (гейты), build-host.yml (сборка хоста и установщиков), release.yml, deploy.yml
 ├── CLAUDE.md, ARCHITECTURE.md, SLICES_LOG.md, README.md
 ```
 
@@ -629,7 +644,7 @@ Windows — долг D52.
 
 ## 9. Платформы
 
-- **macOS 13+** (ScreenCaptureKit), сборки arm64 и x86_64. Поставка — бандл
+- **macOS 13+** (ScreenCaptureKit), сборка только arm64 (`macos-latest` в `build-host.yml`, `installer/macos/build-pkg.sh` — «только macOS, arm64»; x86_64 не собирается). Поставка — бандл
   `rcdesk.app` (`app.rcdesk.agent`) в `rcdesk-macos.pkg`, подписан самоподписанным
   сертификатом (ключ — секреты GitHub `MACOS_SIGN_P12*`, копия у владельца): DR =
   идентификатор + лист сертификата, поэтому TCC-разрешения переживают обновление;
@@ -675,13 +690,12 @@ Windows — долг D52.
 ## 11. Инфраструктура
 
 VPS владельца (FastVPS, Эстония), отдельный пользователь FastPanel `rcdesk`. Docker Compose:
-`rcdesk-server` (порт 8080 на localhost) и `coturn` (host-сеть). База сигналинга (3.1) —
+`rcdesk-server` (в контейнере 8080, на хосте `127.0.0.1:8100` — 8080/8090 заняты другими проектами VPS) и `coturn` (host-сеть). База сигналинга (3.1) —
 в именованном томе `db-data`, смонтированном в `/data`: том пустой при создании наследует
 владельца каталога из образа (`/data` создан как `nobody`), поэтому контейнер под `USER
 nobody` пишет в него без `chown` на VPS, где у пользователя `rcdesk` нет root. nginx FastPanel: статика
-`web/dist`, прокси `/ws`, `/healthz` и `/wake/poll` на 8080, TLS от панели. DNS `rcdesk.app` → VPS;
-`turn.rcdesk.app` → тот же IP (без CDN-прокси). Порты: 443 (https/wss), 3478 udp/tcp и
-5349 tls (TURN), диапазон relay UDP 49152–65535. Деплой — GitHub Actions по push в `main`
+`web/dist`, прокси `/ws`, `/healthz` и `/wake/poll` на `127.0.0.1:8100`, TLS от панели. DNS `rcdesk.app` → VPS;
+`turn.rcdesk.app` → тот же IP (без CDN-прокси). Порты: 443 (https/wss), 3478 udp/tcp (TURN; coturn с `--no-tls`, TURN-TLS на 5349 не поднят — сертификаты пользователю `rcdesk` не читаются), диапазон relay UDP 49152–65535. Деплой — GitHub Actions по push в `main`
 после зелёных гейтов (фаза 3).
 
 Трафик через сервер — только при TURN-релее; при прямом P2P сервер видит лишь
@@ -825,7 +839,8 @@ workflow его не видят, прогон ждёт «Review deployments». �
 
 ## 14. Зависимости — реестр решений
 
-Каждая новая зависимость добавляется сюда с одной строкой «зачем».
+Каждая новая зависимость добавляется сюда с одной строкой «зачем». Версии — по `Cargo.lock` и
+`web/package.json` на 2026-11-04; компилятор Rust закреплён в `rust-toolchain.toml` (1.98.1, обновляется осознанно).
 
 | Крейт/пакет | Где | Зачем |
 |---|---|---|
@@ -846,7 +861,7 @@ workflow его не видят, прогон ждёт «Review deployments». �
 | rtc-turn 0.20.5 (своя копия в `vendor/rtc-turn`, `[patch.crates-io]`) | host (транзитивно через `webrtc`) | одна правка (D75): на 438 Stale Nonce повторить ChannelBind/Refresh/CreatePermission с новым nonce, привязку канала не удалять. coturn 4.18 (stateless nonce) периодически отвечает 438; без правки relay-сеанс рвётся на ~600-й секунде (`no binding found for channel`), аллокация теряется (437). Убрать, когда исправят upstream (в 0.21.1 то же); см. `vendor/rtc-turn/RCDESK-PATCH.md` |
 | scap 0.0.8 (своя копия в `vendor/scap`, `[patch.crates-io]`) | host (macOS/Windows) | захват экрана; NV12 на macOS, BGRA на Windows. Одна правка: `Capturer::get_next_frame_timeout` — без неё `rx.recv()` SCK/WGC не разбудить при остановке на статичном экране (слайс A). Убрать, когда upstream даст таймаут; см. `vendor/scap/RCDESK-PATCH.md` |
 | openh264 0.9 (source) | host | H.264 программный + SIMD-конверсия BGRA→I420 |
-| openh264-sys2 0.9 | host | сырые FFI-типы (`ENCODER_OPTION_BITRATE`, `SBitrateInfo`), которые `openh264` не реэкспортирует — смена битрейта/fps на живом кодере через `Encoder::raw_api` (слайс 2.3). Та же 0.9.8, что уже в графе |
+| openh264-sys2 0.9 | host | сырые FFI-типы (`ENCODER_OPTION_BITRATE`, `SBitrateInfo`), которые `openh264` не реэкспортирует — смена битрейта/fps на живом кодере через `Encoder::raw_api` (слайс 2.3). Та же 0.9.9, что уже в графе |
 | clap 4 (derive) | host | CLI |
 | bytes 1, async-trait 0.1 | host | `Sample.data`, impl `PeerConnectionEventHandler` |
 | tokio-tungstenite 0.30 (rustls-tls-webpki-roots), futures-util 0.3 | host | WS/WSS-клиент сигналинга |
@@ -856,7 +871,7 @@ workflow его не видят, прогон ждёт «Review deployments». �
 | windows 0.61 | host (Windows) | курсор (GetCursorInfo/GetIconInfo/GetDIBits), клавиатура (`SendInput`, `MapVirtualKeyW`), GDI-захват (`BitBlt`, `CreateDIBSection`), проба D3D 11 (`D3D11CreateDevice`; фича Dxgi нужна из-за cfg-гейта), DPI (`SetProcessDpiAwarenessContext`), Media Foundation H.264 MFT (`Win32_Media_MediaFoundation`; `Win32_System_{Com,Ole,Variant}` — COM-инициализация и `VARIANT` для `ICodecAPI::SetValue`), буфер обмена (`Win32_System_DataExchange` — `GetClipboardSequenceNumber`, 2.5b), папка «Загрузки» (`Win32_UI_Shell` — `SHGetKnownFolderPath`, 3.4a), полный режим (4.1a): `Win32_System_Services` — SCM, `CreateServiceW`/`StartServiceCtrlDispatcherW`, служба SYSTEM `rcdesk`; `Win32_System_RemoteDesktop` — `WTSGetActiveConsoleSessionId`, активная консольная сессия для помощника; `Win32_System_JobObjects` — Job с `KILL_ON_JOB_CLOSE`, помощник не переживает службу; `Win32_Security_Authorization` — SDDL и `SetNamedSecurityInfoW`, защищённый DACL (SYSTEM + Administrators) на `%ProgramData%\rcdesk`. Та же версия, что у windows-capture; Wake-on-LAN (W2): `Win32_NetworkManagement_IpHelper` — `GetAdaptersAddresses`, `Win32_NetworkManagement_Ndis` — `IF_OPER_STATUS` в `IP_ADAPTER_ADDRESSES_LH`, `Win32_Networking_WinSock` — `SOCKET_ADDRESS`/`SOCKADDR_IN` (`platform::windows::netifs`) |
 | enigo 0.6 | host (macOS/Windows) | инъекция ввода: macOS — `raw()` = CGKeyCode; Windows — только мышь/колесо (`raw()` не принимает E0-префикс, клавиши идут через свой `SendInput`); `main_display()` для масштаба координат |
 | objc2-core-foundation, objc2-core-video, objc2-core-media, objc2-video-toolbox 0.3 | host (macOS) | VideoToolbox: `VTCompressionSession`, `CVPixelBuffer` (NV12 без конверсии), `CMSampleBuffer`/`CMBlockBuffer` (AVCC → Annex-B), CF-словари свойств, `CVPixelBufferPool` — пул IOSurface-буферов на вход кодера (слайс F3). Минимальные фичи, без objc2-классов; сидят на тех же objc2 0.6 / core-foundation 0.3, что enigo |
-| arboard 3.6 (default-features = false) | host (macOS/Windows) | текст буфера обмена (2.5); изменения — по счётчику ОС (NSPasteboard changeCount / GetClipboardSequenceNumber); список скопированных файлов `get().file_list()` для скачивания с хоста (3.4c) |
+| arboard 3.7 (default-features = false) | host (macOS/Windows) | текст буфера обмена (2.5); изменения — по счётчику ОС (NSPasteboard changeCount / GetClipboardSequenceNumber); список скопированных файлов `get().file_list()` для скачивания с хоста (3.4c) |
 | tray-icon 0.26 (default-features = false) | host (macOS/Windows) | трей/меню-бар `rcdesk-agent` (2.6c): иконка + меню через реэкспорт `tray_icon::menu` (`muda`, без отдельной зависимости). Без winit/tao — свой минимальный цикл событий (`platform::{macos,windows}::event_loop`) |
 | vite 8, typescript 7, vitest 5 | web | сборка, типы, тесты; `vite.config.ts` использует `defineConfig` из `vitest/config` |
 | rusqlite 0.40 (bundled) | server | постоянное состояние сигналинга: устройства, владельцы, привязки (слайс 3.1); SQLite статически в бинарнике, файл в томе `/data` |
@@ -871,7 +886,7 @@ workflow его не видят, прогон ждёт «Review deployments». �
 | @serenity-kit/opaque 1.1 | web | клиентская сторона OPAQUE (3.2d) — `opaque-ke` 4.0 в WASM, первая runtime-зависимость web |
 | tokio-rustls 0.26 (ring, tls12), webpki-roots 1.0, httparse 1 | host | уже в графе через tokio-tungstenite, прямыми — для проверки обновлений (4.3d): ручной `HEAD` к github.com без нового крейта |
 | ring 0.17 | host | уже в графе через rustls, прямой — проверка подписи ed25519 манифеста обновления `rcdesk-update.json` (D50b); ключ подписи — секрет `RELEASE_SIGN_KEY` окружения `release`, два открытых (боевой + резервный) зашиты в `update_verify.rs` (слайс G) |
-| winresource 0.1.31 | host (Windows, build) | иконка и VERSIONINFO exe (4.3b); актуальная на crates.io, поддерживаемый форк-наследник `winres`, умеет `.ico` + строки версии через `rc.exe` MSVC |
+| winresource 0.1.34 | host (Windows, build) | иконка и VERSIONINFO exe (4.3b); актуальная на crates.io, поддерживаемый форк-наследник `winres`, умеет `.ico` + строки версии через `rc.exe` MSVC |
 | rcdesk-server (path, `default-features = false`), axum 0.8 (из workspace) | host | LAN-хаб (D47-3): сигнальный сервер библиотекой внутри хоста (`lan_hub_app`) + раздача вшитого `web/dist` фоллбэком роутера; TLS — свой `axum::serve::Listener` поверх `tokio-rustls` (обёртка `tap_io` ради `ConnectInfo`), без `hyper-util`/`tower-http`. Веб-клиент вшивает `host/build.rs` (`include_bytes!`, без `include_dir`); `RCDESK_REQUIRE_WEB=1` в релизной сборке |
 | rcgen 0.14 (crypto, pem, ring; без default) | host | самоподписанный сертификат LAN-хаба (D47-3), ключ P-256; уже в графе через webrtc, провайдер ring — без aws-lc-rs |
 | Inno Setup 6.7.1 | CI (Windows), инструмент сборки | компилятор установщика `installer/windows/rcdesk.iss` (4.3b); не зависимость кода, ставится в CI через `choco install innosetup --version 6.7.1`, `iscc` собирает `rcdesk-setup.exe` |
