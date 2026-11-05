@@ -855,6 +855,13 @@ details.add-menu[hidden] {
 }
 
 @media (pointer: coarse) {
+  /* iOS Safari zooms into a focused field under 16px and keeps the zoom
+   * after Enter/blur (rename on the start screen). */
+  .device-rename-input,
+  .wake-add-field {
+    font-size: 16px;
+  }
+
   .device-menu-btn {
     width: 44px;
     height: 44px;
