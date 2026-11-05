@@ -65,4 +65,17 @@ describe("downloadBlockHtml (slice 4.3e)", () => {
     expect(html).toContain("SmartScreen");
     expect(html).toContain("Всё равно открыть");
   });
+
+  it("hides the notes inside a collapsed details", () => {
+    expect(html).toContain('<details class="download-help">');
+    expect(html).toContain("<summary>Не запускается?</summary>");
+  });
+
+  it("keeps installer links visible and notes inside details", () => {
+    const d = html.indexOf("<details");
+    expect(html.indexOf("rcdesk-setup.exe")).toBeLessThan(d);
+    expect(html.indexOf("rcdesk-macos.pkg")).toBeLessThan(d);
+    expect(html.indexOf("SmartScreen")).toBeGreaterThan(d);
+    expect(html.indexOf("Всё равно открыть")).toBeGreaterThan(d);
+  });
 });

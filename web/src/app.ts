@@ -351,9 +351,12 @@ export function downloadBlockHtml(): string {
             <a href="${DOWNLOAD_BASE}/latest/download/rcdesk-setup.exe">Windows</a>
             <a href="${DOWNLOAD_BASE}/latest/download/rcdesk-macos.pkg">macOS (Apple Silicon)</a>
           </p>
-          <p class="download-note">Windows: установщик не подписан — SmartScreen: «Подробнее → Выполнить в любом случае».</p>
-          <p class="download-note">macOS: если система не даёт открыть — «Системные настройки → Конфиденциальность и безопасность → Всё равно открыть».</p>
-          <p class="download-note"><a href="${DOWNLOAD_BASE}">Все версии</a></p>
+          <details class="download-help">
+            <summary>Не запускается?</summary>
+            <p class="download-note">Windows: установщик не подписан — SmartScreen: «Подробнее → Выполнить в любом случае».</p>
+            <p class="download-note">macOS: если система не даёт открыть — «Системные настройки → Конфиденциальность и безопасность → Всё равно открыть».</p>
+            <p class="download-note"><a href="${DOWNLOAD_BASE}">Все версии</a></p>
+          </details>
         </div>`;
 }
 
@@ -365,41 +368,54 @@ export function mount(root: Element | null): void {
   root.innerHTML = `
     <div class="build-badge" id="build-badge"></div>
     <div class="pin-screen" id="pin-screen">
-      <div class="card" id="main-card">
-        <h1>rcdesk</h1>
-        <div class="account" id="account" hidden>
-          <div id="account-guest" hidden>
-            <button id="login-open-btn" class="btn">Войти</button>
-            <button id="signup-open-btn" class="btn btn-secondary">Создать аккаунт</button>
-            <button id="passkey-login-btn" class="link-btn">Войти с passkey</button>
-            <p class="hint">Войдите, чтобы список компьютеров был доступен в любом браузере</p>
+      <div class="home" id="main-card">
+        <header class="home-header">
+          <h1>rcdesk</h1>
+          <div class="account" id="account" hidden>
+            <div id="account-guest" hidden>
+              <button id="login-open-btn" class="btn">Войти</button>
+              <button id="signup-open-btn" class="btn btn-secondary">Создать аккаунт</button>
+              <button id="passkey-login-btn" class="link-btn">Войти с passkey</button>
+              <p class="hint">Войдите, чтобы список компьютеров был доступен в любом браузере</p>
+            </div>
+            <button id="account-open-btn" class="btn btn-secondary" hidden>Аккаунт</button>
+            <p id="account-status" class="hint account-status" role="status" aria-live="polite"></p>
           </div>
-          <button id="account-open-btn" class="btn btn-secondary" hidden>Аккаунт</button>
-          <p id="account-status" class="hint account-status" role="status" aria-live="polite"></p>
+        </header>
+        <div class="home-grid">
+          <section class="home-main">
+            <div class="devices" id="devices" hidden>
+              <h2>Мои компьютеры</h2>
+              <ul class="device-list" id="device-list"></ul>
+              <div class="wake-add-buttons" id="wake-add-buttons">
+                <button id="add-manual-btn" class="btn btn-secondary">Добавить устройство по MAC</button>
+                <button id="add-router-btn" class="btn btn-secondary">Добавить роутер-будильник</button>
+              </div>
+              <div class="wake-add-panel" id="wake-add-panel" hidden></div>
+            </div>
+          </section>
+          <aside class="home-side">
+            <div class="home-panel pin-panel">
+              <h2>Подключиться по PIN</h2>
+              <input
+                id="pin-input"
+                class="pin-input"
+                type="text"
+                inputmode="numeric"
+                pattern="[0-9]*"
+                maxlength="6"
+                placeholder="000000"
+                autocomplete="one-time-code"
+                aria-label="PIN хоста"
+              />
+              <button id="connect-btn" class="btn">Подключиться</button>
+              <p class="hint pin-hint">PIN показан на экране хоста</p>
+              <p id="pin-status" class="hint" role="status" aria-live="polite"></p>
+            </div>
+            <div class="home-panel">${downloadBlockHtml()}
+            </div>
+          </aside>
         </div>
-        <div class="devices" id="devices" hidden>
-          <h2>Мои компьютеры</h2>
-          <ul class="device-list" id="device-list"></ul>
-          <div class="wake-add-buttons" id="wake-add-buttons">
-            <button id="add-manual-btn" class="btn btn-secondary">Добавить устройство по MAC</button>
-            <button id="add-router-btn" class="btn btn-secondary">Добавить роутер-будильник</button>
-          </div>
-          <div class="wake-add-panel" id="wake-add-panel" hidden></div>
-        </div>
-        <p class="hint pin-hint">Или введите PIN с экрана хоста</p>
-        <input
-          id="pin-input"
-          class="pin-input"
-          type="text"
-          inputmode="numeric"
-          pattern="[0-9]*"
-          maxlength="6"
-          placeholder="000000"
-          autocomplete="one-time-code"
-          aria-label="PIN хоста"
-        />
-        <button id="connect-btn" class="btn">Подключиться</button>
-        <p id="pin-status" class="hint" role="status" aria-live="polite"></p>${downloadBlockHtml()}
       </div>
       <div class="card account-card" id="account-card" hidden>
         <h1>Аккаунт</h1>
@@ -949,6 +965,12 @@ export function mount(root: Element | null): void {
   fullscreenBtn.hidden = !isFullscreenSupported(document);
   const devicesEl = root.querySelector<HTMLDivElement>("#devices")!;
   const mainCard = root.querySelector<HTMLDivElement>("#main-card")!;
+  const downloadHelp = root.querySelector<HTMLDetailsElement>("details.download-help")!;
+  const openDownloadHelp = (): void => {
+    if (location.hash === "#download") downloadHelp.open = true;
+  };
+  openDownloadHelp();
+  window.addEventListener("hashchange", openDownloadHelp);
   const accountEl = root.querySelector<HTMLDivElement>("#account")!;
   const accountGuestEl = root.querySelector<HTMLDivElement>("#account-guest")!;
   const accountOpenBtn = root.querySelector<HTMLButtonElement>("#account-open-btn")!;
