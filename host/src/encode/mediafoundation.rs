@@ -23,8 +23,8 @@ use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMeanBitRate,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoMaxQP, CODECAPI_AVLowLatencyMode,
-    ICodecAPI, IMFActivate, IMFMediaEvent, IMFMediaEventGenerator, IMFMediaType, IMFSample,
-    IMFTransform, METransformHaveOutput, METransformNeedInput, MFCreateMediaType,
+    ICodecAPI, IMFActivate, IMFMediaBuffer, IMFMediaEvent, IMFMediaEventGenerator, IMFMediaType,
+    IMFSample, IMFTransform, METransformHaveOutput, METransformNeedInput, MFCreateMediaType,
     MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSampleExtension_CleanPoint,
     MFShutdown, MFStartup, MFTEnumEx, MFT_FRIENDLY_NAME_Attribute, MFVideoFormat_H264,
     MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_NOSOCKET,
@@ -48,8 +48,8 @@ use windows::Win32::System::Variant::{
 };
 
 use crate::capture::RawFrame;
-use crate::encode::convert::i420_to_nv12;
-use crate::encode::{fps_compensated_bitrate_bps, nal_types, to_i420};
+use crate::encode::convert::{nv12_len, Nv12Writer};
+use crate::encode::{fps_compensated_bitrate_bps, nal_types};
 
 use super::{EncodeError, EncodedFrame, Encoder, EncoderConfig, RateTarget};
 
@@ -88,6 +88,12 @@ pub struct MediaFoundationEncoder {
     provides_samples: bool,
     /// Minimum output buffer size to allocate when `!provides_samples`.
     output_buffer_size: u32,
+    /// Reused output sample + its buffer for the `!provides_samples` case,
+    /// created lazily by `drain_output` and dropped (to be recreated) on a
+    /// format change or a `ProcessOutput` error.
+    output_cache: Option<(IMFSample, IMFMediaBuffer)>,
+    /// Reusable BGRA->I420 scratch for `build_input_sample`.
+    nv12_writer: Nv12Writer,
     /// Async MFTs only: how many `ProcessInput` calls the MFT has signalled
     /// it can currently accept (one `METransformNeedInput` event = one
     /// credit).
@@ -346,6 +352,8 @@ impl MediaFoundationEncoder {
             started: Instant::now(),
             provides_samples,
             output_buffer_size,
+            output_cache: None,
+            nv12_writer: Nv12Writer::new(),
             credits: 0,
             pending: VecDeque::new(),
             rate_warned: false,
@@ -423,9 +431,9 @@ impl MediaFoundationEncoder {
 
     /// Builds an input `IMFSample` from `frame`'s NV12 pixels, stamped with
     /// `frame.ts()` (relative to `self.started`) as its sample time.
-    fn build_input_sample(&self, frame: &RawFrame) -> Result<IMFSample, EncodeError> {
-        let (y, uv) = frame_to_nv12(frame);
-        let total_len = (y.len() + uv.len()) as u32;
+    fn build_input_sample(&mut self, frame: &RawFrame) -> Result<IMFSample, EncodeError> {
+        let len = nv12_len(frame);
+        let total_len = len as u32;
 
         // SAFETY: `total_len` is a plain size argument.
         let buffer = unsafe { MFCreateMemoryBuffer(total_len) }.map_err(|err| {
@@ -438,14 +446,12 @@ impl MediaFoundationEncoder {
         unsafe { buffer.Lock(&mut ptr, None, None) }.map_err(|err| {
             EncodeError::Backend(format!("MediaFoundation input IMFMediaBuffer::Lock: {err}"))
         })?;
-        // SAFETY: `Lock` returned success just above, so `ptr` is valid for
-        // at least `total_len` bytes (the buffer was created with that
-        // capacity); `y.len() + uv.len() == total_len`, so both copies stay
-        // within bounds and don't overlap the destination.
-        unsafe {
-            std::ptr::copy_nonoverlapping(y.as_ptr(), ptr, y.len());
-            std::ptr::copy_nonoverlapping(uv.as_ptr(), ptr.add(y.len()), uv.len());
-        }
+        // SAFETY: `Lock` returned success just above, so `ptr` is non-null
+        // and valid for writes of at least `total_len == len` bytes (the
+        // buffer was created with that capacity) until `Unlock`; the buffer
+        // is brand new and unshared, so nothing else aliases the slice.
+        let dst = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        self.nv12_writer.write(frame, dst);
         // SAFETY: matches the successful `Lock` above.
         unsafe { buffer.Unlock() }.map_err(|err| {
             EncodeError::Backend(format!(
@@ -498,26 +504,56 @@ impl MediaFoundationEncoder {
             let provided_sample = if self.provides_samples {
                 None
             } else {
-                // SAFETY: `output_buffer_size` was read from
-                // `GetOutputStreamInfo` (or is the frame's raw pixel count,
-                // whichever is larger) at construction time.
-                let buffer =
-                    unsafe { MFCreateMemoryBuffer(self.output_buffer_size) }.map_err(|err| {
+                if self.output_cache.is_none() {
+                    // SAFETY: `output_buffer_size` was read from
+                    // `GetOutputStreamInfo` (or is the frame's raw pixel
+                    // count, whichever is larger) at construction time.
+                    let buffer = unsafe { MFCreateMemoryBuffer(self.output_buffer_size) }.map_err(
+                        |err| {
+                            EncodeError::Backend(format!(
+                                "MediaFoundation MFCreateMemoryBuffer (output): {err}"
+                            ))
+                        },
+                    )?;
+                    // SAFETY: no preconditions beyond MF being started.
+                    let sample = unsafe { MFCreateSample() }.map_err(|err| {
                         EncodeError::Backend(format!(
-                            "MediaFoundation MFCreateMemoryBuffer (output): {err}"
+                            "MediaFoundation MFCreateSample (output): {err}"
                         ))
                     })?;
-                // SAFETY: no preconditions beyond MF being started.
-                let sample = unsafe { MFCreateSample() }.map_err(|err| {
-                    EncodeError::Backend(format!("MediaFoundation MFCreateSample (output): {err}"))
-                })?;
-                // SAFETY: both just created above.
-                unsafe { sample.AddBuffer(&buffer) }.map_err(|err| {
+                    // SAFETY: both just created above.
+                    unsafe { sample.AddBuffer(&buffer) }.map_err(|err| {
+                        EncodeError::Backend(format!(
+                            "MediaFoundation IMFSample::AddBuffer (output): {err}"
+                        ))
+                    })?;
+                    self.output_cache = Some((sample, buffer));
+                }
+                let Some((sample, buffer)) = self.output_cache.as_ref() else {
+                    unreachable!("output_cache was just filled above");
+                };
+                // SAFETY: `buffer` is valid and not locked (every `Lock` in
+                // this module is paired with an `Unlock` before returning);
+                // the previous output was already copied out by
+                // `frame_from_output_sample` before this call, so nothing
+                // reads the old contents.
+                unsafe { buffer.SetCurrentLength(0) }.map_err(|err| {
                     EncodeError::Backend(format!(
-                        "MediaFoundation IMFSample::AddBuffer (output): {err}"
+                        "MediaFoundation IMFMediaBuffer::SetCurrentLength (output): {err}"
                     ))
                 })?;
-                Some(sample)
+                // SAFETY: `sample` is valid. Clears attributes the MFT set on
+                // the previous frame (e.g. `MFSampleExtension_CleanPoint`),
+                // which would otherwise leak into this frame's keyframe
+                // detection.
+                unsafe { sample.DeleteAllItems() }.map_err(|err| {
+                    EncodeError::Backend(format!(
+                        "MediaFoundation IMFSample::DeleteAllItems (output): {err}"
+                    ))
+                })?;
+                // The slot gets a clone (AddRef); `ManuallyDrop::take` below
+                // releases that clone, the cache keeps its own reference.
+                Some(sample.clone())
             };
 
             let mut buffers = [MFT_OUTPUT_DATA_BUFFER {
@@ -543,6 +579,17 @@ impl MediaFoundationEncoder {
             // SAFETY: same reasoning, for the (always unused here) events
             // collection slot.
             drop(unsafe { ManuallyDrop::take(&mut buffers[0].pEvents) });
+
+            let real_error = result
+                .as_ref()
+                .is_err_and(|err| err.code() != MF_E_TRANSFORM_NEED_MORE_INPUT);
+            if format_change || real_error {
+                // The buffer may be too small / in an unknown state now;
+                // recreate on the next call (safer than reasoning about it).
+                // `MF_E_TRANSFORM_NEED_MORE_INPUT` -- the usual end of every
+                // drain -- leaves the buffer untouched, so it stays cached.
+                self.output_cache = None;
+            }
 
             match result {
                 Ok(()) => {
@@ -880,46 +927,6 @@ fn frame_dims(frame: &RawFrame) -> (u32, u32) {
     match frame {
         RawFrame::Nv12 { width, height, .. } | RawFrame::Bgra { width, height, .. } => {
             (*width, *height)
-        }
-    }
-}
-
-/// Converts `frame` to a dense NV12 pair (Y plane, interleaved UV plane),
-/// whatever its native representation: `Nv12` frames are de-strided
-/// in-place, `Bgra` frames go through `to_i420` + `i420_to_nv12`.
-fn frame_to_nv12(frame: &RawFrame) -> (Vec<u8>, Vec<u8>) {
-    match frame {
-        RawFrame::Nv12 {
-            width,
-            height,
-            y,
-            y_stride,
-            uv,
-            uv_stride,
-            ..
-        } => {
-            let w = *width as usize;
-            let h = *height as usize;
-
-            let mut y_plane = vec![0u8; w * h];
-            for row in 0..h {
-                y_plane[row * w..(row + 1) * w]
-                    .copy_from_slice(&y[row * y_stride..row * y_stride + w]);
-            }
-
-            let uv_h = h.div_ceil(2);
-            let uv_row_bytes = w.div_ceil(2) * 2;
-            let mut uv_plane = vec![0u8; uv_row_bytes * uv_h];
-            for row in 0..uv_h {
-                uv_plane[row * uv_row_bytes..(row + 1) * uv_row_bytes]
-                    .copy_from_slice(&uv[row * uv_stride..row * uv_stride + uv_row_bytes]);
-            }
-
-            (y_plane, uv_plane)
-        }
-        RawFrame::Bgra { .. } => {
-            let i420 = to_i420(frame);
-            i420_to_nv12(&i420)
         }
     }
 }
@@ -1480,6 +1487,47 @@ mod tests {
         }
         let encoded = first.expect("expected at least one output within 30 attempts");
         assert!(encoded.keyframe);
+    }
+
+    #[test]
+    fn bgra_with_padded_stride_is_encoded_first_keyframe() {
+        let mut encoder = MediaFoundationEncoder::new(test_cfg(), true).expect("encoder init");
+
+        let stride = 64 * 4 + 32;
+        let data: Vec<u8> = (0..stride * 64).map(|i| (i * 7 % 251) as u8).collect();
+        let frame = RawFrame::Bgra {
+            width: 64,
+            height: 64,
+            data,
+            stride,
+            ts: Instant::now(),
+        };
+
+        let mut first: Option<EncodedFrame> = None;
+        for _ in 0..30 {
+            if let Some(encoded) = encoder.encode(&frame, true).expect("encode") {
+                first = Some(encoded);
+                break;
+            }
+        }
+        let encoded = first.expect("expected at least one output within 30 attempts");
+        assert!(encoded.keyframe);
+    }
+
+    #[test]
+    fn sixty_frames_encode_with_reused_output_sample() {
+        let mut source = SyntheticSource::new(64, 64, 1000);
+        let mut encoder = MediaFoundationEncoder::new(test_cfg(), true).expect("encoder init");
+
+        let mut outputs = 0usize;
+        for _ in 0..60u32 {
+            let raw = source.next_frame().expect("frame");
+            if let Some(encoded) = encoder.encode(&raw, false).expect("encode") {
+                assert!(!encoded.data.is_empty());
+                outputs += 1;
+            }
+        }
+        assert!(outputs > 0, "expected non-empty output within 60 frames");
     }
 
     #[test]
