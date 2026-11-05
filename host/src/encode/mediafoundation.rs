@@ -859,7 +859,7 @@ impl Encoder for MediaFoundationEncoder {
         }
 
         let readback_bps = read_codec_u32(codec_api, &CODECAPI_AVEncCommonMeanBitRate);
-        tracing::info!(
+        tracing::debug!(
             bitrate_kbps = target.bitrate_kbps,
             fps = target.fps,
             cfg_fps = self.cfg.fps,
