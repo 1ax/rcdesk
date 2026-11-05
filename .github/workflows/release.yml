@@ -51,7 +51,7 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "release=true" >> "$GITHUB_OUTPUT"
 
-  # Гейт релиза: те же проверки, что и в deploy.yml.
+  # Гейт релиза: все проверки CI, включая macOS (deploy.yml его пропускает, CI-2).
   test:
     needs: version
     if: needs.version.outputs.release == 'true'

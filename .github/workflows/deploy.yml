@@ -19,6 +19,8 @@ jobs:
   # deploy зависят от него -- падение гейтов блокирует прод-деплой.
   test:
     uses: ./.github/workflows/ci.yml
+    with:
+      skip_macos: true  # CI-2: macOS не гейт прода, его гоняют Release и ветки
     permissions:
       contents: read
       checks: write
