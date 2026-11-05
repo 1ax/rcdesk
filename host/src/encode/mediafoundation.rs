@@ -20,7 +20,8 @@ use windows::core::{Interface, GUID, PWSTR};
 use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, VARIANT_FALSE, VARIANT_TRUE};
 use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Base, eAVEncH264VProfile_ConstrainedBase,
-    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize,
+    CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMeanBitRate,
+    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoMaxQP, CODECAPI_AVLowLatencyMode,
     ICodecAPI, IMFActivate, IMFMediaEvent, IMFMediaEventGenerator, IMFMediaType, IMFSample,
     IMFTransform, METransformHaveOutput, METransformNeedInput, MFCreateMediaType,
@@ -43,7 +44,7 @@ use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, CO_MTA_USAGE_COOKIE,
 };
 use windows::Win32::System::Variant::{
-    VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BOOL, VT_UI4,
+    VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BOOL, VT_I4, VT_UI4, VT_UI8,
 };
 
 use crate::capture::RawFrame;
@@ -62,6 +63,9 @@ const CREDIT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// previous input. Hardware NVENC at 2560x1440 encodes in ~6-15 ms; expiry is
 /// not an error -- the frame surfaces with the next call, as it did before.
 const OUTPUT_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// Minimum interval between `MeanBitRate` readbacks of the drift watchdog.
+const DRIFT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct MediaFoundationEncoder {
     transform: IMFTransform,
@@ -103,10 +107,47 @@ pub struct MediaFoundationEncoder {
     /// Set once the async output backlog warning has fired, so a persistent lag
     /// doesn't spam the log.
     backlog_warned: bool,
+    /// Last `MeanBitRate` (bps) we wrote ourselves (construction or `set_rate`).
+    last_set_bitrate_bps: u32,
+    /// Last `MeanBitRate` read back by the drift watchdog, so a persistent
+    /// drifted value is logged once (`None` until the first check).
+    last_seen_bitrate_bps: Option<u32>,
+    /// When the drift watchdog last read `MeanBitRate` back.
+    drift_checked_at: Instant,
+    /// Balances the successful `MFStartup` with exactly one `MFShutdown`,
+    /// whichever path (build error, drain error, normal drop) ends the
+    /// encoder. Declared after `transform`/`codec_api` so they are released
+    /// first, before `MFShutdown`; and before `_mta`.
+    _mf: MfSession,
     /// MUST stay the last field: fields drop in declaration order, so the MTA
     /// is released only after `transform`/`codec_api` are freed and after
-    /// `Drop::drop` (`MFShutdown`).
+    /// `Drop::drop` and `_mf` (`MFShutdown`).
     _mta: MtaUsage,
+}
+
+/// One successful `MFStartup`; calls `MFShutdown` exactly once when dropped.
+/// Created right after `MFStartup` in `new` and moved into `build` and then
+/// into the encoder, so no error path can shut Media Foundation down twice.
+struct MfSession;
+
+impl MfSession {
+    fn startup() -> Result<Self, EncodeError> {
+        // SAFETY: the matching `MFShutdown` is `MfSession::drop`, run exactly
+        // once for the value returned here.
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET) }
+            .map_err(|err| EncodeError::Backend(format!("MediaFoundation MFStartup: {err}")))?;
+        Ok(Self)
+    }
+}
+
+impl Drop for MfSession {
+    fn drop(&mut self) {
+        // SAFETY: an `MfSession` exists only after a successful `MFStartup`
+        // and is dropped once.
+        unsafe {
+            let _ = MFShutdown();
+        }
+    }
 }
 
 /// Scoped `CoInitializeEx`: calls `CoUninitialize` when dropped, on the same
@@ -197,24 +238,19 @@ impl MediaFoundationEncoder {
         // dropped with `build`'s error).
         let mta = MtaUsage::acquire()?;
 
-        // SAFETY: matched by `MFShutdown` in `Drop`, and on every error path
-        // in `build` below (via the `map_err` here).
-        unsafe { MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET) }
-            .map_err(|err| EncodeError::Backend(format!("MediaFoundation MFStartup: {err}")))?;
+        // The session owns the single `MFShutdown`; `build` hands it to the
+        // encoder, and any error path drops it (once) on the way out.
+        let mf = MfSession::startup()?;
 
-        match Self::build(cfg, allow_software, mta) {
-            Ok(encoder) => Ok(encoder),
-            Err(err) => {
-                // SAFETY: `MFStartup` succeeded just above.
-                unsafe {
-                    let _ = MFShutdown();
-                }
-                Err(err)
-            }
-        }
+        Self::build(cfg, allow_software, mta, mf)
     }
 
-    fn build(cfg: EncoderConfig, allow_software: bool, mta: MtaUsage) -> Result<Self, EncodeError> {
+    fn build(
+        cfg: EncoderConfig,
+        allow_software: bool,
+        mta: MtaUsage,
+        mf: MfSession,
+    ) -> Result<Self, EncodeError> {
         let input_type_info = MFT_REGISTER_TYPE_INFO {
             guidMajorType: MFMediaType_Video,
             guidSubtype: MFVideoFormat_NV12,
@@ -298,6 +334,9 @@ impl MediaFoundationEncoder {
             "initializing mediafoundation encoder"
         );
 
+        log_codec_readback(codec_api.as_ref(), is_async, cfg.fps);
+        let last_set_bitrate_bps = cfg.bitrate_kbps.saturating_mul(1000);
+
         let mut encoder = Self {
             transform,
             is_async,
@@ -312,6 +351,10 @@ impl MediaFoundationEncoder {
             rate_warned: false,
             in_flight: 0,
             backlog_warned: false,
+            last_set_bitrate_bps,
+            last_seen_bitrate_bps: None,
+            drift_checked_at: Instant::now(),
+            _mf: mf,
             _mta: mta,
         };
 
@@ -726,6 +769,8 @@ impl Encoder for MediaFoundationEncoder {
             }
         }
 
+        self.check_bitrate_drift();
+
         if self.is_async {
             self.encode_async(sample)
         } else {
@@ -752,12 +797,6 @@ impl Encoder for MediaFoundationEncoder {
 
         let bitrate_bps =
             fps_compensated_bitrate_bps(target.bitrate_kbps, self.cfg.fps, target.fps);
-        tracing::debug!(
-            bitrate_kbps = target.bitrate_kbps,
-            fps = target.fps,
-            mean_bitrate_bps = bitrate_bps,
-            "media foundation rate target"
-        );
         // SAFETY: `codec_api` is a live `ICodecAPI` obtained at construction
         // time; `CODECAPI_AVEncCommonMeanBitRate` is an extern immutable
         // static of the documented `GUID` type; `variant_u32` builds a live
@@ -772,7 +811,46 @@ impl Encoder for MediaFoundationEncoder {
                 })?;
         }
 
+        let readback_bps = read_codec_u32(codec_api, &CODECAPI_AVEncCommonMeanBitRate);
+        tracing::info!(
+            bitrate_kbps = target.bitrate_kbps,
+            fps = target.fps,
+            cfg_fps = self.cfg.fps,
+            mean_bitrate_bps = bitrate_bps,
+            readback_bps = ?readback_bps,
+            "media foundation rate target"
+        );
+        self.last_set_bitrate_bps = bitrate_bps;
+        self.last_seen_bitrate_bps = readback_bps;
+        self.drift_checked_at = Instant::now();
+
         Ok(())
+    }
+}
+
+impl MediaFoundationEncoder {
+    /// Reads `MeanBitRate` back at most once per `DRIFT_CHECK_INTERVAL` and
+    /// logs (once per distinct value) when it differs from what we last set.
+    fn check_bitrate_drift(&mut self) {
+        if self.drift_checked_at.elapsed() < DRIFT_CHECK_INTERVAL {
+            return;
+        }
+        self.drift_checked_at = Instant::now();
+        let Some(codec_api) = &self.codec_api else {
+            return;
+        };
+        let Some(current) = read_codec_u32(codec_api, &CODECAPI_AVEncCommonMeanBitRate) else {
+            return;
+        };
+        if current != self.last_set_bitrate_bps && self.last_seen_bitrate_bps != Some(current) {
+            tracing::info!(
+                set_bps = self.last_set_bitrate_bps,
+                readback_bps = current,
+                previous_readback_bps = ?self.last_seen_bitrate_bps,
+                "media foundation mean bitrate drifted"
+            );
+        }
+        self.last_seen_bitrate_bps = Some(current);
     }
 }
 
@@ -793,10 +871,8 @@ impl Drop for MediaFoundationEncoder {
                 tracing::warn!(error = %err, "MediaFoundation COMMAND_FLUSH failed during shutdown");
             }
         }
-        // SAFETY: matches the successful `MFStartup` in `new()`.
-        unsafe {
-            let _ = MFShutdown();
-        }
+        // `MFShutdown` is done by the `_mf` field (`MfSession`) after the
+        // fields above are released.
     }
 }
 
@@ -1050,6 +1126,50 @@ fn variant_u32(value: u32) -> VARIANT {
     }
 }
 
+/// Reads an unsigned integer out of a `VARIANT` of type `VT_UI4`, `VT_UI8` or
+/// (non-negative) `VT_I4`; `None` for any other type.
+fn variant_to_u64(value: &VARIANT) -> Option<u64> {
+    // SAFETY: `value` is a live `VARIANT`; `vt` is the discriminant of the
+    // union `Anonymous`, and each union field is read only when `vt` names
+    // exactly that field's type.
+    unsafe {
+        let inner = &value.Anonymous.Anonymous;
+        if inner.vt == VT_UI4 {
+            Some(u64::from(inner.Anonymous.ulVal))
+        } else if inner.vt == VT_UI8 {
+            Some(inner.Anonymous.ullVal)
+        } else if inner.vt == VT_I4 {
+            u64::try_from(inner.Anonymous.lVal).ok()
+        } else {
+            None
+        }
+    }
+}
+
+/// `ICodecAPI::GetValue` as `Option<u32>`: `None` if the call fails or the
+/// value is not an integer fitting `u32`. Diagnostics only, never fatal.
+fn read_codec_u32(codec_api: &ICodecAPI, key: &GUID) -> Option<u32> {
+    // SAFETY: `codec_api` is a live `ICodecAPI`; `key` is an extern immutable
+    // static (or other live `GUID`); the returned `VARIANT` is owned here and
+    // holds only a plain integer for the types `variant_to_u64` accepts.
+    let value = unsafe { codec_api.GetValue(key) }.ok()?;
+    variant_to_u64(&value).and_then(|v| u32::try_from(v).ok())
+}
+
+/// One info line with the rate-control state the MFT reports after
+/// configuration (V-4b diagnostics). Every value is best-effort.
+fn log_codec_readback(codec_api: Option<&ICodecAPI>, is_async: bool, fps: u32) {
+    let get = |key: &GUID| codec_api.and_then(|api| read_codec_u32(api, key));
+    tracing::info!(
+        rate_control_mode = ?get(&CODECAPI_AVEncCommonRateControlMode),
+        mean_bitrate_bps = ?get(&CODECAPI_AVEncCommonMeanBitRate),
+        buffer_size = ?get(&CODECAPI_AVEncCommonBufferSize),
+        is_async,
+        cfg_fps = fps,
+        "media foundation codec readback"
+    );
+}
+
 fn variant_bool(value: bool) -> VARIANT {
     VARIANT {
         Anonymous: VARIANT_0 {
@@ -1259,6 +1379,12 @@ mod tests {
     use super::*;
     use crate::capture::synthetic::SyntheticSource;
     use crate::capture::FrameSource;
+
+    #[test]
+    fn variant_to_u64_reads_integers_and_rejects_others() {
+        assert_eq!(variant_to_u64(&variant_u32(12_000_000)), Some(12_000_000));
+        assert_eq!(variant_to_u64(&variant_bool(true)), None);
+    }
 
     fn test_cfg() -> EncoderConfig {
         EncoderConfig {
