@@ -80,7 +80,9 @@
 //! консольную сессию (нужна `SeTcbPrivilege`, у LocalSystem она есть), затем
 //! `CreateProcessAsUserW` с рабочим столом `winsta0\default`. Процесс
 //! помещается в Job object с `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: умерла
-//! служба -- ядро закрыло хендл job -- умер помощник.
+//! служба -- ядро закрыло хендл job -- умер помощник. Перед запуском из
+//! primary-токена навсегда удаляются все привилегии, кроме allow-list
+//! `KEPT_PRIVILEGES` (M-9): помощник разбирает недоверенный сетевой ввод.
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -91,10 +93,11 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use windows::core::{Owned, BOOL, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    LocalFree, ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED,
-    ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_NO_TOKEN, ERROR_SERVICE_ALREADY_RUNNING,
-    ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_NOT_ACTIVE, GENERIC_ALL, GENERIC_WRITE, HANDLE,
-    HLOCAL, NO_ERROR, WAIT_OBJECT_0,
+    GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED,
+    ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ALL_ASSIGNED,
+    ERROR_NO_TOKEN, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST,
+    ERROR_SERVICE_NOT_ACTIVE, GENERIC_ALL, GENERIC_WRITE, HANDLE, HLOCAL, LUID, NO_ERROR,
+    WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -102,13 +105,15 @@ use windows::Win32::Security::Authorization::{
     SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    AclSizeInformation, CreateWellKnownSid, DuplicateTokenEx, EqualSid, GetAce, GetAclInformation,
-    GetSecurityDescriptorDacl, LookupAccountSidW, SecurityImpersonation, SetTokenInformation,
-    TokenPrimary, TokenSessionId, WinBuiltinAdministratorsSid, WinCreatorOwnerSid,
+    AclSizeInformation, AdjustTokenPrivileges, CreateWellKnownSid, DuplicateTokenEx, EqualSid,
+    GetAce, GetAclInformation, GetSecurityDescriptorDacl, GetTokenInformation, LookupAccountSidW,
+    LookupPrivilegeNameW, SecurityImpersonation, SetTokenInformation, TokenPrimary,
+    TokenPrivileges, TokenSessionId, WinBuiltinAdministratorsSid, WinCreatorOwnerSid,
     WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
-    DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_MAX_SID_SIZE, SID_NAME_USE, TOKEN_ALL_ACCESS,
-    TOKEN_DUPLICATE, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
+    DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_MAX_SID_SIZE,
+    SE_PRIVILEGE_REMOVED, SID_NAME_USE, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_PRIVILEGES,
+    TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
 };
 use windows::Win32::Storage::FileSystem::{
     DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
@@ -1358,6 +1363,149 @@ fn launch_agent_in_console_session(agent: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Привилегии, остающиеся в токене помощника (M-9): `SeTcb` --
+/// `WTSQueryUserToken`; `SeImpersonate` -- `ImpersonateLoggedOnUser`;
+/// `SeChangeNotify`/`SeCreateGlobal` -- обычная работа процесса и глобальные
+/// объекты; `SeAssignPrimaryToken`/`SeIncreaseQuota` -- запуск дочерних
+/// процессов от имени токена.
+const KEPT_PRIVILEGES: [&str; 6] = [
+    "SeTcbPrivilege",
+    "SeImpersonatePrivilege",
+    "SeChangeNotifyPrivilege",
+    "SeCreateGlobalPrivilege",
+    "SeAssignPrimaryTokenPrivilege",
+    "SeIncreaseQuotaPrivilege",
+];
+
+/// Какие из присутствующих в токене привилегий (по именам) нужно удалить:
+/// все, кроме `KEPT_PRIVILEGES`. Порядок сохраняется.
+fn privileges_to_remove<'a>(present: &'a [&'a str]) -> Vec<&'a str> {
+    present
+        .iter()
+        .copied()
+        .filter(|name| !KEPT_PRIVILEGES.iter().any(|k| k.eq_ignore_ascii_case(name)))
+        .collect()
+}
+
+/// Привилегии токена: имя и LUID (включённые и выключенные).
+fn token_privileges(token: HANDLE) -> anyhow::Result<Vec<(String, LUID)>> {
+    let mut buf: Vec<u64> = Vec::new();
+    let mut ready = false;
+    // Набор привилегий может смениться между вызовами -- несколько попыток.
+    for _ in 0..4 {
+        let mut len = 0u32;
+        // Safety: `token` -- живой хендл с `TOKEN_QUERY`; буфер не передан,
+        // `len` -- валидный out-параметр (запрос размера).
+        let probe = unsafe { GetTokenInformation(token, TokenPrivileges, None, 0, &mut len) };
+        match probe {
+            Ok(()) => {}
+            Err(e) if code_is(&e, ERROR_INSUFFICIENT_BUFFER.0) => {}
+            Err(e) => return Err(win_err("GetTokenInformation(TokenPrivileges, размер)", e)),
+        }
+        // `Vec<u64>`: выравнивание 8 >= выравнивания `TOKEN_PRIVILEGES`.
+        buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+        let cap = (buf.len() * 8) as u32;
+        // Safety: буфер `buf` живёт весь вызов, `cap` -- его размер в байтах,
+        // выровнен по 8.
+        let got = unsafe {
+            GetTokenInformation(
+                token,
+                TokenPrivileges,
+                Some(buf.as_mut_ptr().cast::<c_void>()),
+                cap,
+                &mut len,
+            )
+        };
+        match got {
+            Ok(()) => {
+                ready = true;
+                break;
+            }
+            Err(e) if code_is(&e, ERROR_INSUFFICIENT_BUFFER.0) => {}
+            Err(e) => return Err(win_err("GetTokenInformation(TokenPrivileges)", e)),
+        }
+    }
+    if !ready {
+        anyhow::bail!("GetTokenInformation(TokenPrivileges): буфер не подошёл за 4 попытки");
+    }
+    let header = buf.as_ptr().cast::<TOKEN_PRIVILEGES>();
+    // Safety: ядро заполнило буфер структурой `TOKEN_PRIVILEGES`: счётчик и
+    // за ним `PrivilegeCount` записей `LUID_AND_ATTRIBUTES` подряд внутри
+    // `buf`; `buf` выровнен по 8, записи -- `repr(C)` без упаковки.
+    let entries: Vec<LUID_AND_ATTRIBUTES> = unsafe {
+        let count = (*header).PrivilegeCount as usize;
+        let first = std::ptr::addr_of!((*header).Privileges).cast::<LUID_AND_ATTRIBUTES>();
+        std::slice::from_raw_parts(first, count).to_vec()
+    };
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let luid = entry.Luid;
+        let mut name = [0u16; 256];
+        let mut cch = name.len() as u32;
+        // Safety: `luid` и `cch` -- валидные указатели на время вызова;
+        // `name` -- буфер на `cch` символов; имя системы null (локальная).
+        unsafe {
+            LookupPrivilegeNameW(
+                PCWSTR::null(),
+                &luid,
+                Some(PWSTR(name.as_mut_ptr())),
+                &mut cch,
+            )
+        }
+        .map_err(|e| win_err("LookupPrivilegeNameW", e))?;
+        out.push((String::from_utf16_lossy(&name[..cch as usize]), luid));
+    }
+    Ok(out)
+}
+
+/// Навсегда удаляет из токена (нужен `TOKEN_ADJUST_PRIVILEGES`) все
+/// привилегии вне `KEPT_PRIVILEGES`; возвращает имена удалённых.
+/// `ERROR_NOT_ALL_ASSIGNED` -- тоже ошибка.
+fn strip_token_privileges(token: HANDLE) -> anyhow::Result<Vec<String>> {
+    let present = token_privileges(token)?;
+    let names: Vec<&str> = present.iter().map(|(n, _)| n.as_str()).collect();
+    let doomed = privileges_to_remove(&names);
+    let victims: Vec<(String, LUID)> = present
+        .iter()
+        .filter(|(n, _)| doomed.contains(&n.as_str()))
+        .cloned()
+        .collect();
+    if victims.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Заголовок (u32) + записи по 12 байт; `Vec<u64>` даёт нужное выравнивание.
+    let bytes =
+        std::mem::size_of::<u32>() + victims.len() * std::mem::size_of::<LUID_AND_ATTRIBUTES>();
+    let mut buf = vec![0u64; bytes.div_ceil(8)];
+    let header = buf.as_mut_ptr().cast::<TOKEN_PRIVILEGES>();
+    // Safety: буфер выровнен по 8 и вмещает счётчик плюс `victims.len()`
+    // записей (`bytes`), пишем строго внутри него.
+    unsafe {
+        (*header).PrivilegeCount = victims.len() as u32;
+        let first = std::ptr::addr_of_mut!((*header).Privileges).cast::<LUID_AND_ATTRIBUTES>();
+        for (i, (_, luid)) in victims.iter().enumerate() {
+            first.add(i).write(LUID_AND_ATTRIBUTES {
+                Luid: *luid,
+                Attributes: SE_PRIVILEGE_REMOVED,
+            });
+        }
+    }
+    // Safety: `token` -- живой хендл с `TOKEN_ADJUST_PRIVILEGES`; `header`
+    // указывает на корректную `TOKEN_PRIVILEGES`, переживающую вызов;
+    // предыдущее состояние не запрашиваем (длина 0).
+    unsafe { AdjustTokenPrivileges(token, false, Some(header.cast_const()), 0, None, None) }
+        .map_err(|e| win_err("AdjustTokenPrivileges", e))?;
+    // Safety: `GetLastError` без предусловий; сразу после успешного вызова
+    // `AdjustTokenPrivileges`, ничего между ними.
+    let last = unsafe { GetLastError() };
+    if last == ERROR_NOT_ALL_ASSIGNED {
+        anyhow::bail!(
+            "AdjustTokenPrivileges: ERROR_NOT_ALL_ASSIGNED (часть привилегий не удалена)"
+        );
+    }
+    Ok(victims.into_iter().map(|(n, _)| n).collect())
+}
+
 /// Живой помощник: хендл процесса и Job object, который убьёт его при
 /// закрытии (смерть службы).
 struct Helper {
@@ -1438,6 +1586,16 @@ impl Helper {
             )
         }
         .map_err(|e| win_err("SetTokenInformation(TokenSessionId)", e))?;
+
+        // M-9: лишние привилегии SYSTEM помощнику не нужны. Ошибка -- отказ
+        // запуска (fail-closed).
+        let removed = strip_token_privileges(*primary)
+            .context("не удалось урезать привилегии токена помощника (M-9)")?;
+        tracing::info!(
+            count = removed.len(),
+            names = %removed.join(","),
+            "привилегии токена помощника удалены (M-9)"
+        );
 
         let mut command_line = wide_null(&helper_command_line(exe, server));
         let mut desktop = wide_null(HELPER_DESKTOP);
@@ -1521,6 +1679,63 @@ mod tests {
     // тестируется в `crate::service`; ниже -- классификация ACE (M-10) и одна
     // проверка на реальной ФС.
     use super::*;
+
+    #[test]
+    fn privileges_to_remove_keeps_only_allow_list() {
+        let present = [
+            "SeDebugPrivilege",
+            "SeTcbPrivilege",
+            "SeBackupPrivilege",
+            "SeChangeNotifyPrivilege",
+            "SeImpersonatePrivilege",
+        ];
+        assert_eq!(
+            privileges_to_remove(&present),
+            vec!["SeDebugPrivilege", "SeBackupPrivilege"]
+        );
+    }
+
+    #[test]
+    fn privileges_to_remove_allow_list_and_empty_yield_nothing() {
+        assert!(privileges_to_remove(&KEPT_PRIVILEGES).is_empty());
+        assert!(privileges_to_remove(&[]).is_empty());
+        assert_eq!(privileges_to_remove(&["SeLoadDriverPrivilege"]).len(), 1);
+    }
+
+    #[test]
+    fn stripped_own_token_has_only_allow_listed_privileges() {
+        let mut own = HANDLE::default();
+        // Safety: псевдохендл процесса; `own` -- валидный out-параметр.
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut own) }
+            .expect("OpenProcessToken");
+        // Safety: хендл только что вернул успешный `OpenProcessToken`.
+        let own = unsafe { Owned::new(own) };
+        let mut dup = HANDLE::default();
+        // Safety: `own` с `TOKEN_DUPLICATE`; `dup` -- валидный out-параметр.
+        unsafe {
+            DuplicateTokenEx(
+                *own,
+                TOKEN_ALL_ACCESS,
+                None,
+                SecurityImpersonation,
+                TokenPrimary,
+                &mut dup,
+            )
+        }
+        .expect("DuplicateTokenEx");
+        // Safety: хендл только что вернул успешный `DuplicateTokenEx`.
+        let dup = unsafe { Owned::new(dup) };
+
+        strip_token_privileges(*dup).expect("strip_token_privileges");
+        let left = token_privileges(*dup).expect("token_privileges");
+        let names: Vec<&str> = left.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            privileges_to_remove(&names).is_empty(),
+            "остались лишние привилегии: {names:?}"
+        );
+        // Повторное урезание ничего не находит.
+        assert!(strip_token_privileges(*dup).expect("repeat").is_empty());
+    }
 
     const OBJ: [ObjectKind; 3] = [ObjectKind::File, ObjectKind::Dir, ObjectKind::Ancestor];
 
