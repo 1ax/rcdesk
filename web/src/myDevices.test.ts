@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   canConnect,
   clearOwnerToken,
+  deviceDot,
   deviceLabel,
   deviceStatusLabel,
   formatLastSeen,
@@ -9,6 +10,7 @@ import {
   ruPlural,
   saveOwnerToken,
   sortDevices,
+  splitDevices,
 } from "./myDevices";
 import type { DeviceEntry } from "./generated/DeviceEntry";
 
@@ -241,5 +243,35 @@ describe("D84/D85 device kinds", () => {
       device({ device_id: "h0", name: "Y Host", online: true }),
     ]);
     expect(sorted.map((d) => d.device_id)).toEqual(["h0", "h1", "m1", "m2", "r1"]);
+  });
+});
+
+describe("deviceDot", () => {
+  it("host: free is online, busy is busy, offline is offline", () => {
+    expect(deviceDot(device({ online: true, busy: false }))).toBe("online");
+    expect(deviceDot(device({ online: true, busy: true }))).toBe("busy");
+    expect(deviceDot(device({ online: false }))).toBe("offline");
+  });
+
+  it("router: online or offline", () => {
+    expect(deviceDot(device({ kind: "router", online: true }))).toBe("online");
+    expect(deviceDot(device({ kind: "router", online: false }))).toBe("offline");
+  });
+
+  it("manual is always offline", () => {
+    expect(deviceDot(device({ kind: "manual", online: true }))).toBe("offline");
+  });
+});
+
+describe("splitDevices", () => {
+  it("separates routers and keeps order", () => {
+    const { computers, wakers } = splitDevices([
+      device({ device_id: "h1" }),
+      device({ device_id: "r1", kind: "router" }),
+      device({ device_id: "m1", kind: "manual" }),
+      device({ device_id: "r2", kind: "router" }),
+    ]);
+    expect(computers.map((d) => d.device_id)).toEqual(["h1", "m1"]);
+    expect(wakers.map((d) => d.device_id)).toEqual(["r1", "r2"]);
   });
 });

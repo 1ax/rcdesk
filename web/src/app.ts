@@ -107,11 +107,13 @@ import {
 import {
   canConnect,
   clearOwnerToken,
+  deviceDot,
   deviceLabel,
   deviceStatusLabel,
   loadOwnerToken,
   saveOwnerToken,
   sortDevices,
+  splitDevices,
 } from "./myDevices";
 import {
   WAKE_TIMEOUT_MS,
@@ -385,13 +387,22 @@ export function mount(root: Element | null): void {
         <div class="home-grid">
           <section class="home-main">
             <div class="devices" id="devices" hidden>
-              <h2>Мои компьютеры</h2>
-              <ul class="device-list" id="device-list"></ul>
-              <div class="wake-add-buttons" id="wake-add-buttons">
-                <button id="add-manual-btn" class="btn btn-secondary">Добавить устройство по MAC</button>
-                <button id="add-router-btn" class="btn btn-secondary">Добавить роутер-будильник</button>
+              <div class="devices-head">
+                <h2>Мои компьютеры</h2>
+                <details class="add-menu wake-add-buttons" id="wake-add-buttons">
+                  <summary class="btn btn-secondary add-menu-btn">+ Добавить</summary>
+                  <div class="add-menu-pop">
+                    <button id="add-manual-btn" class="menu-item">Устройство по MAC</button>
+                    <button id="add-router-btn" class="menu-item">Роутер-будильник</button>
+                  </div>
+                </details>
               </div>
               <div class="wake-add-panel" id="wake-add-panel" hidden></div>
+              <ul class="device-list" id="device-list"></ul>
+              <div class="wakers" id="wakers" hidden>
+                <h2>Будильники</h2>
+                <ul class="device-list" id="waker-list"></ul>
+              </div>
             </div>
           </section>
           <aside class="home-side">
@@ -1018,7 +1029,9 @@ export function mount(root: Element | null): void {
   const deviceListEl = root.querySelector<HTMLUListElement>("#device-list")!;
   const addManualBtn = root.querySelector<HTMLButtonElement>("#add-manual-btn")!;
   const addRouterBtn = root.querySelector<HTMLButtonElement>("#add-router-btn")!;
-  const wakeAddButtonsEl = root.querySelector<HTMLDivElement>("#wake-add-buttons")!;
+  const wakeAddButtonsEl = root.querySelector<HTMLDetailsElement>("#wake-add-buttons")!;
+  const wakersEl = root.querySelector<HTMLDivElement>("#wakers")!;
+  const wakerListEl = root.querySelector<HTMLUListElement>("#waker-list")!;
   const wakeAddPanelEl = root.querySelector<HTMLDivElement>("#wake-add-panel")!;
   // Slice 3.2d: the OPAQUE-login dialog, shown between `auth_required` and
   // either a successful `pake_finish` (the host then sends `offer`, see that
@@ -1172,6 +1185,9 @@ export function mount(root: Element | null): void {
   // second click to confirm (see the document-level `click` listener below,
   // which resets this when the user clicks anything else).
   let confirmingForgetId: string | null = null;
+  // The device whose "⋯" menu is open (the list is rebuilt on every `devices`
+  // push, so this state lives here, not in the DOM).
+  let menuOpenId: string | null = null;
   // Slice 3.7c: the owner's passkeys (`null` until `passkeys` answers the
   // `list_passkeys` sent after every `authenticated`) and browsers (cabinet).
   let passkeys: PasskeyEntry[] | null = null;
@@ -1549,9 +1565,11 @@ export function mount(root: Element | null): void {
    * few times a minute (see `startDeviceListLoop`). */
   function renderDeviceList(): void {
     const sorted = sortDevices(devices);
+    const { computers, wakers } = splitDevices(sorted);
     devicesEl.hidden = sorted.length === 0;
+    wakersEl.hidden = wakers.length === 0;
     // D34: a pushed `devices` can arrive mid-rename -- keep what was typed.
-    const prevInput = deviceListEl.querySelector<HTMLInputElement>(".device-rename-input");
+    const prevInput = devicesEl.querySelector<HTMLInputElement>(".device-rename-input");
     const kept = prevInput
       ? {
           value: prevInput.value,
@@ -1561,11 +1579,13 @@ export function mount(root: Element | null): void {
         }
       : null;
     deviceListEl.innerHTML = "";
+    wakerListEl.innerHTML = "";
     const nowSecs = Math.floor(Date.now() / 1000);
 
-    for (const entry of sorted) {
+    for (const entry of [...computers, ...wakers]) {
+      const listEl = entry.kind === "router" ? wakerListEl : deviceListEl;
       const li = document.createElement("li");
-      li.className = "device-item";
+      li.className = "device-item device-row";
       li.dataset.deviceId = entry.device_id;
 
       if (renamingDeviceId === entry.device_id) {
@@ -1586,13 +1606,18 @@ export function mount(root: Element | null): void {
         saveBtn.addEventListener("click", () => commitRename(entry.device_id, input.value));
         li.appendChild(input);
         li.appendChild(saveBtn);
-        deviceListEl.appendChild(li);
+        listEl.appendChild(li);
         if (kept?.focused) {
           input.focus();
           input.setSelectionRange(kept.start, kept.end);
         }
         continue;
       }
+
+      const dot = document.createElement("span");
+      dot.className = "device-dot";
+      dot.dataset.state = deviceDot(entry);
+      dot.setAttribute("aria-hidden", "true");
 
       const info = document.createElement("div");
       info.className = "device-info";
@@ -1605,9 +1630,6 @@ export function mount(root: Element | null): void {
       statusEl.textContent = wake.status ?? deviceStatusLabel(entry, nowSecs);
       info.appendChild(nameEl);
       info.appendChild(statusEl);
-
-      const actions = document.createElement("div");
-      actions.className = "device-actions";
 
       const connectRowBtn = document.createElement("button");
       connectRowBtn.className = "btn device-connect";
@@ -1636,15 +1658,16 @@ export function mount(root: Element | null): void {
       });
 
       const renameBtn = document.createElement("button");
-      renameBtn.className = "btn-secondary device-rename";
+      renameBtn.className = "menu-item device-rename";
       renameBtn.textContent = "Переименовать";
       renameBtn.addEventListener("click", () => {
         renamingDeviceId = entry.device_id;
+        menuOpenId = null;
         renderDeviceList();
       });
 
       const forgetBtn = document.createElement("button");
-      forgetBtn.className = "btn-secondary device-forget";
+      forgetBtn.className = "menu-item device-forget";
       forgetBtn.dataset.deviceId = entry.device_id;
       forgetBtn.textContent = confirmingForgetId === entry.device_id ? "Точно?" : "Удалить";
       forgetBtn.addEventListener("click", () => {
@@ -1656,22 +1679,45 @@ export function mount(root: Element | null): void {
             clearAuthRequired(forgetStorage, entry.device_id);
           }
           confirmingForgetId = null;
+          menuOpenId = null;
         } else {
           confirmingForgetId = entry.device_id;
         }
         renderDeviceList();
       });
 
-      if (entry.kind === "host") {
-        actions.appendChild(wake.view.showButton ? wakeBtn : connectRowBtn);
-      } else if (entry.kind === "manual" && wake.view.showButton) {
-        actions.appendChild(wakeBtn);
+      const menu = document.createElement("div");
+      menu.className = "device-menu";
+      menu.dataset.deviceId = entry.device_id;
+      const menuOpen = menuOpenId === entry.device_id;
+      const menuBtn = document.createElement("button");
+      menuBtn.className = "device-menu-btn";
+      menuBtn.textContent = "⋯";
+      menuBtn.setAttribute("aria-label", "Действия");
+      menuBtn.setAttribute("aria-haspopup", "menu");
+      menuBtn.setAttribute("aria-expanded", String(menuOpen));
+      menuBtn.addEventListener("click", () => {
+        menuOpenId = menuOpen ? null : entry.device_id;
+        renderDeviceList();
+      });
+      menu.appendChild(menuBtn);
+      if (menuOpen) {
+        const pop = document.createElement("div");
+        pop.className = "device-menu-pop";
+        pop.appendChild(renameBtn);
+        pop.appendChild(forgetBtn);
+        menu.appendChild(pop);
       }
-      actions.appendChild(renameBtn);
-      actions.appendChild(forgetBtn);
+
+      li.appendChild(dot);
       li.appendChild(info);
-      li.appendChild(actions);
-      deviceListEl.appendChild(li);
+      if (entry.kind === "host") {
+        li.appendChild(wake.view.showButton ? wakeBtn : connectRowBtn);
+      } else if (entry.kind === "manual" && wake.view.showButton) {
+        li.appendChild(wakeBtn);
+      }
+      li.appendChild(menu);
+      listEl.appendChild(li);
     }
   }
 
@@ -1874,8 +1920,14 @@ export function mount(root: Element | null): void {
     signaling.send({ type: "list_wake_networks" });
     renderAddPanel();
   }
-  addManualBtn.addEventListener("click", () => openAddForm("manual"));
-  addRouterBtn.addEventListener("click", () => openAddForm("router"));
+  addManualBtn.addEventListener("click", () => {
+    wakeAddButtonsEl.open = false;
+    openAddForm("manual");
+  });
+  addRouterBtn.addEventListener("click", () => {
+    wakeAddButtonsEl.open = false;
+    openAddForm("router");
+  });
 
   /** Starts the 1 s redraw ticker for the "Включаю… м:сс" counter (one timer
    * at most); it stops itself once no wake is within its timeout. */
@@ -1947,12 +1999,39 @@ export function mount(root: Element | null): void {
   // listener runs (document is last in the bubbling chain), and `closest`
   // matches the (possibly now-detached) target element itself first, so
   // that click is never mistaken for "clicked elsewhere".
+  // The same listener closes the open "⋯" row menu (a click outside that
+  // device's `.device-menu`) and the "+ Добавить" menu (a click outside it).
   document.addEventListener("click", (event) => {
-    if (confirmingForgetId === null) return;
     const target = event.target as Element | null;
-    if (target?.closest(`.device-forget[data-device-id="${CSS.escape(confirmingForgetId)}"]`)) return;
-    confirmingForgetId = null;
-    renderDeviceList();
+    if (wakeAddButtonsEl.open && !target?.closest("#wake-add-buttons")) {
+      wakeAddButtonsEl.open = false;
+    }
+    let changed = false;
+    if (
+      menuOpenId !== null &&
+      !target?.closest(`.device-menu[data-device-id="${CSS.escape(menuOpenId)}"]`)
+    ) {
+      menuOpenId = null;
+      changed = true;
+    }
+    if (
+      confirmingForgetId !== null &&
+      !target?.closest(`.device-forget[data-device-id="${CSS.escape(confirmingForgetId)}"]`)
+    ) {
+      confirmingForgetId = null;
+      changed = true;
+    }
+    if (changed) renderDeviceList();
+  });
+
+  // Esc closes the open row menu and the "+ Добавить" menu.
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    wakeAddButtonsEl.open = false;
+    if (menuOpenId !== null) {
+      menuOpenId = null;
+      renderDeviceList();
+    }
   });
 
   // ---- Slice 3.7c: account row, cabinet, passkey flows ----

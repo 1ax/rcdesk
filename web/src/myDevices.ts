@@ -118,3 +118,30 @@ export function clearOwnerToken(storage: Pick<Storage, "removeItem">): void {
     // Ignored: same reasoning as `saveOwnerToken`.
   }
 }
+
+/** The status dot of a device row: online (green), busy (amber), offline (grey).
+ * Hosts: connectable is online, online-but-busy is busy; routers: online or
+ * not; manual (no rcdesk) devices are always offline. */
+export function deviceDot(entry: DeviceEntry): "online" | "busy" | "offline" {
+  if (entry.kind === "host") {
+    if (canConnect(entry)) return "online";
+    if (entry.online && entry.busy) return "busy";
+    return "offline";
+  }
+  if (entry.kind === "router") return entry.online ? "online" : "offline";
+  return "offline";
+}
+
+/** Splits an already sorted list into computers (hosts and manual devices)
+ * and wake routers ("Будильники"), preserving order in both. */
+export function splitDevices(sorted: DeviceEntry[]): {
+  computers: DeviceEntry[];
+  wakers: DeviceEntry[];
+} {
+  const computers: DeviceEntry[] = [];
+  const wakers: DeviceEntry[] = [];
+  for (const entry of sorted) {
+    (entry.kind === "router" ? wakers : computers).push(entry);
+  }
+  return { computers, wakers };
+}
