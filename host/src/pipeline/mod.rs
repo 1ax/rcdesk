@@ -135,7 +135,7 @@ pub struct RateControl {
     /// Staged preset QP ceiling: outer `Some` = a change is waiting to be
     /// applied, inner value is what to apply (`None` = no preset cap).
     pending_max_qp: Mutex<Option<Option<u8>>>,
-    fps: AtomicU32,
+    fps: Arc<AtomicU32>,
 }
 
 impl RateControl {
@@ -143,7 +143,7 @@ impl RateControl {
         Self {
             pending: Mutex::new(None),
             pending_max_qp: Mutex::new(None),
-            fps: AtomicU32::new(initial.fps),
+            fps: Arc::new(AtomicU32::new(initial.fps)),
         }
     }
 
@@ -250,6 +250,7 @@ impl Pipeline {
             condvar: Condvar::new(),
         });
         let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
+        source.follow_fps(Arc::clone(&rate_control.fps));
 
         let capture_thread = {
             let stop = Arc::clone(&stop);
@@ -833,6 +834,64 @@ mod tests {
              (captured={captured}, encoded={}), got paced_out=0",
             received.len()
         );
+    }
+
+    /// Wraps a synthetic source and records the fps hint it is handed.
+    struct HintSource {
+        inner: SyntheticSource,
+        hint: Arc<Mutex<Option<Arc<AtomicU32>>>>,
+    }
+
+    impl FrameSource for HintSource {
+        fn next_frame(&mut self) -> Result<RawFrame, crate::capture::CaptureError> {
+            self.inner.next_frame()
+        }
+        fn size(&self) -> (u32, u32) {
+            self.inner.size()
+        }
+        fn follow_fps(&mut self, fps: Arc<AtomicU32>) {
+            *self.hint.lock().unwrap() = Some(fps);
+        }
+    }
+
+    #[test]
+    fn source_receives_the_fps_hint_and_sees_rate_control_updates() {
+        let _guard = serialized();
+        let hint = Arc::new(Mutex::new(None));
+        let source: Box<dyn FrameSource> = Box::new(HintSource {
+            inner: SyntheticSource::new(64, 64, 30),
+            hint: Arc::clone(&hint),
+        });
+        let cfg = EncoderConfig {
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_kbps: 2000,
+            keyframe_interval_frames: 60,
+            max_qp: None,
+        };
+        let (encoder, _kind) =
+            build_encoder(Some(EncoderKind::OpenH264), cfg).expect("encoder init");
+        let mut handle = Pipeline::start(
+            source,
+            encoder,
+            RateTarget {
+                bitrate_kbps: 2000,
+                fps: 30,
+            },
+        );
+        let fps = hint
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("follow_fps must be called before the capture thread starts");
+        assert_eq!(fps.load(Ordering::Acquire), 30);
+        handle.rate_control().set(RateTarget {
+            bitrate_kbps: 2000,
+            fps: 15,
+        });
+        assert_eq!(fps.load(Ordering::Acquire), 15);
+        handle.stop();
     }
 
     #[test]

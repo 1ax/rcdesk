@@ -41,7 +41,7 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::slice;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -87,6 +87,12 @@ pub struct GdiSource {
     width: u32,
     height: u32,
     pacer: FramePacer,
+    /// Target fps shared with the pipeline (`FrameSource::follow_fps`).
+    fps_hint: Option<Arc<AtomicU32>>,
+    /// The fps this source was configured with: the ceiling for the hint.
+    configured_fps: u32,
+    /// The fps the pacer currently runs at.
+    current_fps: u32,
     stop: Arc<AtomicBool>,
     /// True until the first tick has run its unthrottled desktop sync.
     first_tick: bool,
@@ -142,6 +148,9 @@ impl GdiSource {
             width,
             height,
             pacer: FramePacer::new(fps),
+            fps_hint: None,
+            configured_fps: fps.max(1),
+            current_fps: fps.max(1),
             stop: Arc::new(AtomicBool::new(false)),
             first_tick: true,
             last_warn: None,
@@ -276,10 +285,21 @@ unsafe fn create_dib(
 }
 
 impl FrameSource for GdiSource {
+    fn follow_fps(&mut self, fps: Arc<AtomicU32>) {
+        self.fps_hint = Some(fps);
+    }
+
     fn next_frame(&mut self) -> Result<RawFrame, CaptureError> {
         loop {
             if self.stop.load(Ordering::Acquire) {
                 return Err(CaptureError::Stopped);
+            }
+            if let Some(hint) = &self.fps_hint {
+                let effective = hint.load(Ordering::Acquire).min(self.configured_fps).max(1);
+                if effective != self.current_fps {
+                    self.pacer.set_fps(effective);
+                    self.current_fps = effective;
+                }
             }
             self.pacer.wait();
 

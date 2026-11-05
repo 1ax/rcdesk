@@ -3,7 +3,7 @@
 //! platform-independent generator used by tests, CI and local development on
 //! machines without screen-recording permission.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -77,6 +77,13 @@ pub trait FrameSource: Send {
     fn stop_signal(&self) -> Option<Arc<AtomicBool>> {
         None
     }
+
+    /// Hands the source the shared target fps (`pipeline::RateControl`), which
+    /// adaptation and presets change at runtime. A source MAY lower its capture
+    /// rate to this value to save CPU; it must never exceed its own configured
+    /// rate. The default ignores the hint (sources that block on the OS for
+    /// frames, or are cheap, need no throttling).
+    fn follow_fps(&mut self, _fps: Arc<AtomicU32>) {}
 }
 
 /// A capturable display, as reported by the OS.
@@ -189,6 +196,23 @@ impl FramePacer {
             next_tick: Instant::now(),
             interval,
         }
+    }
+
+    /// Changes the tick rate (`fps` of 0 is treated as 1) without a jerk in
+    /// the schedule: the already-planned next tick is re-based from the old
+    /// interval to the new one, so raising fps does not wait out the old long
+    /// interval and lowering it does not fire a frame early.
+    pub fn set_fps(&mut self, fps: u32) {
+        let interval = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
+        if interval == self.interval {
+            return;
+        }
+        let base = self
+            .next_tick
+            .checked_sub(self.interval)
+            .unwrap_or(self.next_tick);
+        self.next_tick = base + interval;
+        self.interval = interval;
     }
 
     /// Blocks until the next scheduled tick, then advances the schedule by
@@ -310,6 +334,28 @@ mod pacing_tests {
             pacer.next_tick >= before,
             "pacer must not owe a backlog of ticks after falling behind"
         );
+    }
+
+    #[test]
+    fn set_fps_changes_the_interval_and_rebases_the_next_tick() {
+        let mut pacer = FramePacer::new(10); // 100ms
+        let planned = pacer.next_tick;
+        pacer.set_fps(100); // 10ms
+        assert_eq!(pacer.interval, Duration::from_millis(10));
+        assert!(
+            pacer.next_tick < planned,
+            "raising fps must not wait longer"
+        );
+        pacer.set_fps(10);
+        assert_eq!(pacer.interval, Duration::from_millis(100));
+        assert_eq!(pacer.next_tick, planned, "lowering fps restores the tick");
+    }
+
+    #[test]
+    fn set_fps_zero_is_treated_as_one() {
+        let mut pacer = FramePacer::new(30);
+        pacer.set_fps(0);
+        assert_eq!(pacer.interval, Duration::from_secs(1));
     }
 
     #[test]
