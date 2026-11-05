@@ -14,6 +14,42 @@
 **2026-11-02 (20:45 МСК): НОЧНОЙ РЕЖИМ (слово владельца): коммит/push разрешены, стоп на 90 % лимита +
 `ScheduleWakeup`, COMPAX после 23:00 не включать. План: B → C (веб) → D (CI) → E (мобильный UI) → F/G если успею.**
 
+**2026-11-05 (11:25 МСК): ДОЛГИ WINDOWS-ХОСТА НА СТЕНДЕ — ✅ ВЫПУСК 0.4.6, COMPAX обновлён; V-4b закрыт как не дефект.**
+- Решение владельца: «go, развилки по рекомендации» (состав V-4b-диагностика + MFShutdown×2 + M-10 + M-9; M-10 —
+  отказ, не предупреждение), затем отдельно «Выпуск 0.4.6».
+- Коммиты: `4353a38` (`MfSession` — ровно один `MFShutdown` на `MFStartup`; info-диагностика MF: readback
+  MeanBitRate в `set_rate`, `media foundation codec readback` при сборке, сторож дрейфа раз в 5 с), `bb025f7` M-10
+  (`check_exe_location` до `CreateServiceW`: владелец/DACL exe и каталога + предки до корня — DELETE/DELETE_CHILD/
+  WRITE_DAC/OWNER; доверены SYSTEM, Administrators, TrustedInstaller, CREATOR OWNER), `8430f9d` M-9 (в primary-токене
+  помощника остаются SeTcb, SeImpersonate, SeChangeNotify, SeCreateGlobal, SeAssignPrimaryToken, SeIncreaseQuota;
+  сбой — отказ запуска), `8da25b8` bump 0.4.6.
+- Гейты: host `603 passed; 0 failed; 4 ignored`, fmt/clippy чисто; CI `wip/h-stand` `41989673982` зелёный с первого
+  прогона, windows-latest `594 passed; 0 failed; 1 ignored` (новые Windows-тесты `exe_in_user_profile_is_rejected`,
+  `stripped_own_token_has_only_allow_listed_privileges` прошли). Release `41990951348` зелёный (окружение одобрено
+  циклом 11:07), подпись `rcdesk-update.json` — `release-1.pem` Verified, манифест 0.4.6; Deploy `41990951421` зелёный,
+  `/healthz` ok, бандл `build 8da25b8`.
+- ✅ COMPAX «Обновить хост» 0.4.5 → 0.4.6 из сеанса (Chrome Mac, тестовый аккаунт): служба `0.4.6 (8da25b8)`
+  08:09:16Z, следом `привилегии токена помощника удалены (M-9) count=22`; сеанс с урезанным помощником — видео, клики,
+  смена пресета в порядке.
+- ✅ **V-4b — не дефект (замер на 0.4.6):** лог помощника — `codec readback rate_control_mode=0 (CBR)
+  mean_bitrate_bps=6000000 buffer_size=2250000 cfg_fps=30`; при «Чёткости» `mean_bitrate_bps=12000000
+  readback_bps=Some(12000000)`, дрейфа нет. testufo 960 px/s: 15 fps — 2,0 Мбит/с, «Авто» — 5,3 (24–26 fps);
+  testufo 7680 px/s: **15 fps — 6,2 Мбит/с (52 КБ/кадр)** = цель, «Авто» — 4,8–5,2 (24 КБ/кадр). Компенсация V-4
+  работает; 2–4 Мбит/с на лёгкой картинке — кодеру больше не нужно. `qpSum` Chrome на Mac (аппаратный декодер) не
+  отдаёт — QP не снят.
+- Мелкий долг: info-строка `media foundation rate target` дублирует `adapt: new rate target` — вернуть в debug при
+  следующей правке хоста (выпуск ради неё не нужен).
+- ⏳ **M-9, проверить при 0.4.7:** установщик обновления запускает помощник — он унаследует урезанный токен; путь
+  0.4.6 → 0.4.7 по «Обновить хост» ещё не пройден. Не пройдёт — обновить стенд руками `rcdesk-setup.exe`.
+- Как читать лог стенда без владельца (ProgramData закрыт для Users): поиск → «Блокнот» (НЕ Notepad++ — там `.env`)
+  → «Запуск от имени администратора» → UAC «Да» (окно в фоне, открыть с панели задач) → Файл → Открыть
+  `\programdata\rcdesk\logs\helper.log` (без двоеточия — Shift не доходит), раскладка ENG кликом в трее; Ctrl и
+  перетаскивание ползунка не доходят — искать «Правка → Найти» вверх с «Обтеканием текстом» (= последнее вхождение).
+- Открытые долги после слайса: V-5 (BGRA→NV12 копии), V-10 (адаптация: RTT/jitter, двойной учёт RR, IDR-интервал),
+  V-13 (`[profile.release]`), M-12 (шторка macOS на выходе агента), D88 (WGC + Winlogon), UI-8/UI-9/UI-10, coturn
+  (секрет в argv, `read_only`), D89 (Shift — набрать владельцу), LAN-хаб «Включить», декомпозиция
+  `signaling/mod.rs`/`app.ts`, замена scap; `replace_pipeline` — два кодера на миг (осознанно).
+
 **2026-11-05 (10:30 МСК): F-ОСТАТОК (видеопуть Windows с замерами) — ✅ ВЫПУСК 0.4.5, COMPAX обновлён и замерен.**
 - Решение владельца: «go, развилки по рекомендации, выпуск, пуш и деплой разрешаю сколько нужно». Состав: V-4, V-6,
   V-3, CoInit (M-10/M-9 — не брали).
