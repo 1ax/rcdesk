@@ -45,7 +45,7 @@ use windows::Win32::System::Variant::{
 
 use crate::capture::RawFrame;
 use crate::encode::convert::i420_to_nv12;
-use crate::encode::{nal_types, to_i420};
+use crate::encode::{fps_compensated_bitrate_bps, nal_types, to_i420};
 
 use super::{EncodeError, EncodedFrame, Encoder, EncoderConfig, RateTarget};
 
@@ -669,12 +669,12 @@ impl Encoder for MediaFoundationEncoder {
         }
     }
 
-    /// Changes bitrate only: fps is part of the MFT's negotiated media type
-    /// (`MF_MT_FRAME_RATE`, set once in `set_input_type`/`set_output_type`),
-    /// and Media Foundation has no supported way to change a media type
-    /// attribute on a streaming MFT without a full re-negotiation (tearing
-    /// down and rebuilding the transform) -- out of scope for a same-encoder
-    /// rate change, so `target.fps` is ignored here.
+    /// Changes the mean bitrate. fps is part of the MFT's negotiated media
+    /// type (`MF_MT_FRAME_RATE`, set once in `set_input_type`/
+    /// `set_output_type`) and cannot be changed on a streaming MFT without a
+    /// full re-negotiation. The MFT budgets a frame as
+    /// `MeanBitRate / MF_MT_FRAME_RATE`, so `target.fps` is taken into account
+    /// by compensating the bitrate (see `fps_compensated_bitrate_bps`).
     fn set_rate(&mut self, target: RateTarget) -> Result<(), EncodeError> {
         let Some(codec_api) = &self.codec_api else {
             if !self.rate_warned {
@@ -686,7 +686,14 @@ impl Encoder for MediaFoundationEncoder {
             return Ok(());
         };
 
-        let bitrate_bps = target.bitrate_kbps.saturating_mul(1000);
+        let bitrate_bps =
+            fps_compensated_bitrate_bps(target.bitrate_kbps, self.cfg.fps, target.fps);
+        tracing::debug!(
+            bitrate_kbps = target.bitrate_kbps,
+            fps = target.fps,
+            mean_bitrate_bps = bitrate_bps,
+            "media foundation rate target"
+        );
         // SAFETY: `codec_api` is a live `ICodecAPI` obtained at construction
         // time; `CODECAPI_AVEncCommonMeanBitRate` is an extern immutable
         // static of the documented `GUID` type; `variant_u32` builds a live

@@ -231,9 +231,63 @@ pub fn nal_types(annexb: &[u8]) -> Vec<u8> {
     types
 }
 
+/// Bitrate (bit/s) to hand a fixed-fps rate controller so that the real
+/// stream matches `bitrate_kbps` at `target_fps`.
+///
+/// A live Media Foundation MFT budgets one frame as
+/// `MeanBitRate / MF_MT_FRAME_RATE`, and that frame rate cannot change on a
+/// streaming MFT. If adaptation lowers the fps below the configured one, the
+/// real stream would come out at about `bitrate * target / configured`, so the
+/// bitrate is scaled up by `configured / target`. Above the configured fps the
+/// encoder never receives more frames, so there is no compensation. Zero fps
+/// values count as 1; the result saturates at `u32::MAX`.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn fps_compensated_bitrate_bps(
+    bitrate_kbps: u32,
+    configured_fps: u32,
+    target_fps: u32,
+) -> u32 {
+    let base = u64::from(bitrate_kbps) * 1000;
+    let configured = u64::from(configured_fps.max(1));
+    let target = u64::from(target_fps.max(1));
+    let bps = if target >= configured {
+        base
+    } else {
+        base.saturating_mul(configured) / target
+    };
+    u32::try_from(bps).unwrap_or(u32::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fps_compensation_scales_bitrate_when_fps_is_lowered() {
+        assert_eq!(fps_compensated_bitrate_bps(4000, 30, 15), 8_000_000);
+    }
+
+    #[test]
+    fn fps_compensation_is_identity_at_configured_fps() {
+        assert_eq!(fps_compensated_bitrate_bps(4000, 30, 30), 4_000_000);
+    }
+
+    #[test]
+    fn fps_compensation_zero_target_does_not_panic() {
+        assert_eq!(fps_compensated_bitrate_bps(4000, 30, 0), 120_000_000);
+        assert_eq!(fps_compensated_bitrate_bps(4000, 0, 0), 4_000_000);
+    }
+
+    #[test]
+    fn fps_compensation_skipped_when_target_above_configured() {
+        assert_eq!(fps_compensated_bitrate_bps(4000, 30, 60), 4_000_000);
+    }
+
+    #[test]
+    fn fps_compensation_saturates_instead_of_overflowing() {
+        assert_eq!(fps_compensated_bitrate_bps(u32::MAX, 30, 1), u32::MAX);
+        assert_eq!(fps_compensated_bitrate_bps(u32::MAX, u32::MAX, 1), u32::MAX);
+    }
 
     #[test]
     fn nal_types_parses_3_and_4_byte_start_codes() {
