@@ -109,6 +109,9 @@ windows = { version = "0.61", features = [
     # Media Foundation H.264 encoder MFT (encode::mediafoundation): MFT
     # enumeration/activation, IMFTransform, media types, samples/buffers.
     "Win32_Media_MediaFoundation",
+    # timeBeginPeriod/timeEndPeriod (platform::windows::timer, audit V-3):
+    # 1 ms system timer for the capture pacer and RTP pacing.
+    "Win32_Media",
     # CoInitializeEx/CoTaskMemFree -- MFTEnumEx needs COM initialized on the
     # thread, and hands back its MFT_REGISTER_TYPE_INFO/friendly-name
     # allocations via CoTaskMemAlloc, freed with CoTaskMemFree. Also gates

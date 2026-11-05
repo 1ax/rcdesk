@@ -12,6 +12,7 @@ pub mod power;
 pub mod sas;
 pub mod service;
 pub mod status_file;
+pub mod timer;
 pub mod update;
 
 pub(super) fn name() -> &'static str {

@@ -64,6 +64,26 @@ pub mod display_wake {
         DisplayWakeGuard
     }
 }
+/// Разрешение системного таймера для видеоконвейера (аудит V-3). На Windows
+/// таймер по умолчанию тикает раз в 15,6 мс, из-за чего `thread::sleep` пейсера
+/// захвата и короткие `tokio::time::sleep` RTP-пейсинга квантуются до 15,6 мс;
+/// guard держит `timeBeginPeriod(1)`. На Win10 2004+ разрешение действует на
+/// процесс, а вызовы считаются счётчиком, поэтому перекрытие старого и нового
+/// guard при пересборке конвейера безопасно. На остальных ОС -- заглушка.
+#[cfg(target_os = "windows")]
+pub mod timer_resolution {
+    pub use super::windows::timer::high_resolution;
+    pub use super::windows::timer::TimerResolution as Guard;
+}
+#[cfg(not(target_os = "windows"))]
+pub mod timer_resolution {
+    /// Заглушка: таймер на этой платформе не нужно трогать.
+    pub struct Guard;
+
+    pub fn high_resolution() -> Guard {
+        Guard
+    }
+}
 /// Ctrl+Alt+Del из сеанса (D46): на Windows -- запрос службе (она вызывает `SendSAS`), на остальных
 /// платформах -- заглушка без эффекта.
 #[cfg(target_os = "windows")]

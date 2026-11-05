@@ -215,6 +215,8 @@ pub struct PipelineHandle {
     rate_control: Arc<RateControl>,
     capture_thread: Option<JoinHandle<()>>,
     encode_thread: Option<JoinHandle<()>>,
+    /// Raises the Windows timer resolution while the pipeline lives (V-3).
+    _timer: crate::platform::timer_resolution::Guard,
 }
 
 pub struct Pipeline;
@@ -553,6 +555,7 @@ impl Pipeline {
             rate_control,
             capture_thread: Some(capture_thread),
             encode_thread: Some(encode_thread),
+            _timer: crate::platform::timer_resolution::high_resolution(),
         }
     }
 }
