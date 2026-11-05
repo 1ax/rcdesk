@@ -83,7 +83,7 @@
 //! служба -- ядро закрыло хендл job -- умер помощник.
 
 use std::ffi::c_void;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -93,19 +93,26 @@ use windows::core::{Owned, BOOL, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     LocalFree, ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED,
     ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_NO_TOKEN, ERROR_SERVICE_ALREADY_RUNNING,
-    ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_NOT_ACTIVE, HANDLE, HLOCAL, NO_ERROR,
-    WAIT_OBJECT_0,
+    ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_NOT_ACTIVE, GENERIC_ALL, GENERIC_WRITE, HANDLE,
+    HLOCAL, NO_ERROR, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
-    SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertStringSidToSidW, GetNamedSecurityInfoW, SetNamedSecurityInfoW, SDDL_REVISION_1,
+    SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    CreateWellKnownSid, DuplicateTokenEx, EqualSid, GetSecurityDescriptorDacl,
-    SecurityImpersonation, SetTokenInformation, TokenPrimary, TokenSessionId,
-    WinBuiltinAdministratorsSid, WinLocalSystemSid, ACL, DACL_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_MAX_SID_SIZE, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
+    AclSizeInformation, CreateWellKnownSid, DuplicateTokenEx, EqualSid, GetAce, GetAclInformation,
+    GetSecurityDescriptorDacl, LookupAccountSidW, SecurityImpersonation, SetTokenInformation,
+    TokenPrimary, TokenSessionId, WinBuiltinAdministratorsSid, WinCreatorOwnerSid,
+    WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
+    DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_MAX_SID_SIZE, SID_NAME_USE, TOKEN_ALL_ACCESS,
+    TOKEN_DUPLICATE, TOKEN_QUERY, WELL_KNOWN_SID_TYPE,
+};
+use windows::Win32::Storage::FileSystem::{
+    DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+    FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
 };
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::JobObjects::{
@@ -333,6 +340,323 @@ fn owner_is_trusted(owner: PSID) -> anyhow::Result<bool> {
     Ok(equal(owner, system) || equal(owner, admins))
 }
 
+/// Тип ACE «разрешить» (`ACCESS_ALLOWED_ACE_TYPE` живёт в
+/// `Win32_System_SystemServices`, отдельную фичу ради константы не включаем).
+const ACE_TYPE_ACCESS_ALLOWED: u8 = 0;
+/// ACE действует только на потомков, на сам объект -- нет (`INHERIT_ONLY_ACE`).
+const ACE_FLAG_INHERIT_ONLY: u8 = 0x08;
+/// SID `NT SERVICE\TrustedInstaller`.
+const TRUSTED_INSTALLER_SID: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+/// Права, дающие запись/подмену файла или создание/удаление в каталоге.
+const DANGEROUS_OBJECT_MASK: u32 = FILE_WRITE_DATA.0
+    | FILE_APPEND_DATA.0
+    | FILE_WRITE_EA.0
+    | FILE_WRITE_ATTRIBUTES.0
+    | DELETE.0
+    | WRITE_DAC.0
+    | WRITE_OWNER.0
+    | GENERIC_WRITE.0
+    | GENERIC_ALL.0;
+/// Для предков: только то, что позволяет переименовать/подменить ветку.
+const DANGEROUS_ANCESTOR_MASK: u32 =
+    DELETE.0 | FILE_DELETE_CHILD.0 | WRITE_DAC.0 | WRITE_OWNER.0 | GENERIC_ALL.0;
+
+/// Чем является проверяемый объект на пути к exe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObjectKind {
+    /// Сам `rcdesk-host.exe`.
+    File,
+    /// Каталог с exe.
+    Dir,
+    /// Каталог выше (вплоть до корня тома).
+    Ancestor,
+}
+
+/// Чистая классификация одного ACE: даёт ли он недоверенному SID опасные
+/// права на сам объект. Без WinAPI, покрыта тестами.
+fn ace_is_dangerous(
+    ace_type: u8,
+    ace_flags: u8,
+    mask: u32,
+    trusted_sid: bool,
+    kind: ObjectKind,
+) -> bool {
+    if ace_type != ACE_TYPE_ACCESS_ALLOWED || ace_flags & ACE_FLAG_INHERIT_ONLY != 0 || trusted_sid
+    {
+        return false;
+    }
+    let dangerous = match kind {
+        ObjectKind::File => DANGEROUS_OBJECT_MASK,
+        ObjectKind::Dir => DANGEROUS_OBJECT_MASK | FILE_DELETE_CHILD.0,
+        ObjectKind::Ancestor => DANGEROUS_ANCESTOR_MASK,
+    };
+    mask & dangerous != 0
+}
+
+/// Снимает префикс `\\?\` с путей вида `\\?\C:\...` (его даёт
+/// `canonicalize`); `\\?\UNC\...` и прочее не трогает.
+fn strip_verbatim_prefix(path: &str) -> &str {
+    match path.strip_prefix(r"\\?\") {
+        Some(rest) if rest.len() >= 3 => {
+            let b = rest.as_bytes();
+            if b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' {
+                rest
+            } else {
+                path
+            }
+        }
+        _ => path,
+    }
+}
+
+/// Доверенные SID: SYSTEM, Administrators, TrustedInstaller, CREATOR OWNER.
+struct TrustedSids {
+    /// SYSTEM, Administrators, CREATOR OWNER.
+    well_known: [[u8; SECURITY_MAX_SID_SIZE as usize]; 3],
+    /// SID TrustedInstaller, выделен системой (освобождается в `Drop`).
+    installer: PSID,
+}
+
+impl TrustedSids {
+    fn new() -> anyhow::Result<Self> {
+        let mut well_known = [[0u8; SECURITY_MAX_SID_SIZE as usize]; 3];
+        for (buf, kind) in well_known.iter_mut().zip([
+            WinLocalSystemSid,
+            WinBuiltinAdministratorsSid,
+            WinCreatorOwnerSid,
+        ]) {
+            well_known_sid(kind, buf)?;
+        }
+        let text = wide_null(TRUSTED_INSTALLER_SID);
+        let mut installer = PSID::default();
+        // Safety: `text` -- валидная NUL-терминированная строка, переживает
+        // вызов; `installer` -- валидный out-параметр, память под SID выделяет
+        // система (`LocalAlloc`), освобождается в `Drop`.
+        unsafe { ConvertStringSidToSidW(PCWSTR(text.as_ptr()), &mut installer) }
+            .context("ConvertStringSidToSidW(TrustedInstaller)")?;
+        Ok(Self {
+            well_known,
+            installer,
+        })
+    }
+
+    /// `sid` должен быть валидным.
+    fn contains(&self, sid: PSID) -> bool {
+        // Safety: `sid` валиден (от вызывающего), остальные SID -- в буферах
+        // `self` и в памяти системы, живых, пока жив `self`; `Err` значит
+        // «не равны».
+        let equal = |other: PSID| unsafe { EqualSid(sid, other) }.is_ok();
+        self.well_known
+            .iter()
+            .any(|buf| equal(PSID(buf.as_ptr().cast_mut().cast())))
+            || equal(self.installer)
+    }
+}
+
+impl Drop for TrustedSids {
+    fn drop(&mut self) {
+        // Safety: `installer` выделен системой через `LocalAlloc` внутри
+        // `ConvertStringSidToSidW` и освобождается ровно один раз, здесь.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(self.installer.0)));
+        }
+    }
+}
+
+/// Владелец и DACL объекта; дескриптор освобождается в `Drop`.
+struct ObjectSecurity {
+    descriptor: PSECURITY_DESCRIPTOR,
+    owner: PSID,
+    /// NULL -- у объекта нет DACL (доступ всем).
+    dacl: *const ACL,
+}
+
+impl Drop for ObjectSecurity {
+    fn drop(&mut self) {
+        // Safety: `descriptor` выделен системой (`LocalAlloc`) внутри
+        // `GetNamedSecurityInfoW`; `owner` и `dacl` указывают внутрь него и
+        // дальше не используются. Освобождается ровно один раз.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(self.descriptor.0)));
+        }
+    }
+}
+
+fn read_object_security(path: &Path) -> anyhow::Result<ObjectSecurity> {
+    let wide = wide_path(path);
+    let mut owner = PSID::default();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // Safety: `wide` -- валидная NUL-терминированная строка, переживает
+    // вызов; `owner`, `dacl`, `descriptor` -- валидные out-параметры; группа и
+    // SACL не запрашиваются (None). `owner`/`dacl` указывают внутрь памяти
+    // дескриптора, которую освобождает `Drop` у `ObjectSecurity`.
+    let error = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            Some(&mut dacl),
+            None,
+            &mut descriptor,
+        )
+    };
+    if let Err(e) = error.ok() {
+        return Err(win_err(
+            &format!("GetNamedSecurityInfoW({})", path.display()),
+            e,
+        ));
+    }
+    Ok(ObjectSecurity {
+        descriptor,
+        owner,
+        dacl: dacl.cast_const(),
+    })
+}
+
+/// Читаемое имя SID (`DOMAIN\name`), иначе строковый SID, иначе `?`.
+fn sid_display(sid: PSID) -> String {
+    let mut name = [0u16; 256];
+    let mut domain = [0u16; 256];
+    let mut name_len = name.len() as u32;
+    let mut domain_len = domain.len() as u32;
+    let mut used = SID_NAME_USE::default();
+    // Safety: `sid` валиден (от вызывающего); буферы и их длины в символах
+    // валидны, переживают вызов; имя системы null -- локальная машина.
+    let looked_up = unsafe {
+        LookupAccountSidW(
+            PCWSTR::null(),
+            sid,
+            Some(PWSTR(name.as_mut_ptr())),
+            &mut name_len,
+            Some(PWSTR(domain.as_mut_ptr())),
+            &mut domain_len,
+            &mut used,
+        )
+    };
+    if looked_up.is_ok() {
+        let name = String::from_utf16_lossy(&name[..name_len as usize]);
+        let domain = String::from_utf16_lossy(&domain[..domain_len as usize]);
+        return if domain.is_empty() {
+            name
+        } else {
+            format!("{domain}\\{name}")
+        };
+    }
+    let mut text = PWSTR::null();
+    // Safety: `sid` валиден; `text` -- валидный out-параметр, строку выделяет
+    // система, освобождается `LocalFree` ниже.
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) }.is_ok() {
+        // Safety: после успеха `text` -- валидная NUL-терминированная строка.
+        let s = unsafe { text.to_string() }.unwrap_or_else(|_| "?".to_owned());
+        // Safety: строка выделена `LocalAlloc`, освобождается один раз.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+        }
+        return s;
+    }
+    "?".to_owned()
+}
+
+/// Кто из недоверенных может менять объект: владелец, отсутствие DACL или
+/// первый опасный ALLOW-ACE. `None` -- объект безопасен.
+fn untrusted_principal(
+    sec: &ObjectSecurity,
+    trusted: &TrustedSids,
+    kind: ObjectKind,
+) -> anyhow::Result<Option<String>> {
+    if kind != ObjectKind::Ancestor && !trusted.contains(sec.owner) {
+        return Ok(Some(format!("владелец {}", sid_display(sec.owner))));
+    }
+    if sec.dacl.is_null() {
+        return Ok(Some("DACL отсутствует, права у всех".to_owned()));
+    }
+    let mut info = ACL_SIZE_INFORMATION::default();
+    // Safety: `dacl` -- валидный ACL (жив, пока жив `sec`); `info` -- валидный
+    // out-буфер указанного размера.
+    unsafe {
+        GetAclInformation(
+            sec.dacl,
+            std::ptr::from_mut(&mut info).cast::<c_void>(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    }
+    .context("GetAclInformation")?;
+    for index in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        // Safety: `dacl` валиден, `index < AceCount`; указатель на ACE
+        // остаётся внутри памяти ACL.
+        unsafe { GetAce(sec.dacl, index, &mut ace) }.context("GetAce")?;
+        // Safety: каждый ACE начинается с `ACE_HEADER` (DWORD-выровнен).
+        let header = unsafe { *ace.cast::<ACE_HEADER>() };
+        if header.AceType != ACE_TYPE_ACCESS_ALLOWED {
+            continue;
+        }
+        let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
+        // Safety: тип ACE -- ACCESS_ALLOWED, значит после `Mask` идёт SID
+        // (`SidStart` -- его первый DWORD); читаем маску и берём адрес SID
+        // внутри ACE, не создавая ссылок на хвост структуры.
+        let (mask, sid) = unsafe {
+            (
+                (*allowed).Mask,
+                PSID(std::ptr::addr_of_mut!((*allowed).SidStart).cast()),
+            )
+        };
+        if ace_is_dangerous(
+            header.AceType,
+            header.AceFlags,
+            mask,
+            trusted.contains(sid),
+            kind,
+        ) {
+            return Ok(Some(sid_display(sid)));
+        }
+    }
+    Ok(None)
+}
+
+/// Отказывает, если exe службы (работает как LocalSystem), его каталог или
+/// любой предок допускают подмену не-администратором (аудит M-10): иначе
+/// локальный пользователь заменяет exe и получает SYSTEM.
+fn check_exe_location(exe: &Path) -> anyhow::Result<()> {
+    let exe = match std::fs::canonicalize(exe) {
+        Ok(real) => PathBuf::from(strip_verbatim_prefix(&real.to_string_lossy())),
+        Err(_) => exe.to_path_buf(),
+    };
+    let dir = exe
+        .parent()
+        .with_context(|| format!("у {} нет каталога", exe.display()))?;
+    let trusted = TrustedSids::new()?;
+
+    let mut objects = vec![
+        (exe.clone(), ObjectKind::File),
+        (dir.to_path_buf(), ObjectKind::Dir),
+    ];
+    objects.extend(
+        dir.ancestors()
+            .skip(1)
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| (p.to_path_buf(), ObjectKind::Ancestor)),
+    );
+    for (path, kind) in objects {
+        let sec = read_object_security(&path)?;
+        if let Some(who) = untrusted_principal(&sec, &trusted, kind)? {
+            let name = exe
+                .file_name()
+                .map_or_else(|| "exe".into(), |n| n.to_string_lossy());
+            anyhow::bail!(
+                "{name} лежит там, где менять файлы могут не только администраторы ({}: {who}) -- служба от SYSTEM отсюда небезопасна. Установите rcdesk через rcdesk-setup.exe (Program Files) или закройте права на каталог",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Создаёт машинный каталог, закрывает его DACL (SYSTEM + Administrators,
 /// наследуется) и только потом подкаталог логов -- он унаследует DACL.
 /// Заранее отказывает, если каталог уже есть и принадлежит не админу.
@@ -420,6 +744,7 @@ pub fn install(server: Option<&str>) -> anyhow::Result<()> {
         );
     }
     let exe = std::env::current_exe().context("путь к rcdesk-host.exe")?;
+    check_exe_location(&exe)?;
 
     let scm = open_scm(SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE)?;
 
@@ -1191,7 +1516,132 @@ impl Helper {
 
 #[cfg(test)]
 mod tests {
-    // Без юнит-тестов: каждая функция здесь трогает реальные SCM/токены, а
-    // Windows-машины у исполнителя нет. Чистая логика (командные строки,
-    // супервизор, pin.txt, перенос файлов) тестируется в `crate::service`.
+    // Остальное здесь трогает реальные SCM/токены -- без юнит-тестов.
+    // Чистая логика (командные строки, супервизор, pin.txt, перенос файлов)
+    // тестируется в `crate::service`; ниже -- классификация ACE (M-10) и одна
+    // проверка на реальной ФС.
+    use super::*;
+
+    const OBJ: [ObjectKind; 3] = [ObjectKind::File, ObjectKind::Dir, ObjectKind::Ancestor];
+
+    #[test]
+    fn trusted_sid_never_dangerous() {
+        for kind in OBJ {
+            assert!(!ace_is_dangerous(0, 0, GENERIC_ALL.0, true, kind));
+        }
+    }
+
+    #[test]
+    fn deny_and_other_ace_types_ignored() {
+        for kind in OBJ {
+            assert!(!ace_is_dangerous(1, 0, GENERIC_ALL.0, false, kind));
+            assert!(!ace_is_dangerous(2, 0, GENERIC_ALL.0, false, kind));
+        }
+    }
+
+    #[test]
+    fn inherit_only_ace_ignored() {
+        for kind in OBJ {
+            assert!(!ace_is_dangerous(
+                0,
+                ACE_FLAG_INHERIT_ONLY | 0x03,
+                GENERIC_ALL.0,
+                false,
+                kind
+            ));
+        }
+    }
+
+    #[test]
+    fn write_rights_dangerous_on_file_and_dir() {
+        for kind in [ObjectKind::File, ObjectKind::Dir] {
+            for mask in [
+                FILE_WRITE_DATA.0,
+                FILE_APPEND_DATA.0,
+                FILE_WRITE_EA.0,
+                FILE_WRITE_ATTRIBUTES.0,
+                DELETE.0,
+                WRITE_DAC.0,
+                WRITE_OWNER.0,
+                GENERIC_WRITE.0,
+                GENERIC_ALL.0,
+            ] {
+                assert!(ace_is_dangerous(0, 0, mask, false, kind), "{mask:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn read_execute_not_dangerous() {
+        // FILE_GENERIC_READ | FILE_GENERIC_EXECUTE без записи: 0x1200A9.
+        for kind in OBJ {
+            assert!(!ace_is_dangerous(0, 0, 0x0012_00A9, false, kind));
+        }
+    }
+
+    #[test]
+    fn delete_child_dangerous_only_on_dir_and_ancestor() {
+        assert!(!ace_is_dangerous(
+            0,
+            0,
+            FILE_DELETE_CHILD.0,
+            false,
+            ObjectKind::File
+        ));
+        assert!(ace_is_dangerous(
+            0,
+            0,
+            FILE_DELETE_CHILD.0,
+            false,
+            ObjectKind::Dir
+        ));
+        assert!(ace_is_dangerous(
+            0,
+            0,
+            FILE_DELETE_CHILD.0,
+            false,
+            ObjectKind::Ancestor
+        ));
+    }
+
+    #[test]
+    fn ancestor_ignores_plain_create_rights() {
+        // Authenticated Users на корне тома: создание файлов/каталогов -- норма.
+        let create = FILE_WRITE_DATA.0 | FILE_APPEND_DATA.0 | FILE_WRITE_EA.0 | GENERIC_WRITE.0;
+        assert!(!ace_is_dangerous(0, 0, create, false, ObjectKind::Ancestor));
+        for mask in [DELETE.0, WRITE_DAC.0, WRITE_OWNER.0, GENERIC_ALL.0] {
+            assert!(ace_is_dangerous(0, 0, mask, false, ObjectKind::Ancestor));
+        }
+    }
+
+    #[test]
+    fn verbatim_prefix_stripped_only_for_drive_paths() {
+        assert_eq!(strip_verbatim_prefix(r"\\?\C:\rc\a.exe"), r"C:\rc\a.exe");
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\srv\sh\a.exe"),
+            r"\\?\UNC\srv\sh\a.exe"
+        );
+        assert_eq!(strip_verbatim_prefix(r"C:\rc\a.exe"), r"C:\rc\a.exe");
+    }
+
+    /// Каталог в профиле пользователя наследует ACE самого пользователя
+    /// (FullControl) -- он не входит в доверенные (SYSTEM, Administrators,
+    /// TrustedInstaller, CREATOR OWNER), поэтому `Err` и при обычном
+    /// пользователе (владелец -- он), и при админском раннере CI (владелец
+    /// может быть Administrators, но ACE `runneradmin` остаётся и в самом
+    /// каталоге, и у предка `C:\Users\runneradmin`). Поэтому тест строго
+    /// требует `Err`, без ветки «владелец доверен».
+    #[test]
+    fn exe_in_user_profile_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("rcdesk-m10-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("rcdesk-host.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        let result = check_exe_location(&exe);
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = result.expect_err("exe в профиле пользователя должен быть отвергнут");
+        let text = err.to_string();
+        assert!(text.contains("rcdesk-host.exe"), "{text}");
+        assert!(text.contains("rcdesk-setup.exe"), "{text}");
+    }
 }
