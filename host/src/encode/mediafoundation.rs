@@ -38,7 +38,10 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC,
     MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
 };
-use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{
+    CoDecrementMTAUsage, CoIncrementMTAUsage, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+    COINIT_MULTITHREADED, CO_MTA_USAGE_COOKIE,
+};
 use windows::Win32::System::Variant::{
     VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BOOL, VT_UI4,
 };
@@ -100,6 +103,58 @@ pub struct MediaFoundationEncoder {
     /// Set once the async output backlog warning has fired, so a persistent lag
     /// doesn't spam the log.
     backlog_warned: bool,
+    /// MUST stay the last field: fields drop in declaration order, so the MTA
+    /// is released only after `transform`/`codec_api` are freed and after
+    /// `Drop::drop` (`MFShutdown`).
+    _mta: MtaUsage,
+}
+
+/// Scoped `CoInitializeEx`: calls `CoUninitialize` when dropped, on the same
+/// thread that initialized COM (it never leaves `new`).
+struct ComGuard;
+
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        // SAFETY: a `ComGuard` is only created after `CoInitializeEx`
+        // returned success (`S_OK`/`S_FALSE`) on the current thread, and it
+        // is a local of `new`, dropped on that same thread: one
+        // `CoUninitialize` per successful `CoInitializeEx`.
+        unsafe { CoUninitialize() };
+    }
+}
+
+/// Keeps the process-wide multi-threaded COM apartment alive for the whole
+/// lifetime of the encoder (`CoIncrementMTAUsage`, Win8+).
+///
+/// The encoder is built on a tokio blocking-pool thread (V-1) but driven on
+/// the pipeline's encode thread, which relies on the implicit MTA. The cookie
+/// keeps that MTA alive regardless of which threads come and go, while the
+/// `CoInitializeEx` in `new` is balanced on its own thread, with no
+/// thread-local destructors (they would run under the loader lock, where
+/// `CoUninitialize` must not be called).
+struct MtaUsage(CO_MTA_USAGE_COOKIE);
+
+// SAFETY: the cookie is an opaque handle; per the `CoDecrementMTAUsage`
+// documentation it may be released from any thread, and nothing else is done
+// with it.
+unsafe impl Send for MtaUsage {}
+
+impl MtaUsage {
+    fn acquire() -> Result<Self, EncodeError> {
+        // SAFETY: no preconditions; the returned cookie is released exactly
+        // once by `Drop`.
+        unsafe { CoIncrementMTAUsage() }.map(Self).map_err(|err| {
+            EncodeError::Backend(format!("MediaFoundation CoIncrementMTAUsage: {err}"))
+        })
+    }
+}
+
+impl Drop for MtaUsage {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` came from a successful `CoIncrementMTAUsage` and
+        // is released only here.
+        let _ = unsafe { CoDecrementMTAUsage(self.0) };
+    }
 }
 
 // SAFETY: like `VideoToolboxEncoder`/`OpenH264Encoder`, `MediaFoundationEncoder`
@@ -122,24 +177,32 @@ impl MediaFoundationEncoder {
     pub fn new(cfg: EncoderConfig, allow_software: bool) -> Result<Self, EncodeError> {
         // SAFETY: `None` for `pvReserved` is the documented "reserved, must
         // be null" value; `COINIT_MULTITHREADED` is the apartment model this
-        // module's `Send` impl above relies on. `RPC_E_CHANGED_MODE` means
-        // some other code already initialized COM on this thread with a
-        // different concurrency model -- not a real failure, COM is already
-        // usable, so it's checked for below rather than treated as an error.
+        // module's `Send` impl above relies on. On success the local guard
+        // balances the call with `CoUninitialize` when `new` returns.
+        // `RPC_E_CHANGED_MODE` means COM was already initialized on this
+        // thread with another model: usable, but that call did not bump the
+        // thread's COM count, so no guard (and no `CoUninitialize`).
         let co_status = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        if co_status.is_err() && co_status != RPC_E_CHANGED_MODE {
+        let _com_guard = if co_status.is_ok() {
+            Some(ComGuard)
+        } else if co_status == RPC_E_CHANGED_MODE {
+            None
+        } else {
             return Err(EncodeError::Backend(format!(
                 "MediaFoundation CoInitializeEx: HRESULT {:#x}",
                 co_status.0
             )));
-        }
+        };
+        // Taken while the guard above is alive; owned by the encoder (or
+        // dropped with `build`'s error).
+        let mta = MtaUsage::acquire()?;
 
         // SAFETY: matched by `MFShutdown` in `Drop`, and on every error path
         // in `build` below (via the `map_err` here).
         unsafe { MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET) }
             .map_err(|err| EncodeError::Backend(format!("MediaFoundation MFStartup: {err}")))?;
 
-        match Self::build(cfg, allow_software) {
+        match Self::build(cfg, allow_software, mta) {
             Ok(encoder) => Ok(encoder),
             Err(err) => {
                 // SAFETY: `MFStartup` succeeded just above.
@@ -151,7 +214,7 @@ impl MediaFoundationEncoder {
         }
     }
 
-    fn build(cfg: EncoderConfig, allow_software: bool) -> Result<Self, EncodeError> {
+    fn build(cfg: EncoderConfig, allow_software: bool, mta: MtaUsage) -> Result<Self, EncodeError> {
         let input_type_info = MFT_REGISTER_TYPE_INFO {
             guidMajorType: MFMediaType_Video,
             guidSubtype: MFVideoFormat_NV12,
@@ -249,6 +312,7 @@ impl MediaFoundationEncoder {
             rate_warned: false,
             in_flight: 0,
             backlog_warned: false,
+            _mta: mta,
         };
 
         if is_async {
