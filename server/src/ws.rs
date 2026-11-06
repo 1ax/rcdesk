@@ -885,6 +885,29 @@ fn routers_for(
         .collect()
 }
 
+/// U2: после входа по PIN отвязывает от владельца офлайн-дубли устройства
+/// (то же имя и общий MAC) и переносит псевдоним. Ошибки БД только логируются.
+fn displace_duplicates_logged(db: &Db, registry: &Registry, owner_id: &str, device_id: &str) {
+    let candidates = match db.duplicate_candidates(owner_id, device_id) {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::error!(?err, "failed to look up duplicate devices");
+            return;
+        }
+    };
+    let online: Vec<String> = candidates
+        .into_iter()
+        .filter(|id| registry.host_presence(id).is_some())
+        .collect();
+    match db.displace_duplicates(owner_id, device_id, &online) {
+        Ok(gone) if !gone.is_empty() => {
+            tracing::info!(count = gone.len(), ?gone, %device_id, "displaced offline duplicate devices");
+        }
+        Ok(_) => {}
+        Err(err) => tracing::error!(?err, "failed to displace duplicate devices"),
+    }
+}
+
 /// D34: присутствие или занятость устройства сменились -- каждому владельцу
 /// устройства, у которого есть открытые клиентские соединения, шлём свежий
 /// `Devices` (список собирается один раз на владельца). Ошибки БД только
@@ -2576,6 +2599,7 @@ async fn run_client(
                             {
                                 tracing::error!(?err, "failed to link device to owner");
                             }
+                            displace_duplicates_logged(db, registry, &owner_id, &host_id);
                         }
                         // Клиент узнаёт токен нового владельца и список уже с
                         // этим хостом.

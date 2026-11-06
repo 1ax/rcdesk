@@ -4960,3 +4960,195 @@ async fn router_poll_delivers_macs_of_manual_and_host_targets_once() {
     let (status, _, body) = http_get(&url, "/wake/poll", Some(&token)).await;
     assert_eq!((status, body.as_str()), (401, ""));
 }
+
+// ---- U2: displacing offline duplicates on PIN join ----
+
+const U2_MAC: &str = "AA:BB:CC:00:00:01";
+
+/// Registers a host (no credentials) with the given name and MAC.
+async fn u2_register(url: &str, name: &str, mac: &str) -> (WsStream, String, String) {
+    let mut host = connect(url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: name.to_string(),
+            device: None,
+            session_id: None,
+            pin_rotation: false,
+            ifaces: vec![proto::signal::NetIface {
+                mac: mac.to_string(),
+                ipv4: "10.0.0.5".to_string(),
+                prefix: 24,
+            }],
+            os: None,
+        },
+    )
+    .await;
+    match recv(&mut host).await {
+        SignalMessage::Registered { host_id, pin, .. } => (host, host_id, pin),
+        other => panic!("expected registered, got {other:?}"),
+    }
+}
+
+/// Joins by PIN as `client` and returns the `Devices` push that follows.
+async fn u2_join(
+    client: &mut WsStream,
+    host: &mut WsStream,
+    pin: String,
+) -> Vec<proto::signal::DeviceEntry> {
+    send(client, &SignalMessage::Join { pin }).await;
+    let session_id = match recv(client).await {
+        SignalMessage::Joined { session_id, .. } => session_id,
+        other => panic!("expected joined, got {other:?}"),
+    };
+    let devices = recv_devices(client).await;
+    assert!(matches!(recv(host).await, SignalMessage::PeerJoined { .. }));
+    send(
+        client,
+        &SignalMessage::Bye {
+            session_id,
+            reason: None,
+        },
+    )
+    .await;
+    // Host hears Bye (a PIN rotation may come first); owner gets a push.
+    loop {
+        match recv(host).await {
+            SignalMessage::Bye { .. } => break,
+            SignalMessage::PinChanged { .. } => continue,
+            other => panic!("unexpected host message {other:?}"),
+        }
+    }
+    let _ = recv_devices(client).await;
+    devices
+}
+
+async fn u2_owner(url: &str) -> WsStream {
+    let mut client = connect(url).await;
+    hello(&mut client, Role::Client).await;
+    client_auth_owner(&mut client, None).await;
+    client
+}
+
+async fn u2_rename(client: &mut WsStream, device_id: &str, alias: &str) {
+    send(
+        client,
+        &SignalMessage::RenameDevice {
+            device_id: device_id.to_string(),
+            alias: Some(alias.to_string()),
+        },
+    )
+    .await;
+    let _ = recv_devices(client).await;
+}
+
+/// Owner links offline A (name "VM", MAC), names it, A goes away.
+async fn u2_owner_with_offline_a(url: &str, a_name: &str, a_mac: &str) -> (WsStream, String) {
+    let (mut host_a, a_id, pin_a) = u2_register(url, a_name, a_mac).await;
+    let mut owner = u2_owner(url).await;
+    u2_join(&mut owner, &mut host_a, pin_a).await;
+    u2_rename(&mut owner, &a_id, "Тестовая ВМ").await;
+    drop(host_a);
+    let devices = recv_devices(&mut owner).await;
+    assert!(!devices[0].online);
+    (owner, a_id)
+}
+
+#[tokio::test]
+async fn pin_join_displaces_offline_duplicate_and_moves_alias() {
+    let (url, db) = spawn_server_with_db().await;
+    let (mut owner, a_id) = u2_owner_with_offline_a(&url, "VM", U2_MAC).await;
+
+    let (mut host_b, b_id, pin_b) = u2_register(&url, "VM", &U2_MAC.to_lowercase()).await;
+    send(&mut owner, &SignalMessage::Join { pin: pin_b }).await;
+    assert!(matches!(
+        recv(&mut owner).await,
+        SignalMessage::Joined { .. }
+    ));
+    let devices = recv_devices(&mut owner).await;
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].device_id, b_id);
+    assert_eq!(devices[0].alias.as_deref(), Some("Тестовая ВМ"));
+    assert!(matches!(
+        recv(&mut host_b).await,
+        SignalMessage::PeerJoined { .. }
+    ));
+    assert_ne!(a_id, b_id);
+    assert!(db.owners_of_device(&a_id).expect("owners").is_empty());
+    assert!(db.device(&a_id).expect("device").is_some());
+}
+
+#[tokio::test]
+async fn pin_join_keeps_online_duplicate() {
+    let url = spawn_server().await;
+    let (mut host_a, a_id, pin_a) = u2_register(&url, "VM", U2_MAC).await;
+    let mut owner = u2_owner(&url).await;
+    u2_join(&mut owner, &mut host_a, pin_a).await;
+
+    let (mut host_b, b_id, pin_b) = u2_register(&url, "VM", U2_MAC).await;
+    send(&mut owner, &SignalMessage::Join { pin: pin_b }).await;
+    assert!(matches!(
+        recv(&mut owner).await,
+        SignalMessage::Joined { .. }
+    ));
+    let devices = recv_devices(&mut owner).await;
+    assert_eq!(devices.len(), 2);
+    assert!(devices.iter().any(|d| d.device_id == a_id && d.online));
+    assert!(devices.iter().any(|d| d.device_id == b_id));
+    assert!(matches!(
+        recv(&mut host_b).await,
+        SignalMessage::PeerJoined { .. }
+    ));
+}
+
+#[tokio::test]
+async fn pin_join_displacement_does_not_touch_other_owners() {
+    let (url, db) = spawn_server_with_db().await;
+    let (mut host_a, a_id, pin_a) = u2_register(&url, "VM", U2_MAC).await;
+    let mut owner1 = u2_owner(&url).await;
+    u2_join(&mut owner1, &mut host_a, pin_a).await;
+    // Second owner is linked straight in the database (A's PIN may have
+    // rotated after the first session).
+    drop(host_a);
+    let _ = recv_devices(&mut owner1).await;
+    db.insert_owner("second", 1).expect("owner");
+    db.link_device("second", &a_id, 1).expect("link");
+
+    let (mut host_b, b_id, pin_b) = u2_register(&url, "VM", U2_MAC).await;
+    send(&mut owner1, &SignalMessage::Join { pin: pin_b }).await;
+    assert!(matches!(
+        recv(&mut owner1).await,
+        SignalMessage::Joined { .. }
+    ));
+    let devices = recv_devices(&mut owner1).await;
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].device_id, b_id);
+    assert!(matches!(
+        recv(&mut host_b).await,
+        SignalMessage::PeerJoined { .. }
+    ));
+    assert_eq!(db.owners_of_device(&a_id).expect("owners"), ["second"]);
+}
+
+#[tokio::test]
+async fn pin_join_with_other_name_keeps_device() {
+    let url = spawn_server().await;
+    let (mut owner, a_id) = u2_owner_with_offline_a(&url, "VM", U2_MAC).await;
+
+    let (mut host_b, b_id, pin_b) = u2_register(&url, "Other", U2_MAC).await;
+    send(&mut owner, &SignalMessage::Join { pin: pin_b }).await;
+    assert!(matches!(
+        recv(&mut owner).await,
+        SignalMessage::Joined { .. }
+    ));
+    let devices = recv_devices(&mut owner).await;
+    assert_eq!(devices.len(), 2);
+    assert!(devices.iter().any(|d| d.device_id == a_id));
+    let b = devices.iter().find(|d| d.device_id == b_id).expect("b");
+    assert_eq!(b.alias, None);
+    assert!(matches!(
+        recv(&mut host_b).await,
+        SignalMessage::PeerJoined { .. }
+    ));
+}

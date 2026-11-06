@@ -1037,6 +1037,79 @@ impl Db {
         Ok(changed > 0)
     }
 
+    /// U2: кандидаты в дубли устройства `new_device` у владельца `owner_id`:
+    /// другие привязанные устройства с тем же именем и хотя бы одним общим
+    /// MAC (без учёта регистра). Без MAC у любой из сторон дублей нет.
+    pub fn duplicate_candidates(
+        &self,
+        owner_id: &str,
+        new_device: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        duplicate_candidates_in(&conn, owner_id, new_device)
+    }
+
+    /// U2: атомарно вытесняет дубли `new_device` у владельца: отвязывает их
+    /// (устройства не удаляются, чужие привязки не трогаются) и, если у
+    /// `(owner, new_device)` нет псевдонима, переносит псевдоним самой свежей
+    /// по `added_at` вытесняемой привязки. Дубли из `keep_online` (хост в сети)
+    /// пропускаются. Возвращает id отвязанных устройств.
+    pub fn displace_duplicates(
+        &self,
+        owner_id: &str,
+        new_device: &str,
+        keep_online: &[String],
+    ) -> anyhow::Result<Vec<String>> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        let displaced: Vec<String> = duplicate_candidates_in(&tx, owner_id, new_device)?
+            .into_iter()
+            .filter(|id| !keep_online.contains(id))
+            .collect();
+        if displaced.is_empty() {
+            return Ok(displaced);
+        }
+        let new_alias: Option<String> = tx
+            .query_row(
+                "SELECT alias FROM ownership WHERE owner_id = ?1 AND device_id = ?2",
+                (owner_id, new_device),
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let mut inherited: Option<(i64, String)> = None;
+        for id in &displaced {
+            let row: Option<(Option<String>, i64)> = tx
+                .query_row(
+                    "SELECT alias, added_at FROM ownership WHERE owner_id = ?1 AND device_id = ?2",
+                    (owner_id, id),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((Some(alias), added_at)) = row {
+                if !alias.is_empty() && inherited.as_ref().is_none_or(|(t, _)| added_at > *t) {
+                    inherited = Some((added_at, alias));
+                }
+            }
+        }
+        for id in &displaced {
+            tx.execute(
+                "DELETE FROM ownership WHERE owner_id = ?1 AND device_id = ?2",
+                (owner_id, id),
+            )?;
+        }
+        if new_alias.as_deref().is_none_or(str::is_empty) {
+            if let Some((_, alias)) = inherited {
+                tx.execute(
+                    "UPDATE ownership SET alias = ?1 WHERE owner_id = ?2 AND device_id = ?3",
+                    (alias, owner_id, new_device),
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(displaced)
+    }
+
     /// Returns `false` if no such link exists.
     pub fn set_alias(
         &self,
@@ -1533,6 +1606,35 @@ fn migrate_v1_to_v2(conn: &Connection) -> anyhow::Result<()> {
     // Включаем обратно при любом исходе.
     conn.pragma_update(None, "foreign_keys", true)?;
     result
+}
+
+/// U2: общий SQL поиска дублей (см. `Db::duplicate_candidates`). Порядок
+/// детерминирован по `device_id`.
+fn duplicate_candidates_in(
+    conn: &rusqlite::Connection,
+    owner_id: &str,
+    new_device: &str,
+) -> anyhow::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT d.device_id
+         FROM ownership o
+         JOIN devices d ON d.device_id = o.device_id
+         JOIN devices n ON n.device_id = ?2
+         WHERE o.owner_id = ?1
+           AND d.device_id <> ?2
+           AND d.name = n.name
+           AND EXISTS (
+               SELECT 1 FROM device_ifaces a
+               JOIN device_ifaces b ON lower(a.mac) = lower(b.mac)
+               WHERE a.device_id = d.device_id AND b.device_id = ?2
+                 AND a.mac <> ''
+           )
+         ORDER BY d.device_id",
+    )?;
+    let rows = stmt
+        .query_map((owner_id, new_device), |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -2289,6 +2391,100 @@ mod tests {
         assert!(db.delete_wake_device("o1", "w1").expect("delete"));
         assert!(!db.delete_wake_device("o1", "w1").expect("delete"));
         assert_eq!(db.wake_devices_for_owner("o1").expect("list").len(), 1);
+    }
+
+    fn u2_mk(mac: &str) -> proto::signal::NetIface {
+        proto::signal::NetIface {
+            mac: mac.to_string(),
+            ipv4: "10.0.0.5".to_string(),
+            prefix: 24,
+        }
+    }
+
+    fn u2_setup() -> Db {
+        let db = Db::in_memory().expect("db");
+        db.insert_owner("o", 1).expect("owner");
+        db.insert_owner("o2", 1).expect("owner");
+        db.insert_device("n", "h", "VM", 1).expect("n");
+        db.set_device_ifaces("n", &[u2_mk("AA:BB:CC:00:00:01")])
+            .expect("ifaces");
+        db.link_device("o", "n", 100).expect("link");
+        db
+    }
+
+    fn u2_add(db: &Db, id: &str, name: &str, macs: &[&str], owner: &str, at: i64) {
+        db.insert_device(id, "h", name, 1).expect("device");
+        let ifaces: Vec<_> = macs.iter().map(|m| u2_mk(m)).collect();
+        db.set_device_ifaces(id, &ifaces).expect("ifaces");
+        db.link_device(owner, id, at).expect("link");
+    }
+
+    #[test]
+    fn duplicate_candidates_match_name_and_mac_only() {
+        let db = u2_setup();
+        u2_add(&db, "dup", "VM", &["aa:bb:cc:00:00:01"], "o", 10);
+        u2_add(&db, "othername", "Other", &["aa:bb:cc:00:00:01"], "o", 10);
+        u2_add(&db, "othermac", "VM", &["aa:bb:cc:00:00:99"], "o", 10);
+        u2_add(&db, "nomac", "VM", &[], "o", 10);
+        u2_add(&db, "foreign", "VM", &["aa:bb:cc:00:00:01"], "o2", 10);
+        assert_eq!(db.duplicate_candidates("o", "n").expect("c"), ["dup"]);
+    }
+
+    #[test]
+    fn duplicate_candidates_empty_when_new_device_has_no_mac() {
+        let db = u2_setup();
+        db.set_device_ifaces("n", &[]).expect("clear");
+        u2_add(&db, "dup", "VM", &["aa:bb:cc:00:00:01"], "o", 10);
+        assert!(db.duplicate_candidates("o", "n").expect("c").is_empty());
+    }
+
+    #[test]
+    fn displace_duplicates_moves_alias_and_keeps_other_owners() {
+        let db = u2_setup();
+        u2_add(&db, "dup", "VM", &["aa:bb:cc:00:00:01"], "o", 10);
+        db.set_alias("o", "dup", Some("Тестовая ВМ"))
+            .expect("alias");
+        db.link_device("o2", "dup", 5).expect("link o2");
+        let gone = db.displace_duplicates("o", "n", &[]).expect("displace");
+        assert_eq!(gone, ["dup"]);
+        let list = db.devices_for_owner("o").expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].device_id, "n");
+        assert_eq!(list[0].alias.as_deref(), Some("Тестовая ВМ"));
+        assert_eq!(db.devices_for_owner("o2").expect("o2").len(), 1);
+        assert!(db
+            .owners_of_device("dup")
+            .expect("owners")
+            .contains(&"o2".to_string()));
+    }
+
+    #[test]
+    fn displace_duplicates_keeps_own_alias_and_online_duplicates() {
+        let db = u2_setup();
+        db.set_alias("o", "n", Some("Своё")).expect("alias");
+        u2_add(&db, "dup", "VM", &["aa:bb:cc:00:00:01"], "o", 10);
+        u2_add(&db, "live", "VM", &["aa:bb:cc:00:00:01"], "o", 11);
+        db.set_alias("o", "dup", Some("Старое")).expect("alias");
+        let gone = db
+            .displace_duplicates("o", "n", &["live".to_string()])
+            .expect("displace");
+        assert_eq!(gone, ["dup"]);
+        let list = db.devices_for_owner("o").expect("list");
+        let n = list.iter().find(|d| d.device_id == "n").expect("n");
+        assert_eq!(n.alias.as_deref(), Some("Своё"));
+        assert!(list.iter().any(|d| d.device_id == "live"));
+    }
+
+    #[test]
+    fn displace_duplicates_takes_alias_of_freshest() {
+        let db = u2_setup();
+        u2_add(&db, "d1", "VM", &["aa:bb:cc:00:00:01"], "o", 10);
+        u2_add(&db, "d2", "VM", &["aa:bb:cc:00:00:01"], "o", 20);
+        db.set_alias("o", "d1", Some("Старый")).expect("alias");
+        db.set_alias("o", "d2", Some("Свежий")).expect("alias");
+        db.displace_duplicates("o", "n", &[]).expect("displace");
+        let list = db.devices_for_owner("o").expect("list");
+        assert_eq!(list[0].alias.as_deref(), Some("Свежий"));
     }
 
     #[test]
