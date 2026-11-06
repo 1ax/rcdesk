@@ -3385,7 +3385,12 @@ export function mount(root: Element | null): void {
   // session lifecycle through them.
   signaling.on("authenticated", (msg) => {
     const storage = ownerStorage();
-    if (storage) saveOwnerToken(storage, msg.token);
+    // `token: null` -- anonymous connection (no owner yet; the server creates
+    // one lazily and sends a fresh `authenticated`): drop a stale saved token.
+    if (storage) {
+      if (typeof msg.token === "string") saveOwnerToken(storage, msg.token);
+      else clearOwnerToken(storage);
+    }
     devices = msg.devices;
     lanHub = msg.lan_hub === true;
     applyLanHub();

@@ -427,11 +427,14 @@ pub enum SignalMessage {
         #[serde(default)]
         token: Option<String>,
     },
-    /// server -> client, ответ на `ClientAuth`: актуальный токен владельца
-    /// (тот же, если присланный опознан, иначе свежевыданный — его надо
-    /// сохранить) и его текущий список устройств.
+    /// server -> client: актуальный токен владельца и его текущий список
+    /// устройств. Ответ на `ClientAuth`: токен тот же, если присланный
+    /// опознан; иначе `None` — соединение анонимное, владельца нет (он
+    /// заводится лениво при первом действии, которому нужен, и тогда сервер
+    /// шлёт `Authenticated` с новым токеном — его надо сохранить).
     Authenticated {
-        token: String,
+        #[serde(default)]
+        token: Option<String>,
         devices: Vec<DeviceEntry>,
         /// server -> client (D47): сервер — LAN-хаб: аккаунтов, passkey и
         /// почты нет, клиент прячет их UI. `#[serde(default)]`: старый сервер
@@ -860,7 +863,7 @@ mod tests {
     #[test]
     fn authenticated_with_devices_round_trips_through_json() {
         let authenticated = SignalMessage::Authenticated {
-            token: "tok123".to_string(),
+            token: Some("tok123".to_string()),
             devices: vec![DeviceEntry {
                 device_id: "dev123".to_string(),
                 name: "My Mac".to_string(),
@@ -888,11 +891,27 @@ mod tests {
         assert_eq!(
             msg,
             SignalMessage::Authenticated {
-                token: "t".to_string(),
+                token: Some("t".to_string()),
                 devices: Vec::new(),
                 lan_hub: false,
             }
         );
+    }
+
+    #[test]
+    fn authenticated_anonymous_token_is_null_and_missing_field_is_none() {
+        let anonymous = SignalMessage::Authenticated {
+            token: None,
+            devices: Vec::new(),
+            lan_hub: false,
+        };
+        let json = serde_json::to_string(&anonymous).expect("serialize");
+        assert!(json.contains(r#""token":null"#), "{json}");
+        let back: SignalMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, anonymous);
+        let missing: SignalMessage =
+            serde_json::from_str(r#"{"type":"authenticated","devices":[]}"#).expect("deserialize");
+        assert_eq!(missing, anonymous);
     }
 
     #[test]

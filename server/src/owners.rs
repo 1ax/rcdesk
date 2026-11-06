@@ -7,7 +7,7 @@
 //! fresh token means a fresh, empty list. The devices themselves aren't
 //! affected -- they simply get re-paired the next time their owner joins by
 //! PIN. Since slice 3.7a an owner can hold several tokens (one per browser,
-//! each revocable); `authenticate` also reports which token matched.
+//! each revocable); `lookup_token` also reports which token matched.
 
 use crate::db::Db;
 use crate::devices::hash_secret;
@@ -77,22 +77,6 @@ pub fn create_owner(
     Ok((owner_id, token_id, token))
 }
 
-/// Опознаёт владельца по присланному токену или заводит нового.
-/// Возвращает `(owner_id, token_id, token)`: токен тот же, если присланный
-/// опознан (при этом обновляются `last_used_at` и `user_agent`), иначе
-/// свежевыданный — его надо отдать клиенту в `Authenticated`.
-pub fn authenticate(
-    db: &Db,
-    token: Option<&str>,
-    user_agent: &str,
-    now: i64,
-) -> anyhow::Result<(String, String, String)> {
-    if let Some((owner_id, token_id)) = lookup_token(db, token, user_agent, now)? {
-        return Ok((owner_id, token_id, token.unwrap_or_default().to_string()));
-    }
-    create_owner(db, user_agent, now)
-}
-
 /// Выдаёт существующему владельцу новый токен (вход по passkey, слайс
 /// 3.7b). Возвращает `(token_id, token)`; токен надо отдать клиенту.
 pub fn issue_token(
@@ -130,7 +114,7 @@ mod tests {
     fn no_token_creates_owner_with_hashed_token_in_db() {
         let db = Db::in_memory().expect("open in-memory db");
 
-        let (owner_id, token_id, token) = authenticate(&db, None, "UA", 100).expect("authenticate");
+        let (owner_id, token_id, token) = create_owner(&db, "UA", 100).expect("create");
 
         assert!(!token.is_empty());
         assert_eq!(
@@ -147,8 +131,8 @@ mod tests {
     #[test]
     fn two_authentications_without_token_give_different_owners() {
         let db = Db::in_memory().expect("open in-memory db");
-        let (owner_a, token_id_a, token_a) = authenticate(&db, None, "", 100).expect("auth a");
-        let (owner_b, token_id_b, token_b) = authenticate(&db, None, "", 100).expect("auth b");
+        let (owner_a, token_id_a, token_a) = create_owner(&db, "", 100).expect("create a");
+        let (owner_b, token_id_b, token_b) = create_owner(&db, "", 100).expect("create b");
 
         assert_ne!(owner_a, owner_b);
         assert_ne!(token_id_a, token_id_b);
@@ -158,15 +142,11 @@ mod tests {
     #[test]
     fn issued_token_is_recognized_and_usage_is_updated() {
         let db = Db::in_memory().expect("open in-memory db");
-        let (owner_id, token_id, token) =
-            authenticate(&db, None, "UA-old", 100).expect("authenticate");
+        let (owner_id, token_id, token) = create_owner(&db, "UA-old", 100).expect("create");
 
-        let (owner_id2, token_id2, token2) =
-            authenticate(&db, Some(&token), "UA-new", 200).expect("authenticate with issued token");
+        let found = lookup_token(&db, Some(&token), "UA-new", 200).expect("lookup issued token");
 
-        assert_eq!(owner_id2, owner_id);
-        assert_eq!(token_id2, token_id);
-        assert_eq!(token2, token);
+        assert_eq!(found, Some((owner_id.clone(), token_id)));
 
         let tokens = db.tokens_for_owner(&owner_id).expect("tokens");
         assert_eq!(tokens.len(), 1);
@@ -176,22 +156,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_token_issues_a_new_owner_and_a_new_token() {
+    fn missing_or_unknown_token_is_not_recognized_and_creates_nothing() {
         let db = Db::in_memory().expect("open in-memory db");
-        let (owner_id, _, token) = authenticate(&db, None, "", 100).expect("authenticate");
 
-        let (owner_id2, _, token2) = authenticate(&db, Some("not-a-real-token"), "", 200)
-            .expect("authenticate with unknown token");
-
-        assert_ne!(owner_id2, owner_id);
-        assert_ne!(token2, token);
+        assert_eq!(lookup_token(&db, None, "", 100).expect("lookup"), None);
+        assert_eq!(
+            lookup_token(&db, Some("not-a-real-token"), "", 200).expect("lookup"),
+            None
+        );
     }
 
     #[test]
     fn user_agent_is_truncated_on_char_boundary() {
         let db = Db::in_memory().expect("open in-memory db");
         let long = "я".repeat(300);
-        let (owner_id, _, _) = authenticate(&db, None, &long, 100).expect("authenticate");
+        let (owner_id, _, _) = create_owner(&db, &long, 100).expect("create");
 
         let tokens = db.tokens_for_owner(&owner_id).expect("tokens");
         assert_eq!(tokens[0].user_agent.chars().count(), 256);
@@ -200,7 +179,7 @@ mod tests {
     #[test]
     fn issue_token_adds_a_second_working_token_to_the_same_owner() {
         let db = Db::in_memory().expect("open in-memory db");
-        let (owner_id, _, first) = authenticate(&db, None, "UA1", 100).expect("authenticate");
+        let (owner_id, _, first) = create_owner(&db, "UA1", 100).expect("create");
 
         let (token_id, second) = issue_token(&db, &owner_id, "UA2", 200).expect("issue");
 

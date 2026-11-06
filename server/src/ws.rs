@@ -1011,6 +1011,146 @@ fn require_owner(db: &Db, session: &mut Option<ClientSession>, tx: &Tx) -> Optio
     }
 }
 
+/// Что вернул `owner_for_read`.
+enum ReadOwner {
+    /// Владелец жив.
+    Owner(String),
+    /// Соединение анонимное (владельца не было или он вышел сам): запрос
+    /// чтения отвечает пустым результатом.
+    Anonymous,
+    /// Ответ (`not authenticated` / `internal error`) уже отправлен.
+    Handled,
+}
+
+/// Владелец для запросов чтения, которым аноним отвечает пусто. Если
+/// владелец БЫЛ, но токен отозван посреди соединения (`owner_lost`),
+/// отвечает `not authenticated`: по этой ошибке клиент узнаёт об отзыве.
+fn owner_for_read(
+    db: &Db,
+    session: &mut Option<ClientSession>,
+    owner_lost: &mut bool,
+    tx: &Tx,
+) -> ReadOwner {
+    if session.is_none() && !*owner_lost {
+        return ReadOwner::Anonymous;
+    }
+    match current_owner(db, session) {
+        Ok(Some(owner_id)) => ReadOwner::Owner(owner_id),
+        Ok(None) => {
+            *owner_lost = true;
+            send_error(tx, "not authenticated");
+            ReadOwner::Handled
+        }
+        Err(err) => {
+            tracing::error!(?err, "failed to check owner token");
+            send_error(tx, "internal error");
+            ReadOwner::Handled
+        }
+    }
+}
+
+/// Итог `ensure_owner_quiet`.
+enum Ensured {
+    /// У соединения уже был живой владелец.
+    Existing(String),
+    /// Владелец только что создан (`session` выставлен, клиент ещё не знает).
+    Created(String),
+    /// Исчерпан лимит создания владельцев с этого IP.
+    Limited,
+    /// Ошибка БД (залогирована).
+    Failed,
+}
+
+/// Лениво заводит владельца соединения, если живого нет. Клиенту ничего не
+/// шлёт: `Authenticated` отправляет `announce_owner`.
+fn ensure_owner_quiet(
+    db: &Db,
+    owner_limiter: &IpLimiter,
+    ip: IpAddr,
+    user_agent: &str,
+    session: &mut Option<ClientSession>,
+) -> Ensured {
+    match current_owner(db, session) {
+        Ok(Some(owner_id)) => return Ensured::Existing(owner_id),
+        Ok(None) => {}
+        Err(err) => {
+            tracing::error!(?err, "failed to check owner token");
+            return Ensured::Failed;
+        }
+    }
+    if !owner_limiter.check(ip) {
+        tracing::warn!(%ip, "new owner creation rate-limited");
+        return Ensured::Limited;
+    }
+    match owners::create_owner(db, user_agent, ice::now_unix() as i64) {
+        Ok((owner_id, token_id, token)) => {
+            owner_limiter.spend(ip);
+            *session = Some(ClientSession {
+                owner_id: owner_id.clone(),
+                token_id,
+                token,
+            });
+            Ensured::Created(owner_id)
+        }
+        Err(err) => {
+            tracing::error!(?err, "failed to create owner");
+            Ensured::Failed
+        }
+    }
+}
+
+/// Шлёт `Authenticated` с токеном и актуальным списком устройств владельца
+/// соединения (если он есть).
+fn announce_owner(
+    db: &Db,
+    registry: &Registry,
+    session: &Option<ClientSession>,
+    lan_hub: bool,
+    tx: &Tx,
+) {
+    if let Some(current) = session {
+        send_authenticated(
+            db,
+            registry,
+            &current.owner_id,
+            current.token.clone(),
+            lan_hub,
+            tx,
+        );
+    }
+}
+
+/// Владелец для действий, которым он нужен: возвращает живого или лениво
+/// заводит нового и сообщает клиенту токен (`Authenticated`). При лимите —
+/// `too many attempts`, при ошибке БД — `internal error`, возвращает `None`.
+#[allow(clippy::too_many_arguments)]
+fn ensure_owner(
+    db: &Db,
+    registry: &Registry,
+    owner_limiter: &IpLimiter,
+    ip: IpAddr,
+    user_agent: &str,
+    lan_hub: bool,
+    session: &mut Option<ClientSession>,
+    tx: &Tx,
+) -> Option<String> {
+    match ensure_owner_quiet(db, owner_limiter, ip, user_agent, session) {
+        Ensured::Existing(owner_id) => Some(owner_id),
+        Ensured::Created(owner_id) => {
+            announce_owner(db, registry, session, lan_hub, tx);
+            Some(owner_id)
+        }
+        Ensured::Limited => {
+            send_error(tx, "too many attempts");
+            None
+        }
+        Ensured::Failed => {
+            send_error(tx, "internal error");
+            None
+        }
+    }
+}
+
 /// Список браузеров владельца для `Browsers`; `current_token_id` помечает
 /// токен этого соединения.
 fn browser_entries(
@@ -1146,7 +1286,7 @@ fn send_authenticated(
         }
     };
     let _ = tx.send(SignalMessage::Authenticated {
-        token,
+        token: Some(token),
         devices,
         lan_hub,
     });
@@ -1245,6 +1385,7 @@ async fn handle_email_code_confirm(
     db: &Db,
     registry: &Registry,
     session: &mut Option<ClientSession>,
+    owner_limiter: &IpLimiter,
     ip: IpAddr,
     user_agent: &str,
     tx: &Tx,
@@ -1291,9 +1432,18 @@ async fn handle_email_code_confirm(
         }
         _ => {}
     }
-    // Владелец проверяется до argon2: без него регистрация невозможна.
+    // Владелец заводится до argon2 (лениво): без него регистрация невозможна.
     let register_owner = if existing.is_none() {
-        match require_owner(db, session, tx) {
+        match ensure_owner(
+            db,
+            registry,
+            owner_limiter,
+            ip,
+            user_agent,
+            deps.lan_hub,
+            session,
+            tx,
+        ) {
             Some(owner_id) => Some(owner_id),
             None => return,
         }
@@ -1553,8 +1703,20 @@ async fn run_client(
     // D34: владелец, за которым соединение сейчас числится в registry
     // (получатель push-`Devices`).
     let mut watched_owner: Option<String> = None;
+    // Владелец БЫЛ, но его токен отозван посреди соединения: запросы чтения
+    // отвечают `not authenticated`, а не пусто (как анониму). `known_owner` --
+    // был ли владелец на прошлой итерации; штатные выходы (`SignOut`) его
+    // сбрасывают, чтобы не считаться потерей.
+    let mut owner_lost = false;
+    let mut known_owner = false;
 
     loop {
+        if session.is_some() {
+            owner_lost = false;
+        } else if known_owner {
+            owner_lost = true;
+        }
+        known_owner = session.is_some();
         // Сверяем в начале каждой итерации, до `next_message`: ни один
         // `continue` ниже не пропустит смену владельца (вход, выход,
         // слияние, отзыв токена).
@@ -1584,57 +1746,41 @@ async fn run_client(
         match msg {
             SignalMessage::ClientAuth { token } => {
                 let now = ice::now_unix() as i64;
-                let auth = match owners::lookup_token(db, token.as_deref(), &user_agent, now) {
+                match owners::lookup_token(db, token.as_deref(), &user_agent, now) {
                     Ok(Some((owner_id, token_id))) => {
-                        Ok((owner_id, token_id, token.unwrap_or_default()))
-                    }
-                    Ok(None) => {
-                        if !owner_limiter.check(ip) {
-                            tracing::warn!(%ip, "new owner creation rate-limited");
-                            let _ = tx.send(SignalMessage::Error {
-                                message: "too many attempts".to_string(),
-                            });
-                            continue;
-                        }
-                        let created = owners::create_owner(db, &user_agent, now);
-                        if created.is_ok() {
-                            owner_limiter.spend(ip);
-                        }
-                        created
-                    }
-                    Err(err) => Err(err),
-                };
-                match auth {
-                    Ok((owner_id, token_id, token)) => {
-                        let devices = match device_entries_for_owner(db, registry, &owner_id) {
-                            Ok(devices) => devices,
-                            Err(err) => {
-                                tracing::error!(?err, "failed to load devices for owner");
-                                Vec::new()
-                            }
-                        };
                         session = Some(ClientSession {
                             owner_id,
                             token_id,
-                            token: token.clone(),
+                            token: token.unwrap_or_default(),
                         });
+                        announce_owner(db, registry, &session, account_deps.lan_hub, &tx);
+                    }
+                    Ok(None) => {
+                        // Владелец заводится лениво (`ensure_owner`), не здесь.
+                        session = None;
+                        known_owner = false;
                         let _ = tx.send(SignalMessage::Authenticated {
-                            token,
-                            devices,
+                            token: None,
+                            devices: Vec::new(),
                             lan_hub: account_deps.lan_hub,
                         });
                     }
                     Err(err) => {
                         tracing::error!(?err, "owner authentication failed");
-                        let _ = tx.send(SignalMessage::Error {
-                            message: "internal error".to_string(),
-                        });
+                        send_error(&tx, "internal error");
                     }
                 }
             }
             SignalMessage::ListDevices => {
-                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
-                    continue;
+                let owner_id = match owner_for_read(db, &mut session, &mut owner_lost, &tx) {
+                    ReadOwner::Owner(owner_id) => owner_id,
+                    ReadOwner::Anonymous => {
+                        let _ = tx.send(SignalMessage::Devices {
+                            devices: Vec::new(),
+                        });
+                        continue;
+                    }
+                    ReadOwner::Handled => continue,
                 };
                 match device_entries_for_owner(db, registry, &owner_id) {
                     Ok(devices) => {
@@ -1649,8 +1795,15 @@ async fn run_client(
                 }
             }
             SignalMessage::ListBrowsers => {
-                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
-                    continue;
+                let owner_id = match owner_for_read(db, &mut session, &mut owner_lost, &tx) {
+                    ReadOwner::Owner(owner_id) => owner_id,
+                    ReadOwner::Anonymous => {
+                        let _ = tx.send(SignalMessage::Browsers {
+                            browsers: Vec::new(),
+                        });
+                        continue;
+                    }
+                    ReadOwner::Handled => continue,
                 };
                 let current = session.as_ref().map(|s| s.token_id.as_str()).unwrap_or("");
                 match browser_entries(db, &owner_id, current) {
@@ -1675,6 +1828,7 @@ async fn run_client(
                     .unwrap_or_default();
                 if id == current {
                     sign_out(db, &mut session, &tx);
+                    known_owner = false;
                     continue;
                 }
                 match db
@@ -1697,15 +1851,32 @@ async fn run_client(
                     continue;
                 }
                 sign_out(db, &mut session, &tx);
+                known_owner = false;
             }
             SignalMessage::ListPasskeys => {
-                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
-                    continue;
+                let owner_id = match owner_for_read(db, &mut session, &mut owner_lost, &tx) {
+                    ReadOwner::Owner(owner_id) => owner_id,
+                    ReadOwner::Anonymous => {
+                        let _ = tx.send(SignalMessage::Passkeys {
+                            passkeys: Vec::new(),
+                        });
+                        continue;
+                    }
+                    ReadOwner::Handled => continue,
                 };
                 send_passkeys(db, &owner_id, &tx);
             }
             SignalMessage::PasskeyRegisterStart => {
-                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                let Some(owner_id) = ensure_owner(
+                    db,
+                    registry,
+                    owner_limiter,
+                    ip,
+                    &user_agent,
+                    account_deps.lan_hub,
+                    &mut session,
+                    &tx,
+                ) else {
                     continue;
                 };
                 // S-7: лимит числа ключей на владельца.
@@ -1794,20 +1965,14 @@ async fn run_client(
                     }
                 };
                 match switch_to_account(db, &mut session, &owner_id, &user_agent, now) {
-                    Ok(token) => {
-                        let devices = match device_entries_for_owner(db, registry, &owner_id) {
-                            Ok(devices) => devices,
-                            Err(err) => {
-                                tracing::error!(?err, "failed to load devices for owner");
-                                Vec::new()
-                            }
-                        };
-                        let _ = tx.send(SignalMessage::Authenticated {
-                            token,
-                            devices,
-                            lan_hub: account_deps.lan_hub,
-                        });
-                    }
+                    Ok(token) => send_authenticated(
+                        db,
+                        registry,
+                        &owner_id,
+                        token,
+                        account_deps.lan_hub,
+                        &tx,
+                    ),
                     Err(err) => {
                         tracing::error!(?err, "failed to sign in with passkey");
                         let _ = tx.send(SignalMessage::Error {
@@ -1830,6 +1995,7 @@ async fn run_client(
                     db,
                     registry,
                     &mut session,
+                    owner_limiter,
                     ip,
                     &user_agent,
                     &tx,
@@ -1900,8 +2066,16 @@ async fn run_client(
                 }
             }
             SignalMessage::GetAccount => {
-                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
-                    continue;
+                let owner_id = match owner_for_read(db, &mut session, &mut owner_lost, &tx) {
+                    ReadOwner::Owner(owner_id) => owner_id,
+                    ReadOwner::Anonymous => {
+                        let _ = tx.send(SignalMessage::Account {
+                            email: None,
+                            is_admin: false,
+                        });
+                        continue;
+                    }
+                    ReadOwner::Handled => continue,
                 };
                 send_account(db, account_deps.admin_emails, &owner_id, &tx);
             }
@@ -2040,8 +2214,15 @@ async fn run_client(
                 });
             }
             SignalMessage::ListWakeNetworks => {
-                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
-                    continue;
+                let owner_id = match owner_for_read(db, &mut session, &mut owner_lost, &tx) {
+                    ReadOwner::Owner(owner_id) => owner_id,
+                    ReadOwner::Anonymous => {
+                        let _ = tx.send(SignalMessage::WakeNetworks {
+                            networks: Vec::new(),
+                        });
+                        continue;
+                    }
+                    ReadOwner::Handled => continue,
                 };
                 match owner_wake_networks(db, &owner_id) {
                     Ok(networks) => {
@@ -2059,7 +2240,16 @@ async fn run_client(
                 network,
                 prefix,
             } => {
-                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                let Some(owner_id) = ensure_owner(
+                    db,
+                    registry,
+                    owner_limiter,
+                    ip,
+                    &user_agent,
+                    account_deps.lan_hub,
+                    &mut session,
+                    &tx,
+                ) else {
                     continue;
                 };
 
@@ -2135,7 +2325,16 @@ async fn run_client(
                 network,
                 prefix,
             } => {
-                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                let Some(owner_id) = ensure_owner(
+                    db,
+                    registry,
+                    owner_limiter,
+                    ip,
+                    &user_agent,
+                    account_deps.lan_hub,
+                    &mut session,
+                    &tx,
+                ) else {
                     continue;
                 };
 
@@ -2332,15 +2531,25 @@ async fn run_client(
                 match registry.join(&pin, tx.clone(), pin_ttl, Instant::now()) {
                     Ok((session_id, host_id, host_name, host_tx, new_pin)) => {
                         tracing::info!(%session_id, "client joined");
-                        let owner = current_owner(db, &mut session);
-                        if let Err(err) = &owner {
-                            tracing::error!(?err, "failed to check owner token");
-                        }
+                        // Владелец нужен для привязки устройства и журнала
+                        // сеансов: заводится лениво. Лимит/ошибка БД -- сеанс
+                        // идёт без владельца.
+                        let (owner, created) = match ensure_owner_quiet(
+                            db,
+                            owner_limiter,
+                            ip,
+                            &user_agent,
+                            &mut session,
+                        ) {
+                            Ensured::Existing(owner_id) => (Some(owner_id), false),
+                            Ensured::Created(owner_id) => (Some(owner_id), true),
+                            Ensured::Limited | Ensured::Failed => (None, false),
+                        };
                         insert_session_logged(
                             db,
                             &session_id,
                             &host_id,
-                            owner.as_ref().ok().and_then(|o| o.as_deref()),
+                            owner.as_deref(),
                             "pin",
                             &user_agent,
                         );
@@ -2361,12 +2570,17 @@ async fn run_client(
                         if let Some(pin) = new_pin {
                             let _ = host_tx.send(SignalMessage::PinChanged { pin });
                         }
-                        if let Ok(Some(owner_id)) = owner {
+                        if let Some(owner_id) = owner {
                             if let Err(err) =
                                 db.link_device(&owner_id, &host_id, ice::now_unix() as i64)
                             {
                                 tracing::error!(?err, "failed to link device to owner");
                             }
+                        }
+                        // Клиент узнаёт токен нового владельца и список уже с
+                        // этим хостом.
+                        if created {
+                            announce_owner(db, registry, &session, account_deps.lan_hub, &tx);
                         }
                         notify_device_owners(db, registry, &host_id);
                     }
@@ -2585,7 +2799,7 @@ mod tests {
 
     fn anonymous_session(db: &Db, now: i64) -> (Option<ClientSession>, String, String) {
         let (owner_id, token_id, token) =
-            owners::authenticate(db, None, "UA", now).expect("authenticate");
+            owners::create_owner(db, "UA", now).expect("create owner");
         (
             Some(ClientSession {
                 owner_id: owner_id.clone(),

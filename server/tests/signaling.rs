@@ -162,6 +162,26 @@ async fn expect_silence(ws: &mut WsStream, dur: Duration) {
     }
 }
 
+/// Like `expect_silence`, but for a client that is already an owner: presence
+/// pushes (`Devices`) are fine, a `Bye`/`Error` is not.
+async fn expect_no_bye(ws: &mut WsStream, dur: Duration) {
+    let deadline = tokio::time::Instant::now() + dur;
+    while let Ok(item) = tokio::time::timeout_at(deadline, ws.next()).await {
+        match item {
+            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Text(text))) => {
+                match serde_json::from_str(&text).expect("parse signal message") {
+                    SignalMessage::Devices { .. } => {}
+                    other => panic!("expected no Bye/Error, got {other:?}"),
+                }
+            }
+            Some(Ok(other)) => panic!("expected silence, got {other:?}"),
+            Some(Err(err)) => panic!("expected silence, got transport error {err:?}"),
+            None => return,
+        }
+    }
+}
+
 async fn hello(ws: &mut WsStream, role: Role) {
     send(
         ws,
@@ -174,15 +194,62 @@ async fn hello(ws: &mut WsStream, role: Role) {
 }
 
 /// Sends `ClientAuth { token }` and returns the `Authenticated` response's
-/// own token and device list.
+/// own token (`None` = anonymous connection, no owner) and device list.
 async fn client_auth(
     ws: &mut WsStream,
     token: Option<String>,
-) -> (String, Vec<proto::signal::DeviceEntry>) {
+) -> (Option<String>, Vec<proto::signal::DeviceEntry>) {
     send(ws, &SignalMessage::ClientAuth { token }).await;
     match recv(ws).await {
         SignalMessage::Authenticated { token, devices, .. } => (token, devices),
         other => panic!("expected authenticated, got {other:?}"),
+    }
+}
+
+/// Makes the connection an owner by an action that needs one and leaves no
+/// side effects on the device list (`AddRouterWaker` for an unknown network):
+/// reads the `Authenticated` with the fresh token, then the refusal.
+async fn become_owner(ws: &mut WsStream) -> String {
+    send(
+        ws,
+        &SignalMessage::AddRouterWaker {
+            name: "Probe".to_string(),
+            network: "0.0.0.0".to_string(),
+            prefix: 0,
+        },
+    )
+    .await;
+    let (token, _) = expect_authenticated_with_token(ws).await;
+    expect_error(ws, "unknown network").await;
+    token
+}
+
+/// `ClientAuth` followed by, if the server answered anonymously, a lazy
+/// owner creation (`become_owner`). Returns the connection's token and the
+/// device list known after `ClientAuth`.
+async fn client_auth_owner(
+    ws: &mut WsStream,
+    token: Option<String>,
+) -> (String, Vec<proto::signal::DeviceEntry>) {
+    let (token, devices) = client_auth(ws, token).await;
+    match token {
+        Some(token) => (token, devices),
+        None => (become_owner(ws).await, devices),
+    }
+}
+
+/// Reads the next message, which must be an `Authenticated` carrying a
+/// token (lazy owner creation); returns the token and the device list.
+async fn expect_authenticated_with_token(
+    ws: &mut WsStream,
+) -> (String, Vec<proto::signal::DeviceEntry>) {
+    match recv(ws).await {
+        SignalMessage::Authenticated {
+            token: Some(token),
+            devices,
+            ..
+        } => (token, devices),
+        other => panic!("expected authenticated with a token, got {other:?}"),
     }
 }
 
@@ -263,6 +330,8 @@ async fn host_and_joined_client(url: &str) -> (WsStream, WsStream, String, Strin
         SignalMessage::Joined { session_id, .. } => session_id,
         other => panic!("expected joined, got {other:?}"),
     };
+    // An anonymous joiner becomes an owner lazily: token + device list follow.
+    expect_authenticated_with_token(&mut client).await;
     match recv(&mut host).await {
         SignalMessage::PeerJoined { .. } => {}
         other => panic!("expected peer_joined, got {other:?}"),
@@ -634,6 +703,7 @@ async fn client_in_session_cannot_join_a_second_host() {
         SignalMessage::Joined { .. } => {}
         other => panic!("expected joined, got {other:?}"),
     }
+    expect_authenticated_with_token(&mut client).await;
     send(&mut client, &SignalMessage::Join { pin: pin2.clone() }).await;
     match recv(&mut client).await {
         SignalMessage::Error { message } => assert_eq!(message, "already in session"),
@@ -919,6 +989,7 @@ async fn re_registering_same_device_displaces_old_connection_without_bye_to_its_
         SignalMessage::Joined { .. } => {}
         other => panic!("expected joined, got {other:?}"),
     };
+    expect_authenticated_with_token(&mut client).await;
     match recv(&mut host1).await {
         SignalMessage::PeerJoined { .. } => {}
         other => panic!("expected peer_joined, got {other:?}"),
@@ -943,7 +1014,7 @@ async fn re_registering_same_device_displaces_old_connection_without_bye_to_its_
         SignalMessage::Error { message } => assert_eq!(message, "replaced by a new connection"),
         other => panic!("expected error, got {other:?}"),
     }
-    expect_silence(&mut client, SILENCE_TIMEOUT).await;
+    expect_no_bye(&mut client, SILENCE_TIMEOUT).await;
     match recv(&mut host2).await {
         SignalMessage::Registered {
             host_id, device, ..
@@ -985,6 +1056,7 @@ async fn displaced_host_connection_is_closed_and_cannot_bye_the_session() {
         SignalMessage::Joined { session_id, .. } => session_id,
         other => panic!("expected joined, got {other:?}"),
     };
+    expect_authenticated_with_token(&mut client).await;
     match recv(&mut old).await {
         SignalMessage::PeerJoined { .. } => {}
         other => panic!("expected peer_joined, got {other:?}"),
@@ -1032,21 +1104,23 @@ async fn displaced_host_connection_is_closed_and_cannot_bye_the_session() {
             Some(Ok(other)) => panic!("expected close, got {other:?}"),
         }
     }
-    expect_silence(&mut client, SILENCE_TIMEOUT).await;
+    expect_no_bye(&mut client, SILENCE_TIMEOUT).await;
 }
 
-// (m) a client with no saved token sends ClientAuth{token: None} and gets
-// back a fresh, non-empty token with an empty device list.
+// (m) U1: a client with no saved token sends ClientAuth{token: None} and
+// gets an anonymous `Authenticated` (no token, no devices); no owner is
+// created -- owners appear lazily, on the first action that needs one.
 #[tokio::test]
-async fn client_auth_without_token_issues_token_with_empty_devices() {
-    let url = spawn_server().await;
+async fn client_auth_without_token_is_anonymous_and_creates_no_owner() {
+    let (url, db) = spawn_server_with_db().await;
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
 
     let (token, devices) = client_auth(&mut client, None).await;
 
-    assert!(!token.is_empty());
+    assert_eq!(token, None);
     assert!(devices.is_empty());
+    assert!(db.admin_owner_rows().expect("owners").is_empty());
 }
 
 // (n) presenting a previously issued token on a new connection is
@@ -1056,27 +1130,29 @@ async fn client_auth_with_known_token_returns_same_token() {
     let url = spawn_server().await;
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
-    let (token, _devices) = client_auth(&mut client, None).await;
+    let (token, _devices) = client_auth_owner(&mut client, None).await;
     drop(client);
 
     let mut client2 = connect(&url).await;
     hello(&mut client2, Role::Client).await;
-    let (token2, _devices2) = client_auth(&mut client2, Some(token.clone())).await;
+    let (token2, _devices2) = client_auth_owner(&mut client2, Some(token.clone())).await;
 
     assert_eq!(token2, token);
 }
 
-// (o) an unrecognized token is not resurrected: a different owner and token
-// are issued instead.
+// (o) an unrecognized token is not resurrected and does not create an owner:
+// the connection is anonymous (`token: None`).
 #[tokio::test]
-async fn client_auth_with_unknown_token_issues_a_different_token() {
-    let url = spawn_server().await;
+async fn client_auth_with_unknown_token_is_anonymous_and_creates_no_owner() {
+    let (url, db) = spawn_server_with_db().await;
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
 
-    let (token, _devices) = client_auth(&mut client, Some("not-a-real-token".to_string())).await;
+    let (token, devices) = client_auth(&mut client, Some("not-a-real-token".to_string())).await;
 
-    assert_ne!(token, "not-a-real-token");
+    assert_eq!(token, None);
+    assert!(devices.is_empty());
+    assert!(db.admin_owner_rows().expect("owners").is_empty());
 }
 
 // (p) after ClientAuth, joining by PIN links the device to the owner: on a
@@ -1115,7 +1191,7 @@ async fn joining_by_pin_after_client_auth_links_device_to_owner() {
 
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
-    let (token, _devices) = client_auth(&mut client, None).await;
+    let (token, _devices) = client_auth_owner(&mut client, None).await;
     send(&mut client, &SignalMessage::Join { pin }).await;
     match recv(&mut client).await {
         SignalMessage::Joined { .. } => {}
@@ -1129,7 +1205,7 @@ async fn joining_by_pin_after_client_auth_links_device_to_owner() {
 
     let mut client2 = connect(&url).await;
     hello(&mut client2, Role::Client).await;
-    let (_token2, devices) = client_auth(&mut client2, Some(token)).await;
+    let (_token2, devices) = client_auth_owner(&mut client2, Some(token)).await;
 
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0].device_id, host_id);
@@ -1166,7 +1242,7 @@ async fn connect_device_starts_a_session_for_a_linked_device() {
     // that session so the host is free for `ConnectDevice`.
     let mut linking_client = connect(&url).await;
     hello(&mut linking_client, Role::Client).await;
-    let (token, _devices) = client_auth(&mut linking_client, None).await;
+    let (token, _devices) = client_auth_owner(&mut linking_client, None).await;
     send(&mut linking_client, &SignalMessage::Join { pin }).await;
     let session_id = match recv(&mut linking_client).await {
         SignalMessage::Joined { session_id, .. } => session_id,
@@ -1194,7 +1270,7 @@ async fn connect_device_starts_a_session_for_a_linked_device() {
 
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
-    client_auth(&mut client, Some(token)).await;
+    client_auth_owner(&mut client, Some(token)).await;
     send(
         &mut client,
         &SignalMessage::ConnectDevice {
@@ -1229,7 +1305,7 @@ async fn connect_device_for_unlinked_device_returns_error() {
     let url = spawn_server().await;
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
-    client_auth(&mut client, None).await;
+    client_auth_owner(&mut client, None).await;
 
     send(
         &mut client,
@@ -1272,7 +1348,7 @@ async fn connect_device_for_offline_device_returns_error() {
 
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
-    client_auth(&mut client, None).await;
+    client_auth_owner(&mut client, None).await;
     send(&mut client, &SignalMessage::Join { pin }).await;
     match recv(&mut client).await {
         SignalMessage::Joined { .. } => {}
@@ -1313,18 +1389,18 @@ async fn connect_device_for_offline_device_returns_error() {
     assert_eq!(message, "device offline");
 }
 
-// (t) ListDevices and ConnectDevice before any ClientAuth -> Error{"not
-// authenticated"}.
+// (t) U1: ListDevices from an anonymous connection answers an empty list;
+// ConnectDevice (needs an owner) -> Error{"not authenticated"}.
 #[tokio::test]
-async fn list_devices_and_connect_device_without_client_auth_return_not_authenticated() {
+async fn list_devices_is_empty_and_connect_device_not_authenticated_without_owner() {
     let url = spawn_server().await;
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
 
     send(&mut client, &SignalMessage::ListDevices).await;
     match recv(&mut client).await {
-        SignalMessage::Error { message } => assert_eq!(message, "not authenticated"),
-        other => panic!("expected error, got {other:?}"),
+        SignalMessage::Devices { devices } => assert!(devices.is_empty()),
+        other => panic!("expected empty devices, got {other:?}"),
     }
 
     send(
@@ -1367,7 +1443,7 @@ async fn rename_device_updates_alias_and_forget_device_removes_it() {
 
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
-    client_auth(&mut client, None).await;
+    client_auth_owner(&mut client, None).await;
     send(&mut client, &SignalMessage::Join { pin }).await;
     match recv(&mut client).await {
         SignalMessage::Joined { .. } => {}
@@ -1499,7 +1575,7 @@ async fn host_reconnect_with_live_session_id_marks_device_busy_until_bye() {
     // `connect_device_starts_a_session_for_a_linked_device`.
     let mut owner = connect(&url).await;
     hello(&mut owner, Role::Client).await;
-    let (token, _devices) = client_auth(&mut owner, None).await;
+    let (token, _devices) = client_auth_owner(&mut owner, None).await;
     send(&mut owner, &SignalMessage::Join { pin }).await;
     let session_id = match recv(&mut owner).await {
         SignalMessage::Joined { session_id, .. } => session_id,
@@ -1552,14 +1628,14 @@ async fn host_reconnect_with_live_session_id_marks_device_busy_until_bye() {
 
     let mut viewer = connect(&url).await;
     hello(&mut viewer, Role::Client).await;
-    let (_token2, devices) = client_auth(&mut viewer, Some(token.clone())).await;
+    let (_token2, devices) = client_auth_owner(&mut viewer, Some(token.clone())).await;
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0].device_id, host_id);
     assert!(devices[0].busy, "device must be busy after re-attaching");
 
     let mut second_client = connect(&url).await;
     hello(&mut second_client, Role::Client).await;
-    client_auth(&mut second_client, Some(token.clone())).await;
+    client_auth_owner(&mut second_client, Some(token.clone())).await;
     send(
         &mut second_client,
         &SignalMessage::ConnectDevice {
@@ -1718,7 +1794,7 @@ async fn second_connection_with_same_token_shares_devices_and_lists_one_browser(
 
     let mut first = connect(&url).await;
     hello(&mut first, Role::Client).await;
-    let (token, _) = client_auth(&mut first, None).await;
+    let (token, _) = client_auth_owner(&mut first, None).await;
     send(&mut first, &SignalMessage::Join { pin }).await;
     match recv(&mut first).await {
         SignalMessage::Joined { .. } => {}
@@ -1727,7 +1803,7 @@ async fn second_connection_with_same_token_shares_devices_and_lists_one_browser(
 
     let mut second = connect(&url).await;
     hello(&mut second, Role::Client).await;
-    let (token2, devices) = client_auth(&mut second, Some(token.clone())).await;
+    let (token2, devices) = client_auth_owner(&mut second, Some(token.clone())).await;
     assert_eq!(token2, token);
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0].device_id, host_id);
@@ -1748,7 +1824,7 @@ async fn revoking_another_browser_signs_that_connection_out() {
 
     let mut a = connect(&url).await;
     hello(&mut a, Role::Client).await;
-    let (token_a, _) = client_auth(&mut a, None).await;
+    let (token_a, _) = client_auth_owner(&mut a, None).await;
     let (owner_id, token_id_a) = db
         .token_by_hash(&rcdesk_server::devices::hash_secret(&token_a))
         .expect("query token")
@@ -1764,7 +1840,7 @@ async fn revoking_another_browser_signs_that_connection_out() {
 
     let mut b = connect(&url).await;
     hello(&mut b, Role::Client).await;
-    let (token_b, _) = client_auth(&mut b, Some("token-b-secret".to_string())).await;
+    let (token_b, _) = client_auth_owner(&mut b, Some("token-b-secret".to_string())).await;
     assert_eq!(token_b, "token-b-secret");
 
     send(&mut a, &SignalMessage::ListBrowsers).await;
@@ -1789,7 +1865,7 @@ async fn revoking_another_browser_signs_that_connection_out() {
 
     let mut b2 = connect(&url).await;
     hello(&mut b2, Role::Client).await;
-    let (new_token, devices) = client_auth(&mut b2, Some("token-b-secret".to_string())).await;
+    let (new_token, devices) = client_auth_owner(&mut b2, Some("token-b-secret".to_string())).await;
     assert_ne!(new_token, "token-b-secret");
     assert!(devices.is_empty());
     let (new_owner, _) = db
@@ -1799,28 +1875,32 @@ async fn revoking_another_browser_signs_that_connection_out() {
     assert_ne!(new_owner, owner_id);
 }
 
-// (3.7a-c) SignOut -> SignedOut; afterwards the connection is "not
-// authenticated" and the token is no longer recognized.
+// (3.7a-c) SignOut -> SignedOut; afterwards the connection is anonymous
+// (reads answer empty) and the token is no longer recognized.
 #[tokio::test]
 async fn sign_out_forgets_owner_and_invalidates_token() {
     let url = spawn_server().await;
 
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
-    let (token, _) = client_auth(&mut client, None).await;
+    let (token, _) = client_auth_owner(&mut client, None).await;
 
     send(&mut client, &SignalMessage::SignOut).await;
     match recv(&mut client).await {
         SignalMessage::SignedOut => {}
         other => panic!("expected signed_out, got {other:?}"),
     }
+    // Sign-out is a regular exit, not a loss: the connection is anonymous now.
     send(&mut client, &SignalMessage::ListDevices).await;
-    expect_not_authenticated(&mut client).await;
+    match recv(&mut client).await {
+        SignalMessage::Devices { devices } => assert!(devices.is_empty()),
+        other => panic!("expected empty devices, got {other:?}"),
+    }
 
     let mut again = connect(&url).await;
     hello(&mut again, Role::Client).await;
     let (new_token, _) = client_auth(&mut again, Some(token.clone())).await;
-    assert_ne!(new_token, token);
+    assert_eq!(new_token, None);
 }
 
 // (3.7a-d) RevokeBrowser with the connection's own token id behaves as
@@ -1831,7 +1911,7 @@ async fn revoking_own_browser_acts_as_sign_out() {
 
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
-    client_auth(&mut client, None).await;
+    client_auth_owner(&mut client, None).await;
     send(&mut client, &SignalMessage::ListBrowsers).await;
     let browsers = recv_browsers(&mut client).await;
 
@@ -1846,8 +1926,9 @@ async fn revoking_own_browser_acts_as_sign_out() {
         SignalMessage::SignedOut => {}
         other => panic!("expected signed_out, got {other:?}"),
     }
+    // A regular exit: the connection is anonymous, not "lost".
     send(&mut client, &SignalMessage::ListBrowsers).await;
-    expect_not_authenticated(&mut client).await;
+    assert!(recv_browsers(&mut client).await.is_empty());
 }
 
 /// Asserts the next message is `Error { message }` with exactly this text.
@@ -1858,16 +1939,20 @@ async fn expect_error(ws: &mut WsStream, expected: &str) {
     }
 }
 
-// (3.7b-a) passkey management without ClientAuth is "not authenticated".
+// (3.7b-a) U1: ListPasskeys without an owner is empty; the other passkey
+// management messages that need an existing owner are "not authenticated".
 #[tokio::test]
-async fn passkey_management_without_client_auth_returns_not_authenticated() {
+async fn passkey_management_without_owner_is_empty_or_not_authenticated() {
     let url = spawn_server().await;
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
 
+    send(&mut client, &SignalMessage::ListPasskeys).await;
+    match recv(&mut client).await {
+        SignalMessage::Passkeys { passkeys } => assert!(passkeys.is_empty()),
+        other => panic!("expected passkeys, got {other:?}"),
+    }
     for msg in [
-        SignalMessage::ListPasskeys,
-        SignalMessage::PasskeyRegisterStart,
         SignalMessage::PasskeyRegisterFinish {
             credential: "{}".to_string(),
         },
@@ -1888,7 +1973,7 @@ async fn list_passkeys_is_empty_and_register_start_returns_options() {
     let url = spawn_server().await;
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
-    client_auth(&mut client, None).await;
+    client_auth_owner(&mut client, None).await;
 
     send(&mut client, &SignalMessage::ListPasskeys).await;
     match recv(&mut client).await {
@@ -1917,7 +2002,7 @@ async fn passkey_finish_without_start_or_with_garbage_fails() {
     let url = spawn_server().await;
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
-    client_auth(&mut client, None).await;
+    client_auth_owner(&mut client, None).await;
 
     let finish = SignalMessage::PasskeyRegisterFinish {
         credential: "{}".to_string(),
@@ -1965,7 +2050,7 @@ async fn passkey_ceremonies_are_disabled_without_the_feature() {
     let url = spawn_server().await;
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
-    client_auth(&mut client, None).await;
+    client_auth_owner(&mut client, None).await;
 
     send(&mut client, &SignalMessage::ListPasskeys).await;
     match recv(&mut client).await {
@@ -1993,7 +2078,7 @@ async fn delete_passkey_is_scoped_to_the_owner() {
 
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
-    let (token, _) = client_auth(&mut client, None).await;
+    let (token, _) = client_auth_owner(&mut client, None).await;
     let (owner_id, _) = db
         .token_by_hash(&rcdesk_server::devices::hash_secret(&token))
         .expect("token lookup")
@@ -2107,7 +2192,7 @@ async fn host_name_and_alias_are_truncated_to_64_chars() {
 
     let mut client = connect(&url).await;
     hello(&mut client, Role::Client).await;
-    client_auth(&mut client, None).await;
+    client_auth_owner(&mut client, None).await;
     send(&mut client, &SignalMessage::Join { pin }).await;
     match recv(&mut client).await {
         SignalMessage::Joined { host_name, .. } => assert_eq!(host_name.chars().count(), 64),
@@ -2203,31 +2288,239 @@ async fn peer_that_stops_reading_is_disconnected() {
     assert!(joined, "host must be free after the slow client is dropped");
 }
 
-// B2 (audit S-H2): creating new owners is rate-limited per client IP; known
-// tokens are free, another IP is unaffected.
+/// Exhausts the per-IP owner-creation budget with `NEW_OWNER_BURST` fresh
+/// connections (each becomes an owner lazily). Returns their tokens.
+async fn exhaust_owner_limit(url: &str, ip: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for _ in 0..NEW_OWNER_BURST {
+        let mut ws = connect_as(url, ip).await;
+        hello(&mut ws, Role::Client).await;
+        tokens.push(become_owner(&mut ws).await);
+    }
+    tokens
+}
+
+// B2 (audit S-H2), U1: creating new owners is rate-limited per client IP at
+// the action that needs an owner; known tokens are free, another IP is
+// unaffected.
 #[tokio::test]
 async fn new_owner_creation_is_rate_limited_per_ip() {
     let url = spawn_server().await;
+    let tokens = exhaust_owner_limit(&url, "203.0.113.50").await;
 
     let mut ws = connect_as(&url, "203.0.113.50").await;
     hello(&mut ws, Role::Client).await;
-    let mut tokens = Vec::new();
-    for _ in 0..NEW_OWNER_BURST {
-        let (token, _devices) = client_auth(&mut ws, None).await;
-        tokens.push(token);
-    }
-    send(&mut ws, &SignalMessage::ClientAuth { token: None }).await;
+    send(&mut ws, &SignalMessage::PasskeyRegisterStart).await;
     match recv(&mut ws).await {
         SignalMessage::Error { message } => assert_eq!(message, "too many attempts"),
         other => panic!("expected too many attempts, got {other:?}"),
     }
 
     let (token, _devices) = client_auth(&mut ws, Some(tokens[0].clone())).await;
-    assert_eq!(token, tokens[0]);
+    assert_eq!(token, Some(tokens[0].clone()));
 
     let mut other = connect_as(&url, "203.0.113.51").await;
     hello(&mut other, Role::Client).await;
-    client_auth(&mut other, None).await;
+    become_owner(&mut other).await;
+}
+
+// U1: a PIN join with the owner budget exhausted still succeeds, just with
+// no owner: nothing linked, session logged with `owner_id = NULL`.
+#[tokio::test]
+async fn join_with_exhausted_owner_limit_joins_without_an_owner() {
+    let (url, db) = spawn_server_with_db().await;
+    let ip = "203.0.113.70";
+    exhaust_owner_limit(&url, ip).await;
+    let owners_before = db.admin_owner_rows().expect("owners").len();
+    let (_host, pin) = register_plain_host(&url).await;
+
+    let mut client = connect_as(&url, ip).await;
+    hello(&mut client, Role::Client).await;
+    send(&mut client, &SignalMessage::Join { pin }).await;
+    let session_id = match recv(&mut client).await {
+        SignalMessage::Joined { session_id, .. } => session_id,
+        other => panic!("expected joined, got {other:?}"),
+    };
+
+    expect_silence(&mut client, SILENCE_TIMEOUT).await;
+    let rows = db.admin_owner_rows().expect("owners");
+    assert_eq!(rows.len(), owners_before);
+    assert!(rows.iter().all(|r| r.devices == 0));
+    let row = db.session(&session_id).expect("query").expect("row");
+    assert_eq!(row.owner_id, None);
+}
+
+// U1: an anonymous PIN join lazily creates exactly one owner: the host is
+// linked, the session log carries the owner, and the client gets
+// `Authenticated` with a token (known to the server) and the device list
+// already containing the host.
+#[tokio::test]
+async fn anonymous_join_creates_one_owner_linked_to_the_host() {
+    let (url, db) = spawn_server_with_db().await;
+    let (_host, pin) = register_plain_host(&url).await;
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    let (anon, _) = client_auth(&mut client, None).await;
+    assert_eq!(anon, None);
+
+    send(&mut client, &SignalMessage::Join { pin }).await;
+    let (session_id, host_device_id) = match recv(&mut client).await {
+        SignalMessage::Joined {
+            session_id,
+            device_id,
+            ..
+        } => (session_id, device_id.expect("device id")),
+        other => panic!("expected joined, got {other:?}"),
+    };
+    let (token, devices) = expect_authenticated_with_token(&mut client).await;
+
+    let owner = owner_of_token(&db, &token).expect("token is recognized");
+    let rows = db.admin_owner_rows().expect("owners");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].owner_id, owner);
+    assert_eq!(rows[0].devices, 1);
+    assert_eq!(
+        db.devices_for_owner(&owner).expect("devices")[0].device_id,
+        host_device_id
+    );
+    assert!(devices.iter().any(|d| d.device_id == host_device_id));
+    let row = db.session(&session_id).expect("query").expect("row");
+    assert_eq!(row.owner_id, Some(owner));
+}
+
+// U1: read requests of an anonymous connection answer empty, never an Error.
+#[tokio::test]
+async fn anonymous_read_requests_answer_empty() {
+    let (url, db) = spawn_server_with_db().await;
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    client_auth(&mut client, None).await;
+
+    send(&mut client, &SignalMessage::ListDevices).await;
+    match recv(&mut client).await {
+        SignalMessage::Devices { devices } => assert!(devices.is_empty()),
+        other => panic!("expected devices, got {other:?}"),
+    }
+    send(&mut client, &SignalMessage::ListPasskeys).await;
+    match recv(&mut client).await {
+        SignalMessage::Passkeys { passkeys } => assert!(passkeys.is_empty()),
+        other => panic!("expected passkeys, got {other:?}"),
+    }
+    send(&mut client, &SignalMessage::GetAccount).await;
+    match recv(&mut client).await {
+        SignalMessage::Account { email, is_admin } => {
+            assert_eq!(email, None);
+            assert!(!is_admin);
+        }
+        other => panic!("expected account, got {other:?}"),
+    }
+    send(&mut client, &SignalMessage::ListBrowsers).await;
+    match recv(&mut client).await {
+        SignalMessage::Browsers { browsers } => assert!(browsers.is_empty()),
+        other => panic!("expected browsers, got {other:?}"),
+    }
+    send(&mut client, &SignalMessage::ListWakeNetworks).await;
+    match recv(&mut client).await {
+        SignalMessage::WakeNetworks { networks } => assert!(networks.is_empty()),
+        other => panic!("expected wake networks, got {other:?}"),
+    }
+    expect_silence(&mut client, SILENCE_TIMEOUT).await;
+    assert!(db.admin_owner_rows().expect("owners").is_empty());
+}
+
+// U1: a token revoked mid-connection (the owner existed) is NOT anonymous:
+// read requests answer `not authenticated`, which is how the client learns
+// about the revocation.
+#[tokio::test]
+async fn revoked_token_mid_connection_reads_answer_not_authenticated() {
+    let (url, db) = spawn_server_with_db().await;
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    let token = become_owner(&mut client).await;
+    let owner = owner_of_token(&db, &token).expect("owner");
+    let tokens = db.tokens_for_owner(&owner).expect("tokens");
+    db.delete_token(&owner, &tokens[0].token_id)
+        .expect("revoke");
+
+    for request in [
+        SignalMessage::ListDevices,
+        SignalMessage::ListPasskeys,
+        SignalMessage::GetAccount,
+        SignalMessage::ListBrowsers,
+        SignalMessage::ListWakeNetworks,
+    ] {
+        send(&mut client, &request).await;
+        expect_not_authenticated(&mut client).await;
+    }
+}
+
+// U1: actions that need an owner create one lazily and the client learns the
+// token: AddRouterWaker (goes on to fail on the unknown network, but the
+// owner already exists) and AddManualDevice.
+#[tokio::test]
+async fn add_router_waker_and_add_manual_device_create_the_owner_lazily() {
+    let (url, db) = spawn_server_with_db().await;
+
+    let mut a = connect(&url).await;
+    hello(&mut a, Role::Client).await;
+    client_auth(&mut a, None).await;
+    send(
+        &mut a,
+        &SignalMessage::AddRouterWaker {
+            name: "Router".to_string(),
+            network: "192.168.1.0".to_string(),
+            prefix: 24,
+        },
+    )
+    .await;
+    let (token_a, devices) = expect_authenticated_with_token(&mut a).await;
+    assert!(devices.is_empty());
+    match recv(&mut a).await {
+        SignalMessage::Error { message } => assert_eq!(message, "unknown network"),
+        other => panic!("expected unknown network, got {other:?}"),
+    }
+    assert!(owner_of_token(&db, &token_a).is_some());
+
+    let mut b = connect(&url).await;
+    hello(&mut b, Role::Client).await;
+    send(
+        &mut b,
+        &SignalMessage::AddManualDevice {
+            name: "PC".to_string(),
+            mac: "aa:bb:cc:dd:ee:ff".to_string(),
+            network: "192.168.1.0".to_string(),
+            prefix: 24,
+        },
+    )
+    .await;
+    let (token_b, _) = expect_authenticated_with_token(&mut b).await;
+    match recv(&mut b).await {
+        SignalMessage::Error { message } => assert_eq!(message, "unknown network"),
+        other => panic!("expected unknown network, got {other:?}"),
+    }
+    assert!(owner_of_token(&db, &token_b).is_some());
+    assert_eq!(db.admin_owner_rows().expect("owners").len(), 2);
+}
+
+// U1: PasskeyRegisterStart from an anonymous connection creates the owner and
+// sends `Authenticated` with the token before the ceremony options.
+#[cfg(feature = "passkeys")]
+#[tokio::test]
+async fn passkey_register_start_creates_the_owner_lazily() {
+    let (url, db) = spawn_server_with_db().await;
+    let mut client = connect(&url).await;
+    hello(&mut client, Role::Client).await;
+    client_auth(&mut client, None).await;
+
+    send(&mut client, &SignalMessage::PasskeyRegisterStart).await;
+    let (token, _) = expect_authenticated_with_token(&mut client).await;
+    match recv(&mut client).await {
+        SignalMessage::PasskeyRegisterOptions { .. } => {}
+        other => panic!("expected passkey options, got {other:?}"),
+    }
+
+    assert!(owner_of_token(&db, &token).is_some());
+    assert_eq!(db.admin_owner_rows().expect("owners").len(), 1);
 }
 
 /// Registers a host with `device` over a fresh connection from `ip`.
@@ -2491,6 +2784,7 @@ async fn join_rotates_pin_for_host_that_opted_in() {
         SignalMessage::Joined { session_id, .. } => session_id,
         other => panic!("expected joined, got {other:?}"),
     };
+    expect_authenticated_with_token(&mut client).await;
     match recv(&mut host).await {
         SignalMessage::PeerJoined { .. } => {}
         other => panic!("expected peer_joined, got {other:?}"),
@@ -2538,6 +2832,7 @@ async fn join_keeps_pin_static_for_host_without_rotation() {
         SignalMessage::Joined { session_id, .. } => session_id,
         other => panic!("expected joined, got {other:?}"),
     };
+    expect_authenticated_with_token(&mut client).await;
     match recv(&mut host).await {
         SignalMessage::PeerJoined { .. } => {}
         other => panic!("expected peer_joined, got {other:?}"),
@@ -2633,7 +2928,7 @@ async fn client_first_message_resets_to_idle_timeout() {
     let url = spawn_server_with(IceConfig::from_env(), liveness).await;
     let mut ws = connect(&url).await;
     hello(&mut ws, Role::Client).await;
-    client_auth(&mut ws, None).await;
+    client_auth_owner(&mut ws, None).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     send(&mut ws, &SignalMessage::ListDevices).await;
     match recv(&mut ws).await {
@@ -2768,6 +3063,7 @@ async fn already_in_session_spends_a_pin_attempt() {
         SignalMessage::Joined { .. } => {}
         other => panic!("expected joined, got {other:?}"),
     }
+    expect_authenticated_with_token(&mut client).await;
     for _ in 0..10 {
         join_and_expect(&mut client, &pin2, "already in session").await;
     }
@@ -2962,8 +3258,12 @@ async fn password_login(ws: &mut WsStream, email: &str, password: &str) {
 /// Reads `Authenticated` + `Account`, returns the token, devices and email.
 async fn expect_signed_in(ws: &mut WsStream) -> (String, Vec<proto::signal::DeviceEntry>, String) {
     let (token, devices) = match recv(ws).await {
-        SignalMessage::Authenticated { token, devices, .. } => (token, devices),
-        other => panic!("expected authenticated, got {other:?}"),
+        SignalMessage::Authenticated {
+            token: Some(token),
+            devices,
+            ..
+        } => (token, devices),
+        other => panic!("expected authenticated with a token, got {other:?}"),
     };
     let email = match recv(ws).await {
         SignalMessage::Account {
@@ -2978,7 +3278,7 @@ async fn expect_signed_in(ws: &mut WsStream) -> (String, Vec<proto::signal::Devi
 async fn registration_binds_email_to_the_current_owner_and_password_login_finds_it() {
     let (url, db, mailer) = spawn_with_recording_mailer().await;
     let mut a = client_conn(&url).await;
-    let (token_a, _) = client_auth(&mut a, None).await;
+    let (token_a, _) = client_auth_owner(&mut a, None).await;
     let owner = owner_of_token(&db, &token_a).expect("owner");
     link_new_device(&db, &owner, "dev1");
 
@@ -3037,7 +3337,7 @@ async fn password_reset_merges_anonymous_devices_and_revokes_old_sessions() {
 
     // An anonymous connection with its own device resets the password.
     let mut anon = client_conn(&url).await;
-    let (anon_token, _) = client_auth(&mut anon, None).await;
+    let (anon_token, _) = client_auth_owner(&mut anon, None).await;
     let anon_owner = owner_of_token(&db, &anon_token).expect("anon owner");
     link_new_device(&db, &anon_owner, "dev-anon");
 
@@ -3056,7 +3356,7 @@ async fn password_reset_merges_anonymous_devices_and_revokes_old_sessions() {
     // The old browser token no longer works: a fresh anonymous owner appears.
     assert_eq!(owner_of_token(&db, &old_token), None);
     let mut stale = client_conn(&url).await;
-    let (fresh_token, fresh_devices) = client_auth(&mut stale, Some(old_token.clone())).await;
+    let (fresh_token, fresh_devices) = client_auth_owner(&mut stale, Some(old_token.clone())).await;
     assert_ne!(fresh_token, old_token);
     assert!(fresh_devices.is_empty());
 
@@ -3111,7 +3411,7 @@ async fn successful_logins_do_not_spend_the_login_limit() {
 async fn wrong_code_weak_password_and_invalid_email_are_rejected() {
     let (url, _db, mailer) = spawn_with_recording_mailer().await;
     let mut ws = client_conn(&url).await;
-    client_auth(&mut ws, None).await;
+    client_auth_owner(&mut ws, None).await;
 
     send(
         &mut ws,
@@ -3155,7 +3455,7 @@ async fn second_code_request_within_a_minute_is_refused() {
 async fn disabled_mailer_reports_email_unavailable() {
     let url = spawn_server().await;
     let mut ws = client_conn(&url).await;
-    client_auth(&mut ws, None).await;
+    client_auth_owner(&mut ws, None).await;
     send(
         &mut ws,
         &SignalMessage::EmailCodeRequest {
@@ -3170,7 +3470,7 @@ async fn disabled_mailer_reports_email_unavailable() {
 async fn owner_with_an_account_cannot_register_another_email() {
     let (url, db, mailer) = spawn_with_recording_mailer().await;
     let mut ws = client_conn(&url).await;
-    let (token, _) = client_auth(&mut ws, None).await;
+    let (token, _) = client_auth_owner(&mut ws, None).await;
     let owner = owner_of_token(&db, &token).expect("owner");
     let hash = rcdesk_server::accounts::hash_password("right-password").expect("hash");
     db.insert_account(&owner, "bob@example.com", &hash, 1)
@@ -3181,15 +3481,29 @@ async fn owner_with_an_account_cannot_register_another_email() {
     expect_error(&mut ws, "already registered").await;
 }
 
+// U1: GetAccount without an owner is an empty account; registering by email
+// without an owner creates one lazily (an early `Authenticated` with the new
+// token, then the usual `Authenticated` + `Account`).
 #[tokio::test]
-async fn registration_without_an_owner_is_not_authenticated_and_get_account_too() {
-    let (url, _db, mailer) = spawn_with_recording_mailer().await;
+async fn registration_without_an_owner_creates_one_lazily_and_get_account_is_empty() {
+    let (url, db, mailer) = spawn_with_recording_mailer().await;
     let mut ws = client_conn(&url).await;
     send(&mut ws, &SignalMessage::GetAccount).await;
-    expect_not_authenticated(&mut ws).await;
+    match recv(&mut ws).await {
+        SignalMessage::Account { email, is_admin } => {
+            assert_eq!(email, None);
+            assert!(!is_admin);
+        }
+        other => panic!("expected account, got {other:?}"),
+    }
+    assert!(db.admin_owner_rows().expect("owners").is_empty());
     let code = request_code(&mut ws, &mailer, "bob@example.com").await;
     confirm(&mut ws, "bob@example.com", &code, "long-enough-pass").await;
-    expect_not_authenticated(&mut ws).await;
+    let (early_token, _) = expect_authenticated_with_token(&mut ws).await;
+    let (token, _devices, email) = expect_signed_in(&mut ws).await;
+    assert_eq!(token, early_token);
+    assert_eq!(email, "bob@example.com");
+    assert_eq!(db.admin_owner_rows().expect("owners").len(), 1);
 }
 
 // ---- EmailCodeConfirm purpose ----
@@ -3199,7 +3513,7 @@ async fn reset_purpose_without_an_account_is_refused_and_creates_nothing() {
     use proto::signal::EmailCodePurpose;
     let (url, db, mailer) = spawn_with_recording_mailer().await;
     let mut ws = client_conn(&url).await;
-    let (token, _) = client_auth(&mut ws, None).await;
+    let (token, _) = client_auth_owner(&mut ws, None).await;
     let owner = owner_of_token(&db, &token).expect("owner");
 
     let code = request_code(&mut ws, &mailer, "ghost@example.com").await;
@@ -3230,7 +3544,7 @@ async fn register_purpose_with_a_taken_email_is_refused_and_keeps_the_other_pass
         .expect("account"));
 
     let mut ws = client_conn(&url).await;
-    let (token, _) = client_auth(&mut ws, None).await;
+    let (token, _) = client_auth_owner(&mut ws, None).await;
     let owner = owner_of_token(&db, &token).expect("owner");
     let code = request_code(&mut ws, &mailer, "bob@example.com").await;
     confirm_with(
@@ -3258,7 +3572,7 @@ async fn explicit_register_purpose_registers_on_a_free_email() {
     use proto::signal::EmailCodePurpose;
     let (url, db, mailer) = spawn_with_recording_mailer().await;
     let mut ws = client_conn(&url).await;
-    let (token, _) = client_auth(&mut ws, None).await;
+    let (token, _) = client_auth_owner(&mut ws, None).await;
     let owner = owner_of_token(&db, &token).expect("owner");
     let code = request_code(&mut ws, &mailer, "bob@example.com").await;
     confirm_with(
@@ -3287,7 +3601,7 @@ async fn explicit_reset_purpose_resets_an_existing_account() {
         .insert_account(&acc, "carol@example.com", &hash, 1)
         .expect("account"));
     let mut ws = client_conn(&url).await;
-    client_auth(&mut ws, None).await;
+    client_auth_owner(&mut ws, None).await;
     let code = request_code(&mut ws, &mailer, "carol@example.com").await;
     confirm_with(
         &mut ws,
@@ -3313,7 +3627,7 @@ async fn old_client_without_purpose_still_resets_by_existing_email() {
         .insert_account(&acc, "dave@example.com", &hash, 1)
         .expect("account"));
     let mut ws = client_conn(&url).await;
-    client_auth(&mut ws, None).await;
+    client_auth_owner(&mut ws, None).await;
     let code = request_code(&mut ws, &mailer, "dave@example.com").await;
     send_raw_json(
         &mut ws,
@@ -3353,7 +3667,7 @@ async fn registered_conn(
     password: &str,
 ) -> (WsStream, String) {
     let mut ws = client_conn(url).await;
-    let (token, _) = client_auth(&mut ws, None).await;
+    let (token, _) = client_auth_owner(&mut ws, None).await;
     let owner = owner_of_token(db, &token).expect("owner");
     let code = request_code(&mut ws, mailer, email).await;
     confirm(&mut ws, email, &code, password).await;
@@ -3483,7 +3797,7 @@ async fn email_change_requires_an_account_and_an_owner() {
 
     // Owner without an account.
     let mut ws = client_conn(&url).await;
-    client_auth(&mut ws, None).await;
+    client_auth_owner(&mut ws, None).await;
     email_change(&mut ws, "new@example.com", "123456", "hunter22-pass").await;
     expect_error(&mut ws, "no account").await;
 
@@ -3533,6 +3847,7 @@ async fn session_log_records_join_stats_and_bye() {
         SignalMessage::Joined { session_id, .. } => session_id,
         other => panic!("expected joined, got {other:?}"),
     };
+    let (join_token, _) = expect_authenticated_with_token(&mut client).await;
     match recv(&mut host).await {
         SignalMessage::PeerJoined { .. } => {}
         other => panic!("expected peer_joined, got {other:?}"),
@@ -3541,7 +3856,9 @@ async fn session_log_records_join_stats_and_bye() {
     let row = db.session(&session_id).expect("query").expect("row");
     assert_eq!(row.via, "pin");
     assert_eq!(row.device_id, host_id);
-    assert_eq!(row.owner_id, None);
+    // The anonymous joiner became an owner lazily; the log row points at it.
+    assert_eq!(row.owner_id, owner_of_token(&db, &join_token));
+    assert!(row.owner_id.is_some());
     assert_eq!(row.ended_at, None);
 
     send(
@@ -3619,7 +3936,7 @@ async fn admin_gets_snapshot_and_sets_note_while_others_are_forbidden() {
 
     // Анонимный владелец: не админ.
     let mut anon = client_conn(&url).await;
-    let (anon_token, _) = client_auth(&mut anon, None).await;
+    let (anon_token, _) = client_auth_owner(&mut anon, None).await;
     let anon_owner = owner_of_token(&db, &anon_token).expect("owner");
     send(&mut anon, &SignalMessage::GetAccount).await;
     assert_eq!(
@@ -3650,7 +3967,7 @@ async fn admin_gets_snapshot_and_sets_note_while_others_are_forbidden() {
 
     // Админ: Account.is_admin == true, AdminData, заметка.
     let mut admin = client_conn(&url).await;
-    let (admin_token, _) = client_auth(&mut admin, None).await;
+    let (admin_token, _) = client_auth_owner(&mut admin, None).await;
     let admin_owner = owner_of_token(&db, &admin_token).expect("owner");
     link_new_device(&db, &admin_owner, "dev-admin");
     let code = request_code(&mut admin, &mailer, "boss@example.com").await;
@@ -3716,8 +4033,10 @@ async fn expect_signed_in_admin(
     ws: &mut WsStream,
 ) -> (String, Vec<proto::signal::DeviceEntry>, String) {
     let token = match recv(ws).await {
-        SignalMessage::Authenticated { token, .. } => token,
-        other => panic!("expected authenticated, got {other:?}"),
+        SignalMessage::Authenticated {
+            token: Some(token), ..
+        } => token,
+        other => panic!("expected authenticated with a token, got {other:?}"),
     };
     match recv(ws).await {
         SignalMessage::Account {
@@ -3795,7 +4114,7 @@ async fn host_linked_to_connected_owner(
     };
     let mut client = connect(url).await;
     hello(&mut client, Role::Client).await;
-    let (token, _) = client_auth(&mut client, None).await;
+    let (token, _) = client_auth_owner(&mut client, None).await;
     send(&mut client, &SignalMessage::Join { pin }).await;
     let session_id = match recv(&mut client).await {
         SignalMessage::Joined { session_id, .. } => session_id,
@@ -3831,7 +4150,7 @@ async fn presence_changes_are_pushed_to_the_owner_but_not_to_others() {
 
     let mut stranger = connect(&url).await;
     hello(&mut stranger, Role::Client).await;
-    client_auth(&mut stranger, None).await;
+    client_auth_owner(&mut stranger, None).await;
 
     drop(host);
     let devices = recv_devices(&mut owner).await;
@@ -3855,7 +4174,7 @@ async fn session_busy_state_is_pushed_to_other_owner_connections() {
     let (_host, host_id, _creds, mut owner, token) = host_linked_to_connected_owner(&url).await;
     let mut watcher = connect(&url).await;
     hello(&mut watcher, Role::Client).await;
-    client_auth(&mut watcher, Some(token)).await;
+    client_auth_owner(&mut watcher, Some(token)).await;
 
     send(
         &mut owner,
@@ -3974,7 +4293,7 @@ async fn wait_devices(
 async fn wake_owner(url: &str) -> WsStream {
     let mut client = connect(url).await;
     hello(&mut client, Role::Client).await;
-    client_auth(&mut client, None).await;
+    client_auth_owner(&mut client, None).await;
     client
 }
 
