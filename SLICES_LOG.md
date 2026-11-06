@@ -14,6 +14,23 @@
 **2026-11-02 (20:45 МСК): НОЧНОЙ РЕЖИМ (слово владельца): коммит/push разрешены, стоп на 90 % лимита +
 `ScheduleWakeup`, COMPAX после 23:00 не включать. План: B → C (веб) → D (CI) → E (мобильный UI) → F/G если успею.**
 
+**2026-11-06 (09:50 МСК): U1 — ленивое создание владельца — ✅ НА ПРОДЕ (`5c05085`).**
+- Повод: в админке 49 из 58 владельцев пустые (ни устройств, ни сеансов). Разбор UA в `owner_tokens` (read-only):
+  11 явных ботов (HeadlessChrome, bingbot, meta-webindexer, RootEvidence, BuiltWith, CertSignalBot), ~18 сканеров
+  с поддельными/устаревшими UA, 9 без UA (до 3.7), ~11 похожих на людей (часть — наши проверки). Причина:
+  страница шлёт `client_auth` при загрузке, а сервер на пустой/незнакомый токен заводил владельца.
+- Решение владельца: «1б, 2а, 3 ок», затем «пуш и деплой разрешаю». `Authenticated.token` → `Option`; `ClientAuth`
+  без токена — `token: null`, владельца нет; `ensure_owner` на `Join`, `PasskeyRegisterStart`, регистрации по почте,
+  `AddManualDevice`, `AddRouterWaker` (лимит 20/мин переехал туда); анонимные `List*`/`GetAccount` — пусто, отозванный
+  посреди соединения токен — `not authenticated` (флаг `owner_lost`). `owners::authenticate` удалён. Детали —
+  ARCHITECTURE «Ленивое создание владельца (U1)».
+- Гейты: server lib `183 passed`, signaling `103 passed` (было 97), proto `113 passed`, host `606 passed; 4 ignored`,
+  web `Tests  611 passed (611)`; fmt/clippy чисто. Deploy `42175236244` зелёный с первого раза, `/healthz` ok.
+- Живая проверка: rcdesk.app в чистом профиле Playwright — токена в localStorage нет, ошибок в консоли нет, владельцев
+  в БД не прибавилось (58). Вход по PIN от анонима — только интеграционными тестами, вживую не гонялся.
+- Разовая чистка (1б): `.backup` → `/data/rcdesk.db.pre-owner-cleanup-20261106` (в томе, удалить после проверки), тем же
+  условием, что `prune_empty_owners`, с порогом 1 сутки: удалено 48, осталось 10, висячих токенов 0.
+
 **2026-11-05 (21:45 МСК): CI-2 — ✅ ЗАКРЫТ (`4531966`).**
 - Причина (аннотации обоих отменённых прогонов): «The job was not acquired by Runner of type hosted even after
   multiple attempts» + «capacity constraints … macOS arm64» — раннер не выдан за 15 мин, шагов у джобы нет. Не наш код.
