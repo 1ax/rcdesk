@@ -52,6 +52,12 @@
 //!   0.2.3 live log, 2026-10-26, 1 lost of 2 sent (0.496) on a static screen
 //!   cut the target every 30-60 s for hours. A report counts as loss only if
 //!   the cumulative lost counter grew by `MIN_LOST_PACKETS` or more.
+//! - A single RR with loss was applied on every tick while it stayed fresh
+//!   (`LOSS_FRESH`, 3 s): RRs and ticks both run at ~1 Hz, so one report cut
+//!   the target two or three times in a row (audit 2026-11-02, V-10). The
+//!   multiplicative cut now looks only at the reports that arrived since the
+//!   previous tick (`Window::max_loss`), so each report cuts at most once;
+//!   `LOSS_FRESH` only keeps the time-based holds (probe pause, ceilings) alive.
 
 use std::time::{Duration, Instant};
 
@@ -86,9 +92,12 @@ pub const REMB_FRESH: Duration = Duration::from_secs(3);
 /// the `LOSS_HIGH` loss path, so such values are estimator junk, not a signal.
 pub const REMB_IGNORE_BELOW_KBPS: f64 = 50.0;
 
-/// A loss fraction from an RTCP RR older than this counts as zero. Chrome
-/// sends RRs about once a second; when they stop, acting on the last value
-/// forever would cut the target to the floor every tick, so instead the
+/// A loss fraction from an RTCP RR older than this counts as zero for the
+/// time-based holds and the probe condition (`LOSS_PROBE_HOLD`,
+/// `LOSS_CAP_HOLD`, the sent-rate ceiling). It does not drive the
+/// multiplicative `LOSS_HIGH` cut: that fires once per report, from the
+/// reports accumulated since the previous tick (`Window::max_loss`). Chrome
+/// sends RRs about once a second; when they stop, the holds expire and the
 /// target recovers by probing.
 pub const LOSS_FRESH: Duration = Duration::from_secs(3);
 
@@ -176,6 +185,18 @@ pub const ENCODER_OVERRUN_FRAMES: u64 = 2;
 /// rungs every couple of seconds.
 pub const ENCODER_FAST_TICKS: u32 = 5;
 
+/// A fps step-down (encoder overrun) within this long after a step-up means
+/// the step-up did not hold: the encoder cannot sustain the higher rung. Each
+/// such failure doubles the clean-tick wait before the next attempt
+/// (`Controller::step_up_ticks_required`); without it fps oscillated
+/// down/up every ~7 s forever (overrun, 5 clean ticks, step up, overrun...).
+pub const STEP_UP_PROBATION: Duration = Duration::from_secs(10);
+
+/// Ceiling of the clean-tick wait before a fps step-up after repeated failed
+/// attempts (see `STEP_UP_PROBATION`): the encoder is still retried about once
+/// a minute, since the load that caused the overruns may be gone.
+pub const ENCODER_FAST_TICKS_MAX: u32 = 60;
+
 /// Minimum bits-per-pixel-per-frame the target bitrate/fps combination must
 /// afford. Below this, more fps just spreads the same bits over more (worse)
 /// frames -- ARCHITECTURE.md §5 says to sacrifice fps before quality. This is
@@ -240,7 +261,10 @@ pub enum Feedback {
     /// controller works with its delta between reports, see `MIN_LOST_PACKETS`).
     Loss { fraction: f32, total_lost: u32 },
     /// RTT and jitter from the same RTCP receiver report as `Loss`. Pure
-    /// diagnostics for the `video: 5s summary` line; the controller ignores it.
+    /// diagnostics for the `video: 5s summary` line; the controller ignores it
+    /// on purpose: it has no delay-based estimate to feed them into, and the
+    /// browser's REMB already carries its receive-side delay estimation
+    /// (decision of V-10, 2026-11-11).
     ReceiverStats {
         rtt: Option<std::time::Duration>,
         jitter_ms: f32,
@@ -328,6 +352,12 @@ struct Window {
     bytes: u64,
     frames: u32,
     overruns: u64,
+    /// Receiver reports that arrived since the previous tick.
+    loss_reports: u32,
+    /// Largest significant loss fraction among them (an insignificant report,
+    /// see `MIN_LOST_PACKETS`, contributes 0.0). Lets one report cut the
+    /// bitrate exactly once instead of on every tick while it stays fresh.
+    max_loss: f32,
 }
 
 impl Window {
@@ -382,6 +412,13 @@ pub struct Controller {
     /// Consecutive ticks the encoder has kept up (frames encoded, no
     /// overruns) at the current rung (see `ENCODER_FAST_TICKS`).
     fast_ticks: u32,
+    /// Exponent of the clean-tick wait before a fps step-up: grows by one each
+    /// time a step-up fails within `STEP_UP_PROBATION`, back to 0 when a
+    /// step-down comes later than that (see `step_up_ticks_required`).
+    up_backoff: u32,
+    /// When fps was last stepped up by the encoder branch; `None` once the
+    /// following step-down has been judged against `STEP_UP_PROBATION`.
+    last_step_up_at: Option<Instant>,
     last_tick_at: Instant,
 }
 
@@ -411,8 +448,19 @@ impl Controller {
             window: Window::default(),
             congested_ticks: 0,
             fast_ticks: 0,
+            up_backoff: 0,
+            last_step_up_at: None,
             last_tick_at: now,
         }
+    }
+
+    /// Consecutive clean ticks required before the next fps step-up:
+    /// `ENCODER_FAST_TICKS` doubled per failed attempt, capped at
+    /// `ENCODER_FAST_TICKS_MAX`. The shift is bounded so it cannot overflow.
+    fn step_up_ticks_required(&self) -> u32 {
+        ENCODER_FAST_TICKS
+            .saturating_mul(1u32 << self.up_backoff.min(16))
+            .min(ENCODER_FAST_TICKS_MAX)
     }
 
     /// The controller's current committed rate target (only changes when a
@@ -445,12 +493,15 @@ impl Controller {
                 let lost = total_lost.saturating_sub(self.prev_total_lost.unwrap_or(0));
                 self.prev_total_lost = Some(total_lost);
                 // An insignificant report is still a fresh "no loss" sample.
-                self.last_loss = if lost >= MIN_LOST_PACKETS {
+                let significant = if lost >= MIN_LOST_PACKETS {
                     fraction
                 } else {
                     0.0
                 };
+                self.last_loss = significant;
                 self.last_loss_at = Some(now);
+                self.window.loss_reports += 1;
+                self.window.max_loss = self.window.max_loss.max(significant);
             }
             Feedback::ReceiverStats { .. } => {}
             Feedback::Frame { bytes, .. } => {
@@ -492,6 +543,11 @@ impl Controller {
             .clamp(self.cfg.min_bitrate_kbps, self.cfg.max_bitrate_kbps);
         self.target = RateTarget { bitrate_kbps, fps };
         self.window.reset();
+        // The new preset starts from its own ceiling, so the old rung's
+        // step-up history says nothing about it.
+        self.fast_ticks = 0;
+        self.up_backoff = 0;
+        self.last_step_up_at = None;
         self.last_tick_at = now;
         self.preset_announce_pending = true;
     }
@@ -573,7 +629,16 @@ impl Controller {
             self.congested_ticks = 0;
         }
 
-        let loss = if self
+        // `report_loss` is what arrived since the previous tick and alone
+        // triggers the multiplicative cut, so one RR cuts once. `loss` also
+        // includes the still-fresh last report: it keeps the holds and the
+        // probe condition alive for `LOSS_FRESH`, as before.
+        let report_loss = if self.window.loss_reports > 0 {
+            self.window.max_loss
+        } else {
+            0.0
+        };
+        let fresh_loss = if self
             .last_loss_at
             .is_some_and(|at| now.saturating_duration_since(at) <= LOSS_FRESH)
         {
@@ -581,6 +646,7 @@ impl Controller {
         } else {
             0.0
         };
+        let loss = fresh_loss.max(report_loss);
         if loss >= LOSS_LOW && remb_kbps.is_some() {
             self.loss_cap_until = Some(now + LOSS_CAP_HOLD);
         }
@@ -599,8 +665,8 @@ impl Controller {
         let loss_cap = remb_kbps
             .filter(|_| self.loss_cap_until.is_some_and(|until| now < until))
             .map(|r| (r * LOSS_CAP_RATIO).max(LOSS_CAP_FLOOR_KBPS));
-        let (mut b, mut bitrate_reason) = if loss > LOSS_HIGH {
-            (old_b * (1.0 - 0.5 * loss as f64), Some("loss"))
+        let (mut b, mut bitrate_reason) = if report_loss > LOSS_HIGH {
+            (old_b * (1.0 - 0.5 * report_loss as f64), Some("loss"))
         } else if remb_congested && self.congested_ticks >= REMB_CONGESTION_TICKS {
             // `remb_congested` implies `remb_kbps` is `Some`.
             let remb = remb_kbps.unwrap_or(old_b);
@@ -645,13 +711,27 @@ impl Controller {
         let (encoder_fps, encoder_fired) = if self.window.overruns >= ENCODER_OVERRUN_FRAMES {
             self.fast_ticks = 0;
             let stepped = step_down(&steps, current_fps);
+            if stepped != current_fps {
+                // A step-down soon after our own step-up means the higher
+                // rung did not hold: wait twice as long before retrying.
+                let failed_up = self
+                    .last_step_up_at
+                    .is_some_and(|at| now.saturating_duration_since(at) <= STEP_UP_PROBATION);
+                if !failed_up {
+                    self.up_backoff = 0;
+                } else if self.step_up_ticks_required() < ENCODER_FAST_TICKS_MAX {
+                    self.up_backoff += 1;
+                }
+                self.last_step_up_at = None;
+            }
             (stepped, stepped != current_fps)
         } else if self.window.frames > 0 && self.window.overruns == 0 {
             let higher = step_up(&steps, current_fps);
             if higher != current_fps {
                 self.fast_ticks += 1;
-                if self.fast_ticks >= ENCODER_FAST_TICKS {
+                if self.fast_ticks >= self.step_up_ticks_required() {
                     self.fast_ticks = 0;
+                    self.last_step_up_at = Some(now);
                     (higher, true)
                 } else {
                     (current_fps, false)
@@ -1149,14 +1229,16 @@ mod tests {
         let d = c.tick(now).expect("expected a decision");
         assert_eq!(d.reason, "loss");
         assert_eq!(d.target.bitrate_kbps, 5400);
-        let loss_at = now;
 
-        // Same cuts while the loss stays fresh (last arming at +3 s)...
+        // Each new report cuts once more (a report is applied only once)...
         for _ in 0..3 {
             now += TICK;
+            loss(&mut c, now, 0.2);
             c.tick(now).expect("expected a loss cut");
         }
         assert_eq!(c.target().bitrate_kbps, 3937);
+        // ...and the last one re-arms the hold at its own time.
+        let loss_at = now;
         // ...then no probe until LOSS_PROBE_HOLD after that arming.
         let hold_end = loss_at + LOSS_FRESH + LOSS_PROBE_HOLD;
         while now + TICK < hold_end {
@@ -1233,16 +1315,18 @@ mod tests {
         assert_eq!(decision.reason, "loss");
         assert_eq!(decision.target.bitrate_kbps, 5400);
 
-        // Within LOSS_FRESH (ages 1 s, 2 s, 3 s) the old RR still counts:
-        // three more cuts of x0.9, 5400 -> 4860 -> 4374 -> 3937.
+        // Three more reports, three more cuts of x0.9, 5400 -> 4860 -> 4374
+        // -> 3937: every report cuts once.
         for expected in [4860u32, 4374, 3937] {
             now += TICK;
+            loss(&mut c, now, 0.2);
             let d = c.tick(now).expect("expected a loss cut");
             assert_eq!(d.reason, "loss");
             assert_eq!(d.target.bitrate_kbps, expected);
         }
-        // Age 4 s > LOSS_FRESH: loss counts as zero -- no more cuts (and
-        // no probe yet, see `LOSS_PROBE_HOLD`).
+        // No new reports: the last one is not applied again, neither while
+        // it is still fresh (ages 1-3 s) nor after LOSS_FRESH -- no more
+        // cuts (and no probe yet, see `LOSS_PROBE_HOLD`).
         for _ in 0..5 {
             now += TICK;
             assert_eq!(c.tick(now), None);
@@ -1759,6 +1843,166 @@ mod tests {
         let steps = c.ladder();
         assert_eq!(steps, vec![30, 24, 20, 15, 12, 10, 8]);
         assert_eq!(c.bitrate_fps_step(&steps, 6000.0), 30);
+    }
+
+    /// One tick with `frames` and an overrun burst; returns the decision.
+    fn overrun_tick(c: &mut Controller, now: Instant) -> Option<Decision> {
+        frames(c, now, 25_000);
+        c.feedback(Feedback::Overrun { frames: 5 }, now);
+        c.tick(now)
+    }
+
+    /// Ticks with frames and no overruns until fps changes, at most `max`
+    /// ticks; returns how many ticks it took (`None` if it never changed).
+    fn clean_ticks_until_up(c: &mut Controller, now: &mut Instant, max: u32) -> Option<u32> {
+        let before = c.target().fps;
+        for n in 1..=max {
+            *now += TICK;
+            frames(c, *now, 25_000);
+            c.tick(*now);
+            if c.target().fps != before {
+                return Some(n);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn one_loss_report_cuts_bitrate_once() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0 + TICK;
+        loss(&mut c, now, 0.2);
+        let d = c.tick(now).expect("expected a loss cut");
+        assert_eq!(d.reason, "loss");
+        assert_eq!(d.target.bitrate_kbps, 5400);
+
+        // No new report: no second cut (and no growth, the probe is held).
+        for _ in 0..3 {
+            now += TICK;
+            assert_eq!(c.tick(now), None);
+            assert_eq!(c.target().bitrate_kbps, 5400);
+        }
+    }
+
+    #[test]
+    fn each_new_loss_report_cuts_again() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0 + TICK;
+        loss(&mut c, now, 0.2);
+        assert_eq!(c.tick(now).expect("first cut").target.bitrate_kbps, 5400);
+        now += TICK;
+        loss(&mut c, now, 0.2);
+        let d = c.tick(now).expect("second cut");
+        assert_eq!(d.reason, "loss");
+        assert_eq!(d.target.bitrate_kbps, 4860);
+    }
+
+    #[test]
+    fn two_reports_in_one_tick_use_the_larger_loss() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0 + TICK;
+        loss_total(&mut c, now, 0.3, 100);
+        // Second report: no new lost packets, so a "no loss" sample.
+        loss_total(&mut c, now, 0.0, 100);
+        let d = c.tick(now).expect("expected a loss cut");
+        assert_eq!(d.reason, "loss");
+        assert_eq!(d.target.bitrate_kbps, 5100);
+
+        // The probe hold was armed from the larger loss: nothing grows.
+        for _ in 0..3 {
+            now += TICK;
+            assert_eq!(c.tick(now), None);
+        }
+        assert_eq!(c.target().bitrate_kbps, 5100);
+    }
+
+    #[test]
+    fn failed_step_up_doubles_the_wait_before_the_next_attempt() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0 + TICK;
+        assert_eq!(overrun_tick(&mut c, now).expect("down").target.fps, 24);
+
+        // First step-up after the plain streak.
+        assert_eq!(clean_ticks_until_up(&mut c, &mut now, 60), Some(5));
+        assert_eq!(c.target().fps, 30);
+
+        // It does not hold: down again within the probation.
+        now += TICK;
+        assert_eq!(overrun_tick(&mut c, now).expect("down").target.fps, 24);
+        assert_eq!(clean_ticks_until_up(&mut c, &mut now, 9), None);
+        assert_eq!(c.target().fps, 24);
+        // 9 clean ticks so far; the 10th lifts.
+        assert_eq!(clean_ticks_until_up(&mut c, &mut now, 60), Some(1));
+
+        // Fails once more: now 20 ticks.
+        now += TICK;
+        assert_eq!(overrun_tick(&mut c, now).expect("down").target.fps, 24);
+        assert_eq!(clean_ticks_until_up(&mut c, &mut now, 19), None);
+        assert_eq!(clean_ticks_until_up(&mut c, &mut now, 60), Some(1));
+    }
+
+    #[test]
+    fn step_up_wait_is_capped() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0 + TICK;
+        assert_eq!(overrun_tick(&mut c, now).expect("down").target.fps, 24);
+        for _ in 0..40 {
+            let waited = clean_ticks_until_up(&mut c, &mut now, ENCODER_FAST_TICKS_MAX)
+                .expect("step-up within the cap");
+            assert!(waited <= ENCODER_FAST_TICKS_MAX);
+            now += TICK;
+            assert_eq!(overrun_tick(&mut c, now).expect("down").target.fps, 24);
+        }
+        assert_eq!(c.step_up_ticks_required(), ENCODER_FAST_TICKS_MAX);
+        assert_eq!(
+            clean_ticks_until_up(&mut c, &mut now, ENCODER_FAST_TICKS_MAX),
+            Some(ENCODER_FAST_TICKS_MAX)
+        );
+    }
+
+    #[test]
+    fn step_up_that_held_resets_the_backoff() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0 + TICK;
+        overrun_tick(&mut c, now).expect("down");
+        clean_ticks_until_up(&mut c, &mut now, 60).expect("up");
+        now += TICK;
+        overrun_tick(&mut c, now).expect("down");
+        assert_eq!(c.step_up_ticks_required(), 2 * ENCODER_FAST_TICKS);
+        clean_ticks_until_up(&mut c, &mut now, 60).expect("up");
+
+        // The step-up lasts past the probation: the overrun is a new event.
+        now += STEP_UP_PROBATION + TICK;
+        overrun_tick(&mut c, now).expect("down");
+        assert_eq!(c.step_up_ticks_required(), ENCODER_FAST_TICKS);
+        assert_eq!(
+            clean_ticks_until_up(&mut c, &mut now, 60),
+            Some(ENCODER_FAST_TICKS)
+        );
+    }
+
+    #[test]
+    fn preset_switch_resets_the_backoff() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0 + TICK;
+        overrun_tick(&mut c, now).expect("down");
+        clean_ticks_until_up(&mut c, &mut now, 60).expect("up");
+        now += TICK;
+        overrun_tick(&mut c, now).expect("down");
+        assert_eq!(c.step_up_ticks_required(), 2 * ENCODER_FAST_TICKS);
+
+        now += TICK;
+        c.set_preset(QualityPreset::Smooth, now);
+        assert_eq!(c.up_backoff, 0);
+        assert_eq!(c.last_step_up_at, None);
+        assert_eq!(c.step_up_ticks_required(), ENCODER_FAST_TICKS);
     }
 
     /// Feeds a receiver report with an explicit cumulative lost counter.
