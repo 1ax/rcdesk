@@ -154,7 +154,12 @@ keyframe. Старый pipeline останавливается через `spawn
 `~/Library/Logs/rcdesk/agent.log` / `%LOCALAPPDATA%\rcdesk\logs\agent.log`, ротация от 5 МБ)
 вместо stderr; один экземпляр — лок-файл в `agent::paths::data_dir()`. На время активной
 сессии хост держит систему от сна: `NSProcessInfo` activity (macOS) / `SetThreadExecutionState`
-(Windows) — иначе App Nap/сон душит фоновый процесс без окон.
+(Windows) — иначе App Nap/сон душит фоновый процесс без окон. На Windows в начале сеанса хост
+будит дисплей сдвигом указателя на 1 пиксель и обратно
+(`platform::windows::power::wake_display`, V-14, 2026-11-11): `ES_DISPLAY_REQUIRED` не
+включает уже погасший дисплей, а при погасшем дисплее GDI-захват отдаёт застывший кадр
+(замер на стенде: 1 кадр/с и 14 кбит/с до первого ввода, 23–27 fps через 1 с после
+движения мыши).
 
 Постоянное устройство (3.1): при первой регистрации сервер выдаёт `device_id` + секрет,
 хост хранит их в `device.json` рядом с локом (`agent::paths::data_dir()`, 0600 на Unix,
