@@ -779,7 +779,10 @@ OAuth-токен в `~/.config/rclone/rclone.conf`) 90 дней, heartbeat Bette
 actions по SHA, явные секреты `MACOS_*` вместо `inherit`, ключ VPS в `infra/known_hosts`
 (`StrictHostKeyChecking=yes`), job `cargo-audit` (`rustsec/audit-check`), Dependabot (cargo, npm, actions,
 docker, compose, еженедельно, группами), деплой выставляет `IMAGE_TAG=sha-<7>` — откат одной командой
-(`infra/README.md` «Откат»). **nginx:** дополнительные директивы сайта в `infra/nginx/rcdesk.app.conf` (источник
+(`infra/README.md` «Откат»). **Предполётная проба деплоя (I-10, 2026-11-11):** до `up -d` на VPS поднимается
+`rcdesk-probe` — новый образ через `compose run` на `127.0.0.1:8101` с БД в tmpfs; пока его `/healthz` не ответил
+`ok`, рабочий контейнер не трогается (ловит и нерабочий образ, и поломку публикации портов Docker — пропавшую
+цепочку `DOCKER` в iptables, из-за которой прод лежал 10 минут). Сбой самого `up -d` ведёт в откат, а не в выход. **nginx:** дополнительные директивы сайта в `infra/nginx/rcdesk.app.conf` (источник
 правды; конфиг панели вне репо): `Cache-Control: no-cache` на `index.html` (D39), `immutable` на `/assets/`,
 CSP сначала `Report-Only`, затем enforcing; HSTS/nosniff/X-Frame-Options/Referrer-Policy панель ставит сама.
 

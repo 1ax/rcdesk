@@ -139,7 +139,41 @@ jobs:
             fi
             echo "previous image: ${PREV_IMAGE:-none}"
             $C pull
-            $C up -d --remove-orphans
+            # I-10 (инцидент 2026-11-11, 10 мин простоя): `up -d` сначала удаляет
+            # рабочий контейнер, и если новый не стартует -- прод лежит. Тогда на
+            # VPS пропала цепочка DOCKER в iptables, и публикация порта падала.
+            # Поэтому ДО замены поднимаем пробный контейнер из нового образа на
+            # соседнем порту со своей БД в tmpfs: он проверяет и публикацию портов,
+            # и то, что образ вообще стартует. Провал -- деплой отменён, прод цел.
+            docker rm -f rcdesk-probe >/dev/null 2>&1 || true
+            probe_ok=""
+            if $C run -d --rm --name rcdesk-probe -p 127.0.0.1:8101:8080 \
+                -e RCDESK_DB_PATH=/tmp/probe.db server >/dev/null; then
+              for i in $(seq 1 10); do
+                if [ "$(curl -s http://127.0.0.1:8101/healthz || true)" = "ok" ]; then
+                  probe_ok=1
+                  break
+                fi
+                sleep 2
+              done
+            fi
+            if [ -z "$probe_ok" ]; then
+              docker logs --tail 30 rcdesk-probe 2>&1 || true
+              docker rm -f rcdesk-probe >/dev/null 2>&1 || true
+              echo "::error::preflight failed: пробный контейнер нового образа не поднялся; рабочий контейнер НЕ тронут"
+              exit 1
+            fi
+            docker rm -f rcdesk-probe >/dev/null 2>&1 || true
+            echo "preflight OK"
+            # Без `set -e` здесь: при сбое `up` нужен откат, а не выход.
+            if ! $C up -d --remove-orphans; then
+              echo "::error::docker compose up failed"
+              if [ -n "$PREV_IMAGE" ]; then
+                IMAGE_TAG="${PREV_IMAGE##*:}" $C up -d server || true
+                echo "rollback to $PREV_IMAGE attempted"
+              fi
+              exit 1
+            fi
             for i in $(seq 1 10); do
               r=$(curl -s http://127.0.0.1:8100/healthz || true)
               if [ "$r" = "ok" ]; then
