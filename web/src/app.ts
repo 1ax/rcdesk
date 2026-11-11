@@ -34,21 +34,6 @@ import {
   type Zoom,
 } from "./viewport";
 import { ClipboardBridge, isSafari, loadClipboardSyncSetting, saveClipboardSyncSetting } from "./clipboard";
-import {
-  FileReceiver,
-  FileSender,
-  chooseChunkSize,
-  defaultMaxDownloadBytes,
-  downloadFailLabel,
-  downloadFileName,
-  dragHasFiles,
-  failReasonLabel,
-  groupByRelativePath,
-  pickDroppedFiles,
-  readFolder,
-  type DirEntryLike,
-} from "./fileTransfer";
-import type { OfferedFile } from "./generated/OfferedFile";
 import { applyCursor } from "./cursor";
 import { displayOptions, parseDisplayId, shouldShowPicker } from "./displays";
 import {
@@ -62,6 +47,7 @@ import { ScreenWakeLock } from "./wakeLock";
 import { createDevicesPanel } from "./devicesPanel";
 import { createAccountPanel } from "./accountPanel";
 import { createHostAuthDialog } from "./hostAuthDialog";
+import { createFilesPanel } from "./filesPanel";
 import { VideoResume } from "./videoResume";
 import { inputBlockedLabel } from "./inputBlocked";
 import { hostOutdatedLabel, updateStatusLabel } from "./hostVersion";
@@ -287,8 +273,6 @@ const DEVICE_LIST_INTERVAL_MS = 60000;
 /** How long `#clipboard-note` stays visible after `ClipboardBridge.notify`
  * reports a too-large clipboard text (slice 2.5c, decision 5). */
 const CLIPBOARD_NOTE_MS = 4000;
-/** How long a downloaded file's object URL stays valid (slice 3.4c). */
-const DOWNLOAD_URL_REVOKE_MS = 60_000;
 
 /** How long `#fullscreen-note` (the "for exit press/hold Esc" hint) stays
  * visible after entering fullscreen (slice 3.5c). */
@@ -426,18 +410,6 @@ export function mount(root: Element | null): void {
   });
   const clipboardNoteEl = root.querySelector<HTMLSpanElement>("#clipboard-note")!;
   const fullscreenNoteEl = root.querySelector<HTMLSpanElement>("#fullscreen-note")!;
-  const fileStatusEl = root.querySelector<HTMLSpanElement>("#file-status")!;
-  const fileStatusTextEl = root.querySelector<HTMLSpanElement>("#file-status-text")!;
-  const fileCancelBtn = root.querySelector<HTMLButtonElement>("#file-cancel-btn")!;
-  const downloadStatusEl = root.querySelector<HTMLSpanElement>("#download-status")!;
-  const downloadStatusTextEl = root.querySelector<HTMLSpanElement>("#download-status-text")!;
-  const downloadCancelBtn = root.querySelector<HTMLButtonElement>("#download-cancel-btn")!;
-  const fileFetchBtn = root.querySelector<HTMLButtonElement>("#file-fetch-btn")!;
-  const fileSendBtn = root.querySelector<HTMLButtonElement>("#file-send-btn")!;
-  const fileInput = root.querySelector<HTMLInputElement>("#file-input")!;
-  const folderSendBtn = root.querySelector<HTMLButtonElement>("#folder-send-btn")!;
-  const folderInput = root.querySelector<HTMLInputElement>("#folder-input")!;
-  const fileDropHint = root.querySelector<HTMLDivElement>("#file-drop-hint")!;
   const touchCursorEl = root.querySelector<HTMLImageElement>("#touch-cursor")!;
   const sessionVideoEl = root.querySelector<HTMLDivElement>(".session-video")!;
   const fullscreenBtn = root.querySelector<HTMLButtonElement>("#fullscreen-btn")!;
@@ -810,20 +782,6 @@ export function mount(root: Element | null): void {
   // `navigator.clipboard` (only where `clipboardchange` exists -- Chrome),
   // so `teardown` knows whether to remove it.
   let clipboardChangeAttached = false;
-  // Slice 3.4b: file upload to the host. `filesEnabled` is the host's
-  // `host_info.files_enabled`; `fileSender` exists once the `file` channel
-  // arrived. Both are reset in `stopSessionResources`.
-  let filesEnabled = false;
-  let fileSender: FileSender | null = null;
-  // Slice 3.4c: files the host user copied, offered for download.
-  let fileReceiver: FileReceiver | null = null;
-  let offeredFiles: OfferedFile[] = [];
-  let offeredFolders = 0;
-  let downloading = false;
-  // Set when the current download is cancelled or a file fails: the offer
-  // then stays so the user can retry; a clean download forgets it.
-  let downloadFailed = false;
-  let fileDragDepth = 0;
   let clipboardNoteTimer: ReturnType<typeof setTimeout> | undefined;
   let fullscreenNoteTimer: ReturnType<typeof setTimeout> | undefined;
   // Set once the signaling socket itself closes (not just a session ending)
@@ -890,130 +848,6 @@ export function mount(root: Element | null): void {
       clipboardNoteEl.textContent = "";
       clipboardNoteTimer = undefined;
     }, CLIPBOARD_NOTE_MS);
-  }
-
-  /** Whether file upload can be used right now (host allows it and the
-   * `file` channel is in hand). */
-  function filesAvailable(): boolean {
-    return filesEnabled && fileSender !== null;
-  }
-
-  function updateFileUi(): void {
-    fileSendBtn.hidden = !filesAvailable();
-    folderSendBtn.hidden = !filesAvailable();
-    if (!filesAvailable()) {
-      fileStatusEl.hidden = true;
-      fileStatusTextEl.textContent = "";
-      offeredFiles = [];
-      offeredFolders = 0;
-      downloading = false;
-      downloadStatusEl.hidden = true;
-      downloadStatusTextEl.textContent = "";
-    }
-    const canFetch = filesAvailable() && offeredFiles.length > 0 && !downloading;
-    fileFetchBtn.hidden = !canFetch;
-    fileFetchBtn.textContent = `Скачать (${offeredFiles.length})`;
-    fileFetchBtn.title = offeredFiles.map((f) => f.name).join("\n");
-  }
-
-  /** Hands a downloaded file to the browser as an ordinary download. */
-  function saveDownloadedFile(name: string, blob: Blob): void {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = downloadFileName(name);
-    a.style.display = "none";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), DOWNLOAD_URL_REVOKE_MS);
-  }
-
-  function hideFileDropHint(): void {
-    fileDragDepth = 0;
-    fileDropHint.hidden = true;
-  }
-
-  /** Queues `files` for upload (slice 3.4b). */
-  function submitFiles(files: File[]): void {
-    if (!fileSender || !filesEnabled) return;
-    fileSender.enqueue(files);
-  }
-
-  /** Reads dropped folders one by one and queues each as a folder upload. */
-  async function submitDroppedFolders(folders: DirEntryLike[]): Promise<void> {
-    for (const folder of folders) {
-      try {
-        const { entries, skipped } = await readFolder(folder);
-        if (entries.length === 0) {
-          showClipboardNote(`Пустая папка не отправлена: ${folder.name}`);
-        } else if (fileSender && filesEnabled) {
-          fileSender.enqueueFolder(entries);
-        }
-        if (skipped > 0) showClipboardNote(`Не удалось прочитать: ${skipped}`);
-      } catch {
-        showClipboardNote(`Не удалось прочитать: ${folder.name}`);
-      }
-    }
-  }
-
-  function setupFileChannel(dc: RTCDataChannel): void {
-    fileSender?.dispose();
-    fileReceiver?.dispose();
-    fileReceiver = new FileReceiver(dc, {
-      onOffer: (files, skippedFolders) => {
-        // Files on the host clipboard replaced the last synced text.
-        if (files.length > 0 || skippedFolders > 0) clipboardBridge?.forgetLastText();
-        offeredFiles = files;
-        offeredFolders = skippedFolders;
-        if (files.length === 0 && skippedFolders > 0) {
-          showClipboardNote(`Папки пока не поддерживаются: пропущено ${skippedFolders}`);
-        }
-        updateFileUi();
-      },
-      onProgress: (p) => {
-        const pct = p.size > 0 ? Math.floor((p.sent / p.size) * 100) : 0;
-        downloadStatusTextEl.textContent = `⬇ ${p.name} ${pct}% (${p.index}/${p.total})`;
-        downloadStatusEl.hidden = false;
-      },
-      onFile: (name, blob) => {
-        saveDownloadedFile(name, blob);
-        showClipboardNote(`Скачано: ${name}`);
-      },
-      onError: (name, reason) => {
-        downloadFailed = true;
-        showClipboardNote(
-          name === ""
-            ? `Не скачано: ${downloadFailLabel(reason, defaultMaxDownloadBytes())}`
-            : `Не скачано: ${name} — ${downloadFailLabel(reason, defaultMaxDownloadBytes())}`,
-        );
-      },
-      onDone: () => {
-        if (downloading && !downloadFailed) {
-          offeredFiles = [];
-          offeredFolders = 0;
-        }
-        downloading = false;
-        downloadStatusEl.hidden = true;
-        downloadStatusTextEl.textContent = "";
-        updateFileUi();
-      },
-    });
-    fileSender = new FileSender(dc, chooseChunkSize(session?.maxMessageSize()), {
-      onProgress: (p) => {
-        const pct = p.size > 0 ? Math.floor((p.sent / p.size) * 100) : 0;
-        fileStatusTextEl.textContent = `⬆ ${p.name} ${pct}% (${p.index}/${p.total})`;
-        fileStatusEl.hidden = false;
-      },
-      onSaved: (name) => showClipboardNote(`Сохранено в Загрузки: ${name}`),
-      onError: (name, reason) =>
-        showClipboardNote(`Не отправлено: ${name} — ${failReasonLabel(reason)}`),
-      onDone: () => {
-        fileStatusEl.hidden = true;
-        fileStatusTextEl.textContent = "";
-      },
-    });
-    updateFileUi();
   }
 
   /** Shows `note` in `#fullscreen-note` for `FULLSCREEN_NOTE_MS` -- the "for
@@ -1165,6 +999,14 @@ export function mount(root: Element | null): void {
       const trustStorage = ownerStorage();
       if (deviceId !== null && trustStorage !== null) saveAuthRequired(trustStorage, deviceId);
     },
+  });
+
+  const filesPanel = createFilesPanel({
+    root,
+    sessionVideoEl,
+    showClipboardNote,
+    maxMessageSize: () => session?.maxMessageSize(),
+    forgetClipboardText: () => clipboardBridge?.forgetLastText(),
   });
 
   signaling.on("email_code_sent", () => accountPanel.onEmailCodeSent());
@@ -1422,8 +1264,7 @@ export function mount(root: Element | null): void {
         hostVersion = msg.version ?? null;
         softKeyboard.setHostOs(hostOs === "other" ? null : hostOs);
         updateCmdAsCtrlVisibility();
-        filesEnabled = msg.files_enabled;
-        updateFileUi();
+        filesPanel.onHostInfo(msg.files_enabled);
         curtain = curtainOnHostInfo(curtain, msg.curtain_available);
         renderCurtain();
         inputSourceAvailable = msg.input_source_available;
@@ -1499,75 +1340,6 @@ export function mount(root: Element | null): void {
     });
   }
 
-  fileSendBtn.addEventListener("click", () => {
-    fileInput.click();
-  });
-  fileInput.addEventListener("change", () => {
-    const files = Array.from(fileInput.files ?? []);
-    // Reset so picking the same file again fires `change` again.
-    fileInput.value = "";
-    submitFiles(files);
-  });
-  folderSendBtn.addEventListener("click", () => {
-    folderInput.click();
-  });
-  folderInput.addEventListener("change", () => {
-    const entries = groupByRelativePath(Array.from(folderInput.files ?? []));
-    folderInput.value = "";
-    if (entries.length === 0) return;
-    if (!fileSender || !filesEnabled) return;
-    fileSender.enqueueFolder(entries);
-  });
-  fileCancelBtn.addEventListener("click", () => {
-    fileSender?.cancelAll();
-  });
-  fileFetchBtn.addEventListener("click", () => {
-    if (!fileReceiver || offeredFiles.length === 0) return;
-    if (offeredFolders > 0) {
-      showClipboardNote(`Папки пока не поддерживаются: пропущено ${offeredFolders}`);
-    }
-    downloadFailed = false;
-    if (fileReceiver.fetch()) {
-      downloading = true;
-      updateFileUi();
-    }
-  });
-  downloadCancelBtn.addEventListener("click", () => {
-    downloadFailed = true;
-    fileReceiver?.cancel();
-  });
-  // Drag-and-drop onto the video area. These are HTML5 drag events, which
-  // are separate from the pointer/mouse events `input.ts` listens to on
-  // `video` (the browser does not fire pointermove/pointerdown during an
-  // OS-level file drag), so nothing is sent to the host's `input` channel.
-  // File drags are always `preventDefault`ed over the video so a stray drop
-  // never navigates the tab to the file; the hint shows only when uploads
-  // are available.
-  sessionVideoEl.addEventListener("dragenter", (e) => {
-    if (!dragHasFiles(e.dataTransfer)) return;
-    e.preventDefault();
-    fileDragDepth += 1;
-    if (filesAvailable()) fileDropHint.hidden = false;
-  });
-  sessionVideoEl.addEventListener("dragover", (e) => {
-    if (!dragHasFiles(e.dataTransfer)) return;
-    e.preventDefault();
-    if (e.dataTransfer) e.dataTransfer.dropEffect = filesAvailable() ? "copy" : "none";
-  });
-  sessionVideoEl.addEventListener("dragleave", (e) => {
-    if (!dragHasFiles(e.dataTransfer)) return;
-    fileDragDepth = Math.max(0, fileDragDepth - 1);
-    if (fileDragDepth === 0) fileDropHint.hidden = true;
-  });
-  sessionVideoEl.addEventListener("drop", (e) => {
-    if (!dragHasFiles(e.dataTransfer)) return;
-    e.preventDefault();
-    hideFileDropHint();
-    if (!filesAvailable() || !e.dataTransfer) return;
-    const { files, folders } = pickDroppedFiles(e.dataTransfer);
-    submitFiles(files);
-    void submitDroppedFolders(folders);
-  });
 
   function setSessionStatus(status: SessionStatus): void {
     sessionStatus.textContent = SESSION_STATUS_LABELS[status];
@@ -1708,27 +1480,7 @@ export function mount(root: Element | null): void {
     renderCtrlAltDelBtn();
     // A throw in one external call must not skip the rest (a dead channel
     // after Chrome sleep would otherwise leave `session`/`video` alive).
-    if (fileSender) {
-      try {
-        fileSender.cancelAll();
-        fileSender.dispose();
-      } catch (err) {
-        console.warn("[rcdesk] file sender cleanup failed", err);
-      }
-      fileSender = null;
-    }
-    if (fileReceiver) {
-      try {
-        fileReceiver.cancel();
-        fileReceiver.dispose();
-      } catch (err) {
-        console.warn("[rcdesk] file receiver cleanup failed", err);
-      }
-      fileReceiver = null;
-    }
-    filesEnabled = false;
-    hideFileDropHint();
-    updateFileUi();
+    filesPanel.resetSession();
     inputBlocked = false;
     viewOnlyEl.hidden = true;
     viewOnlyEl.textContent = "";
@@ -2100,7 +1852,7 @@ export function mount(root: Element | null): void {
           if (label === "input") inputChannel = dc;
           else if (label === "pointer") pointerChannel = dc;
           else if (label === "control") setupControlChannel(dc);
-          else if (label === "file") setupFileChannel(dc);
+          else if (label === "file") filesPanel.attachChannel(dc);
           maybeAttachInput();
         },
         onConnectionStateChange: (state) => {
