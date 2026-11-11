@@ -36,6 +36,19 @@ sha2 = "0.10"
 rpassword = "7"
 hmac = "0.12"
 
+# V-13: значения совпадают с умолчаниями cargo и записаны явно, чтобы их не
+# «оптимизировали» мимоходом (обоснование -- ARCHITECTURE §4.1, «Профиль release»).
+[profile.release]
+# Хост изолирует панику потока захвата/кодера и перезапускает конвейер (D58, V-2);
+# с `abort` любая паника в vendor-коде роняла бы агент вместе с сеансом.
+panic = "unwind"
+# Имена функций нужны в системных отчётах о падении (FFI: SCK, VT, MF, GDI),
+# поэтому срезается только отладочная информация std (как и по умолчанию).
+# На macOS "symbols" дал бы 21.4 -> 16.6 МБ; "none" -- 22.3 МБ.
+strip = "debuginfo"
+lto = false
+codegen-units = 16
+
 [patch.crates-io]
 rtc-sctp = { path = "vendor/rtc-sctp" }
 rtc-turn = { path = "vendor/rtc-turn" }
