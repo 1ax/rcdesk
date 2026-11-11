@@ -195,6 +195,60 @@ impl StartupKeyframe {
     }
 }
 
+/// Minimum interval between keyframes ordered by client PLI/FIR requests.
+///
+/// On a lossy path the browser repeats its PLI while the requested IDR is
+/// still in flight; honouring each one orders another IDR (hundreds of KB at
+/// 1080p) whose burst deepens the loss. A PLI sent before the already
+/// ordered IDR could have arrived must not order a second one. The request
+/// is deferred rather than dropped, because it may mean the previous IDR was
+/// itself lost. Does not apply to the startup keyframe paths.
+const PLI_KEYFRAME_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// What `PliGate::on_request` decided for one PLI/FIR.
+#[derive(Debug, PartialEq, Eq)]
+enum PliAction {
+    /// Order a keyframe now.
+    Fire,
+    /// Order a keyframe after the given delay.
+    Defer(Duration),
+    /// A deferred keyframe is already scheduled; this request is absorbed.
+    Pending,
+}
+
+/// Rate limiter for PLI/FIR-driven keyframes (see
+/// `PLI_KEYFRAME_MIN_INTERVAL`). Plain, non-async and webrtc-free by design
+/// so it can be driven with explicit `Instant`s in tests.
+#[derive(Default)]
+struct PliGate {
+    last_fired: Option<Instant>,
+    deferred_until: Option<Instant>,
+}
+
+impl PliGate {
+    fn on_request(&mut self, now: Instant) -> PliAction {
+        if let Some(until) = self.deferred_until {
+            if now < until {
+                return PliAction::Pending;
+            }
+            // The deferred keyframe has been ordered by now.
+            self.last_fired = Some(until);
+            self.deferred_until = None;
+        }
+        match self.last_fired {
+            Some(last) if now.duration_since(last) < PLI_KEYFRAME_MIN_INTERVAL => {
+                let until = last + PLI_KEYFRAME_MIN_INTERVAL;
+                self.deferred_until = Some(until);
+                PliAction::Defer(until - now)
+            }
+            _ => {
+                self.last_fired = Some(now);
+                PliAction::Fire
+            }
+        }
+    }
+}
+
 /// Constrained Baseline `42e01f`: the one profile both Safari and Chrome are
 /// guaranteed to decode in hardware (see ARCHITECTURE.md §5).
 const H264_FMTP_LINE: &str =
@@ -1136,6 +1190,7 @@ impl PeerSession {
             // connection is up; fetched once here rather than per packet.
             let video_ssrc = session.video_track.ssrcs().await.first().copied();
             let ntp_clock = NtpClock::now();
+            let mut pli_gate = PliGate::default();
             while let Some(event) = session.video_track.poll().await {
                 match event {
                     TrackLocalEvent::OnRtcpPacket(packets) => {
@@ -1190,7 +1245,21 @@ impl PeerSession {
                             }
                         }
                         if keyframe_requested {
-                            request_keyframe.store(true, Ordering::Release);
+                            match pli_gate.on_request(Instant::now()) {
+                                PliAction::Fire => request_keyframe.store(true, Ordering::Release),
+                                PliAction::Defer(delay) => {
+                                    tracing::debug!(
+                                        delay_ms = delay.as_millis() as u64,
+                                        "deferring PLI keyframe to respect the minimum IDR interval"
+                                    );
+                                    let deferred = Arc::clone(&request_keyframe);
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(delay).await;
+                                        deferred.store(true, Ordering::Release);
+                                    });
+                                }
+                                PliAction::Pending => {}
+                            }
                             let _ = session.events.send(SessionEvent::KeyframeRequested).await;
                         }
                     }
@@ -1607,6 +1676,71 @@ mod tests {
         let now = base + Duration::from_secs(15);
         assert!(sk.finished(now, false));
         assert!(!sk.should_request(now, false));
+    }
+
+    #[test]
+    fn pli_gate_first_request_fires() {
+        let base = Instant::now();
+        let mut gate = PliGate::default();
+        assert_eq!(gate.on_request(base), PliAction::Fire);
+    }
+
+    #[test]
+    fn pli_gate_request_within_interval_is_deferred_to_the_interval_end() {
+        let base = Instant::now();
+        let mut gate = PliGate::default();
+        assert_eq!(gate.on_request(base), PliAction::Fire);
+        assert_eq!(
+            gate.on_request(base + Duration::from_millis(100)),
+            PliAction::Defer(Duration::from_millis(400))
+        );
+    }
+
+    #[test]
+    fn pli_gate_further_requests_while_deferred_are_pending() {
+        let base = Instant::now();
+        let mut gate = PliGate::default();
+        assert_eq!(gate.on_request(base), PliAction::Fire);
+        assert!(matches!(
+            gate.on_request(base + Duration::from_millis(100)),
+            PliAction::Defer(_)
+        ));
+        assert_eq!(
+            gate.on_request(base + Duration::from_millis(200)),
+            PliAction::Pending
+        );
+        assert_eq!(
+            gate.on_request(base + Duration::from_millis(499)),
+            PliAction::Pending
+        );
+    }
+
+    #[test]
+    fn pli_gate_fires_again_after_interval() {
+        let base = Instant::now();
+        let mut gate = PliGate::default();
+        assert_eq!(gate.on_request(base), PliAction::Fire);
+        assert_eq!(
+            gate.on_request(base + PLI_KEYFRAME_MIN_INTERVAL),
+            PliAction::Fire
+        );
+    }
+
+    #[test]
+    fn pli_gate_counts_the_deferred_keyframe_as_fired() {
+        let base = Instant::now();
+        let mut gate = PliGate::default();
+        assert_eq!(gate.on_request(base), PliAction::Fire);
+        assert_eq!(
+            gate.on_request(base + Duration::from_millis(100)),
+            PliAction::Defer(Duration::from_millis(400))
+        );
+        // The deferred keyframe fired at base+500; 100 ms later a new
+        // request is again inside the interval.
+        assert_eq!(
+            gate.on_request(base + Duration::from_millis(600)),
+            PliAction::Defer(Duration::from_millis(400))
+        );
     }
 
     fn test_clock() -> NtpClock {
