@@ -857,8 +857,7 @@ details.add-menu[hidden] {
 @media (pointer: coarse) {
   /* iOS Safari zooms into a focused field under 16px and keeps the zoom
    * after Enter/blur (rename on the start screen). */
-  .device-rename-input,
-  .wake-add-field {
+  .device-rename-input {
     font-size: 16px;
   }
 
@@ -1290,4 +1289,15 @@ details.add-menu[hidden] {
   border: 1px solid var(--border);
   border-radius: 6px;
   user-select: all;
+}
+
+/* Последним в файле: медиа-запрос не добавляет специфичности, поэтому правило
+ * должно стоять ниже базовых `.wake-add-field` (14px) и селектов панели
+ * сеанса (12px) — иначе iOS Safari зумит страницу при фокусе (UI-12). */
+@media (pointer: coarse) {
+  .wake-add-field,
+  .display-select,
+  .quality-select {
+    font-size: 16px;
+  }
 }
