@@ -1,0 +1,10 @@
+[Unit]
+Description=Check Docker iptables chains every minute (rcdesk I-10)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

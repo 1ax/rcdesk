@@ -1,0 +1,7 @@
+[Unit]
+Description=Restore Docker iptables chains if something flushed them (rcdesk I-10)
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/docker-fw-heal
