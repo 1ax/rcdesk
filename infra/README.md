@@ -15,7 +15,10 @@
   coturn ограничен: `denied-peer-ip` на внутренние адреса, квоты
   (`--user-quota=8`, `--total-quota=200`), потолки полосы `--max-bps=2500000`
   (~20 Мбит/с на сеанс в каждую сторону) и `--bps-capacity=25000000` (~200 Мбит/с
-  на весь coturn; аудит I-8), без TCP-relay (`--no-tcp-relay`); контейнеры идут с `cap_drop`, логи ротируются. Откат при
+  на весь coturn; аудит I-8), без TCP-relay (`--no-tcp-relay`); контейнеры идут с `cap_drop`, логи ротируются.
+  Секрет TURN coturn читает из `/tmp/turnserver.conf` (tmpfs, пишет `entrypoint` из переменной `TURN_SECRET`), в argv
+  его нет; файловая система контейнера `read_only`. Проверка релея:
+  `docker exec rcdesk-coturn-1 sh -c 'turnutils_uclient -y -W "$(sed -n s/^static-auth-secret=//p /tmp/turnserver.conf)" -p 3478 <внешний IP>'`. Откат при
   проблеме с привязкой 3478 -- убрать `cap_drop`/`cap_add` у coturn и
   `docker compose up -d`.
 - `.env.prod.example` -- шаблон секретов; на сервере копируется в `.env`

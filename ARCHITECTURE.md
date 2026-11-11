@@ -768,7 +768,10 @@ Telegram-бот (`TRAFFIC_TG_BOT_TOKEN`/`TRAFFIC_TG_CHAT_ID` в `~/app/.env`); �
 имени после `:`, поэтому сервер выдаёт TURN-имя `"{expiry}:{session_id}"`; до I3, 2026-10-14, было `:rcdesk` —
 одна квота на всех, `486` в живых сеансах); контейнеры с `cap_drop: ALL` (coturn
 `+NET_BIND_SERVICE`, без `no-new-privileges` — порт 3478 под `nobody` держится file-capability), сервер `read_only`
-+ tmpfs `/tmp`, логи json-file 10m × 3. **Бэкап БД** (аудит I-H1): `infra/backup-db.sh` по cron `rcdesk` в 04:30
++ tmpfs `/tmp`, логи json-file 10m × 3. С 2026-11-11 coturn тоже `read_only` + tmpfs `/tmp`, а `static-auth-secret`
+убран из argv (`/proc/<pid>/cmdline` читает любой пользователь VPS): `entrypoint` — оболочка, которая пишет секрет из
+переменной окружения в `/tmp/turnserver.conf` (0600, `nobody`) и запускает `turnserver -c …` через `env -u TURN_SECRET`,
+остальные ключи по-прежнему в `command`. **Бэкап БД** (аудит I-H1): `infra/backup-db.sh` по cron `rcdesk` в 04:30
 UTC — `sqlite3 .backup` через `docker run --entrypoint sqlite3` из образа сервера (поэтому в образ добавлен
 `sqlite3`, сборка `--locked`), `integrity_check`, GPG на общий ключ владельца «CrewTally Backup» (`CE0B…3DA7`,
 приватная часть только у владельца), `~/backups` 14 дней, Box через rclone (`~/bin`, remote `box:rcdesk-backups`,

@@ -68,11 +68,29 @@ services:
       resources:
         limits:
           memory: 256M
+    # Секрет не в argv: `/proc/<pid>/cmdline` читает любой пользователь VPS
+    # (host-сеть не изолирует PID-пространство хоста от чтения cmdline соседями
+    # по машине). Оболочка пишет его в конфиг на tmpfs (0600, nobody) и
+    # запускает turnserver уже без переменной в окружении (`env -u`).
+    # `$$` -- экранирование от подстановки compose: раскрывает оболочка контейнера.
+    environment:
+      TURN_SECRET: ${TURN_SECRET}
+    # Контейнер пишет только в /tmp (tmpfs: конфиг с секретом) и в том
+    # /var/lib/coturn образа (sqlite `turndb`).
+    read_only: true
+    tmpfs: ["/tmp"]
+    entrypoint:
+      - "/bin/sh"
+      - "-c"
+      - |
+        umask 077
+        printf 'static-auth-secret=%s\n' "$$TURN_SECRET" > /tmp/turnserver.conf
+        exec env -u TURN_SECRET turnserver -c /tmp/turnserver.conf "$$@"
+      - "coturn"
     command:
       - "--listening-port=3478"
       - "--realm=rcdesk.app"
       - "--use-auth-secret"
-      - "--static-auth-secret=${TURN_SECRET}"
       - "--external-ip=${TURN_EXTERNAL_IP}"
       - "--min-port=49152"
       - "--max-port=65535"
