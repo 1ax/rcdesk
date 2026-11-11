@@ -10,7 +10,6 @@
 
 import { ctrlAltDelMessage, ctrlAltDelVisible } from "./ctrlAltDel";
 import "./style.css";
-import { trapFocus } from "./focusTrap";
 import { SignalingClient } from "./signaling";
 import { PeerSession, toRtcIceServers } from "./session";
 import { summarizeStats, takeSnapshot } from "./stats";
@@ -62,6 +61,7 @@ import type { NavigatorWithKeyboard } from "./fullscreen";
 import { ScreenWakeLock } from "./wakeLock";
 import { createDevicesPanel } from "./devicesPanel";
 import { createAccountPanel } from "./accountPanel";
+import { createHostAuthDialog } from "./hostAuthDialog";
 import { VideoResume } from "./videoResume";
 import { inputBlockedLabel } from "./inputBlocked";
 import { hostOutdatedLabel, updateStatusLabel } from "./hostVersion";
@@ -122,14 +122,6 @@ import {
 } from "./sessionRecovery";
 import { ConnectGuard } from "./connectGuard";
 import type { ConnectionBannerPhase } from "./sessionRecovery";
-import {
-  authFailedPhase,
-  canSubmit,
-  opaqueClient,
-  phaseLabel,
-  wrongPasswordPhase,
-} from "./hostAuth";
-import type { AuthPhase } from "./hostAuth";
 import { authTag, decodeBase64Url, fingerprintFromSdp, verifyAuthTag } from "./dtlsBind";
 import {
   loadAuthRequired,
@@ -702,15 +694,6 @@ export function mount(root: Element | null): void {
   openDownloadHelp();
   window.addEventListener("hashchange", openDownloadHelp);
   const deviceListEl = root.querySelector<HTMLUListElement>("#device-list")!;
-  // Slice 3.2d: the OPAQUE-login dialog, shown between `auth_required` and
-  // either a successful `pake_finish` (the host then sends `offer`, see that
-  // handler below) or a cancel/teardown.
-  const authDialog = root.querySelector<HTMLDivElement>("#auth-dialog")!;
-  const authHostNameEl = root.querySelector<HTMLParagraphElement>("#auth-host-name")!;
-  const authPasswordInput = root.querySelector<HTMLInputElement>("#auth-password")!;
-  const authStatusEl = root.querySelector<HTMLParagraphElement>("#auth-status")!;
-  const authSubmitBtn = root.querySelector<HTMLButtonElement>("#auth-submit")!;
-  const authCancelBtn = root.querySelector<HTMLButtonElement>("#auth-cancel")!;
 
   // Slice 3.5g: the session bar, its collapse-to-a-strip control, and the
   // "Статистика" checkbox gating the overlay's text -- both choices are
@@ -894,28 +877,6 @@ export function mount(root: Element | null): void {
   // burning it on a send that would just be dropped (see
   // `performRecoveryAttempt`).
   let recoveryWaitingForSocket = false;
-  // Slice 3.2d: `null` while `#auth-dialog` is hidden (no OPAQUE login in
-  // flight or pending); set by `auth_required` and cleared once `offer`
-  // arrives, the login is cancelled, or the session ends. Drives
-  // `renderAuthDialog`.
-  let authPhase: AuthPhase | null = null;
-  // The host name from the current session's `joined` (slice 3.2d) --
-  // shown in the auth dialog so the owner knows which device is asking.
-  let authHostName: string | null = null;
-  // The password typed for the *current* login attempt, held only between
-  // `startLogin` (which needs it again for `finishLogin`) and that
-  // `finishLogin` call -- never kept around longer than one attempt needs.
-  let authPassword: string | null = null;
-  // `opaqueClient.startLogin`'s `state`, needed by the matching
-  // `finishLogin` once `pake_response` arrives; `null` outside that window.
-  let authState: string | null = null;
-  // The session key `finishLogin` derived on a successful login -- not used
-  // by this slice (3.2e wires it into the data channel), only stored and
-  // reset alongside the rest of the auth state.
-  let authSessionKey: string | null = null;
-  // Ticks once a second while `authPhase.kind === "locked"`, re-rendering
-  // the countdown and flipping back to `prompt` once it expires.
-  let authLockTimer: ReturnType<typeof setInterval> | undefined;
 
   /** Shows `note` in `#clipboard-note` for `CLIPBOARD_NOTE_MS`, used as
    * `ClipboardBridge`'s `notify` dependency (decision 5: a too-large
@@ -1193,6 +1154,17 @@ export function mount(root: Element | null): void {
     isConnectionLost: () => connectionLost,
     ownerStorage,
     devicesPanel,
+  });
+
+  const hostAuthDialog = createHostAuthDialog({
+    signaling,
+    root,
+    getSessionId: () => sessionId,
+    teardown,
+    rememberAuthRequired: () => {
+      const trustStorage = ownerStorage();
+      if (deviceId !== null && trustStorage !== null) saveAuthRequired(trustStorage, deviceId);
+    },
   });
 
   signaling.on("email_code_sent", () => accountPanel.onEmailCodeSent());
@@ -1698,90 +1670,6 @@ export function mount(root: Element | null): void {
     connectionBannerEl.hidden = label === null;
   }
 
-  /** Stops the per-second `locked`-countdown tick (`authLockTimer`), if
-   * running -- called whenever `authPhase` moves away from `locked`, and by
-   * every full auth-state reset. */
-  function stopAuthLockTimer(): void {
-    if (authLockTimer !== undefined) {
-      clearInterval(authLockTimer);
-      authLockTimer = undefined;
-    }
-  }
-
-  /** Clears the password/`clientLoginState` pair of one OPAQUE login attempt
-   * (slice 3.2d) and stops the `locked` countdown timer -- called after
-   * every attempt settles, one way or another (a wrong password caught
-   * locally, an `auth_failed` from the host, a successful `pake_finish`, or
-   * the whole session ending). Leaves `authHostName`/`authPhase`/the
-   * dialog's visibility to the caller -- those live for the whole dialog
-   * (or session), not just one attempt. */
-  function resetAuthAttempt(): void {
-    stopAuthLockTimer();
-    authPassword = null;
-    authState = null;
-  }
-
-  /** Renders `#auth-dialog` from `authPhase`: hidden when `null`, otherwise
-   * the status line (`phaseLabel`), the field's `disabled` state (editable
-   * only at rest, on `prompt`), and the submit button's `disabled` state
-   * (`canSubmit`). Called on every `authPhase` change and on the password
-   * field's own `input` event, since `canSubmit` also depends on what's
-   * typed. */
-  function renderAuthDialog(): void {
-    authDialog.hidden = authPhase === null;
-    if (authPhase === null) return;
-    authHostNameEl.textContent = authHostName ?? "";
-    authStatusEl.textContent = phaseLabel(authPhase);
-    const editable = authPhase.kind === "prompt";
-    authPasswordInput.disabled = !editable;
-    authSubmitBtn.disabled = !canSubmit(authPhase, authPasswordInput.value);
-  }
-
-  /** Starts one OPAQUE login attempt (slice 3.2d): `opaqueClient.startLogin`
-   * (the ~1s Argon2id "memory-constrained" KSF, see `hostAuth.ts`), then
-   * `pake_start` over signaling. Only runs from `authPhase.kind ===
-   * "prompt"` with a submittable password (`canSubmit`) -- the click/Enter
-   * handlers below already check that, this is the defensive inner check.
-   * `requestSessionId` guards the awaited `startLogin` against a session
-   * that ended (cancel, `bye`, lost connection) while it was running -- its
-   * result would otherwise resurrect auth state for a dialog that's already
-   * gone. */
-  async function submitAuthLogin(): Promise<void> {
-    if (authPhase === null || authPhase.kind !== "prompt" || sessionId === null) return;
-    const password = authPasswordInput.value;
-    if (!canSubmit(authPhase, password)) return;
-    const requestSessionId = sessionId;
-    authPhase = { kind: "starting" };
-    renderAuthDialog();
-    let started: { state: string; request: string };
-    try {
-      started = await opaqueClient.startLogin(password);
-    } catch (err) {
-      console.error("failed to start OPAQUE login", err);
-      if (sessionId !== requestSessionId) return;
-      authPhase = { kind: "prompt", message: "Не удалось загрузить модуль входа" };
-      renderAuthDialog();
-      return;
-    }
-    if (sessionId !== requestSessionId) return;
-    authState = started.state;
-    authPassword = password;
-    signaling.send({ type: "pake_start", session_id: requestSessionId, payload: started.request });
-    authPhase = { kind: "verifying" };
-    renderAuthDialog();
-  }
-
-  /** Cancels the auth dialog (slice 3.2d): same path as `#disconnect-btn`
-   * (`bye` if a session is open, then `teardown`) so the device list
-   * refreshes the same way. Used by `#auth-cancel` and Esc in the password
-   * field. */
-  function cancelAuthDialog(): void {
-    if (sessionId) {
-      signaling.send({ type: "bye", session_id: sessionId });
-    }
-    teardown("Подключение отменено");
-  }
-
   /** Tears down everything belonging to the *current* `PeerSession` --
    * shared by `teardown` (an intentional/final end of session) and
    * `handleSessionLost` (which, unlike `teardown`, may then start
@@ -1886,11 +1774,7 @@ export function mount(root: Element | null): void {
     applyZoom(identityZoom());
     overlay.textContent = "";
     firstFrameShown = false;
-    resetAuthAttempt();
-    authHostName = null;
-    authSessionKey = null;
-    authPhase = null;
-    renderAuthDialog();
+    hostAuthDialog.resetSession();
   }
 
   /** Final, intentional end of session (slice 3.5b: button, peer `bye`,
@@ -2155,7 +2039,7 @@ export function mount(root: Element | null): void {
     // Slice 3.2d: shown in `#auth-dialog` if the host turns out to have a
     // password set (`auth_required`, below) -- saved now since `joined`
     // (unlike `auth_required`) carries the host's name.
-    authHostName = msg.host_name;
+    hostAuthDialog.setHostName(msg.host_name);
     // Slice 3.5b: refreshed on *every* `joined` (a fresh PIN join, a device-list
     // connect, or a `beginRecovery` retry) -- what a later `handleSessionLost`
     // reconnects to. Also resets the whole disconnect-grace/recovery state
@@ -2260,91 +2144,11 @@ export function mount(root: Element | null): void {
   // `offer` -- the OPAQUE login below (`pake_start`/`pake_response`/
   // `pake_finish`) must complete first. See `hostAuth.ts`'s doc comment and
   // `proto::signal::SignalMessage::AuthRequired`.
-  signaling.on("auth_required", (msg) => {
-    if (msg.session_id !== sessionId) return;
-    // Slice E2: remember that this host requires a password, so a later
-    // `offer` without a completed login (a MITM swallowing `auth_required`)
-    // is refused.
-    const trustStorage = ownerStorage();
-    if (deviceId !== null && trustStorage !== null) saveAuthRequired(trustStorage, deviceId);
-    resetAuthAttempt();
-    authSessionKey = null;
-    authPhase = { kind: "prompt", message: null };
-    authPasswordInput.value = "";
-    renderAuthDialog();
-    authPasswordInput.focus();
-  });
+  signaling.on("auth_required", (msg) => hostAuthDialog.onAuthRequired(msg));
 
-  signaling.on("pake_response", (msg) => {
-    if (msg.session_id !== sessionId) return;
-    if (authState === null || authPassword === null) return;
-    const state = authState;
-    const password = authPassword;
-    const requestSessionId = sessionId;
-    void (async () => {
-      let result: Awaited<ReturnType<typeof opaqueClient.finishLogin>>;
-      try {
-        result = await opaqueClient.finishLogin(state, msg.payload, password);
-      } catch (err) {
-        // Internal failure (e.g. the WASM module failed to load) -- not a
-        // wrong password.
-        console.error("OPAQUE finishLogin failed", err);
-        if (sessionId !== requestSessionId) return;
-        resetAuthAttempt();
-        authPhase = { kind: "prompt", message: "Ошибка проверки пароля — попробуйте ещё раз" };
-        authPasswordInput.value = "";
-        renderAuthDialog();
-        authPasswordInput.focus();
-        return;
-      }
-      if (sessionId !== requestSessionId) return;
-      if (result === null) {
-        resetAuthAttempt();
-        authPhase = wrongPasswordPhase();
-        authPasswordInput.value = "";
-        renderAuthDialog();
-        authPasswordInput.focus();
-        return;
-      }
-      // Slice 3.2e: kept until the session ends (see
-      // `stopSessionResources`) and read below, in `signaling.on("offer")`/
-      // `session.acceptOffer(...).then(...)`, to bind the offer/answer to
-      // this session key.
-      authSessionKey = result.sessionKey;
-      resetAuthAttempt();
-      signaling.send({
-        type: "pake_finish",
-        session_id: requestSessionId,
-        payload: result.finalization,
-      });
-      authPhase = { kind: "waiting-host" };
-      renderAuthDialog();
-    })();
-  });
+  signaling.on("pake_response", (msg) => hostAuthDialog.onPakeResponse(msg));
 
-  signaling.on("auth_failed", (msg) => {
-    if (msg.session_id !== sessionId) return;
-    resetAuthAttempt();
-    authSessionKey = null;
-    authPhase = authFailedPhase(msg.retry_after_secs, Date.now());
-    authPasswordInput.value = "";
-    renderAuthDialog();
-    if (authPhase.kind === "locked") {
-      authLockTimer = setInterval(() => {
-        if (authPhase === null || authPhase.kind !== "locked") {
-          stopAuthLockTimer();
-          return;
-        }
-        if (Date.now() >= authPhase.untilMs) {
-          stopAuthLockTimer();
-          authPhase = { kind: "prompt", message: null };
-        }
-        renderAuthDialog();
-      }, 1000);
-    } else {
-      authPasswordInput.focus();
-    }
-  });
+  signaling.on("auth_failed", (msg) => hostAuthDialog.onAuthFailed(msg));
 
   signaling.on("offer", (msg) => {
     if (!session) return;
@@ -2362,7 +2166,7 @@ export function mount(root: Element | null): void {
     const trustStorage = ownerStorage();
     const authRequiredRemembered =
       deviceId !== null && trustStorage !== null && loadAuthRequired(trustStorage, deviceId);
-    if (offerRejectedByTrust(authRequiredRemembered, authSessionKey !== null)) {
+    if (offerRejectedByTrust(authRequiredRemembered, hostAuthDialog.sessionKey() !== null)) {
       console.error("offer without password login for a host that requires one");
       signaling.send({ type: "bye", session_id: offerSessionId });
       setSessionStatus("error");
@@ -2375,16 +2179,12 @@ export function mount(root: Element | null): void {
     // the OPAQUE login has succeeded (`pake_finish` accepted) -- close the
     // dialog if it's still up rather than leaving it stuck on
     // "Ожидание хоста…" behind the now-connecting session.
-    if (authPhase !== null) {
-      resetAuthAttempt();
-      authPhase = null;
-      renderAuthDialog();
-    }
+    hostAuthDialog.closeOnOffer();
     const currentSession = session;
     // Captured for the async body below (a nested closure loses the outer
     // `let`'s narrowing) -- same reason `pake_response` above captures
     // `authState`/`authPassword` into locals before its own `await`.
-    const sessionKeyB64 = authSessionKey;
+    const sessionKeyB64 = hostAuthDialog.sessionKey();
     void (async () => {
       // Slice 3.2e: when this session was gated by a password, the offer
       // must carry a dtls-binding tag over its own fingerprint, verifiable
@@ -2623,31 +2423,6 @@ export function mount(root: Element | null): void {
     teardown("Отключено");
   });
 
-  // Slice 3.2d: submitting the auth dialog, by button or by Enter in the
-  // password field -- both just start `submitAuthLogin`, which re-checks
-  // `canSubmit` itself (the button is only enabled when it's true, but the
-  // field's `keydown` isn't gated the same way).
-  authSubmitBtn.addEventListener("click", () => {
-    void submitAuthLogin();
-  });
-  authPasswordInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      void submitAuthLogin();
-    } else if (event.key === "Escape") {
-      event.preventDefault();
-      cancelAuthDialog();
-    }
-  });
-  // `canSubmit` depends on what's typed, not just `authPhase` -- re-render
-  // on every keystroke so the submit button enables/disables live.
-  authPasswordInput.addEventListener("input", () => {
-    renderAuthDialog();
-  });
-  authCancelBtn.addEventListener("click", () => {
-    cancelAuthDialog();
-  });
-
   fullscreenBtn.addEventListener("click", () => {
     if (document.fullscreenElement) {
       void document.exitFullscreen().catch((err: unknown) => {
@@ -2751,12 +2526,6 @@ export function mount(root: Element | null): void {
     const expanded = sessionBarEl.classList.toggle("session-bar--expanded");
     barMoreBtn.setAttribute("aria-expanded", String(expanded));
     barMoreBtn.textContent = expanded ? "Меньше" : "Ещё";
-  });
-
-  // UI-4: keep Tab inside the password dialog while it is open.
-  authDialog.addEventListener("keydown", (event) => {
-    if (authDialog.hidden) return;
-    trapFocus(authDialog, event);
   });
 
   barCollapseBtn.addEventListener("click", () => {
