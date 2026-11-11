@@ -64,7 +64,9 @@ rcdesk/
 │       ├── clipboard/    # буфер обмена (текст, файлы), macos/windows
 │       ├── cursor/       # форма системного курсора, macos/windows
 │       ├── files/        # передача файлов, zip, windows
-│       ├── signaling/    # клиент WS к серверу
+│       ├── signaling/    # клиент WS к серверу и сеанс: mod.rs (HostContext, AgentStatus), client.rs,
+│       │                 #   session.rs (ActiveSession, SessionSlot), handlers.rs, start.rs, display.rs,
+│       │                 #   control.rs, stats.rs, tests/ (сеансовые тесты по темам)
 │       ├── hub/          # LAN-хаб (D47): HTTPS, сертификат, вшитый web/dist
 │       ├── access.rs, device.rs, settings.rs   # пароль доступа (OPAQUE), device.json, settings.json
 │       ├── curtain.rs, fullmode.rs, service.rs, input_source.rs, wake.rs   # полный режим, штора, Wake-on-LAN
@@ -72,7 +74,9 @@ rcdesk/
 │       ├── dtls_bind.rs, fsutil.rs, log_throttle.rs
 │       └── platform/     # macos/*, windows/*, unix_netifs.rs, other.rs — всё, что за cfg
 ├── server/               # сигнальный сервер (бинарник rcdesk-server)
-├── web/                  # веб-клиент (Vite + TS)
+├── web/                  # веб-клиент (Vite + TS); src/app.ts — mount() как оркестратор сеанса,
+│   │                     #   фичи — фабрики createX(deps) со своим состоянием и элементами:
+│   │                     #   devicesPanel, accountPanel, hostAuthDialog, filesPanel; разметка — appTemplate.ts
 │   └── src/generated/    # TS-типы из proto (ts-rs), коммитятся
 ├── installer/            # macos/ (build-pkg.sh → rcdesk-macos.pkg), windows/ (rcdesk.iss → rcdesk-setup.exe)
 ├── vendor/               # патчи rtc-sctp, rtc-turn, scap (см. §14)
