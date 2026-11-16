@@ -16,6 +16,7 @@ import {
   groupByRelativePath,
   pickDroppedFiles,
   readFolder,
+  splitFileName,
   type DirEntryLike,
   type EntryLike,
   type DataTransferLike,
@@ -827,5 +828,52 @@ describe("downloadFileName", () => {
 
   it("leaves an ordinary name alone", () => {
     expect(downloadFileName("report.docx")).toBe("report.docx");
+  });
+});
+
+describe("splitFileName", () => {
+  const check = (name: string, head: string, tail: string): void => {
+    const r = splitFileName(name);
+    expect(r).toEqual({ head, tail });
+    expect(r.head + r.tail).toBe(name);
+  };
+
+  it("keeps the extension and 6 chars of the stem", () => {
+    check("very_long_document_name.docx", "very_long_documen", "t_name.docx");
+  });
+
+  it("takes the last 6 chars when there is no extension", () => {
+    check("abcdefghijklmnopqrst", "abcdefghijklmn", "opqrst");
+  });
+
+  it("leaves short names whole", () => {
+    check("report.docx", "report.docx", "");
+    check("abcdefghijkl", "abcdefghijkl", "");
+  });
+
+  it("does not treat a leading dot as an extension", () => {
+    check(".bashrc_long_name_here", ".bashrc_long_nam", "e_here");
+  });
+
+  it("uses the last dot for double extensions", () => {
+    check("archive_backup.tar.gz", "archive_back", "up.tar.gz");
+  });
+
+  it("ignores an over-long extension", () => {
+    check("file.averyveryverylongext", "file.averyveryveryl", "ongext");
+  });
+
+  it("keeps Cyrillic intact", () => {
+    check("очень_длинное_имя_файла.pdf", "очень_длинное_имя", "_файла.pdf");
+  });
+
+  it("does not split surrogate pairs", () => {
+    const name = "😀😀😀😀😀😀😀😀😀😀😀😀😀😀.txt";
+    const r = splitFileName(name);
+    expect(r.head + r.tail).toBe(name);
+    expect(Array.from(r.tail)).toHaveLength(10);
+    expect(Array.from(r.head)).toHaveLength(8);
+    const noExt = "😀😀😀😀😀😀😀😀😀😀😀😀😀😀";
+    expect(Array.from(splitFileName(noExt).tail)).toHaveLength(6);
   });
 });

@@ -855,6 +855,12 @@ details.add-menu[hidden] {
 }
 
 @media (pointer: coarse) {
+  /* The badge's ✕ gets the 44px touch height below; no vertical padding on
+     the badge so it stays as tall as the bar's other buttons. */
+  .session-bar .file-status {
+    padding-block: 0;
+  }
+
   /* iOS Safari zooms into a focused field under 16px and keeps the zoom
    * after Enter/blur (rename on the start screen). */
   .device-rename-input {
@@ -890,6 +896,10 @@ details.add-menu[hidden] {
 }
 
 @media (max-width: 600px) {
+  .session-bar .file-status {
+    flex-basis: 160px;
+  }
+
   .build-badge {
     font-size: 10px;
     opacity: 0.5;
@@ -1002,19 +1012,85 @@ details.add-menu[hidden] {
   text-transform: none;
 }
 
-/* Slice 3.4b: upload progress ("⬆ name 45% (2/5)" + cancel) in the bar. */
+/* Slice 3.4b: transfer progress badge ("⬆ name 45% 2/5" + cancel) in the bar's
+   left part. Geometry never depends on the text: the width comes only from
+   the container (`flex-basis` + `min-width: 0`), the name is truncated in
+   the middle (head ellipsizes, tail stays), numbers are tabular. The fill is
+   `--pct`, set through CSSOM (CSP forbids style attributes). */
 .file-status {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  flex: 0 1 240px;
+  min-width: 0;
+  overflow: hidden;
   text-transform: none;
+  background: linear-gradient(
+    to right,
+    rgb(79 140 255 / 35%) var(--pct, 0%),
+    rgb(0 0 0 / 55%) var(--pct, 0%)
+  );
 }
 
-.file-status-text {
-  max-width: 260px;
+.file-status-arrow {
+  flex-shrink: 0;
+}
+
+.file-status-name {
+  display: flex;
+  align-items: center;
+  /* Fixed height: an emoji's fallback font has a taller line box (15 -> 20px)
+     and would grow the bar by a pixel. */
+  height: 1.25em;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.file-name-head {
+  min-width: 0;
+  flex: 0 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Keep the "…" visible when the head is cut down to nothing. */
+.file-name-head:not(:empty) {
+  min-width: 2ch;
+}
+
+/* With a badge shown, the stats line yields first: basis 0 means it only
+   takes what is left, so the badge keeps its 240px. */
+.session-bar-left .overlay {
+  flex: 1 1 0;
+}
+
+.file-name-tail {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.file-status-pct,
+.file-status-count {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.file-status-pct {
+  min-width: 4ch;
+  text-align: right;
+}
+
+/* The cancel button left `.controls` with the badge, so it no longer gets
+   `.controls .btn`; without this it takes the base `.btn` size (37px tall,
+   16px top margin) and the badge grows the bar from 40 to 74px. */
+.file-status .btn {
+  width: auto;
+  margin: 0;
+  padding: 2px 8px;
+  font-size: 12px;
+  line-height: 1;
+  flex-shrink: 0;
 }
 
 /* Slice 3.4b: translucent drop hint over the video while files are dragged;

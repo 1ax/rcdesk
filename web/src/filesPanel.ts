@@ -18,6 +18,7 @@ import {
   groupByRelativePath,
   pickDroppedFiles,
   readFolder,
+  splitFileName,
   type DirEntryLike,
 } from "./fileTransfer";
 import type { OfferedFile } from "./generated/OfferedFile";
@@ -53,10 +54,8 @@ export function createFilesPanel(deps: FilesPanelDeps): FilesPanel {
 
 
   const fileStatusEl = root.querySelector<HTMLSpanElement>("#file-status")!;
-  const fileStatusTextEl = root.querySelector<HTMLSpanElement>("#file-status-text")!;
   const fileCancelBtn = root.querySelector<HTMLButtonElement>("#file-cancel-btn")!;
   const downloadStatusEl = root.querySelector<HTMLSpanElement>("#download-status")!;
-  const downloadStatusTextEl = root.querySelector<HTMLSpanElement>("#download-status-text")!;
   const downloadCancelBtn = root.querySelector<HTMLButtonElement>("#download-cancel-btn")!;
   const fileFetchBtn = root.querySelector<HTMLButtonElement>("#file-fetch-btn")!;
   const fileSendBtn = root.querySelector<HTMLButtonElement>("#file-send-btn")!;
@@ -80,6 +79,34 @@ export function createFilesPanel(deps: FilesPanelDeps): FilesPanel {
   let downloadFailed = false;
   let fileDragDepth = 0;
 
+  /** Fills a progress badge (fixed geometry: only text and `--pct` change). */
+  function showProgress(
+    el: HTMLElement,
+    p: { name: string; sent: number; size: number; index: number; total: number },
+  ): void {
+    const pct = p.size > 0 ? Math.floor((p.sent / p.size) * 100) : 0;
+    const { head, tail } = splitFileName(p.name);
+    el.querySelector<HTMLElement>(".file-name-head")!.textContent = head;
+    el.querySelector<HTMLElement>(".file-name-tail")!.textContent = tail;
+    el.querySelector<HTMLElement>(".file-status-pct")!.textContent = `${pct}%`;
+    const countEl = el.querySelector<HTMLElement>(".file-status-count")!;
+    countEl.textContent = `${p.index}/${p.total}`;
+    countEl.hidden = p.total <= 1;
+    el.title = p.name;
+    el.style.setProperty("--pct", `${pct}%`);
+    el.hidden = false;
+  }
+
+  /** Hides a progress badge and clears its texts and fill. */
+  function clearProgress(el: HTMLElement): void {
+    for (const sel of [".file-name-head", ".file-name-tail", ".file-status-pct", ".file-status-count"]) {
+      el.querySelector<HTMLElement>(sel)!.textContent = "";
+    }
+    el.title = "";
+    el.style.removeProperty("--pct");
+    el.hidden = true;
+  }
+
   /** Whether file upload can be used right now (host allows it and the
    * `file` channel is in hand). */
   function filesAvailable(): boolean {
@@ -90,16 +117,14 @@ export function createFilesPanel(deps: FilesPanelDeps): FilesPanel {
     fileSendBtn.hidden = !filesAvailable();
     folderSendBtn.hidden = !filesAvailable();
     if (!filesAvailable()) {
-      fileStatusEl.hidden = true;
-      fileStatusTextEl.textContent = "";
+      clearProgress(fileStatusEl);
       offeredFiles = [];
       offeredFolders = 0;
       downloading = false;
-      downloadStatusEl.hidden = true;
-      downloadStatusTextEl.textContent = "";
+      clearProgress(downloadStatusEl);
     }
-    const canFetch = filesAvailable() && offeredFiles.length > 0 && !downloading;
-    fileFetchBtn.hidden = !canFetch;
+    fileFetchBtn.hidden = !(filesAvailable() && offeredFiles.length > 0);
+    fileFetchBtn.disabled = downloading;
     fileFetchBtn.textContent = `Скачать (${offeredFiles.length})`;
     fileFetchBtn.title = offeredFiles.map((f) => f.name).join("\n");
   }
@@ -160,9 +185,7 @@ export function createFilesPanel(deps: FilesPanelDeps): FilesPanel {
         updateFileUi();
       },
       onProgress: (p) => {
-        const pct = p.size > 0 ? Math.floor((p.sent / p.size) * 100) : 0;
-        downloadStatusTextEl.textContent = `⬇ ${p.name} ${pct}% (${p.index}/${p.total})`;
-        downloadStatusEl.hidden = false;
+        showProgress(downloadStatusEl, p);
       },
       onFile: (name, blob) => {
         saveDownloadedFile(name, blob);
@@ -182,23 +205,19 @@ export function createFilesPanel(deps: FilesPanelDeps): FilesPanel {
           offeredFolders = 0;
         }
         downloading = false;
-        downloadStatusEl.hidden = true;
-        downloadStatusTextEl.textContent = "";
+        clearProgress(downloadStatusEl);
         updateFileUi();
       },
     });
     fileSender = new FileSender(dc, chooseChunkSize(deps.maxMessageSize()), {
       onProgress: (p) => {
-        const pct = p.size > 0 ? Math.floor((p.sent / p.size) * 100) : 0;
-        fileStatusTextEl.textContent = `⬆ ${p.name} ${pct}% (${p.index}/${p.total})`;
-        fileStatusEl.hidden = false;
+        showProgress(fileStatusEl, p);
       },
       onSaved: (name) => showClipboardNote(`Сохранено в Загрузки: ${name}`),
       onError: (name, reason) =>
         showClipboardNote(`Не отправлено: ${name} — ${failReasonLabel(reason)}`),
       onDone: () => {
-        fileStatusEl.hidden = true;
-        fileStatusTextEl.textContent = "";
+        clearProgress(fileStatusEl);
       },
     });
     updateFileUi();

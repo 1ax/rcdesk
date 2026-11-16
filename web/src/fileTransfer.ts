@@ -774,3 +774,19 @@ export function dragHasFiles(dt: { types?: ArrayLike<string> } | null): boolean 
   if (!dt?.types) return false;
   return Array.from(dt.types).includes("Files");
 }
+
+/**
+ * Splits a file name for middle truncation in the progress badge: `head` may
+ * be ellipsized, `tail` (last 6 characters of the stem plus the extension, or
+ * the last 6 characters when there is no usable extension) always stays
+ * visible. `head + tail === name`. Works on code points, so surrogate pairs
+ * stay whole.
+ */
+export function splitFileName(name: string): { head: string; tail: string } {
+  const chars = Array.from(name);
+  if (chars.length <= 12) return { head: name, tail: "" };
+  const dot = chars.lastIndexOf(".");
+  const hasExt = dot > 0 && chars.length - dot <= 12;
+  const cut = hasExt ? Math.max(0, dot - 6) : chars.length - 6;
+  return { head: chars.slice(0, cut).join(""), tail: chars.slice(cut).join("") };
+}

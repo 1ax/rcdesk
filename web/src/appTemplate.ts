@@ -133,17 +133,23 @@ export function appTemplate(params: { downloadBlock: string }): string {
             Буфер обмена
           </label>
           <button id="clipboard-push-btn" class="btn btn-secondary bar-secondary" title="Отправить буфер телефона на хост" hidden>Буфер →</button>
-          <span class="overlay" id="stats-overlay" hidden></span>
-        </div>
-        <div class="controls">
           <span id="file-status" class="status file-status" hidden>
-            <span id="file-status-text" class="file-status-text"></span>
+            <span class="file-status-arrow" aria-hidden="true">⬆</span>
+            <span class="file-status-name"><span class="file-name-head"></span><span class="file-name-tail"></span></span>
+            <span class="file-status-pct"></span>
+            <span class="file-status-count" hidden></span>
             <button id="file-cancel-btn" class="btn btn-secondary" title="Отменить передачу" aria-label="Отменить передачу">✕</button>
           </span>
           <span id="download-status" class="status file-status" hidden>
-            <span id="download-status-text" class="file-status-text"></span>
+            <span class="file-status-arrow" aria-hidden="true">⬇</span>
+            <span class="file-status-name"><span class="file-name-head"></span><span class="file-name-tail"></span></span>
+            <span class="file-status-pct"></span>
+            <span class="file-status-count" hidden></span>
             <button id="download-cancel-btn" class="btn btn-secondary" title="Отменить скачивание" aria-label="Отменить скачивание">✕</button>
           </span>
+          <span class="overlay" id="stats-overlay" hidden></span>
+        </div>
+        <div class="controls">
           <button id="file-fetch-btn" class="btn btn-secondary bar-secondary" hidden>Скачать</button>
           <button id="file-send-btn" class="btn btn-secondary bar-secondary" hidden>Отправить файлы</button>
           <input id="file-input" type="file" multiple hidden />
