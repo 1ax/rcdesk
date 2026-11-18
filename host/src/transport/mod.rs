@@ -99,33 +99,52 @@ const MAX_CAPTURE_GAP: Duration = Duration::from_secs(10);
 /// session that never finishes negotiating.
 const KEYFRAME_REARM_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Packets per pacing burst in `PeerSession::start_video` (about 38 KB at
-/// `RTP_MTU`). A frame that fits one burst is sent back to back, as before.
-const PACE_BURST_PACKETS: usize = 32;
+/// Instantaneous send rate inside one video frame, in kbit/s. About twice
+/// the 6 Mbit/s ceiling of the adaptive target: a frame is spread over time
+/// at this rate instead of leaving as one line-rate burst. Live case
+/// (2026-11): both ends wired at 70-90 Mbit/s, RTT 130-140 ms, yet scroll
+/// frames of 15-30 KB (12-25 packets) sent back to back lost 150 packets in
+/// 5 s at 6.3 Mbit/s and 11-25 at 1-2 Mbit/s, i.e. something on the path
+/// drops bursts. At 12 Mbit/s a 25-packet frame takes about 19 ms.
+const PACE_RATE_KBPS: u64 = 12_000;
 
-/// Pause between two pacing bursts of one video frame.
-const PACE_BURST_GAP: Duration = Duration::from_millis(1);
+/// Packets due within this long of "now" are sent immediately instead of
+/// sleeping (timer granularity makes shorter sleeps pointless).
+const PACE_MIN_SLEEP: Duration = Duration::from_millis(1);
 
 /// Ceiling on the total time spent sending one frame (about one frame
-/// interval at 30 fps). Once exceeded (e.g. the Windows timer granularity,
-/// up to 15.6 ms per sleep, ate the budget) the rest of the frame goes out
-/// without pauses, so pacing never adds more than one frame of latency.
+/// interval at 30 fps). `pace_offsets` raises the send rate above
+/// `PACE_RATE_KBPS` for big frames (IDRs) so pacing never adds more than
+/// one frame of latency.
 const PACE_MAX_SPREAD: Duration = Duration::from_millis(30);
 
-/// Says whether to pause before packet `next` of a `total`-packet frame
-/// whose first packet went out `elapsed` ago. Pauses only at burst
-/// boundaries (`next` a non-zero multiple of `PACE_BURST_PACKETS`, with
-/// packets still left to send) and only while `elapsed < PACE_MAX_SPREAD`.
-fn pace_gap(next: usize, total: usize, elapsed: Duration) -> Option<Duration> {
-    if next > 0
-        && next < total
-        && next.is_multiple_of(PACE_BURST_PACKETS)
-        && elapsed < PACE_MAX_SPREAD
-    {
-        Some(PACE_BURST_GAP)
-    } else {
-        None
+/// Send-time offset from the start of the frame for each packet, given the
+/// packet sizes in bytes. Packet `i` leaves once the bytes of packets
+/// `0..i` have been sent at `PACE_RATE_KBPS`; if the last packet would then
+/// leave later than `PACE_MAX_SPREAD`, all offsets are scaled so it leaves
+/// exactly at `PACE_MAX_SPREAD` (the rate goes up). The first offset is 0.
+fn pace_offsets(sizes: &[usize]) -> Vec<Duration> {
+    let bits_per_sec = PACE_RATE_KBPS * 1000;
+    let mut sent_bytes: u64 = 0;
+    let mut offsets: Vec<Duration> = Vec::with_capacity(sizes.len());
+    for &size in sizes {
+        offsets.push(Duration::from_secs_f64(
+            (sent_bytes * 8) as f64 / bits_per_sec as f64,
+        ));
+        sent_bytes += size as u64;
     }
+    if let Some(&last) = offsets.last() {
+        if last > PACE_MAX_SPREAD {
+            let k = PACE_MAX_SPREAD.as_secs_f64() / last.as_secs_f64();
+            for o in &mut offsets {
+                *o = Duration::from_secs_f64(o.as_secs_f64() * k);
+            }
+            if let Some(l) = offsets.last_mut() {
+                *l = PACE_MAX_SPREAD;
+            }
+        }
+    }
+    offsets
 }
 
 /// How often `PeerSession::start_video`'s startup keyframe task re-requests a
@@ -1147,15 +1166,24 @@ impl PeerSession {
                 // Pacing (audit 2026-10-13, slice F2): an IDR of 126-322 KB
                 // is 110-270 packets; sent back to back that burst overflows
                 // Wi-Fi/TURN queues -> loss -> PLI -> new IDR -> loop, and
-                // Chrome's GCC cuts REMB. Send in bursts of
-                // `PACE_BURST_PACKETS` with `PACE_BURST_GAP` between them,
-                // but stop pausing after `PACE_MAX_SPREAD` so pacing never
-                // costs more than about one frame interval of latency.
+                // Chrome's GCC cuts REMB. First fix: bursts of 32 packets
+                // with a 1 ms gap. That left ordinary scroll frames (12-25
+                // packets) as line-rate bursts, and a live session (2026-11,
+                // wired ends, RTT 130-140 ms) lost 11-150 packets per 5 s at
+                // only 1-6 Mbit/s. Now every packet is spread by
+                // `pace_offsets` (`PACE_RATE_KBPS`, capped at
+                // `PACE_MAX_SPREAD` per frame, so at most about one frame
+                // interval of latency). Packets due within `PACE_MIN_SLEEP`
+                // go out immediately.
                 let started = Instant::now();
                 let total = packets.len();
-                for (i, mut pkt) in packets.into_iter().enumerate() {
-                    if let Some(gap) = pace_gap(i, total, started.elapsed()) {
-                        tokio::time::sleep(gap).await;
+                let sizes: Vec<usize> = packets.iter().map(|p| p.payload.len()).collect();
+                let offsets = pace_offsets(&sizes);
+                for (pkt, offset) in packets.into_iter().zip(offsets.iter().copied()) {
+                    let mut pkt = pkt;
+                    let due = started + offset;
+                    if due.saturating_duration_since(Instant::now()) >= PACE_MIN_SLEEP {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
                     }
                     pkt.header.payload_type = pt;
                     // Stamped after the pacing pause, right before the write:
@@ -1170,10 +1198,11 @@ impl PeerSession {
                         tracing::warn!(?err, "failed to write video packet");
                     }
                 }
-                if total > PACE_BURST_PACKETS {
+                if total >= 2 {
                     tracing::debug!(
                         packets = total,
                         keyframe,
+                        planned_ms = offsets.last().map_or(0.0, |o| o.as_secs_f64() * 1000.0),
                         spread_ms = started.elapsed().as_secs_f64() * 1000.0,
                         "paced video frame"
                     );
@@ -1572,34 +1601,37 @@ mod tests {
     }
 
     #[test]
-    fn pace_gap_small_frame_never_pauses() {
-        for next in 0..=10 {
-            assert_eq!(pace_gap(next, 10, Duration::ZERO), None);
+    fn pace_offsets_spreads_frame_at_rate() {
+        let offsets = pace_offsets(&[1200; 25]);
+        assert_eq!(offsets.len(), 25);
+        assert_eq!(offsets[0], Duration::ZERO);
+        let last = offsets[24].as_secs_f64() * 1000.0;
+        assert!((last - 19.2).abs() < 0.1, "last = {last} ms");
+        assert!(offsets.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn pace_offsets_single_and_empty() {
+        assert_eq!(pace_offsets(&[1200]), vec![Duration::ZERO]);
+        assert!(pace_offsets(&[]).is_empty());
+    }
+
+    #[test]
+    fn pace_offsets_large_frame_scaled_to_max_spread() {
+        let offsets = pace_offsets(&[1200; 270]);
+        assert_eq!(offsets.len(), 270);
+        assert_eq!(offsets[0], Duration::ZERO);
+        assert_eq!(offsets[269], PACE_MAX_SPREAD);
+        assert!(offsets.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn pace_offsets_proportional_to_accumulated_bytes() {
+        let offsets = pace_offsets(&[1000, 500, 1500, 200]);
+        let unit = 8.0 / (PACE_RATE_KBPS as f64 * 1000.0);
+        for (o, bytes) in offsets.iter().zip([0.0, 1000.0, 1500.0, 3000.0]) {
+            assert!((o.as_secs_f64() - bytes * unit).abs() < 1e-9);
         }
-    }
-
-    #[test]
-    fn pace_gap_pauses_at_burst_boundaries_only() {
-        for next in 0..100 {
-            let expected = matches!(next, 32 | 64 | 96);
-            assert_eq!(
-                pace_gap(next, 100, Duration::ZERO).is_some(),
-                expected,
-                "next = {next}"
-            );
-        }
-        assert_eq!(pace_gap(32, 100, Duration::ZERO), Some(PACE_BURST_GAP));
-    }
-
-    #[test]
-    fn pace_gap_exact_burst_frame_has_no_trailing_pause() {
-        assert_eq!(pace_gap(32, 32, Duration::ZERO), None);
-    }
-
-    #[test]
-    fn pace_gap_stops_after_max_spread() {
-        assert_eq!(pace_gap(32, 100, PACE_MAX_SPREAD), None);
-        assert_eq!(pace_gap(64, 100, PACE_MAX_SPREAD * 2), None);
     }
 
     #[test]
