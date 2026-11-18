@@ -599,21 +599,16 @@ mod mac {
     }
 
     fn variants() -> Vec<Variant> {
-        // Old production tuning (pre-measurement): the other variants in the
-        // historical tables are expressed relative to it.
-        let d = VtTuning {
-            data_rate_limit: Some(1.0),
-            avg_factor: 1.0,
-            ..VtTuning::default()
-        };
+        // Production tuning (DataRateLimits 1.0x / 1 s, average = target): the
+        // other variants are expressed relative to it.
+        let d = VtTuning::default();
         let v = |name, tuning, max_qp| Variant {
             name,
             tuning,
             max_qp,
         };
         vec![
-            v("old-base", d, None),
-            v("base", VtTuning::default(), None),
+            v("base", d, None),
             v(
                 "no-drl",
                 VtTuning {

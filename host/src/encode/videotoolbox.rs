@@ -79,33 +79,29 @@ pub enum VtProfile {
     ConstrainedHigh,
 }
 
-/// Production `AverageBitRate` factor: `AverageBitRate` = target x 0.6.
-///
-/// Measured with `examples/vt_scroll_bench.rs`: the old setting (`DataRateLimits`
-/// = target bytes per 1 s window, `AverageBitRate` = target) choked the encoder
-/// on smooth scrolling. Without `DataRateLimits` and with 0.6 x target:
-/// smooth scroll at 6000 kbit/s -- 3744 kbit/s at QP 26 became 5538 kbit/s at
-/// QP 19; fast scroll at 6000 -- 6682 became 8368 kbit/s; fast scroll at 3000
-/// -- 5428 kbit/s at QP 37 became 5309 kbit/s at QP 36. The 1 s `DataRateLimits`
-/// is a ceiling that VT does not hold on fast scroll anyway, so it only hurt
-/// quality on smooth scroll.
-pub const PROD_AVG_FACTOR: f32 = 0.6;
-
 /// Encoder knobs (see `examples/vt_scroll_bench.rs`).
 /// `Default` is exactly the production behaviour of `VideoToolboxEncoder::new`:
-/// no `DataRateLimits`, `AverageBitRate` = target x `PROD_AVG_FACTOR`.
+/// `DataRateLimits` = 1.0x target bytes per 1 s window, `AverageBitRate` = target.
+///
+/// Why not `data_rate_limit: None`: 0.5.0 dropped the limit (and scaled the
+/// average by 0.6) because it gave better QP on smooth scroll in the bench. In
+/// live sessions (Windows -> Mac over the internet, 0.5.0-0.5.3, 2026-11-18)
+/// frame size was then unbounded: the first scroll after idle peaked at
+/// 8.6 Mbit/s (2186 packets lost in 5 s) and a keyframe on a window switch hit
+/// 11.9 Mbit/s (869 lost, artifacts for several seconds). The hard 1.0x / 1 s
+/// limit is restored.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VtTuning {
     pub profile: VtProfile,
-    /// `Some(f)`: `DataRateLimits` = f x average bytes per window (the old
-    /// pre-measurement behaviour was `Some(1.0)`, kept for the bench).
-    /// `None` (production): the property is not set at all.
+    /// `Some(f)`: `DataRateLimits` = f x average bytes per window
+    /// (production: `Some(1.0)`). `None`: the property is not set at all
+    /// (0.5.0-0.5.3 behaviour, kept for the bench).
     pub data_rate_limit: Option<f32>,
     /// `kVTVideoEncoderSpecification_EnableLowLatencyRateControl` in the
     /// encoder specification.
     pub low_latency_rc: bool,
-    /// `AverageBitRate` = target x factor (`PROD_AVG_FACTOR` = production,
-    /// `1.0` = old behaviour). Does not affect `DataRateLimits`, which is
+    /// `AverageBitRate` = target x factor (`1.0` = production, `0.6` = the
+    /// 0.5.0 experiment). Does not affect `DataRateLimits`, which is
     /// derived from the unscaled target.
     pub avg_factor: f32,
     /// `DataRateLimits` window in seconds (used only when `data_rate_limit`
@@ -117,9 +113,9 @@ impl Default for VtTuning {
     fn default() -> Self {
         Self {
             profile: VtProfile::ConstrainedBaseline,
-            data_rate_limit: None,
+            data_rate_limit: Some(1.0),
             low_latency_rc: false,
-            avg_factor: PROD_AVG_FACTOR,
+            avg_factor: 1.0,
             drl_window_s: 1.0,
         }
     }
@@ -1470,26 +1466,25 @@ mod tests {
     #[test]
     fn avg_bps_scales_target_by_factor() {
         let d = VtTuning::default();
-        assert_eq!(avg_bps(2000, &d), 1_200_000);
-        assert_eq!(avg_bps(800, &d), 480_000);
-        let old = VtTuning {
-            avg_factor: 1.0,
+        assert_eq!(avg_bps(2000, &d), 2_000_000);
+        let scaled = VtTuning {
+            avg_factor: 0.6,
             ..d
         };
-        assert_eq!(avg_bps(2000, &old), 2_000_000);
+        assert_eq!(avg_bps(2000, &scaled), 1_200_000);
+        assert_eq!(avg_bps(800, &scaled), 480_000);
     }
 
     #[test]
-    fn default_tuning_has_no_data_rate_limit_and_scaled_average() {
+    fn default_tuning_is_one_second_data_rate_limit_and_unscaled_average() {
         let mut default = VideoToolboxEncoder::new(test_cfg()).expect("init");
-        assert_eq!(default.tuning.data_rate_limit, None);
-        assert_eq!(default.tuning.avg_factor, PROD_AVG_FACTOR);
-        assert_eq!(read_data_rate_limits(&default.session), None);
-        let avg = read_average_bitrate(&default.session);
+        assert_eq!(default.tuning.data_rate_limit, Some(1.0));
+        assert_eq!(default.tuning.avg_factor, 1.0);
         assert_eq!(
-            avg,
-            Some(i64::from(avg_bps(test_cfg().bitrate_kbps, &default.tuning)))
+            read_data_rate_limits(&default.session),
+            Some(vec![250_000.0, 1.0])
         );
+        assert_eq!(read_average_bitrate(&default.session), Some(2_000_000));
         default
             .set_rate(RateTarget {
                 bitrate_kbps: 800,
@@ -1498,34 +1493,9 @@ mod tests {
             .expect("set_rate");
         assert_eq!(
             read_data_rate_limits(&default.session),
-            None,
-            "set_rate must not introduce DataRateLimits"
-        );
-        assert_eq!(read_average_bitrate(&default.session), Some(480_000));
-    }
-
-    #[test]
-    fn explicit_old_tuning_keeps_data_rate_limit_one_second() {
-        let tuning = VtTuning {
-            data_rate_limit: Some(1.0),
-            avg_factor: 1.0,
-            ..VtTuning::default()
-        };
-        let mut old = VideoToolboxEncoder::new_tuned(test_cfg(), tuning).expect("init");
-        assert_eq!(
-            read_data_rate_limits(&old.session),
-            Some(vec![250_000.0, 1.0])
-        );
-        old.set_rate(RateTarget {
-            bitrate_kbps: 800,
-            fps: 15,
-        })
-        .expect("set_rate");
-        assert_eq!(
-            read_data_rate_limits(&old.session),
             Some(vec![100_000.0, 1.0])
         );
-        assert_eq!(read_average_bitrate(&old.session), Some(800_000));
+        assert_eq!(read_average_bitrate(&default.session), Some(800_000));
     }
 
     #[test]
