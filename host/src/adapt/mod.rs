@@ -52,6 +52,16 @@
 //!   0.2.3 live log, 2026-10-26, 1 lost of 2 sent (0.496) on a static screen
 //!   cut the target every 30-60 s for hours. A report counts as loss only if
 //!   the cumulative lost counter grew by `MIN_LOST_PACKETS` or more.
+//! - The REMB ceiling (`loss_cap`) must not be trusted when the link was idle
+//!   just before the loss: Mac host 0.5.0 live log, client on Windows over the
+//!   internet (RTT 140 ms). Idle sent ~100 kbit/s, REMB sank to 340-454 (the
+//!   "hungry" browser sees only our trickle); at the start of a scroll one RR
+//!   with 3 lost packets said 0.164, the `LOSS_HIGH` cut gave ~5500 and then
+//!   `loss_cap` = REMB*0.9 cut it to `LOSS_CAP_FLOOR_KBPS` (1000) for 10 s plus
+//!   ~25 s of probing back: the whole scroll was blurry. `loss_cap` therefore
+//!   arms only if the link was loaded in at least `LOSS_CAP_TRUST_MIN_LOADED`
+//!   of the last `LOSS_CAP_TRUST_TICKS` ticks; otherwise loss gets only the
+//!   multiplicative cut and the probe pause.
 //! - A single RR with loss was applied on every tick while it stayed fresh
 //!   (`LOSS_FRESH`, 3 s): RRs and ticks both run at ~1 Hz, so one report cut
 //!   the target two or three times in a row (audit 2026-11-02, V-10). The
@@ -150,7 +160,24 @@ pub const LOSS_CAP_RATIO: f64 = 0.9;
 /// 05:49-09:03Z, static screen sent 19-31 kbit/s (3-15 packets/s) and 211
 /// `loss` cuts followed, e.g. loss=0.496 from 1 lost packet out of 2, each
 /// cutting the target to 1000/8 then 834/5 for hours.
-pub const MIN_LOST_PACKETS: u32 = 3;
+///
+/// Raised 3 -> 5 after Mac host 0.5.0 (live log, RTT 140 ms): idle -> scroll,
+/// 3 lost packets gave `fraction_lost` 0.164 and cut the target from 6000.
+pub const MIN_LOST_PACKETS: u32 = 5;
+
+/// How many of the latest ticks (including the current one) are looked at when
+/// deciding whether REMB may serve as a loss ceiling (`loss_cap`). REMB is a
+/// capacity estimate only if the link had been carrying real traffic: at idle
+/// the browser's estimate sags to 340-454 kbit/s against a 6000 target (Mac
+/// host 0.5.0 live log), and as a ceiling it collapsed the scroll to 1000.
+pub const LOSS_CAP_TRUST_TICKS: u32 = 5;
+
+/// Minimum number of loaded ticks (`REMB_LOADED_RATIO`) among the last
+/// `LOSS_CAP_TRUST_TICKS` for `loss_cap` to arm. Three of five survives a
+/// couple of content-driven dips in a genuinely busy stream (second user's
+/// live log, 2026-10-14: REMB 1986, target 5800) but not an idle -> scroll
+/// start where the current tick is the only loaded one.
+pub const LOSS_CAP_TRUST_MIN_LOADED: u32 = 3;
 
 /// The loss ceiling never drops below this (kbps). On a static screen the
 /// browser's REMB is "hungry" (capped at ~1.5x of what it received) and says
@@ -409,6 +436,10 @@ pub struct Controller {
     /// Consecutive ticks the loaded-link REMB signal has said "congested"
     /// (see `REMB_CONGESTION_TICKS`).
     congested_ticks: u32,
+    /// Bit i = the link was loaded `i` ticks ago (bit 0 = the current tick),
+    /// see `LOSS_CAP_TRUST_TICKS`. Like `congested_ticks`, not reset by a
+    /// preset switch: it describes the link, not the preset.
+    loaded_history: u32,
     /// Consecutive ticks the encoder has kept up (frames encoded, no
     /// overruns) at the current rung (see `ENCODER_FAST_TICKS`).
     fast_ticks: u32,
@@ -447,6 +478,7 @@ impl Controller {
             sent_cap_kbps: None,
             window: Window::default(),
             congested_ticks: 0,
+            loaded_history: 0,
             fast_ticks: 0,
             up_backoff: 0,
             last_step_up_at: None,
@@ -615,6 +647,9 @@ impl Controller {
         // estimator *lower* its estimate (multiplicative decrease), which
         // is what this looks for.
         let link_loaded = sent_kbps >= REMB_LOADED_RATIO * old_b;
+        self.loaded_history = (self.loaded_history << 1 | u32::from(link_loaded))
+            & ((1u32 << LOSS_CAP_TRUST_TICKS) - 1);
+        let remb_trusted = self.loaded_history.count_ones() >= LOSS_CAP_TRUST_MIN_LOADED;
         let remb_rising = match (remb_kbps, self.prev_tick_remb_kbps) {
             (Some(now), Some(prev)) => now > prev,
             _ => false,
@@ -647,7 +682,7 @@ impl Controller {
             0.0
         };
         let loss = fresh_loss.max(report_loss);
-        if loss >= LOSS_LOW && remb_kbps.is_some() {
+        if loss >= LOSS_LOW && remb_kbps.is_some() && remb_trusted {
             self.loss_cap_until = Some(now + LOSS_CAP_HOLD);
         }
         let hold_active = self.probe_hold_until.is_some_and(|until| now < until);
@@ -877,6 +912,18 @@ mod tests {
 
     fn remb(c: &mut Controller, now: Instant, bitrate_bps: u64) {
         c.feedback(Feedback::Remb { bitrate_bps }, now);
+    }
+
+    /// Runs `ticks` ticks of a busy link: sends the full current target
+    /// (`REMB_LOADED_RATIO` loaded), no REMB and no loss, so the target stays
+    /// put and `loaded_history` fills up (`LOSS_CAP_TRUST_TICKS`).
+    fn prime_loaded(c: &mut Controller, now: &mut Instant, ticks: u32) {
+        for _ in 0..ticks {
+            *now += TICK;
+            let bytes = c.target().bitrate_kbps as usize * 1000 / 8;
+            frames(c, *now, bytes);
+            c.tick(*now);
+        }
     }
 
     #[test]
@@ -1179,7 +1226,10 @@ mod tests {
             bitrate_kbps: 5800,
             fps: 30,
         };
-        let mut now = t0 + TICK;
+        let mut now = t0;
+        // The link was busy before the loss, so REMB is a trusted ceiling.
+        prime_loaded(&mut c, &mut now, LOSS_CAP_TRUST_MIN_LOADED);
+        now += TICK;
 
         frames(&mut c, now, 375_000);
         remb(&mut c, now, 1_986_000);
@@ -1276,7 +1326,10 @@ mod tests {
             bitrate_kbps: 5800,
             fps: 30,
         };
-        let mut now = t0 + TICK;
+        let mut now = t0;
+        // The link was busy before the loss, so REMB is a trusted ceiling.
+        prime_loaded(&mut c, &mut now, LOSS_CAP_TRUST_MIN_LOADED);
+        now += TICK;
 
         frames(&mut c, now, 375_000);
         remb(&mut c, now, 1_986_000);
@@ -1541,7 +1594,9 @@ mod tests {
         // affords 30 fps (33_333 bits/frame), so fps stays 30.
         let t0 = Instant::now();
         let mut c = Controller::new(cfg(), t0);
-        let now = t0 + TICK;
+        let mut now = t0;
+        prime_loaded(&mut c, &mut now, LOSS_CAP_TRUST_MIN_LOADED);
+        now += TICK;
         frames(&mut c, now, 1_000);
         remb(&mut c, now, 115_000);
         loss(&mut c, now, 0.05);
@@ -2070,5 +2125,89 @@ mod tests {
         loss_total(&mut c, now, 0.5, 10);
         assert_eq!(c.tick(now), None);
         assert_eq!(c.target().bitrate_kbps, 6000);
+    }
+
+    #[test]
+    fn idle_then_scroll_loss_does_not_collapse_target_to_remb() {
+        // Mac host 0.5.0 live log: idle ~100 kbps, hungry REMB ~400, then at
+        // the start of a scroll one RR with fraction 0.164. Only the
+        // multiplicative cut may apply, not the REMB ceiling.
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0;
+        for _ in 0..8 {
+            now += TICK;
+            frames(&mut c, now, 12_500);
+            remb(&mut c, now, 400_000);
+            assert_eq!(c.tick(now), None);
+        }
+        now += TICK;
+        frames(&mut c, now, 104_375); // ~835 kbps
+        remb(&mut c, now, 400_000);
+        loss_total(&mut c, now, 0.164, 5);
+        let d = c.tick(now).expect("expected a loss cut");
+        assert_eq!(d.reason, "loss");
+        assert!(d.target.bitrate_kbps >= 5000, "{d:?}");
+        let cut = c.target().bitrate_kbps;
+        for _ in 0..10 {
+            now += TICK;
+            frames(&mut c, now, 104_375);
+            remb(&mut c, now, 400_000);
+            c.tick(now);
+            assert!(c.target().bitrate_kbps >= cut, "{:?}", c.target());
+        }
+    }
+
+    #[test]
+    fn loss_cap_still_arms_when_link_was_loaded() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0;
+        prime_loaded(&mut c, &mut now, LOSS_CAP_TRUST_MIN_LOADED);
+        now += TICK;
+        frames(&mut c, now, 750_000);
+        remb(&mut c, now, 2_000_000);
+        loss(&mut c, now, 0.2);
+        c.tick(now).expect("expected a cut");
+        let cap = 2000.0 * LOSS_CAP_RATIO;
+        assert!(
+            f64::from(c.target().bitrate_kbps) <= cap,
+            "{:?}",
+            c.target()
+        );
+    }
+
+    #[test]
+    fn loss_cap_needs_enough_loaded_ticks_in_the_window() {
+        // 2 loaded ticks of the last 5 (the current one included) is not
+        // enough; 3 is.
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let mut now = t0;
+        prime_loaded(&mut c, &mut now, LOSS_CAP_TRUST_MIN_LOADED - 1);
+        now += TICK;
+        frames(&mut c, now, 1_000);
+        remb(&mut c, now, 2_000_000);
+        loss(&mut c, now, 0.2);
+        c.tick(now).expect("expected a cut");
+        assert_eq!(c.target().bitrate_kbps, 5400);
+    }
+
+    #[test]
+    fn four_lost_packets_are_insignificant_five_are_significant() {
+        assert_eq!(MIN_LOST_PACKETS, 5);
+        let t0 = Instant::now();
+        let mut c = Controller::new(cfg(), t0);
+        let now = t0 + TICK;
+        frames(&mut c, now, 125_000);
+        loss_total(&mut c, now, 0.2, MIN_LOST_PACKETS - 1);
+        assert_eq!(c.tick(now), None);
+        assert_eq!(c.target().bitrate_kbps, 6000);
+
+        let mut c = Controller::new(cfg(), t0);
+        frames(&mut c, now, 125_000);
+        loss_total(&mut c, now, 0.2, MIN_LOST_PACKETS);
+        let d = c.tick(now).expect("expected a loss cut");
+        assert_eq!(d.reason, "loss");
     }
 }
