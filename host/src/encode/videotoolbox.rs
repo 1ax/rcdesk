@@ -90,6 +90,12 @@ pub struct VtTuning {
     /// `kVTVideoEncoderSpecification_EnableLowLatencyRateControl` in the
     /// encoder specification.
     pub low_latency_rc: bool,
+    /// `AverageBitRate` = target x factor (`1.0` = production). Does not
+    /// affect `DataRateLimits`, which is derived from the unscaled target.
+    pub avg_factor: f32,
+    /// `DataRateLimits` window in seconds (`1.0` = production); the byte
+    /// budget is target bytes/s x `data_rate_limit` x window.
+    pub drl_window_s: f32,
 }
 
 impl Default for VtTuning {
@@ -98,6 +104,8 @@ impl Default for VtTuning {
             profile: VtProfile::ConstrainedBaseline,
             data_rate_limit: Some(1.0),
             low_latency_rc: false,
+            avg_factor: 1.0,
+            drl_window_s: 1.0,
         }
     }
 }
@@ -280,13 +288,7 @@ fn configure_session(
             .as_ref(),
         )?;
 
-        apply_rate(
-            session,
-            cfg.bitrate_kbps,
-            cfg.fps,
-            tuning.data_rate_limit,
-            tuning.low_latency_rc,
-        )?;
+        apply_rate(session, cfg.bitrate_kbps, cfg.fps, tuning)?;
 
         put(
             session,
@@ -348,11 +350,16 @@ unsafe fn apply_rate(
     session: &VTCompressionSession,
     bitrate_kbps: u32,
     fps: u32,
-    data_rate_limit: Option<f32>,
-    low_latency_rc: bool,
+    tuning: &VtTuning,
 ) -> Result<(), EncodeError> {
-    let soft = low_latency_rc;
+    let soft = tuning.low_latency_rc;
+    let low_latency_rc = tuning.low_latency_rc;
     let bitrate_bps = bitrate_kbps.saturating_mul(1000);
+    let avg_bps = if tuning.avg_factor == 1.0 {
+        bitrate_bps
+    } else {
+        (f64::from(bitrate_bps) * f64::from(tuning.avg_factor)) as u32
+    };
     // SAFETY: forwarded from this function's own safety contract; every key
     // is an extern immutable static of the documented `&'static CFString`
     // type.
@@ -362,15 +369,19 @@ unsafe fn apply_rate(
             soft,
             "AverageBitRate",
             kVTCompressionPropertyKey_AverageBitRate,
-            CFNumber::new_i32(bitrate_bps as i32).as_ref(),
+            CFNumber::new_i32(avg_bps as i32).as_ref(),
         )?;
 
-        if let Some(factor) = data_rate_limit {
-            let bytes = (f64::from(bitrate_bps / 8) * f64::from(factor)) as i32;
-            let data_rate_limits = CFArray::<CFNumber>::from_objects(&[
-                &CFNumber::new_i32(bytes),
-                &CFNumber::new_i32(1),
-            ]);
+        if let Some(factor) = tuning.data_rate_limit {
+            let window = f64::from(tuning.drl_window_s);
+            let bytes = (f64::from(bitrate_bps / 8) * f64::from(factor) * window) as i32;
+            let window_num = if window.fract() == 0.0 {
+                CFNumber::new_i32(window as i32)
+            } else {
+                CFNumber::new_f64(window)
+            };
+            let data_rate_limits =
+                CFArray::<CFNumber>::from_objects(&[&CFNumber::new_i32(bytes), &window_num]);
             let key = kVTCompressionPropertyKey_DataRateLimits;
             put(
                 session,
@@ -607,15 +618,7 @@ impl Encoder for VideoToolboxEncoder {
     fn set_rate(&mut self, target: RateTarget) -> Result<(), EncodeError> {
         // SAFETY: `self.session` was successfully created and configured in
         // `new()` and stays valid until `Drop::drop` invalidates it.
-        unsafe {
-            apply_rate(
-                &self.session,
-                target.bitrate_kbps,
-                target.fps,
-                self.tuning.data_rate_limit,
-                self.tuning.low_latency_rc,
-            )
-        }
+        unsafe { apply_rate(&self.session, target.bitrate_kbps, target.fps, &self.tuning) }
     }
 
     fn set_max_qp(&mut self, max_qp: Option<u8>) -> Result<(), EncodeError> {
@@ -1435,6 +1438,30 @@ mod tests {
         assert_eq!(
             read_data_rate_limits(&default.session),
             Some(vec![100_000.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn drl_window_and_factor_survive_set_rate() {
+        let tuning = VtTuning {
+            data_rate_limit: Some(1.5),
+            drl_window_s: 3.0,
+            ..VtTuning::default()
+        };
+        let mut encoder = VideoToolboxEncoder::new_tuned(test_cfg(), tuning).expect("init");
+        assert_eq!(
+            read_data_rate_limits(&encoder.session),
+            Some(vec![1_125_000.0, 3.0])
+        );
+        encoder
+            .set_rate(RateTarget {
+                bitrate_kbps: 2000,
+                fps: 15,
+            })
+            .expect("set_rate");
+        assert_eq!(
+            read_data_rate_limits(&encoder.session),
+            Some(vec![1_125_000.0, 3.0])
         );
     }
 }

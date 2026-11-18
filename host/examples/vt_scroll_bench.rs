@@ -623,6 +623,61 @@ mod mac {
                 },
                 None,
             ),
+            v(
+                "nodrl-avg0.6",
+                VtTuning {
+                    data_rate_limit: None,
+                    avg_factor: 0.6,
+                    ..d
+                },
+                None,
+            ),
+            v(
+                "nodrl-avg0.75",
+                VtTuning {
+                    data_rate_limit: None,
+                    avg_factor: 0.75,
+                    ..d
+                },
+                None,
+            ),
+            v(
+                "drl1.5-w3",
+                VtTuning {
+                    data_rate_limit: Some(1.5),
+                    drl_window_s: 3.0,
+                    ..d
+                },
+                None,
+            ),
+            v(
+                "drl2-w3",
+                VtTuning {
+                    data_rate_limit: Some(2.0),
+                    drl_window_s: 3.0,
+                    ..d
+                },
+                None,
+            ),
+            v(
+                "drl1.2-w2",
+                VtTuning {
+                    data_rate_limit: Some(1.2),
+                    drl_window_s: 2.0,
+                    ..d
+                },
+                None,
+            ),
+            v(
+                "drl1.5-w3-avg0.75",
+                VtTuning {
+                    data_rate_limit: Some(1.5),
+                    drl_window_s: 3.0,
+                    avg_factor: 0.75,
+                    ..d
+                },
+                None,
+            ),
             v("qp36", d, Some(36)),
             v(
                 "main",
