@@ -34,7 +34,10 @@ use objc2_video_toolbox::{
     kVTCompressionPropertyKey_RealTime,
     kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
     kVTEncodeFrameOptionKey_ForceKeyFrame, kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel,
-    kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder, VTCompressionSession,
+    kVTProfileLevel_H264_ConstrainedHigh_AutoLevel, kVTProfileLevel_H264_High_AutoLevel,
+    kVTProfileLevel_H264_Main_AutoLevel,
+    kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder,
+    kVTVideoEncoderSpecification_EnableLowLatencyRateControl, VTCompressionSession,
     VTEncodeInfoFlags, VTSessionCopyProperty, VTSessionSetProperty,
 };
 
@@ -66,6 +69,39 @@ struct CallbackState {
     pending: Mutex<Vec<Result<EncodedOutput, i32>>>,
 }
 
+/// H.264 profile requested from VideoToolbox (`VtTuning::profile`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VtProfile {
+    #[default]
+    ConstrainedBaseline,
+    Main,
+    High,
+    ConstrainedHigh,
+}
+
+/// Experimental encoder knobs (measurement only, see `examples/vt_scroll_bench.rs`).
+/// `Default` is exactly the production behaviour of `VideoToolboxEncoder::new`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VtTuning {
+    pub profile: VtProfile,
+    /// `Some(f)`: `DataRateLimits` = f x average bytes per 1 s window
+    /// (`Some(1.0)` = production). `None`: the property is not set at all.
+    pub data_rate_limit: Option<f32>,
+    /// `kVTVideoEncoderSpecification_EnableLowLatencyRateControl` in the
+    /// encoder specification.
+    pub low_latency_rc: bool,
+}
+
+impl Default for VtTuning {
+    fn default() -> Self {
+        Self {
+            profile: VtProfile::ConstrainedBaseline,
+            data_rate_limit: Some(1.0),
+            low_latency_rc: false,
+        }
+    }
+}
+
 pub struct VideoToolboxEncoder {
     session: CFRetained<VTCompressionSession>,
     // Never read after `new()` sets `output_callback_ref_con` from it --
@@ -73,6 +109,8 @@ pub struct VideoToolboxEncoder {
     // the session (after which VT can no longer call back into it).
     callback_state: Box<CallbackState>,
     cfg: EncoderConfig,
+    /// Kept so `set_rate` re-applies `DataRateLimits` the same way.
+    tuning: VtTuning,
     /// Wall-clock reference for the presentation timestamps handed to VT
     /// (see `docs/host-libs-api-notes.md`'s webrtc section for why these
     /// need to track real elapsed time rather than a frame-count-derived
@@ -103,12 +141,25 @@ unsafe impl Send for VideoToolboxEncoder {}
 
 impl VideoToolboxEncoder {
     pub fn new(cfg: EncoderConfig) -> Result<Self, EncodeError> {
+        Self::new_tuned(cfg, VtTuning::default())
+    }
+
+    pub fn new_tuned(cfg: EncoderConfig, tuning: VtTuning) -> Result<Self, EncodeError> {
         // SAFETY: reading an extern immutable static of the documented type.
         let hw_key = unsafe { kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder };
-        let encoder_spec = CFDictionary::<CFString, CFType>::from_slices(
-            &[hw_key],
-            &[CFBoolean::new(true).as_ref()],
-        );
+        let encoder_spec = if tuning.low_latency_rc {
+            // SAFETY: as above.
+            let ll_key = unsafe { kVTVideoEncoderSpecification_EnableLowLatencyRateControl };
+            CFDictionary::<CFString, CFType>::from_slices(
+                &[hw_key, ll_key],
+                &[CFBoolean::new(true).as_ref(), CFBoolean::new(true).as_ref()],
+            )
+        } else {
+            CFDictionary::<CFString, CFType>::from_slices(
+                &[hw_key],
+                &[CFBoolean::new(true).as_ref()],
+            )
+        };
 
         let callback_state = Box::new(CallbackState {
             pending: Mutex::new(Vec::new()),
@@ -152,7 +203,7 @@ impl VideoToolboxEncoder {
         let session: CFRetained<VTCompressionSession> =
             unsafe { CFRetained::from_raw(session_ptr) };
 
-        if let Err(err) = configure_session(&session, &cfg) {
+        if let Err(err) = configure_session(&session, &cfg, &tuning) {
             // SAFETY: `session` was just successfully created above.
             unsafe { session.invalidate() };
             return Err(err);
@@ -183,6 +234,7 @@ impl VideoToolboxEncoder {
             session,
             callback_state,
             cfg,
+            tuning,
             started: Instant::now(),
             pool: None,
             force_keyframe_next: false,
@@ -196,36 +248,56 @@ impl VideoToolboxEncoder {
 fn configure_session(
     session: &VTCompressionSession,
     cfg: &EncoderConfig,
+    tuning: &VtTuning,
 ) -> Result<(), EncodeError> {
     // SAFETY (this whole function): every `kVTCompressionPropertyKey_*`/
     // `kVTProfileLevel_*` access below reads an extern immutable static of
     // the documented `&'static CFString` type; every `VTSessionSetProperty`
     // call passes a live CF object for the key and value, both retained by
     // the callee (VT copies whatever it needs synchronously).
+    let soft = tuning.low_latency_rc;
     unsafe {
-        set_property(
+        put(
             session,
+            soft,
             "RealTime",
             kVTCompressionPropertyKey_RealTime,
             CFBoolean::new(true).as_ref(),
         )?;
-        set_property(
+        put(
             session,
+            soft,
             "ProfileLevel",
             kVTCompressionPropertyKey_ProfileLevel,
-            kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel.as_ref(),
+            match tuning.profile {
+                VtProfile::ConstrainedBaseline => {
+                    kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel
+                }
+                VtProfile::Main => kVTProfileLevel_H264_Main_AutoLevel,
+                VtProfile::High => kVTProfileLevel_H264_High_AutoLevel,
+                VtProfile::ConstrainedHigh => kVTProfileLevel_H264_ConstrainedHigh_AutoLevel,
+            }
+            .as_ref(),
         )?;
 
-        apply_rate(session, cfg.bitrate_kbps, cfg.fps)?;
-
-        set_property(
+        apply_rate(
             session,
+            cfg.bitrate_kbps,
+            cfg.fps,
+            tuning.data_rate_limit,
+            tuning.low_latency_rc,
+        )?;
+
+        put(
+            session,
+            soft,
             "AllowFrameReordering",
             kVTCompressionPropertyKey_AllowFrameReordering,
             CFBoolean::new(false).as_ref(),
         )?;
-        set_property(
+        put(
             session,
+            soft,
             "MaxKeyFrameInterval",
             kVTCompressionPropertyKey_MaxKeyFrameInterval,
             CFNumber::new_i32(cfg.keyframe_interval_frames as i32).as_ref(),
@@ -276,32 +348,42 @@ unsafe fn apply_rate(
     session: &VTCompressionSession,
     bitrate_kbps: u32,
     fps: u32,
+    data_rate_limit: Option<f32>,
+    low_latency_rc: bool,
 ) -> Result<(), EncodeError> {
+    let soft = low_latency_rc;
     let bitrate_bps = bitrate_kbps.saturating_mul(1000);
     // SAFETY: forwarded from this function's own safety contract; every key
     // is an extern immutable static of the documented `&'static CFString`
     // type.
     unsafe {
-        set_property(
+        put(
             session,
+            soft,
             "AverageBitRate",
             kVTCompressionPropertyKey_AverageBitRate,
             CFNumber::new_i32(bitrate_bps as i32).as_ref(),
         )?;
 
-        let data_rate_limits = CFArray::<CFNumber>::from_objects(&[
-            &CFNumber::new_i32((bitrate_bps / 8) as i32),
-            &CFNumber::new_i32(1),
-        ]);
-        set_property(
-            session,
-            "DataRateLimits",
-            kVTCompressionPropertyKey_DataRateLimits,
-            data_rate_limits.as_ref(),
-        )?;
+        if let Some(factor) = data_rate_limit {
+            let bytes = (f64::from(bitrate_bps / 8) * f64::from(factor)) as i32;
+            let data_rate_limits = CFArray::<CFNumber>::from_objects(&[
+                &CFNumber::new_i32(bytes),
+                &CFNumber::new_i32(1),
+            ]);
+            let key = kVTCompressionPropertyKey_DataRateLimits;
+            put(
+                session,
+                low_latency_rc,
+                "DataRateLimits",
+                key,
+                data_rate_limits.as_ref(),
+            )?;
+        }
 
-        set_property(
+        put(
             session,
+            soft,
             "ExpectedFrameRate",
             kVTCompressionPropertyKey_ExpectedFrameRate,
             CFNumber::new_i32(fps as i32).as_ref(),
@@ -309,6 +391,36 @@ unsafe fn apply_rate(
     }
 
     Ok(())
+}
+
+/// `set_property` in production mode; in experimental low-latency-RC mode
+/// (`soft`) a rejected property is reported with `warn!` and ignored.
+///
+/// # Safety
+///
+/// Same contract as `set_property`.
+unsafe fn put(
+    session: &VTCompressionSession,
+    soft: bool,
+    name: &str,
+    key: &CFString,
+    value: &CFType,
+) -> Result<(), EncodeError> {
+    if soft {
+        // SAFETY: forwarded from this function's own safety contract.
+        let status = unsafe { VTSessionSetProperty(session, key, Some(value)) };
+        if status != 0 {
+            tracing::warn!(
+                name,
+                status,
+                "VideoToolbox property rejected (low-latency RC)"
+            );
+        }
+        Ok(())
+    } else {
+        // SAFETY: forwarded from this function's own safety contract.
+        unsafe { set_property(session, name, key, value) }
+    }
 }
 
 /// # Safety
@@ -495,7 +607,15 @@ impl Encoder for VideoToolboxEncoder {
     fn set_rate(&mut self, target: RateTarget) -> Result<(), EncodeError> {
         // SAFETY: `self.session` was successfully created and configured in
         // `new()` and stays valid until `Drop::drop` invalidates it.
-        unsafe { apply_rate(&self.session, target.bitrate_kbps, target.fps) }
+        unsafe {
+            apply_rate(
+                &self.session,
+                target.bitrate_kbps,
+                target.fps,
+                self.tuning.data_rate_limit,
+                self.tuning.low_latency_rc,
+            )
+        }
     }
 
     fn set_max_qp(&mut self, max_qp: Option<u8>) -> Result<(), EncodeError> {
@@ -1210,5 +1330,111 @@ mod tests {
             }
         }
         assert!(after_reset > 0, "expected output after set_max_qp(None)");
+    }
+
+    fn first_output(encoder: &mut VideoToolboxEncoder) -> Option<EncodedFrame> {
+        let mut source = SyntheticSource::new(64, 64, 1000);
+        for _ in 0..30 {
+            let raw = source.next_frame().expect("frame");
+            if let Some(encoded) = encoder.encode(&raw, false).expect("encode") {
+                return Some(encoded);
+            }
+        }
+        None
+    }
+
+    /// Reads back `DataRateLimits`; `None` when the property is unset.
+    fn read_data_rate_limits(session: &VTCompressionSession) -> Option<Vec<f64>> {
+        let mut value: *const CFArray<CFNumber> = std::ptr::null();
+        // SAFETY: valid out-pointer; the key is a documented static.
+        let status = unsafe {
+            VTSessionCopyProperty(
+                session,
+                kVTCompressionPropertyKey_DataRateLimits,
+                None,
+                (&mut value as *mut *const CFArray<CFNumber>).cast(),
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        let ptr = NonNull::new(value.cast_mut())?;
+        // SAFETY: success hands back a +1 reference.
+        let arr: CFRetained<CFArray<CFNumber>> = unsafe { CFRetained::from_raw(ptr) };
+        // An unset property reads back as an empty array.
+        let v: Vec<f64> = arr
+            .to_vec()
+            .iter()
+            .map(|n| n.as_f64().unwrap_or(f64::NAN))
+            .collect();
+        (!v.is_empty()).then_some(v)
+    }
+
+    #[test]
+    fn new_tuned_every_profile_creates_session_and_encodes() {
+        for profile in [
+            VtProfile::ConstrainedBaseline,
+            VtProfile::Main,
+            VtProfile::High,
+            VtProfile::ConstrainedHigh,
+        ] {
+            let tuning = VtTuning {
+                profile,
+                ..VtTuning::default()
+            };
+            let mut encoder = VideoToolboxEncoder::new_tuned(test_cfg(), tuning)
+                .unwrap_or_else(|e| panic!("{profile:?}: {e}"));
+            let out = first_output(&mut encoder)
+                .unwrap_or_else(|| panic!("{profile:?}: no output within 30 frames"));
+            assert!(out.keyframe, "{profile:?}");
+        }
+    }
+
+    #[test]
+    fn new_tuned_low_latency_rc_encodes() {
+        let tuning = VtTuning {
+            low_latency_rc: true,
+            ..VtTuning::default()
+        };
+        let mut encoder = VideoToolboxEncoder::new_tuned(test_cfg(), tuning).expect("llrc init");
+        assert!(first_output(&mut encoder).is_some());
+    }
+
+    #[test]
+    fn set_rate_keeps_data_rate_limit_none() {
+        let tuning = VtTuning {
+            data_rate_limit: None,
+            ..VtTuning::default()
+        };
+        let mut encoder = VideoToolboxEncoder::new_tuned(test_cfg(), tuning).expect("init");
+        assert_eq!(read_data_rate_limits(&encoder.session), None);
+        encoder
+            .set_rate(RateTarget {
+                bitrate_kbps: 800,
+                fps: 15,
+            })
+            .expect("set_rate");
+        assert_eq!(
+            read_data_rate_limits(&encoder.session),
+            None,
+            "set_rate must not introduce DataRateLimits"
+        );
+
+        // Control: the default tuning does set it, and set_rate updates it.
+        let mut default = VideoToolboxEncoder::new(test_cfg()).expect("init");
+        assert_eq!(
+            read_data_rate_limits(&default.session),
+            Some(vec![250_000.0, 1.0])
+        );
+        default
+            .set_rate(RateTarget {
+                bitrate_kbps: 800,
+                fps: 15,
+            })
+            .expect("set_rate");
+        assert_eq!(
+            read_data_rate_limits(&default.session),
+            Some(vec![100_000.0, 1.0])
+        );
     }
 }
