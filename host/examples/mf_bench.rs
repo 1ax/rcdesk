@@ -91,6 +91,156 @@ mod scale {
     }
 }
 
+/// Which frames a re-feed strategy gives the encoder after the picture froze;
+/// a plain module so it is unit-tested on every platform (unused off Windows).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod settle {
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Strategy {
+        /// Production: the last frame once per second.
+        Pulse,
+        /// Every tick for the first `burst_ticks`, then like `Pulse`.
+        Burst,
+        /// First tick is a forced keyframe, then like `Pulse`.
+        Idr,
+    }
+
+    impl Strategy {
+        pub const ALL: [Strategy; 3] = [Strategy::Pulse, Strategy::Burst, Strategy::Idr];
+
+        pub fn name(self) -> &'static str {
+            match self {
+                Strategy::Pulse => "pulse",
+                Strategy::Burst => "burst",
+                Strategy::Idr => "idr",
+            }
+        }
+
+        /// Settle tick `k` (1-based): `None` = no feed, `Some(force_keyframe)`.
+        pub fn feed(self, k: u64, fps: u64, burst_ticks: u64) -> Option<bool> {
+            let pulse = fps > 0 && k.is_multiple_of(fps);
+            match self {
+                Strategy::Pulse => pulse.then_some(false),
+                Strategy::Burst => (k <= burst_ticks || pulse).then_some(false),
+                Strategy::Idr => {
+                    if k == 1 {
+                        Some(true)
+                    } else {
+                        pulse.then_some(false)
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Strategy;
+
+        #[test]
+        fn pulse_feeds_only_at_multiples_of_fps() {
+            let fed: Vec<u64> = (1..=60)
+                .filter(|&k| Strategy::Pulse.feed(k, 20, 20).is_some())
+                .collect();
+            assert_eq!(fed, vec![20, 40, 60]);
+            assert_eq!(Strategy::Pulse.feed(20, 20, 20), Some(false));
+        }
+
+        #[test]
+        fn burst_feeds_first_ticks_then_multiples() {
+            let fed: Vec<u64> = (1..=60)
+                .filter(|&k| Strategy::Burst.feed(k, 20, 5).is_some())
+                .collect();
+            assert_eq!(fed, vec![1, 2, 3, 4, 5, 20, 40, 60]);
+            assert_eq!(Strategy::Burst.feed(1, 20, 5), Some(false));
+        }
+
+        #[test]
+        fn idr_forces_first_tick_then_pulses() {
+            assert_eq!(Strategy::Idr.feed(1, 20, 20), Some(true));
+            assert_eq!(Strategy::Idr.feed(2, 20, 20), None);
+            assert_eq!(Strategy::Idr.feed(20, 20, 20), Some(false));
+            assert_eq!(Strategy::Idr.feed(40, 20, 20), Some(false));
+        }
+
+        #[test]
+        fn names_are_unique() {
+            let names: Vec<&str> = Strategy::ALL.iter().map(|s| s.name()).collect();
+            assert_eq!(names, vec!["pulse", "burst", "idr"]);
+        }
+    }
+}
+
+/// 24-bit BMP writer for the reference picture; a plain function so it is
+/// unit-tested on every platform (unused off Windows).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod bmp {
+    /// Tightly packed BGRA (`w * h * 4`) to a bottom-up 24-bit BMP.
+    pub fn bgra_to_bmp24(bgra: &[u8], w: usize, h: usize) -> Vec<u8> {
+        let row = (w * 3 + 3) & !3;
+        let size = 54 + row * h;
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&(size as u32).to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&54u32.to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&(w as i32).to_le_bytes());
+        out.extend_from_slice(&(h as i32).to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&24u16.to_le_bytes());
+        out.extend_from_slice(&[0; 24]);
+        for y in (0..h).rev() {
+            let src = &bgra[y * w * 4..(y + 1) * w * 4];
+            for x in 0..w {
+                out.extend_from_slice(&src[x * 4..x * 4 + 3]);
+            }
+            out.resize(out.len() + row - w * 3, 0);
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::bgra_to_bmp24;
+
+        fn sample() -> Vec<u8> {
+            // 3x2: row 0 pixels 1..3, row 1 pixels 11..13 (b = value).
+            let mut v = Vec::new();
+            for p in [1u8, 2, 3, 11, 12, 13] {
+                v.extend_from_slice(&[p, p + 100, p + 50, 255]);
+            }
+            v
+        }
+
+        #[test]
+        fn length_is_header_plus_padded_rows() {
+            let out = bgra_to_bmp24(&sample(), 3, 2);
+            // Row: 9 bytes padded to 12.
+            assert_eq!(out.len(), 54 + 12 * 2);
+        }
+
+        #[test]
+        fn first_file_row_is_last_source_row() {
+            let out = bgra_to_bmp24(&sample(), 3, 2);
+            assert_eq!(&out[54..57], &[11, 111, 61]);
+            assert_eq!(&out[54 + 12..54 + 12 + 3], &[1, 101, 51]);
+            // Padding is zero.
+            assert_eq!(&out[54 + 9..54 + 12], &[0, 0, 0]);
+        }
+
+        #[test]
+        fn magic_and_size_field() {
+            let out = bgra_to_bmp24(&sample(), 3, 2);
+            assert_eq!(&out[..2], b"BM");
+            let size = u32::from_le_bytes([out[2], out[3], out[4], out[5]]);
+            assert_eq!(size as usize, out.len());
+            assert_eq!(u32::from_le_bytes([out[10], out[11], out[12], out[13]]), 54);
+            assert_eq!(i32::from_le_bytes([out[22], out[23], out[24], out[25]]), 2);
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod win {
     use std::collections::VecDeque;
@@ -115,7 +265,8 @@ mod win {
     };
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
-    use super::{qp, scale};
+    use super::settle::Strategy;
+    use super::{bmp, qp, scale};
 
     /// Warm-up per variant, not counted in the statistics.
     const WARMUP: Duration = Duration::from_secs(2);
@@ -126,6 +277,8 @@ mod win {
         Replay,
         /// Every variant captures the live screen (frames differ between variants).
         Live,
+        /// Motion from the recorded clip, then a static screen: how fast each re-feed strategy cleans up the picture.
+        Settle,
     }
 
     #[derive(Parser)]
@@ -146,6 +299,15 @@ mod win {
         /// Replay: directory for the .h264 dumps.
         #[arg(long, default_value = ".")]
         dump_dir: String,
+        /// Settle: how many times the clip is played before the screen freezes.
+        #[arg(long, default_value_t = 2)]
+        motion_loops: usize,
+        /// Settle: seconds of the static screen after the motion.
+        #[arg(long, default_value_t = 6)]
+        settle_seconds: u64,
+        /// Settle (burst strategy): seconds of feeding every tick after the freeze.
+        #[arg(long, default_value_t = 1.0)]
+        burst_seconds: f64,
         /// Measured seconds per variant (after the 2 s warm-up).
         #[arg(long, default_value_t = 15)]
         seconds: u64,
@@ -1232,6 +1394,263 @@ mod win {
         render_replay(args, screen, &info, &rows)
     }
 
+    // ------------------------------------------------------------------
+    // Settle mode: motion, then a static screen, per re-feed strategy
+    // ------------------------------------------------------------------
+
+    /// One encoder output of a settle run.
+    struct SettleOut {
+        /// 'm' (motion) or 's' (settle).
+        phase: char,
+        /// 1-based tick within the phase.
+        tick: u64,
+        data: Vec<u8>,
+        keyframe: bool,
+        qp: Option<i32>,
+    }
+
+    /// Sleeps until the tick deadline, re-anchoring after a late tick.
+    fn pace(next: &mut Instant, period: Duration) {
+        let now = Instant::now();
+        if *next > now {
+            thread::sleep(*next - now);
+        }
+        *next = (*next).max(Instant::now()) + period;
+    }
+
+    fn run_settle(
+        args: &Args,
+        strat: Strategy,
+        clip: &Clip,
+        size: Size,
+    ) -> Result<Vec<SettleOut>, String> {
+        let cfg = EncoderConfig {
+            width: size.0,
+            height: size.1,
+            fps: args.fps,
+            bitrate_kbps: args.bitrate,
+            keyframe_interval_frames: args.fps.max(1) * 2,
+            max_qp: None,
+        };
+        let mut encoder = MediaFoundationEncoder::new_tuned(cfg, true, MfTuning::default())
+            .map_err(|e| e.to_string())?;
+        let fps = u64::from(args.replay_fps.max(1));
+        let burst_ticks = (args.burst_seconds * fps as f64).round().max(0.0) as u64;
+        let period = Duration::from_secs_f64(1.0 / fps as f64);
+        let motion_ticks = args.motion_loops as u64 * clip.frames.len() as u64;
+        let settle_ticks = args.settle_seconds * fps;
+        let last = clip.frames.last().ok_or_else(|| "empty clip".to_string())?;
+
+        let mut parser = qp::QpParser::default();
+        let mut outs = Vec::new();
+        let mut next = Instant::now();
+        let mut feed = |encoder: &mut MediaFoundationEncoder,
+                        data: &[u8],
+                        force: bool,
+                        phase: char,
+                        tick: u64,
+                        outs: &mut Vec<SettleOut>|
+         -> Result<(), String> {
+            let frame = RawFrame::Bgra {
+                width: size.0,
+                height: size.1,
+                data: data.to_vec(),
+                stride: size.0 as usize * 4,
+                ts: Instant::now(),
+            };
+            let encoded = encoder.encode(&frame, force).map_err(|e| e.to_string())?;
+            if let Some(encoded) = encoded {
+                let qp = parser.frame_qp(&encoded.data);
+                outs.push(SettleOut {
+                    phase,
+                    tick,
+                    data: encoded.data,
+                    keyframe: encoded.keyframe,
+                    qp,
+                });
+            }
+            Ok(())
+        };
+
+        eprintln!(
+            "{} ... {} motion ticks + {} settle ticks",
+            strat.name(),
+            motion_ticks,
+            settle_ticks
+        );
+        for i in 0..motion_ticks {
+            pace(&mut next, period);
+            let data = &clip.frames[i as usize % clip.frames.len()];
+            feed(&mut encoder, data, false, 'm', i + 1, &mut outs)?;
+        }
+        for k in 1..=settle_ticks {
+            pace(&mut next, period);
+            if let Some(force) = strat.feed(k, fps, burst_ticks) {
+                feed(&mut encoder, last, force, 's', k, &mut outs)?;
+            }
+        }
+        Ok(outs)
+    }
+
+    /// Dumps `s-<name>.h264` and `s-<name>.tsv` into `--dump-dir`.
+    fn dump_settle(args: &Args, name: &str, outs: &[SettleOut]) {
+        let dir = std::path::Path::new(&args.dump_dir);
+        let mut h264 = Vec::new();
+        let mut tsv = String::from("idx\tphase\ttick\tbytes\tkey\tqp\n");
+        for (idx, o) in outs.iter().enumerate() {
+            h264.extend_from_slice(&o.data);
+            let qp = o.qp.map_or(String::new(), |q| q.to_string());
+            let _ = writeln!(
+                tsv,
+                "{idx}\t{}\t{}\t{}\t{}\t{qp}",
+                o.phase,
+                o.tick,
+                o.data.len(),
+                u8::from(o.keyframe)
+            );
+        }
+        for (file, bytes) in [
+            (format!("s-{name}.h264"), h264),
+            (format!("s-{name}.tsv"), tsv.into_bytes()),
+        ] {
+            let path = dir.join(file);
+            if let Err(err) = std::fs::write(&path, bytes) {
+                eprintln!("{name}: cannot write {}: {err}", path.display());
+            }
+        }
+    }
+
+    struct SettleRow {
+        name: &'static str,
+        result: Result<Vec<SettleOut>, String>,
+    }
+
+    fn render_settle(args: &Args, screen: Size, recorded: usize, rows: &[SettleRow]) -> String {
+        let mut s = String::new();
+        let _ = writeln!(
+            s,
+            "Screen {}x{}, recorded {} frames @ {} fps, bitrate {} kbit/s, motion loops {}, \
+             settle seconds {}, burst seconds {}\n",
+            screen.0,
+            screen.1,
+            recorded,
+            args.replay_fps,
+            args.bitrate,
+            args.motion_loops,
+            args.settle_seconds,
+            args.burst_seconds
+        );
+        s.push_str(
+            "| strategy | motion frames | motion QP avg | last motion QP | settle frames \
+             | settle kB total | settle QP/kB sequence |\n",
+        );
+        s.push_str("|---|---:|---:|---:|---:|---:|---|\n");
+        for row in rows {
+            match &row.result {
+                Ok(outs) => {
+                    let motion: Vec<&SettleOut> = outs.iter().filter(|o| o.phase == 'm').collect();
+                    let settle: Vec<&SettleOut> = outs.iter().filter(|o| o.phase == 's').collect();
+                    let mqp: Vec<f64> = motion.iter().filter_map(|o| o.qp.map(f64::from)).collect();
+                    let avg_qp = if mqp.is_empty() {
+                        "-".to_string()
+                    } else {
+                        format!("{:.1}", avg(&mqp))
+                    };
+                    let last_qp = mqp.last().map_or("-".to_string(), |q| format!("{q:.0}"));
+                    let kb: f64 = settle.iter().map(|o| o.data.len() as f64).sum::<f64>() / 1024.0;
+                    let seq: Vec<String> = settle
+                        .iter()
+                        .take(12)
+                        .map(|o| {
+                            let q = o.qp.map_or("-".to_string(), |q| q.to_string());
+                            format!("{q}/{:.1}", o.data.len() as f64 / 1024.0)
+                        })
+                        .collect();
+                    let _ = writeln!(
+                        s,
+                        "| {} | {} | {} | {} | {} | {:.1} | {} |",
+                        row.name,
+                        motion.len(),
+                        avg_qp,
+                        last_qp,
+                        settle.len(),
+                        kb,
+                        seq.join(", ")
+                    );
+                }
+                Err(err) => {
+                    let err = err.replace('|', "/").replace('\n', " ");
+                    let _ = writeln!(s, "| {} | ERROR: {} | - | - | - | - | - |", row.name, err);
+                }
+            }
+        }
+        s
+    }
+
+    fn settle_main(args: &Args, screen: Size) -> String {
+        let (sw, sh) = screen;
+        for name in &args.only {
+            if !Strategy::ALL.iter().any(|s| s.name() == name) {
+                eprintln!("mf_bench: unknown strategy {name:?}");
+                std::process::exit(2);
+            }
+        }
+        if args.record_frames == 0 {
+            eprintln!("mf_bench: --record-frames must be > 0");
+            std::process::exit(2);
+        }
+        let (clip, _) = match record_clip(args, screen) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("mf_bench: recording failed: {err}");
+                std::process::exit(1);
+            }
+        };
+        let recorded = clip.frames.len();
+        let size = variant_size(Res::Native, screen);
+        let clip = if size == (sw, sh) {
+            clip
+        } else {
+            Clip {
+                width: size.0,
+                height: size.1,
+                frames: clip
+                    .frames
+                    .iter()
+                    .map(|f| crop_bgra(f, sw as usize, size.0 as usize, size.1 as usize))
+                    .collect(),
+            }
+        };
+
+        if let Err(err) = std::fs::create_dir_all(&args.dump_dir) {
+            eprintln!("mf_bench: cannot create {}: {err}", args.dump_dir);
+        }
+        if let Some(last) = clip.frames.last() {
+            let path = std::path::Path::new(&args.dump_dir).join("s-ref.bmp");
+            let bytes = bmp::bgra_to_bmp24(last, size.0 as usize, size.1 as usize);
+            if let Err(err) = std::fs::write(&path, bytes) {
+                eprintln!("mf_bench: cannot write {}: {err}", path.display());
+            }
+        }
+
+        let mut rows = Vec::new();
+        for strat in Strategy::ALL
+            .iter()
+            .filter(|s| args.only.is_empty() || args.only.iter().any(|n| n == s.name()))
+        {
+            let result = run_settle(args, *strat, &clip, size);
+            match &result {
+                Ok(outs) => dump_settle(args, strat.name(), outs),
+                Err(err) => eprintln!("{}: {err}", strat.name()),
+            }
+            rows.push(SettleRow {
+                name: strat.name(),
+                result,
+            });
+        }
+        render_settle(args, screen, recorded, &rows)
+    }
+
     pub fn main() {
         let args = Args::parse();
         dpi::set_dpi_aware();
@@ -1251,6 +1670,16 @@ mod win {
 
         if args.mode == Mode::Replay {
             let report = replay_main(&args, (sw, sh));
+            print!("{report}");
+            if let Err(err) = std::fs::write(&args.out, &report) {
+                eprintln!("mf_bench: cannot write {}: {err}", args.out);
+                std::process::exit(1);
+            }
+            return;
+        }
+
+        if args.mode == Mode::Settle {
+            let report = settle_main(&args, (sw, sh));
             print!("{report}");
             if let Err(err) = std::fs::write(&args.out, &report) {
                 eprintln!("mf_bench: cannot write {}: {err}", args.out);
