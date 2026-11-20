@@ -27,7 +27,25 @@ const SLOT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 /// asks for a keyframe (PLI) after ~3 s without a decodable frame; an
 /// unchanged-image P-frame once a second keeps the receiver's buffer fed, so
 /// a static screen causes neither PLI nor a (large) IDR in response.
+///
+/// This is the steady-state pulse. Right after real content the encode
+/// thread runs a faster "refine burst" instead (see `REFINE_MAX_REPEATS`),
+/// and falls back to this interval once the burst is over.
 const IDLE_REPEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Cap on back-to-back "refine" repeats of the last frame after real
+/// content, while the source is quiet. A rate-controlled encoder (measured:
+/// Media Foundation software H.264, CBR 6 Mbit/s, 1080p) lowers QP by at most
+/// 2 per frame, so after a scroll (QP 36) a frozen screen needs ~10
+/// re-encodes to reach clean text (QP 16). With only the 1 s idle pulse that
+/// is ~12 s of blurry text; repeating at the poll rate (`SLOT_WAIT_TIMEOUT`,
+/// <= 10 fps) converges in well under a second. 15 leaves headroom over 10.
+const REFINE_MAX_REPEATS: u32 = 15;
+
+/// An encoded refine repeat smaller than this means the encoder has
+/// converged (the unchanged picture costs ~1 kB at final QP): nothing is
+/// left to refine, so the burst ends early.
+const REFINE_DONE_BYTES: usize = 2048;
 
 /// Burst capacity of the fps pacer's token bucket (see the encode thread in
 /// `Pipeline::start`): how many frames may pass back to back after a stall
@@ -322,6 +340,11 @@ impl Pipeline {
                 // When an encoded frame (of any kind) was last handed to the
                 // output channel; drives the idle P-frame pulse.
                 let mut last_sent = Instant::now();
+                // Remaining "refine burst" repeats after real content (see
+                // `REFINE_MAX_REPEATS`); while > 0 the `Timeout` arm
+                // re-encodes the last frame every poll instead of waiting
+                // for `IDLE_REPEAT_INTERVAL`.
+                let mut refine_left: u32 = 0;
 
                 // What the wait for the next slot frame ended with:
                 // distinguishing a real timeout from a frame arriving lets
@@ -387,11 +410,16 @@ impl Pipeline {
                             // channel.
                             if let Some(last) = last_raw.as_mut().filter(|_| tx.capacity() > 0) {
                                 let force_keyframe = request_keyframe.swap(false, Ordering::AcqRel);
-                                // No request: pulse a cheap P-frame once the
-                                // channel has been silent for a whole
+                                // No request, two regimes: right after real
+                                // content a refine burst re-encodes the last
+                                // frame on every poll (<= 10 fps) so the
+                                // encoder's QP can settle; once it is over
+                                // (or converged), a cheap P-frame pulse once
+                                // the channel has been silent for a whole
                                 // `IDLE_REPEAT_INTERVAL`.
-                                let idle_pulse =
-                                    !force_keyframe && last_sent.elapsed() >= IDLE_REPEAT_INTERVAL;
+                                let idle_pulse = !force_keyframe
+                                    && (refine_left > 0
+                                        || last_sent.elapsed() >= IDLE_REPEAT_INTERVAL);
                                 if force_keyframe || idle_pulse {
                                     slot.state
                                         .lock()
@@ -419,6 +447,12 @@ impl Pipeline {
                                                     stats.keyframes.fetch_add(1, Ordering::Relaxed);
                                                 }
                                                 stats.idle_repeats.fetch_add(1, Ordering::Relaxed);
+                                                if refine_left > 0 {
+                                                    refine_left -= 1;
+                                                    if encoded.data.len() < REFINE_DONE_BYTES {
+                                                        refine_left = 0;
+                                                    }
+                                                }
                                                 tracing::trace!(
                                                     "idle repeat: re-encoded the last frame to \
                                                      keep the receiver fed"
@@ -486,6 +520,9 @@ impl Pipeline {
                         // Still the most recent real frame the source
                         // produced, even though it isn't being encoded now
                         // -- keep it as the keyframe-repeat candidate.
+                        // It is also a picture the encoder has not seen yet,
+                        // so the refine repeat must encode it.
+                        refine_left = REFINE_MAX_REPEATS;
                         last_raw = Some(raw);
                         continue;
                     }
@@ -496,6 +533,9 @@ impl Pipeline {
                     // frame instead.
                     if tx.capacity() == 0 {
                         stats.dropped.fetch_add(1, Ordering::Relaxed);
+                        // Same as the paced-out path: the newest picture is
+                        // still unencoded, the refine repeat will take it.
+                        refine_left = REFINE_MAX_REPEATS;
                         last_raw = Some(raw);
                         continue;
                     }
@@ -513,6 +553,9 @@ impl Pipeline {
                                 stats.keyframes.fetch_add(1, Ordering::Relaxed);
                             }
                             last_sent = Instant::now();
+                            // Real content just went out: refine it while
+                            // the source stays quiet.
+                            refine_left = REFINE_MAX_REPEATS;
                             tracing::trace!(
                                 convert_encode_latency_us =
                                     (encoded.ts - captured_at).as_micros() as u64,
@@ -1165,9 +1208,10 @@ mod tests {
             },
         );
 
-        // The one frame the source ever produces on its own.
+        // The one frame the source serves, plus possibly refine repeats
+        // (P-frames) after it.
         let first = drain_for(&mut handle, Duration::from_millis(300));
-        assert_eq!(first.len(), 1, "expected exactly the one served frame");
+        assert!(!first.is_empty(), "expected the served frame");
         assert!(first[0].keyframe, "first encoded frame must be a keyframe");
 
         handle.request_keyframe();
@@ -1212,13 +1256,14 @@ mod tests {
         );
 
         let first = drain_for(&mut handle, Duration::from_millis(300));
-        assert_eq!(first.len(), 1, "expected exactly the one served frame");
+        assert!(!first.is_empty(), "expected the served frame");
+        assert!(first[0].keyframe, "first encoded frame must be a keyframe");
 
         // No `request_keyframe()` call this time: with the source blocked,
-        // only idle P-frame pulses may arrive, never a keyframe.
+        // only refine/idle P-frame repeats may arrive, never a keyframe.
         let idle = drain_for(&mut handle, Duration::from_secs(2));
         assert!(
-            idle.iter().all(|f| !f.keyframe),
+            first[1..].iter().chain(idle.iter()).all(|f| !f.keyframe),
             "expected no keyframes without a pending keyframe request"
         );
         assert_eq!(
@@ -1265,6 +1310,110 @@ mod tests {
         assert!(!frames[1].keyframe, "idle pulse must be a P-frame");
         assert!(handle.stats.idle_repeats.load(Ordering::Relaxed) >= 1);
         assert_eq!(handle.stats.keyframe_repeats.load(Ordering::Relaxed), 0);
+
+        StaticScreenSource::unblock(&stop_signal);
+        handle.stop();
+    }
+
+    #[test]
+    fn refine_burst_follows_content_then_stops() {
+        let _guard = serialized();
+        let (source, stop_signal) = StaticScreenSource::new(64, 64);
+        let cfg = EncoderConfig {
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_kbps: 2000,
+            keyframe_interval_frames: 60,
+            max_qp: None,
+        };
+        let (encoder, _kind) =
+            build_encoder(Some(EncoderKind::OpenH264), cfg).expect("encoder init");
+        let mut handle = Pipeline::start(
+            Box::new(source),
+            encoder,
+            RateTarget {
+                bitrate_kbps: 2000,
+                fps: 30,
+            },
+        );
+
+        // The first frame, then an idle repeat well before the 1 s pulse.
+        let head = drain_until(&mut handle, Duration::from_millis(900), |f| f.len() >= 2);
+        assert!(
+            head.len() >= 2,
+            "expected a refine repeat soon after content"
+        );
+        assert!(head[0].keyframe, "first frame must be a keyframe");
+        assert!(
+            head[1].data.len() < REFINE_DONE_BYTES,
+            "flat static image should converge immediately, got {} bytes",
+            head[1].data.len()
+        );
+
+        // The tiny repeat ended the burst: from here on only the 1 s pulse
+        // may land (at most 1 extra frame in ~800 ms, not ~8).
+        let tail = drain_for(&mut handle, Duration::from_millis(800));
+        assert!(
+            tail.len() <= 1,
+            "refine burst must stop on a converged frame, got {} more frames",
+            tail.len()
+        );
+
+        StaticScreenSource::unblock(&stop_signal);
+        handle.stop();
+    }
+
+    /// Encodes every frame as a fixed 4096-byte P-frame (a keyframe on
+    /// request): a never-converging encoder for the refine cap.
+    struct BigRepeatEncoder;
+
+    impl Encoder for BigRepeatEncoder {
+        fn encode(
+            &mut self,
+            frame: &RawFrame,
+            force_keyframe: bool,
+        ) -> Result<Option<EncodedFrame>, crate::encode::EncodeError> {
+            Ok(Some(EncodedFrame {
+                data: vec![0u8; 4096],
+                keyframe: force_keyframe,
+                ts: Instant::now(),
+                captured_at: frame.ts(),
+            }))
+        }
+
+        fn set_rate(&mut self, _target: RateTarget) -> Result<(), crate::encode::EncodeError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn refine_burst_is_capped() {
+        let _guard = serialized();
+        let (source, stop_signal) = StaticScreenSource::new(64, 64);
+        let mut handle = Pipeline::start(
+            Box::new(source),
+            Box::new(BigRepeatEncoder),
+            RateTarget {
+                bitrate_kbps: 2000,
+                fps: 30,
+            },
+        );
+
+        let head = drain_until(&mut handle, Duration::from_secs(5), |f| !f.is_empty());
+        assert_eq!(head.len(), 1, "expected the first frame");
+        // Burst: REFINE_MAX_REPEATS repeats at <= 10 fps (~1.5 s), then at
+        // most the 1 s pulses within the window.
+        let _ = drain_for(&mut handle, Duration::from_millis(2500));
+        let repeats = handle.stats.idle_repeats.load(Ordering::Relaxed);
+        assert!(
+            repeats >= u64::from(REFINE_MAX_REPEATS),
+            "expected a full burst of {REFINE_MAX_REPEATS} repeats, got {repeats}"
+        );
+        assert!(
+            repeats <= u64::from(REFINE_MAX_REPEATS) + 3,
+            "burst must be capped, got {repeats} repeats"
+        );
 
         StaticScreenSource::unblock(&stop_signal);
         handle.stop();
