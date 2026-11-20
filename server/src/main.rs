@@ -7,8 +7,74 @@ use rcdesk_server::maintenance::spawn_maintenance;
 use rcdesk_server::passkeys;
 use rcdesk_server::registry::Registry;
 
+/// Что делать по аргументам командной строки.
+#[derive(Debug, PartialEq, Eq)]
+enum CliAction {
+    Run,
+    Help,
+    Version,
+    Unknown(String),
+}
+
+/// Разбирает аргументы (без имени программы). Решает по первому аргументу;
+/// остальные игнорируются.
+fn parse_args(args: impl IntoIterator<Item = String>) -> CliAction {
+    match args.into_iter().next() {
+        None => CliAction::Run,
+        Some(arg) => match arg.as_str() {
+            "-h" | "--help" => CliAction::Help,
+            "-V" | "--version" => CliAction::Version,
+            _ => CliAction::Unknown(arg),
+        },
+    }
+}
+
+const HELP: &str = "\
+rcdesk-server: сигнальный сервер rcdesk (удалённый рабочий стол через браузер).
+
+Использование: rcdesk-server [-h | --help] [-V | --version]
+
+Аргументов настройки нет: сервер настраивается только переменными окружения.
+
+Переменные окружения:
+  RCDESK_PORT              порт HTTP/WebSocket (по умолчанию 8080)
+  RCDESK_DB_PATH           путь к файлу SQLite (по умолчанию rcdesk.db)
+  RCDESK_ADMIN_EMAILS      почты администраторов через запятую
+  RCDESK_STUN_URLS         STUN-адреса через запятую (по умолчанию stun:stun.l.google.com:19302)
+  RCDESK_TURN_URLS         TURN-адреса через запятую; без них TURN отключён
+  RCDESK_TURN_SECRET       общий секрет coturn (use-auth-secret) для временных учётных данных
+  RCDESK_TURN_TTL_SECS     срок жизни учётных данных TURN, секунды (по умолчанию 7200)
+  RCDESK_WEBAUTHN_ORIGIN   origin для passkeys (по умолчанию https://rcdesk.app)
+  RCDESK_WEBAUTHN_RP_ID    RP ID для passkeys (по умолчанию rcdesk.app)
+  RCDESK_MAIL              режим почты: smtp, log или пусто (отключена)
+  RCDESK_MAIL_FROM         адрес отправителя при RCDESK_MAIL=smtp (по умолчанию rcdesk <noreply@rcdesk.app>)
+  RCDESK_SMTP_HOST         SMTP-сервер (по умолчанию smtp.resend.com)
+  RCDESK_SMTP_PORT         порт SMTP (по умолчанию 465)
+  RCDESK_SMTP_USER         пользователь SMTP (по умолчанию resend)
+  RCDESK_SMTP_PASSWORD     пароль SMTP; обязателен при RCDESK_MAIL=smtp
+  RUST_LOG                 уровень логов tracing (по умолчанию info)
+";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Аргументы разбираем до любых побочных эффектов (хук, логгер, БД).
+    match parse_args(std::env::args().skip(1)) {
+        CliAction::Run => {}
+        CliAction::Help => {
+            print!("{HELP}");
+            return Ok(());
+        }
+        CliAction::Version => {
+            println!("rcdesk-server {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        CliAction::Unknown(arg) => {
+            eprintln!("rcdesk-server: неизвестный аргумент «{arg}»");
+            eprintln!("см. rcdesk-server --help");
+            std::process::exit(2);
+        }
+    }
+
     // S-12: паника в задаче tokio отравляет std-мьютексы реестра/БД
     // (`expect("... poisoned")` повсюду): `/healthz` отдаёт 503, но
     // `restart: unless-stopped` на unhealthy контейнер не реагирует. Поэтому
@@ -101,5 +167,69 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> CliAction {
+        parse_args(args.iter().map(|a| a.to_string()))
+    }
+
+    #[test]
+    fn no_args_runs_server() {
+        assert_eq!(parse(&[]), CliAction::Run);
+    }
+
+    #[test]
+    fn help_flags() {
+        assert_eq!(parse(&["--help"]), CliAction::Help);
+        assert_eq!(parse(&["-h"]), CliAction::Help);
+    }
+
+    #[test]
+    fn version_flags() {
+        assert_eq!(parse(&["--version"]), CliAction::Version);
+        assert_eq!(parse(&["-V"]), CliAction::Version);
+    }
+
+    #[test]
+    fn unknown_arg() {
+        assert_eq!(parse(&["--foo"]), CliAction::Unknown("--foo".into()));
+    }
+
+    #[test]
+    fn first_arg_decides() {
+        assert_eq!(parse(&["--help", "--foo"]), CliAction::Help);
+        assert_eq!(
+            parse(&["--foo", "--help"]),
+            CliAction::Unknown("--foo".into())
+        );
+    }
+
+    #[test]
+    fn help_lists_every_variable() {
+        for var in [
+            "RCDESK_PORT",
+            "RCDESK_DB_PATH",
+            "RCDESK_ADMIN_EMAILS",
+            "RCDESK_STUN_URLS",
+            "RCDESK_TURN_URLS",
+            "RCDESK_TURN_SECRET",
+            "RCDESK_TURN_TTL_SECS",
+            "RCDESK_WEBAUTHN_ORIGIN",
+            "RCDESK_WEBAUTHN_RP_ID",
+            "RCDESK_MAIL",
+            "RCDESK_MAIL_FROM",
+            "RCDESK_SMTP_HOST",
+            "RCDESK_SMTP_PORT",
+            "RCDESK_SMTP_USER",
+            "RCDESK_SMTP_PASSWORD",
+            "RUST_LOG",
+        ] {
+            assert!(HELP.contains(var), "в справке нет {var}");
+        }
     }
 }
