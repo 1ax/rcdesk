@@ -1,0 +1,32 @@
+name: MF bench
+
+# Замер программного кодера Media Foundation на слабом Windows-хосте (под-шаг B
+# слайса качества кодера): собирает `mf_bench.exe` для запуска на стенде.
+# Запуск: push в ветку `wip/mf-bench` (workflow_dispatch GitHub видит, только
+# когда файл уже есть в main) или вручную `gh workflow run mf-bench.yml`.
+on:
+  push:
+    branches: [wip/mf-bench]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Кросс-компиляции нет: openh264 собирается из исходников под MSVC, поэтому
+  # пример собирает CI. Веб-клиент не нужен: без RCDESK_REQUIRE_WEB build.rs
+  # вшивает заглушку хаба. Артефакт скачивается со страницы запуска.
+  mf-bench:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: mf-bench
+      - run: cargo build --locked --release -p rcdesk-host --example mf_bench
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: mf-bench
+          path: target/release/examples/mf_bench.exe
+          if-no-files-found: error

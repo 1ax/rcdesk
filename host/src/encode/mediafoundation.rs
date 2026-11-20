@@ -20,7 +20,8 @@ use windows::core::{Interface, GUID, PWSTR};
 use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, VARIANT_FALSE, VARIANT_TRUE};
 use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Base, eAVEncH264VProfile_ConstrainedBase,
-    CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMeanBitRate,
+    eAVEncH264VProfile_High, eAVEncH264VProfile_Main, CODECAPI_AVEncCommonBufferSize,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQualityVsSpeed,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoMaxQP, CODECAPI_AVLowLatencyMode,
     ICodecAPI, IMFActivate, IMFMediaBuffer, IMFMediaEvent, IMFMediaEventGenerator, IMFMediaType,
@@ -70,6 +71,37 @@ const OUTPUT_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
 const DRIFT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// How often `maybe_recompensate` re-evaluates the measured input fps.
 const FPS_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// H.264 profile requested from the MFT (`MfTuning::profile`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MfProfile {
+    #[default]
+    ConstrainedBaseline,
+    Main,
+    High,
+}
+
+/// Encoder knobs (see `examples/mf_bench.rs`). `Default` is exactly the
+/// production behaviour of `MediaFoundationEncoder::new`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MfTuning {
+    /// `Some(q)`: soft-set `CODECAPI_AVEncCommonQualityVsSpeed` = q (0..=100).
+    /// `None`: the property is not touched (production).
+    pub quality_vs_speed: Option<u32>,
+    /// `CODECAPI_AVLowLatencyMode` (production: `true`).
+    pub low_latency: bool,
+    pub profile: MfProfile,
+}
+
+impl Default for MfTuning {
+    fn default() -> Self {
+        Self {
+            quality_vs_speed: None,
+            low_latency: true,
+            profile: MfProfile::ConstrainedBaseline,
+        }
+    }
+}
 
 pub struct MediaFoundationEncoder {
     transform: IMFTransform,
@@ -235,6 +267,15 @@ impl MediaFoundationEncoder {
     /// see `build_encoder`'s doc comment), `true` when the caller explicitly
     /// requested `EncoderKind::MediaFoundation`.
     pub fn new(cfg: EncoderConfig, allow_software: bool) -> Result<Self, EncodeError> {
+        Self::new_tuned(cfg, allow_software, MfTuning::default())
+    }
+
+    /// Like `new`, with explicit encoder knobs (measurement tooling).
+    pub fn new_tuned(
+        cfg: EncoderConfig,
+        allow_software: bool,
+        tuning: MfTuning,
+    ) -> Result<Self, EncodeError> {
         // SAFETY: `None` for `pvReserved` is the documented "reserved, must
         // be null" value; `COINIT_MULTITHREADED` is the apartment model this
         // module's `Send` impl above relies on. On success the local guard
@@ -261,12 +302,13 @@ impl MediaFoundationEncoder {
         // encoder, and any error path drops it (once) on the way out.
         let mf = MfSession::startup()?;
 
-        Self::build(cfg, allow_software, mta, mf)
+        Self::build(cfg, allow_software, tuning, mta, mf)
     }
 
     fn build(
         cfg: EncoderConfig,
         allow_software: bool,
+        tuning: MfTuning,
         mta: MtaUsage,
         mf: MfSession,
     ) -> Result<Self, EncodeError> {
@@ -310,8 +352,8 @@ impl MediaFoundationEncoder {
 
         let is_async = unlock_async(&transform)?;
 
-        let codec_api = configure_codec_api(&transform, &cfg)?;
-        set_output_type(&transform, &cfg)?;
+        let codec_api = configure_codec_api(&transform, &cfg, &tuning)?;
+        set_output_type(&transform, &cfg, &tuning)?;
         set_input_type(&transform, &cfg)?;
 
         // SAFETY: `transform` has both its input and output types set.
@@ -350,6 +392,9 @@ impl MediaFoundationEncoder {
             max_qp = ?cfg.max_qp,
             hardware,
             r#async = is_async,
+            quality_vs_speed = ?tuning.quality_vs_speed,
+            low_latency = tuning.low_latency,
+            profile = ?tuning.profile,
             "initializing mediafoundation encoder"
         );
 
@@ -1099,6 +1144,7 @@ fn unlock_async(transform: &IMFTransform) -> Result<bool, EncodeError> {
 fn configure_codec_api(
     transform: &IMFTransform,
     cfg: &EncoderConfig,
+    tuning: &MfTuning,
 ) -> Result<Option<ICodecAPI>, EncodeError> {
     let codec_api = match transform.cast::<ICodecAPI>() {
         Ok(codec_api) => codec_api,
@@ -1142,8 +1188,16 @@ fn configure_codec_api(
         &codec_api,
         "AVLowLatencyMode",
         &CODECAPI_AVLowLatencyMode,
-        &variant_bool(true),
+        &variant_bool(tuning.low_latency),
     );
+    if let Some(q) = tuning.quality_vs_speed {
+        soft_set_codec_value(
+            &codec_api,
+            "AVEncCommonQualityVsSpeed",
+            &CODECAPI_AVEncCommonQualityVsSpeed,
+            &variant_u32(q),
+        );
+    }
     soft_set_codec_value(
         &codec_api,
         "AVEncMPVGOPSize",
@@ -1256,7 +1310,16 @@ fn variant_bool(value: bool) -> VARIANT {
 /// profile first, falling back to plain Baseline (with a `tracing::warn!`)
 /// if the MFT rejects it -- Microsoft's own software encoder MFT documents
 /// only Base/Main/High, not Constrained Baseline, on some Windows versions.
-fn set_output_type(transform: &IMFTransform, cfg: &EncoderConfig) -> Result<(), EncodeError> {
+fn set_output_type(
+    transform: &IMFTransform,
+    cfg: &EncoderConfig,
+    tuning: &MfTuning,
+) -> Result<(), EncodeError> {
+    let profile = match tuning.profile {
+        MfProfile::ConstrainedBaseline => eAVEncH264VProfile_ConstrainedBase,
+        MfProfile::Main => eAVEncH264VProfile_Main,
+        MfProfile::High => eAVEncH264VProfile_High,
+    };
     // SAFETY: no preconditions.
     let media_type = unsafe { MFCreateMediaType() }.map_err(|err| {
         EncodeError::Backend(format!("MediaFoundation MFCreateMediaType (output): {err}"))
@@ -1299,10 +1362,7 @@ fn set_output_type(transform: &IMFTransform, cfg: &EncoderConfig) -> Result<(), 
                 EncodeError::Backend(format!("MediaFoundation MF_MT_INTERLACE_MODE: {err}"))
             })?;
         media_type
-            .SetUINT32(
-                &MF_MT_MPEG2_PROFILE,
-                eAVEncH264VProfile_ConstrainedBase.0 as u32,
-            )
+            .SetUINT32(&MF_MT_MPEG2_PROFILE, profile.0 as u32)
             .map_err(|err| {
                 EncodeError::Backend(format!("MediaFoundation MF_MT_MPEG2_PROFILE: {err}"))
             })?;
@@ -1311,6 +1371,12 @@ fn set_output_type(transform: &IMFTransform, cfg: &EncoderConfig) -> Result<(), 
     // SAFETY: `media_type` is fully populated above.
     match unsafe { transform.SetOutputType(0, &media_type, 0) } {
         Ok(()) => Ok(()),
+        Err(err) if tuning.profile != MfProfile::ConstrainedBaseline => {
+            Err(EncodeError::Backend(format!(
+                "MediaFoundation SetOutputType ({:?} profile): {err}",
+                tuning.profile
+            )))
+        }
         Err(err) => {
             tracing::warn!(
                 error = %err,
