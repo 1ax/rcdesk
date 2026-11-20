@@ -147,6 +147,28 @@ fn pace_offsets(sizes: &[usize]) -> Vec<Duration> {
     offsets
 }
 
+/// Hard ceiling on a packet's scheduled send time within one frame. When
+/// late wake-ups push the chain `pace_sched` builds past this, the rest of the
+/// frame leaves immediately without sleeping, which bounds the latency added by
+/// a long run of late packets. `PACE_MAX_SPREAD` stays the ceiling of the
+/// *plan* in `pace_offsets`; this one only limits the shifted schedule.
+const PACE_HARD_CAP: Duration = Duration::from_millis(60);
+
+/// Scheduled send time (from the frame start) of a packet. `plan_offset` and
+/// `plan_gap` come from `pace_offsets` (gap to the previous packet's plan
+/// offset); `prev_sched` / `prev_sent` are the previous packet's scheduled and
+/// actual send times. A late previous packet shifts the tail of the frame
+/// instead of letting every overdue packet leave in one burst; a packet that
+/// left early (`PACE_MIN_SLEEP`) causes no drift because `prev_sched` is used.
+fn pace_sched(
+    plan_offset: Duration,
+    plan_gap: Duration,
+    prev_sched: Duration,
+    prev_sent: Duration,
+) -> Duration {
+    plan_offset.max(prev_sched.max(prev_sent) + plan_gap)
+}
+
 /// How much later than planned a frame finished leaving: `spread` (measured
 /// from the frame start to the last packet written) minus `planned` (the last
 /// `pace_offsets` entry). Zero when the frame finished early.
@@ -1200,17 +1222,44 @@ impl PeerSession {
                 // `pace_offsets` (`PACE_RATE_KBPS`, capped at
                 // `PACE_MAX_SPREAD` per frame, so at most about one frame
                 // interval of latency). Packets due within `PACE_MIN_SLEEP`
-                // go out immediately.
+                // go out immediately. Then a Windows host under load (GDI +
+                // software encoder, 2026-11-20, path host>srflx RTT 127 ms)
+                // woke 5-12 ms late and every packet whose time had passed
+                // left back to back: 65-94 lost packets per 5 s at 3 Mbit/s
+                // (Mac host, same path: 0-5). Now a packet's time is also
+                // counted from the previous packet (`pace_sched`): a late
+                // wake-up shifts the tail instead of squeezing it into a
+                // burst, bounded by `PACE_HARD_CAP`.
                 let started = Instant::now();
                 let total = packets.len();
                 let sizes: Vec<usize> = packets.iter().map(|p| p.payload.len()).collect();
                 let offsets = pace_offsets(&sizes);
-                for (pkt, offset) in packets.into_iter().zip(offsets.iter().copied()) {
+                let mut prev_sched = Duration::ZERO;
+                let mut prev_sent = Duration::ZERO;
+                let mut prev_offset = Duration::ZERO;
+                for (i, (pkt, offset)) in
+                    packets.into_iter().zip(offsets.iter().copied()).enumerate()
+                {
                     let mut pkt = pkt;
-                    let due = started + offset;
-                    if due.saturating_duration_since(Instant::now()) >= PACE_MIN_SLEEP {
-                        tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+                    let sched = if i == 0 {
+                        Duration::ZERO
+                    } else {
+                        pace_sched(
+                            offset,
+                            offset.saturating_sub(prev_offset),
+                            prev_sched,
+                            prev_sent,
+                        )
+                    };
+                    prev_offset = offset;
+                    if sched <= PACE_HARD_CAP {
+                        let due = started + sched;
+                        if due.saturating_duration_since(Instant::now()) >= PACE_MIN_SLEEP {
+                            tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+                        }
                     }
+                    prev_sched = sched;
+                    prev_sent = started.elapsed();
                     pkt.header.payload_type = pt;
                     // Stamped after the pacing pause, right before the write:
                     // the receiver's estimator needs the send time, not the
@@ -1645,6 +1694,75 @@ mod tests {
     #[test]
     fn empty_report_has_no_path() {
         assert!(path_from_report(&RTCStatsReport::default()).is_none());
+    }
+
+    #[test]
+    fn pace_sched_on_time_keeps_plan() {
+        let ms = Duration::from_millis;
+        assert_eq!(pace_sched(ms(10), ms(2), ms(8), ms(8)), ms(10));
+        assert_eq!(pace_sched(ms(10), ms(2), ms(8), ms(7)), ms(10));
+    }
+
+    #[test]
+    fn pace_sched_late_shifts_tail() {
+        let ms = Duration::from_millis;
+        // previous packet planned at 8 ms, left at 18 ms
+        assert_eq!(pace_sched(ms(10), ms(2), ms(8), ms(18)), ms(20));
+    }
+
+    #[test]
+    fn pace_sched_early_send_does_not_drift() {
+        let ms = Duration::from_millis;
+        // previous packet left 0.5 ms early (MIN_SLEEP): plan unchanged
+        let early = ms(8) - Duration::from_micros(500);
+        assert_eq!(pace_sched(ms(10), ms(2), ms(8), early), ms(10));
+    }
+
+    #[test]
+    fn pace_sched_chain_has_no_catch_up_burst() {
+        let sizes = [1200usize; 25];
+        let offsets = pace_offsets(&sizes);
+        let late = Duration::from_millis(10);
+        let mut sent: Vec<Duration> = Vec::new();
+        let mut sched_prev = Duration::ZERO;
+        let mut sent_prev = Duration::ZERO;
+        for i in 0..offsets.len() {
+            let sched = if i == 0 {
+                Duration::ZERO
+            } else {
+                pace_sched(
+                    offsets[i],
+                    offsets[i] - offsets[i - 1],
+                    sched_prev,
+                    sent_prev,
+                )
+            };
+            let now = if i == 5 { sched + late } else { sched };
+            let s = sched.max(now);
+            sent.push(s);
+            sched_prev = sched;
+            sent_prev = s;
+        }
+        let tol = Duration::from_micros(1);
+        for i in 1..sent.len() {
+            let gap = offsets[i] - offsets[i - 1];
+            assert!(
+                sent[i] + tol >= sent[i - 1] + gap,
+                "packet {i}: interval {:?} < gap {gap:?}",
+                sent[i] - sent[i - 1]
+            );
+        }
+        let want = offsets[24] + late;
+        assert!(
+            sent[24].abs_diff(want) <= tol,
+            "last = {:?}, want {want:?}",
+            sent[24]
+        );
+    }
+
+    #[test]
+    fn pace_hard_cap_above_plan_ceiling() {
+        assert!(PACE_HARD_CAP > PACE_MAX_SPREAD);
     }
 
     #[test]
