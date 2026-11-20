@@ -1,6 +1,8 @@
 //! H.264 encoding: turns `RawFrame`s into Annex-B access units.
 
 use std::time::Instant;
+#[cfg(any(windows, test))]
+use std::{collections::VecDeque, time::Duration};
 
 use crate::capture::RawFrame;
 
@@ -258,6 +260,91 @@ pub(crate) fn fps_compensated_bitrate_bps(
     u32::try_from(bps).unwrap_or(u32::MAX)
 }
 
+/// Window over which `InputFpsMeter` measures the input frame rate.
+#[cfg(any(windows, test))]
+pub(crate) const FPS_METER_WINDOW: Duration = Duration::from_secs(1);
+/// Minimum span of the metered marks for `InputFpsMeter::fps` to answer.
+#[cfg(any(windows, test))]
+pub(crate) const FPS_METER_MIN_SPAN: Duration = Duration::from_millis(250);
+
+/// Sliding-window meter of the real input frame rate, fed with frame capture
+/// timestamps.
+#[cfg(any(windows, test))]
+#[derive(Debug, Default)]
+pub(crate) struct InputFpsMeter {
+    marks: VecDeque<Instant>,
+}
+
+#[cfg(any(windows, test))]
+impl InputFpsMeter {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a frame timestamp; one earlier than the last recorded is
+    /// ignored. Marks older than `last - FPS_METER_WINDOW` are dropped.
+    pub(crate) fn record(&mut self, ts: Instant) {
+        if let Some(&last) = self.marks.back() {
+            if ts < last {
+                return;
+            }
+        }
+        self.marks.push_back(ts);
+        while let Some(&first) = self.marks.front() {
+            if ts.duration_since(first) > FPS_METER_WINDOW {
+                self.marks.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Frames per second over the window, `None` with fewer than 2 marks or a
+    /// span under `FPS_METER_MIN_SPAN`.
+    pub(crate) fn fps(&self) -> Option<f64> {
+        let (&first, &last) = (self.marks.front()?, self.marks.back()?);
+        if self.marks.len() < 2 {
+            return None;
+        }
+        let span = last.duration_since(first);
+        if span < FPS_METER_MIN_SPAN {
+            return None;
+        }
+        Some((self.marks.len() - 1) as f64 / span.as_secs_f64())
+    }
+}
+
+/// The fps the bitrate should be compensated for: the measured input fps
+/// rounded and clamped to `[ceil(target_fps * 2 / 3), target_fps]` (at least
+/// 1); `target_fps` when there is no measurement.
+///
+/// The software MFT in CBR divides `MeanBitRate` by the `MF_MT_FRAME_RATE`
+/// fixed at 30, so a weak host whose GDI capture yields 20-23 fps really
+/// outputs `target * fps / 30` (target 6000: fps 21.8 -> 4357 kbps, fps 23.2
+/// -> 4702 kbps). The compensation by the measurement is capped at 1.5x:
+/// lesson of 0.5.0, an unbounded frame size knocks the network over.
+#[cfg(any(windows, test))]
+pub(crate) fn effective_fps(target_fps: u32, measured: Option<f64>) -> u32 {
+    let Some(measured) = measured else {
+        return target_fps;
+    };
+    let floor = (u64::from(target_fps) * 2).div_ceil(3).max(1) as u32;
+    let rounded = measured.round();
+    let rounded = if rounded.is_finite() && rounded > 0.0 {
+        rounded.min(f64::from(u32::MAX)) as u32
+    } else {
+        0
+    };
+    rounded.clamp(floor.min(target_fps.max(1)), target_fps.max(1))
+}
+
+/// Whether the applied compensation fps is stale: the effective fps differs
+/// by 10 % or more (hysteresis); `applied_fps == 0` always is.
+#[cfg(any(windows, test))]
+pub(crate) fn needs_recompensation(applied_fps: u32, effective_fps: u32) -> bool {
+    u64::from(effective_fps.abs_diff(applied_fps)) * 10 >= u64::from(applied_fps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +388,80 @@ mod tests {
         ];
 
         assert_eq!(nal_types(&stream), vec![7, 8, 5]);
+    }
+
+    fn meter_with(t0: Instant, offsets_ms: &[u64]) -> InputFpsMeter {
+        let mut m = InputFpsMeter::new();
+        for &o in offsets_ms {
+            m.record(t0 + Duration::from_millis(o));
+        }
+        m
+    }
+
+    #[test]
+    fn meter_empty_or_single_is_none() {
+        let t0 = Instant::now();
+        assert_eq!(InputFpsMeter::new().fps(), None);
+        assert_eq!(meter_with(t0, &[0]).fps(), None);
+    }
+
+    #[test]
+    fn meter_measures_twenty_fps() {
+        let t0 = Instant::now();
+        let offs: Vec<u64> = (0..21).map(|i| i * 50).collect();
+        let fps = meter_with(t0, &offs).fps().expect("fps");
+        assert!((fps - 20.0).abs() < 0.01, "{fps}");
+    }
+
+    #[test]
+    fn meter_short_span_is_none() {
+        let t0 = Instant::now();
+        assert_eq!(meter_with(t0, &[0, 50, 100, 200]).fps(), None);
+    }
+
+    #[test]
+    fn meter_ignores_backwards_mark() {
+        let t0 = Instant::now();
+        let mut m = meter_with(t0, &[0, 100, 200, 300]);
+        m.record(t0 + Duration::from_millis(50));
+        let fps = m.fps().expect("fps");
+        assert!((fps - 10.0).abs() < 0.01, "{fps}");
+    }
+
+    #[test]
+    fn meter_drops_old_marks() {
+        let t0 = Instant::now();
+        let mut offs: Vec<u64> = (0..=30).map(|i| i * 1000 / 30).collect();
+        offs.extend((0..11).map(|i| 3000 + i * 100));
+        let fps = meter_with(t0, &offs).fps().expect("fps");
+        assert!((fps - 10.0).abs() < 0.01, "{fps}");
+    }
+
+    #[test]
+    fn effective_fps_cases() {
+        assert_eq!(effective_fps(30, None), 30);
+        assert_eq!(effective_fps(30, Some(21.8)), 22);
+        assert_eq!(effective_fps(30, Some(5.0)), 20);
+        assert_eq!(effective_fps(30, Some(40.0)), 30);
+        assert_eq!(effective_fps(15, Some(8.0)), 10);
+        assert_eq!(effective_fps(1, Some(0.2)), 1);
+    }
+
+    #[test]
+    fn needs_recompensation_cases() {
+        assert!(!needs_recompensation(30, 30));
+        assert!(!needs_recompensation(30, 28));
+        assert!(needs_recompensation(30, 27));
+        assert!(needs_recompensation(20, 22));
+        assert!(needs_recompensation(0, 5));
+    }
+
+    #[test]
+    fn measured_fps_compensation_bitrate() {
+        assert_eq!(
+            fps_compensated_bitrate_bps(6000, 30, effective_fps(30, Some(22.0))),
+            8_181_818
+        );
     }
 
     #[test]

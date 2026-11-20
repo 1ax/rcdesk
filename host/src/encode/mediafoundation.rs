@@ -49,7 +49,9 @@ use windows::Win32::System::Variant::{
 
 use crate::capture::RawFrame;
 use crate::encode::convert::{nv12_len, Nv12Writer};
-use crate::encode::{fps_compensated_bitrate_bps, nal_types};
+use crate::encode::{
+    effective_fps, fps_compensated_bitrate_bps, nal_types, needs_recompensation, InputFpsMeter,
+};
 
 use super::{EncodeError, EncodedFrame, Encoder, EncoderConfig, RateTarget};
 
@@ -66,6 +68,8 @@ const OUTPUT_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Minimum interval between `MeanBitRate` readbacks of the drift watchdog.
 const DRIFT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// How often `maybe_recompensate` re-evaluates the measured input fps.
+const FPS_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct MediaFoundationEncoder {
     transform: IMFTransform,
@@ -120,6 +124,15 @@ pub struct MediaFoundationEncoder {
     last_seen_bitrate_bps: Option<u32>,
     /// When the drift watchdog last read `MeanBitRate` back.
     drift_checked_at: Instant,
+    /// Measures the real input fps from frame timestamps (see
+    /// `effective_fps`).
+    fps_meter: InputFpsMeter,
+    /// Last target handed to `set_rate` (initially from the config).
+    rate_target: RateTarget,
+    /// The fps the currently written `MeanBitRate` is compensated for.
+    applied_fps: u32,
+    /// When `maybe_recompensate` last looked at the measured fps.
+    fps_checked_at: Instant,
     /// Balances the successful `MFStartup` with exactly one `MFShutdown`,
     /// whichever path (build error, drain error, normal drop) ends the
     /// encoder. Declared after `transform`/`codec_api` so they are released
@@ -342,6 +355,7 @@ impl MediaFoundationEncoder {
 
         log_codec_readback(codec_api.as_ref(), is_async, cfg.fps);
         let last_set_bitrate_bps = cfg.bitrate_kbps.saturating_mul(1000);
+        let (cfg_bitrate_kbps, cfg_fps) = (cfg.bitrate_kbps, cfg.fps);
 
         let mut encoder = Self {
             transform,
@@ -362,6 +376,13 @@ impl MediaFoundationEncoder {
             last_set_bitrate_bps,
             last_seen_bitrate_bps: None,
             drift_checked_at: Instant::now(),
+            fps_meter: InputFpsMeter::new(),
+            rate_target: RateTarget {
+                bitrate_kbps: cfg_bitrate_kbps,
+                fps: cfg_fps,
+            },
+            applied_fps: cfg_fps,
+            fps_checked_at: Instant::now(),
             _mf: mf,
             _mta: mta,
         };
@@ -816,6 +837,8 @@ impl Encoder for MediaFoundationEncoder {
             }
         }
 
+        self.fps_meter.record(frame.ts());
+        self.maybe_recompensate();
         self.check_bitrate_drift();
 
         if self.is_async {
@@ -829,9 +852,24 @@ impl Encoder for MediaFoundationEncoder {
     /// type (`MF_MT_FRAME_RATE`, set once in `set_input_type`/
     /// `set_output_type`) and cannot be changed on a streaming MFT without a
     /// full re-negotiation. The MFT budgets a frame as
-    /// `MeanBitRate / MF_MT_FRAME_RATE`, so `target.fps` is taken into account
-    /// by compensating the bitrate (see `fps_compensated_bitrate_bps`).
+    /// `MeanBitRate / MF_MT_FRAME_RATE`, so both `target.fps` and the measured
+    /// input fps (see `effective_fps`) are taken into account by compensating
+    /// the bitrate (see `fps_compensated_bitrate_bps`).
     fn set_rate(&mut self, target: RateTarget) -> Result<(), EncodeError> {
+        self.rate_target = target;
+        let eff = effective_fps(target.fps, self.fps_meter.fps());
+        self.apply_mean_bitrate(eff, "set_rate")
+    }
+}
+
+impl MediaFoundationEncoder {
+    /// Writes `MeanBitRate` compensated for `effective_fps` and refreshes the
+    /// drift-watchdog bookkeeping.
+    fn apply_mean_bitrate(
+        &mut self,
+        effective_fps: u32,
+        reason: &'static str,
+    ) -> Result<(), EncodeError> {
         let Some(codec_api) = &self.codec_api else {
             if !self.rate_warned {
                 tracing::warn!(
@@ -843,7 +881,7 @@ impl Encoder for MediaFoundationEncoder {
         };
 
         let bitrate_bps =
-            fps_compensated_bitrate_bps(target.bitrate_kbps, self.cfg.fps, target.fps);
+            fps_compensated_bitrate_bps(self.rate_target.bitrate_kbps, self.cfg.fps, effective_fps);
         // SAFETY: `codec_api` is a live `ICodecAPI` obtained at construction
         // time; `CODECAPI_AVEncCommonMeanBitRate` is an extern immutable
         // static of the documented `GUID` type; `variant_u32` builds a live
@@ -860,18 +898,39 @@ impl Encoder for MediaFoundationEncoder {
 
         let readback_bps = read_codec_u32(codec_api, &CODECAPI_AVEncCommonMeanBitRate);
         tracing::debug!(
-            bitrate_kbps = target.bitrate_kbps,
-            fps = target.fps,
+            bitrate_kbps = self.rate_target.bitrate_kbps,
+            target_fps = self.rate_target.fps,
+            measured_fps = ?self.fps_meter.fps(),
+            effective_fps,
             cfg_fps = self.cfg.fps,
             mean_bitrate_bps = bitrate_bps,
             readback_bps = ?readback_bps,
+            reason,
             "media foundation rate target"
         );
         self.last_set_bitrate_bps = bitrate_bps;
         self.last_seen_bitrate_bps = readback_bps;
         self.drift_checked_at = Instant::now();
+        self.applied_fps = effective_fps;
 
         Ok(())
+    }
+
+    /// Re-applies the bitrate when the measured input fps has moved enough
+    /// (see `needs_recompensation`) from the one it was last compensated for.
+    /// Checked at most once per `FPS_RECHECK_INTERVAL`; errors are logged, the
+    /// frame is not failed.
+    fn maybe_recompensate(&mut self) {
+        if self.codec_api.is_none() || self.fps_checked_at.elapsed() < FPS_RECHECK_INTERVAL {
+            return;
+        }
+        self.fps_checked_at = Instant::now();
+        let eff = effective_fps(self.rate_target.fps, self.fps_meter.fps());
+        if needs_recompensation(self.applied_fps, eff) {
+            if let Err(err) = self.apply_mean_bitrate(eff, "measured_fps") {
+                tracing::warn!(error = %err, "media foundation fps recompensation failed");
+            }
+        }
     }
 }
 
@@ -1551,5 +1610,28 @@ mod tests {
             let raw = source.next_frame().expect("frame");
             encoder.encode(&raw, false).expect("encode");
         }
+    }
+
+    #[test]
+    fn measured_low_fps_keeps_encoding() {
+        let mut source = SyntheticSource::new(64, 64, 1000);
+        let mut encoder = MediaFoundationEncoder::new(test_cfg(), true).expect("encoder init");
+        encoder
+            .set_rate(RateTarget {
+                bitrate_kbps: 2000,
+                fps: 30,
+            })
+            .expect("set_rate");
+
+        let t0 = Instant::now();
+        let mut outputs = 0usize;
+        for i in 0..40u32 {
+            let mut raw = source.next_frame().expect("frame");
+            raw.set_ts(t0 + Duration::from_millis(u64::from(i) * 50));
+            if encoder.encode(&raw, false).expect("encode").is_some() {
+                outputs += 1;
+            }
+        }
+        assert!(outputs > 0, "expected output within 40 frames");
     }
 }
