@@ -356,6 +356,7 @@ pub(super) async fn run_adapt_task(
                         discarded_seen = p.packets_discarded_on_send;
                         d
                     });
+                    let (pace_late_ms_max, pace_spread_ms_max) = peer.take_pace_stats();
                     tracing::info!(
                         captured = s.captured,
                         encoded = s.encoded,
@@ -382,6 +383,8 @@ pub(super) async fn run_adapt_task(
                         rr_rtt_ms = %fmt_opt(s.rr_rtt_ms),
                         rr_jitter_ms = %fmt_opt(s.rr_jitter_ms),
                         send_discarded,
+                        pace_late_ms_max = format_args!("{:.1}", pace_late_ms_max),
+                        pace_spread_ms_max = format_args!("{:.1}", pace_spread_ms_max),
                         "video: {}s summary",
                         s.seconds
                     );

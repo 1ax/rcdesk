@@ -147,6 +147,13 @@ fn pace_offsets(sizes: &[usize]) -> Vec<Duration> {
     offsets
 }
 
+/// How much later than planned a frame finished leaving: `spread` (measured
+/// from the frame start to the last packet written) minus `planned` (the last
+/// `pace_offsets` entry). Zero when the frame finished early.
+fn pace_late(planned: Duration, spread: Duration) -> Duration {
+    spread.saturating_sub(planned)
+}
+
 /// How often `PeerSession::start_video`'s startup keyframe task re-requests a
 /// keyframe after the connection reaches `Connected`, until the receiver
 /// confirms it is actually getting video via an RTCP Receiver Report (see
@@ -588,6 +595,14 @@ pub struct PeerSession {
     tag: u64,
     /// Set by `close`; see `is_closed`.
     closed: AtomicBool,
+    /// Largest `pace_late` (microseconds) over frames with 2+ packets since
+    /// the last `take_pace_stats`. Measures how far the real send time runs
+    /// past the `pace_offsets` plan on Windows, where the timer resolution is
+    /// held at 1 ms by `timeBeginPeriod(1)` (V-3, `platform::timer_resolution`).
+    pace_late_us_max: AtomicU64,
+    /// Largest total send time of one frame (microseconds) over the same
+    /// window and frames; companion of `pace_late_us_max`.
+    pace_spread_us_max: AtomicU64,
 }
 
 /// One end of the selected ICE candidate pair, for the `agent.log` path line.
@@ -939,9 +954,20 @@ impl PeerSession {
             file_rx: std::sync::Mutex::new(Some(file_rx)),
             tag,
             closed: AtomicBool::new(false),
+            pace_late_us_max: AtomicU64::new(0),
+            pace_spread_us_max: AtomicU64::new(0),
         });
 
         Ok(session)
+    }
+
+    /// `(late_ms_max, spread_ms_max)` of the paced video frames since the last
+    /// call, resetting both counters. Diagnostics only (the `video: Ns summary`
+    /// line), to measure pacing lateness on Windows.
+    pub fn take_pace_stats(&self) -> (f64, f64) {
+        let late = self.pace_late_us_max.swap(0, Ordering::Relaxed);
+        let spread = self.pace_spread_us_max.swap(0, Ordering::Relaxed);
+        (late as f64 / 1000.0, spread as f64 / 1000.0)
     }
 
     /// The currently selected ICE candidate pair (host/srflx/relay, RTT), or
@@ -1199,11 +1225,20 @@ impl PeerSession {
                     }
                 }
                 if total >= 2 {
+                    let planned = offsets.last().copied().unwrap_or_default();
+                    let spread = started.elapsed();
+                    session.pace_late_us_max.fetch_max(
+                        pace_late(planned, spread).as_micros() as u64,
+                        Ordering::Relaxed,
+                    );
+                    session
+                        .pace_spread_us_max
+                        .fetch_max(spread.as_micros() as u64, Ordering::Relaxed);
                     tracing::debug!(
                         packets = total,
                         keyframe,
-                        planned_ms = offsets.last().map_or(0.0, |o| o.as_secs_f64() * 1000.0),
-                        spread_ms = started.elapsed().as_secs_f64() * 1000.0,
+                        planned_ms = planned.as_secs_f64() * 1000.0,
+                        spread_ms = spread.as_secs_f64() * 1000.0,
                         "paced video frame"
                     );
                 }
@@ -1593,6 +1628,18 @@ mod tests {
         assert!(!TrafficStats::from_parts(Some((1, 2)), None).unwrap().relay);
         assert!(TrafficStats::from_parts(None, Some(&path("host", "host"))).is_none());
         assert!(traffic_from_report(&RTCStatsReport::default()).is_none());
+    }
+
+    #[test]
+    fn pace_late_is_overshoot_over_plan() {
+        let late = pace_late(Duration::from_millis(19), Duration::from_millis(34));
+        assert_eq!(late, Duration::from_millis(15));
+    }
+
+    #[test]
+    fn pace_late_zero_when_ahead_of_plan() {
+        let late = pace_late(Duration::from_millis(19), Duration::from_millis(10));
+        assert_eq!(late, Duration::ZERO);
     }
 
     #[test]
