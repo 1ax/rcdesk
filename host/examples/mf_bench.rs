@@ -436,11 +436,14 @@ mod win {
         qp: Option<(f64, f64)>,
     }
 
+    /// Encoded frame size (width, height) of a variant.
+    type Size = (u32, u32);
+
     fn run_variant(
         args: &Args,
         var: &Variant,
         screen: (u32, u32),
-    ) -> Result<(Stats, (u32, u32)), (String, (u32, u32))> {
+    ) -> Result<(Stats, Size), (String, Size)> {
         let (sw, sh) = screen;
         let size = match var.res {
             Res::Native => (sw & !1, sh & !1),
