@@ -6,6 +6,8 @@
 // demanded a password and rejects any later `offer` that arrives without a
 // completed login. Pure module, no DOM (same style as `qualityPreset.ts`).
 
+import type { SignalMessage } from "./generated/SignalMessage";
+
 /** localStorage key for the "host requires a password" flag of `deviceId`. */
 export function authRequiredStorageKey(deviceId: string): string {
   return "rcdesk.authRequired." + deviceId;
@@ -37,6 +39,20 @@ export function clearAuthRequired(storage: Pick<Storage, "removeItem">, deviceId
   } catch {
     // Ignored, same reasoning as `saveAuthRequired`.
   }
+}
+
+/** What the "delete and re-pair by PIN" button does after a distrusted
+ * `offer`: forgets the device on the server, drops the local flag and asks
+ * for a fresh device list. Same steps the user would do by hand via the
+ * device menu; the trust check itself is unchanged. */
+export function forgetDistrustedHost(
+  send: (msg: SignalMessage) => void,
+  storage: Pick<Storage, "removeItem"> | null,
+  deviceId: string,
+): void {
+  send({ type: "forget_device", device_id: deviceId });
+  if (storage !== null) clearAuthRequired(storage, deviceId);
+  send({ type: "list_devices" });
 }
 
 /** `true` exactly when the host is remembered as requiring a password but

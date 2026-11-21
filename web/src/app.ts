@@ -110,6 +110,7 @@ import { ConnectGuard } from "./connectGuard";
 import type { ConnectionBannerPhase } from "./sessionRecovery";
 import { authTag, decodeBase64Url, fingerprintFromSdp, verifyAuthTag } from "./dtlsBind";
 import {
+  forgetDistrustedHost,
   loadAuthRequired,
   offerRejectedByTrust,
   saveAuthRequired,
@@ -1922,9 +1923,30 @@ export function mount(root: Element | null): void {
       console.error("offer without password login for a host that requires one");
       signaling.send({ type: "bye", session_id: offerSessionId });
       setSessionStatus("error");
+      const distrustedId = deviceId;
       teardown(
-        "Хост требует пароль, подтверждения не было — возможна подмена. Удалите устройство из списка и привяжите заново по PIN",
+        "Хост требует пароль, подтверждения не было — возможна подмена. Если вы сами сняли пароль на хосте — удалите устройство и привяжите заново по PIN",
       );
+      if (distrustedId !== null) {
+        const forgetBtn = document.createElement("button");
+        forgetBtn.type = "button";
+        forgetBtn.className = "link-btn";
+        forgetBtn.textContent = "Удалить и привязать заново по PIN";
+        forgetBtn.addEventListener(
+          "click",
+          () => {
+            forgetDistrustedHost(
+              (m) => signaling.send(m),
+              ownerStorage(),
+              distrustedId,
+            );
+            pinStatus.textContent = "Устройство удалено. Введите PIN с экрана хоста";
+            pinInput.focus();
+          },
+          { once: true },
+        );
+        pinStatus.append(" ", forgetBtn);
+      }
       return;
     }
     // Slice 3.2d: a `joined`/`auth_required` host only sends `offer` once

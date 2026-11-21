@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   authRequiredStorageKey,
   clearAuthRequired,
+  forgetDistrustedHost,
   loadAuthRequired,
   offerRejectedByTrust,
   saveAuthRequired,
@@ -64,5 +65,31 @@ describe("offerRejectedByTrust", () => {
     expect(offerRejectedByTrust(true, true)).toBe(false);
     expect(offerRejectedByTrust(false, false)).toBe(false);
     expect(offerRejectedByTrust(false, true)).toBe(false);
+  });
+});
+
+describe("forgetDistrustedHost", () => {
+  it("sends forget_device then list_devices and clears the flag", () => {
+    const storage = memoryStorage();
+    saveAuthRequired(storage, "dev1");
+    const sent: unknown[] = [];
+    forgetDistrustedHost((m) => sent.push(m), storage, "dev1");
+    expect(sent).toEqual([
+      { type: "forget_device", device_id: "dev1" },
+      { type: "list_devices" },
+    ]);
+    expect(loadAuthRequired(storage, "dev1")).toBe(false);
+  });
+
+  it("survives a throwing storage and a null storage", () => {
+    const sent: unknown[] = [];
+    const throwing = {
+      removeItem() {
+        throw new Error("blocked");
+      },
+    };
+    expect(() => forgetDistrustedHost((m) => sent.push(m), throwing, "d")).not.toThrow();
+    expect(() => forgetDistrustedHost((m) => sent.push(m), null, "d")).not.toThrow();
+    expect(sent).toHaveLength(4);
   });
 });
