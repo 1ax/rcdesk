@@ -14,27 +14,16 @@ import { SignalingClient } from "./signaling";
 import { PeerSession, toRtcIceServers } from "./session";
 import { summarizeStats, takeSnapshot } from "./stats";
 import type { Snapshot, StatsSummary } from "./stats";
-import { attachInput, unmapPointer } from "./input";
+import { attachInput } from "./input";
 import {
-  KEYBOARD_ZOOM,
-  centerOn,
-  clampZoom,
-  followPoint,
-  identityZoom,
   loadTouchMode,
-  panBy,
   saveTouchMode,
   touchModeLabel,
-  anchorOf,
-  zoomAt,
-  zoomAtAnchor,
-  zoomCss,
   type TouchMode,
-  type ViewAnchor,
-  type Zoom,
 } from "./viewport";
 import { loadClipboardSyncSetting, saveClipboardSyncSetting } from "./clipboard";
 import { createClipboardUi } from "./clipboardUi";
+import { createSessionView } from "./sessionView";
 import { applyCursor } from "./cursor";
 import { displayOptions, parseDisplayId, shouldShowPicker } from "./displays";
 import {
@@ -89,10 +78,7 @@ import {
   saveCmdAsCtrlSetting,
 } from "./keyRemap";
 import {
-  collapseButtonTitle,
-  loadSessionBarCollapsed,
   loadStatsVisible,
-  saveSessionBarCollapsed,
   saveStatsVisible,
 } from "./sessionBar";
 import { reconnectBackoffMs } from "./reconnectBackoff";
@@ -272,11 +258,6 @@ const STATS_INTERVAL_MS = 1000;
  * is the server's push of `devices` on every presence/busy change. */
 const DEVICE_LIST_INTERVAL_MS = 60000;
 
-
-/** How long `#fullscreen-note` (the "for exit press/hold Esc" hint) stays
- * visible after entering fullscreen (slice 3.5c). */
-const FULLSCREEN_NOTE_MS = 3000;
-
 const DOWNLOAD_BASE = "https://github.com/1ax/rcdesk/releases";
 
 /** The "download the host" block of the start screen (slice 4.3e). Static
@@ -407,8 +388,6 @@ export function mount(root: Element | null): void {
     dc.send(JSON.stringify(msg));
     hostUpdateBtn.disabled = true;
   });
-  const fullscreenNoteEl = root.querySelector<HTMLSpanElement>("#fullscreen-note")!;
-  const touchCursorEl = root.querySelector<HTMLImageElement>("#touch-cursor")!;
   const sessionVideoEl = root.querySelector<HTMLDivElement>(".session-video")!;
   const fullscreenBtn = root.querySelector<HTMLButtonElement>("#fullscreen-btn")!;
   const keyboardBtn = root.querySelector<HTMLButtonElement>("#keyboard-btn")!;
@@ -416,7 +395,6 @@ export function mount(root: Element | null): void {
   const softInputEl = root.querySelector<HTMLInputElement>("#soft-input")!;
   softInputEl.setAttribute("autocorrect", "off");
   const touchModeBtn = root.querySelector<HTMLButtonElement>("#touch-mode-btn")!;
-  const zoomLayer = root.querySelector<HTMLDivElement>("#zoom-layer")!;
   keyboardBtn.hidden = !matchMedia("(pointer: coarse)").matches;
   touchModeBtn.hidden = keyboardBtn.hidden;
   // Slice H3: touch mode (global setting) and pinch-zoom of the video layer.
@@ -428,89 +406,17 @@ export function mount(root: Element | null): void {
     touchModeBtn.textContent = touchModeLabel(touchMode);
     focusVideoUnlessTyping();
   });
-  let zoom: Zoom = identityZoom();
-  // H5-18: frame point at the container centre, to keep it when the container resizes.
-  let viewAnchor: ViewAnchor | null = null;
-  // Slice H5-2: last virtual-cursor frame position and the zoom to restore
-  // once the phone keyboard goes away (`null` -- the keyboard didn't zoom).
-  let lastTouchCursor: { x: number; y: number } | null = null;
-  // H5-10: a touch is active, so the overlay must show as soon as it has an image.
-  let touchCursorWanted = false;
-  // Zoom scale and centre frame point before the keyboard zoomed (H5-18).
-  let zoomBeforeKeyboard: { scale: number; anchor: ViewAnchor | null } | null = null;
-  // H5-12: the keyboard zoom is applied once per show; later layout changes keep manual pinch/pan.
-  let keyboardZoomApplied = false;
-  let heightBeforeKeyboard = 0;
-  // H5-4: the session bar was collapsed automatically for the keyboard in landscape.
-  let barAutoCollapsed = false;
-  function applyZoom(next: Zoom): void {
-    zoom = clampZoom(
-      next,
-      sessionVideoEl.clientWidth,
-      sessionVideoEl.clientHeight,
-      video.videoWidth,
-      video.videoHeight,
-    );
-    zoomLayer.style.transform = zoomCss(zoom);
-    viewAnchor = anchorOf(
-      zoom,
-      sessionVideoEl.clientWidth,
-      sessionVideoEl.clientHeight,
-      video.videoWidth,
-      video.videoHeight,
-    );
-    placeTouchCursor();
-  }
-  // H5-18: the container changed size (keyboard, bar, rotation) -- keep the
-  // frame point that was at the centre there, instead of re-clamping the
-  // box-relative offset (the letterbox moved the frame under it).
-  function refitZoom(): void {
-    const w = sessionVideoEl.clientWidth;
-    const h = sessionVideoEl.clientHeight;
-    if (zoom.scale === 1 || !viewAnchor) {
-      applyZoom(zoom);
-      return;
-    }
-    applyZoom(zoomAtAnchor(zoom.scale, viewAnchor, w, h, video.videoWidth, video.videoHeight));
-  }
-  // H5-6: places the virtual-cursor overlay from its frame position in
-  // unscaled-layer coordinates (the layer at 1x is the container), so it
-  // stays on the frame when the container's height changes (keyboard, bar).
-  function placeTouchCursor(): void {
-    if (!lastTouchCursor || touchCursorEl.hidden) return;
-    const p = unmapPointer(
-      lastTouchCursor.x,
-      lastTouchCursor.y,
-      { left: 0, top: 0, width: sessionVideoEl.clientWidth, height: sessionVideoEl.clientHeight },
-      video.videoWidth,
-      video.videoHeight,
-    );
-    if (!p) return;
-    const hx = Number(touchCursorEl.dataset.hx ?? 0) || 0;
-    const hy = Number(touchCursorEl.dataset.hy ?? 0) || 0;
-    const s = zoom.scale;
-    touchCursorEl.style.transform = `translate(${p.clientX - hx / s}px, ${p.clientY - hy / s}px) scale(${1 / s})`;
-  }
-  window.addEventListener("resize", () => {
-    refitZoom();
-    placeTouchCursor();
+  const sessionView = createSessionView({
+    root,
+    video,
+    initialStorage,
+    getStorage: ownerStorage,
+    getTouchMode: () => touchMode,
+    isSessionActive: () => session !== null,
+    focusVideoUnlessTyping: () => focusVideoUnlessTyping(),
   });
-  // H5-12: the container changes height without a window resize too (session
-  // bar wrapping, collapse); keep the layer clamped and the cursor overlay placed.
-  if (typeof ResizeObserver !== "undefined") {
-    new ResizeObserver(() => refitZoom()).observe(sessionVideoEl);
-  }
   // Slice H2b: версия хоста из `host_info` (null -- поле не пришло).
   let hostVersion: string | null = null;
-  // H5-12/H5-15: collapse the bar while the keyboard is up. Measured in the
-  // simulator (iPhone 17 Pro, portrait): with the keyboard open the wrapped bar
-  // left the frame 80 px of height -- in portrait too, not only in landscape.
-  function syncBarForKeyboard(): void {
-    if (!barAutoCollapsed && !sessionScreen.classList.contains("is-collapsed")) {
-      barAutoCollapsed = true;
-      applyBarCollapsed(true, false);
-    }
-  }
   const softKeyboard: SoftKeyboardController = mountSoftKeyboard({
     button: keyboardBtn,
     strip: softKeysEl,
@@ -530,68 +436,12 @@ export function mount(root: Element | null): void {
       // (after `click`), undoing the refocus of `resume()` -- not focusable
       // while the phone keyboard owns the input.
       video.removeAttribute("tabindex");
-      zoomBeforeKeyboard = zoom.scale < KEYBOARD_ZOOM ? { scale: zoom.scale, anchor: viewAnchor } : null;
-      keyboardZoomApplied = false;
-      heightBeforeKeyboard = sessionVideoEl.clientHeight;
-      syncBarForKeyboard();
+      sessionView.onKeyboardShow();
     },
-    onLayout: () => {
-      syncBarForKeyboard();
-      const w = sessionVideoEl.clientWidth;
-      const h = sessionVideoEl.clientHeight;
-      if (
-        zoomBeforeKeyboard === null ||
-        keyboardZoomApplied ||
-        h >= heightBeforeKeyboard * 0.85
-      ) {
-        refitZoom(); // keep the centre frame point in the resized container
-      } else {
-        keyboardZoomApplied = true;
-        const anchor = lastTouchCursor
-          ? unmapPointer(
-              lastTouchCursor.x,
-              lastTouchCursor.y,
-              { left: 0, top: 0, width: w, height: h },
-              video.videoWidth,
-              video.videoHeight,
-            )
-          : null;
-        applyZoom(
-          anchor
-            ? centerOn(KEYBOARD_ZOOM, anchor.clientX, anchor.clientY, w, h)
-            : centerOn(KEYBOARD_ZOOM, w / 2, h / 2, w, h),
-        );
-      }
-      placeTouchCursor();
-    },
+    onLayout: () => sessionView.onKeyboardLayout(),
     onHide: () => {
       video.tabIndex = 0;
-      if (session === null) {
-        zoomBeforeKeyboard = null;
-        barAutoCollapsed = false;
-        return;
-      }
-      if (barAutoCollapsed) {
-        barAutoCollapsed = false;
-        applyBarCollapsed(false, false);
-      }
-      const restore = zoomBeforeKeyboard;
-      zoomBeforeKeyboard = null;
-      if (restore === null) refitZoom();
-      else if (restore.scale === 1 || !restore.anchor) applyZoom({ scale: restore.scale, tx: 0, ty: 0 });
-      else {
-        applyZoom(
-          zoomAtAnchor(
-            restore.scale,
-            restore.anchor,
-            sessionVideoEl.clientWidth,
-            sessionVideoEl.clientHeight,
-            video.videoWidth,
-            video.videoHeight,
-          ),
-        );
-      }
-      placeTouchCursor();
+      sessionView.onKeyboardHide();
     },
   });
   /** H5-12: focus the video for key events, unless the phone keyboard owns focus. */
@@ -671,7 +521,6 @@ export function mount(root: Element | null): void {
   // from `initialStorage`, same as `cmdAsCtrl` above.
   const sessionBarEl = root.querySelector<HTMLDivElement>("#session-bar")!;
   const sessionBarHandle = root.querySelector<HTMLButtonElement>("#session-bar-handle")!;
-  const barCollapseBtn = root.querySelector<HTMLButtonElement>("#bar-collapse-btn")!;
   const statsCheckbox = root.querySelector<HTMLInputElement>("#stats-checkbox")!;
   const clipboardUi = createClipboardUi({
     root,
@@ -688,27 +537,6 @@ export function mount(root: Element | null): void {
   let statsVisible = initialStorage ? loadStatsVisible(initialStorage) : false;
   statsCheckbox.checked = statsVisible;
   overlay.hidden = !statsVisible;
-
-  /** Applies `collapsed` to the session bar/handle (hidden state, title/
-   * aria-label) and saves the choice (slice 3.5g) -- used both to apply the
-   * setting loaded from storage at mount, and by `#bar-collapse-btn`'s and
-   * `#session-bar-handle`'s click listeners below. The `is-collapsed` class
-   * on `#session-screen` is read by the fullscreen CSS rules (slice 3.5h).
-   * `persist = false` skips saving (temporary auto-collapse, H5-4). */
-  function applyBarCollapsed(collapsed: boolean, persist = true): void {
-    sessionScreen.classList.toggle("is-collapsed", collapsed);
-    sessionBarEl.hidden = collapsed;
-    sessionBarHandle.hidden = !collapsed;
-    const title = collapseButtonTitle(collapsed);
-    barCollapseBtn.title = title;
-    barCollapseBtn.setAttribute("aria-label", title);
-    sessionBarHandle.title = title;
-    sessionBarHandle.setAttribute("aria-label", title);
-    const storage = ownerStorage();
-    if (storage && persist) saveSessionBarCollapsed(storage, collapsed);
-  }
-
-  applyBarCollapsed(initialStorage ? loadSessionBarCollapsed(initialStorage) : false);
 
   // One long-lived signaling connection for the whole tab (slice 3.1e): the
   // server remembers which owner a socket authenticated as (and which
@@ -752,7 +580,6 @@ export function mount(root: Element | null): void {
   // 2.5a, debt D26), from `ControlMessage::InputStatus`. While true, input
   // is never attached (see `maybeAttachInput`) and `#view-only` shows why.
   let inputBlocked = false;
-  let fullscreenNoteTimer: ReturnType<typeof setTimeout> | undefined;
   // Set once the signaling socket itself closes (not just a session ending)
   // -- disables every connect affordance until `scheduleReconnect`'s next
   // attempt succeeds (slice 3.5a; the live WebRTC session, if any, is
@@ -804,29 +631,6 @@ export function mount(root: Element | null): void {
   // burning it on a send that would just be dropped (see
   // `performRecoveryAttempt`).
   let recoveryWaitingForSocket = false;
-
-  /** Shows `note` in `#fullscreen-note` for `FULLSCREEN_NOTE_MS` -- the "for
-   * exit press/hold Esc" hint shown once on entering fullscreen (see the
-   * `fullscreenchange` listener below). */
-  function showFullscreenNote(note: string): void {
-    fullscreenNoteEl.textContent = note;
-    fullscreenNoteEl.hidden = false;
-    if (fullscreenNoteTimer !== undefined) clearTimeout(fullscreenNoteTimer);
-    fullscreenNoteTimer = setTimeout(() => {
-      hideFullscreenNote();
-    }, FULLSCREEN_NOTE_MS);
-  }
-
-  /** Hides `#fullscreen-note` right away, e.g. on exiting fullscreen (so a
-   * still-pending hint from a brief fullscreen stay doesn't linger). */
-  function hideFullscreenNote(): void {
-    if (fullscreenNoteTimer !== undefined) {
-      clearTimeout(fullscreenNoteTimer);
-      fullscreenNoteTimer = undefined;
-    }
-    fullscreenNoteEl.hidden = true;
-    fullscreenNoteEl.textContent = "";
-  }
 
   /** Rebuilds `#display-select`'s options from `displays`/`currentDisplay`
    * and shows/hides it (only worth showing with 2+ displays, see
@@ -991,49 +795,14 @@ export function mount(root: Element | null): void {
       {
         mode: () => touchMode,
         onCursor: (pos) => {
-          if (!pos) {
-            touchCursorWanted = false;
-            touchCursorEl.hidden = true;
-            return;
+          if (pos) {
+            keyboardBtn.hidden = false;
+            touchModeBtn.hidden = false;
           }
-          lastTouchCursor = { x: pos.x, y: pos.y };
-          keyboardBtn.hidden = false;
-          touchModeBtn.hidden = false;
-          touchCursorWanted = true;
-          touchCursorEl.hidden = !touchCursorEl.getAttribute("src");
-          placeTouchCursor();
-          if (touchMode === "trackpad") {
-            const c = sessionVideoEl.getBoundingClientRect();
-            applyZoom(
-              followPoint(
-                zoom,
-                pos.clientX - c.left,
-                pos.clientY - c.top,
-                sessionVideoEl.clientWidth,
-                sessionVideoEl.clientHeight,
-                24,
-              ),
-            );
-          }
+          sessionView.onTouchCursor(pos);
         },
-        onPinch: (factor, cx, cy) => {
-          const c = sessionVideoEl.getBoundingClientRect();
-          applyZoom(
-            zoomAt(
-              zoom,
-              factor,
-              cx - c.left,
-              cy - c.top,
-              sessionVideoEl.clientWidth,
-              sessionVideoEl.clientHeight,
-            ),
-          );
-        },
-        onPan: (dx, dy) => {
-          applyZoom(
-            panBy(zoom, dx, dy, sessionVideoEl.clientWidth, sessionVideoEl.clientHeight),
-          );
-        },
+        onPinch: (factor, cx, cy) => sessionView.onPinch(factor, cx, cy),
+        onPan: (dx, dy) => sessionView.onPan(dx, dy),
       },
     );
   }
@@ -1215,12 +984,8 @@ export function mount(root: Element | null): void {
         clipboardUi.onHostText(msg.text);
         return;
       }
-      applyCursor(video, msg, touchCursorEl);
-      // H5-10: the overlay stayed hidden while it had no image; show it now.
-      if (touchCursorWanted && touchCursorEl.getAttribute("src")) {
-        touchCursorEl.hidden = false;
-        placeTouchCursor();
-      }
+      applyCursor(video, msg, sessionView.touchCursorEl);
+      sessionView.onHostCursor();
     });
   }
 
@@ -1391,18 +1156,7 @@ export function mount(root: Element | null): void {
     prevSnapshot = undefined;
     video.srcObject = null;
     video.style.cursor = "";
-    touchCursorEl.hidden = true;
-    touchCursorEl.removeAttribute("src");
-    touchCursorEl.style.visibility = "";
-    touchCursorEl.style.transform = "";
-    touchCursorEl.style.width = "";
-    touchCursorEl.style.height = "";
-    touchCursorWanted = false;
-    zoomBeforeKeyboard = null;
-    barAutoCollapsed = false;
-    lastTouchCursor = null;
-    viewAnchor = null;
-    applyZoom(identityZoom());
+    sessionView.resetSession();
     overlay.textContent = "";
     firstFrameShown = false;
     hostAuthDialog.resetSession();
@@ -2105,10 +1859,10 @@ export function mount(root: Element | null): void {
           console.error("failed to lock keyboard", err);
         });
       }
-      showFullscreenNote(fullscreenHintLabel(keyboardLockActive));
+      sessionView.showFullscreenNote(fullscreenHintLabel(keyboardLockActive));
     } else {
       nav.keyboard?.unlock?.();
-      hideFullscreenNote();
+      sessionView.hideFullscreenNote();
     }
     // Keyboard input is listened for on `video` itself (see `input.ts`'s
     // `attachInput`) -- give it focus back after the transition either way,
@@ -2156,9 +1910,6 @@ export function mount(root: Element | null): void {
     focusVideoUnlessTyping();
   });
 
-  // Slice 3.5g: collapses the session bar to its thin handle strip, which
-  // becomes the only layout element left above the video -- not a pixel of
-  // the remote screen is covered either way.
   // UI-3: on a phone the secondary controls live behind "Ещё" (collapsed by
   // default, not persisted); on desktop the button is hidden by CSS.
   const barMoreBtn = root.querySelector<HTMLButtonElement>("#bar-more-btn")!;
@@ -2166,16 +1917,6 @@ export function mount(root: Element | null): void {
     const expanded = sessionBarEl.classList.toggle("session-bar--expanded");
     barMoreBtn.setAttribute("aria-expanded", String(expanded));
     barMoreBtn.textContent = expanded ? "Меньше" : "Ещё";
-  });
-
-  barCollapseBtn.addEventListener("click", () => {
-    applyBarCollapsed(true);
-    focusVideoUnlessTyping();
-  });
-
-  sessionBarHandle.addEventListener("click", () => {
-    applyBarCollapsed(false);
-    focusVideoUnlessTyping();
   });
 
   statsCheckbox.addEventListener("change", () => {
