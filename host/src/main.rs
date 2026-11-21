@@ -144,6 +144,14 @@ enum Command {
     /// хосте только в виде записи OPAQUE (`access.json` рядом с
     /// `device.json`) -- сам пароль хост не сохраняет.
     Password {
+        /// Каталог данных вместо выбираемого автоматически -- для локальных
+        /// проверок, чтобы не трогать машинный каталог боевого хоста (полный
+        /// режим/служба). Детекция установки не вызывается, запись без прав
+        /// администратора. Пример: `HOME=/tmp/x rcdesk-host password
+        /// --data-dir "/tmp/x/Library/Application Support/rcdesk" set` в паре с
+        /// `HOME=/tmp/x rcdesk-host serve`.
+        #[arg(long, global = true, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
         #[command(subcommand)]
         action: PasswordAction,
     },
@@ -328,7 +336,7 @@ async fn main() -> anyhow::Result<()> {
             run_serve(opts).await
         }
         Command::Autostart { action } => run_autostart(action),
-        Command::Password { action } => run_password(action),
+        Command::Password { data_dir, action } => run_password(data_dir, action),
         Command::Hub {
             port,
             local_port,
@@ -607,9 +615,11 @@ async fn run_hub(port: u16, local_port: u16, data_dir: Option<PathBuf>) -> anyho
 /// record, never the password itself). Uses the same data directory as
 /// `DeviceStore` (`agent::paths::data_dir()`). На Windows при установленной
 /// службе (полный режим, 4.1a) -- машинный каталог `%ProgramData%\rcdesk`:
-/// туда смотрит помощник; запись требует прав администратора.
-fn run_password(action: PasswordAction) -> anyhow::Result<()> {
-    let (data_dir, machine) = password_data_dir();
+/// туда смотрит помощник; запись требует прав администратора. С `--data-dir`
+/// используется ровно этот каталог (не машинный, детекция установки не
+/// вызывается) -- для локальных проверок.
+fn run_password(explicit_dir: Option<PathBuf>, action: PasswordAction) -> anyhow::Result<()> {
+    let (data_dir, machine) = password_dir(explicit_dir);
     let store = AccessStore::new(&data_dir);
     // macOS, полный режим: файлы машинного каталога общие для root и admin.
     #[cfg(target_os = "macos")]
@@ -657,6 +667,15 @@ fn run_password(action: PasswordAction) -> anyhow::Result<()> {
         },
     }
     Ok(())
+}
+
+/// Выбор каталога для `password`: явный `--data-dir` (не машинный, без
+/// детекции установки) либо автоматический (`password_data_dir`).
+fn password_dir(explicit: Option<PathBuf>) -> (PathBuf, bool) {
+    match explicit {
+        Some(dir) => (dir, false),
+        None => password_data_dir(),
+    }
 }
 
 /// Каталог для `password`: машинный, если на Windows установлена служба
@@ -1067,4 +1086,38 @@ async fn run_serve(opts: ServeOptions) -> anyhow::Result<()> {
     .await?;
     print_task.abort();
     match never {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed_dir(args: &[&str]) -> Option<PathBuf> {
+        let cli = Cli::try_parse_from(args).expect("parse");
+        match cli.command {
+            Command::Password { data_dir, .. } => data_dir,
+            _ => panic!("not password"),
+        }
+    }
+
+    #[test]
+    fn password_data_dir_flag_parses_in_both_positions() {
+        let want = Some(PathBuf::from("/tmp/x"));
+        assert_eq!(
+            parsed_dir(&["rcdesk-host", "password", "--data-dir", "/tmp/x", "set"]),
+            want
+        );
+        assert_eq!(
+            parsed_dir(&["rcdesk-host", "password", "set", "--data-dir", "/tmp/x"]),
+            want
+        );
+        assert_eq!(parsed_dir(&["rcdesk-host", "password", "status"]), None);
+    }
+
+    #[test]
+    fn explicit_password_dir_is_never_machine() {
+        let (dir, machine) = password_dir(Some(PathBuf::from("/tmp/x")));
+        assert_eq!(dir, PathBuf::from("/tmp/x"));
+        assert!(!machine);
+    }
 }
