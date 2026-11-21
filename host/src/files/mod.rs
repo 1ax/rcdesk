@@ -2861,6 +2861,16 @@ mod tests {
     async fn aborted_upload_is_removed_through_fs_user() {
         let mut h = Harness::new(true);
         h.feed(vec![start(1, "a.bin", 10), chunk(b"abc")]).await;
+        // The count check below only means something if the host accepted the
+        // `Start` (a refusal, e.g. by the free-space reserve of the CI volume,
+        // leaves nothing to remove). Say so instead of failing on the count.
+        assert!(
+            h.sent().is_empty() && h.files().len() == 2,
+            "Start was not accepted: sent {:?}, files {:?}, free {:?}",
+            h.sent(),
+            h.files(),
+            free_space_bytes(&h.dir)
+        );
         let before = h.scope.count();
         h.feed(vec![text(&FileMessage::Abort {
             id: 1,
@@ -2870,7 +2880,8 @@ mod tests {
         assert!(h.files().is_empty());
         assert!(
             h.scope.count() > before,
-            "removing the files must enter the scope"
+            "removing the files must enter the scope: before {before}, after {}",
+            h.scope.count()
         );
     }
 
