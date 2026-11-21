@@ -52,135 +52,37 @@ pub(super) async fn handle_signal_message(
             session_id,
             ice_servers,
         } => {
-            // Slice 3.2c: a new `PeerJoined` supersedes any login the
-            // previous joining peer was in the middle of.
-            *pending_auth = None;
-
-            let access = ctx.access_store.load();
-            if let crate::access::AccessLoad::Unusable(err) = &access {
-                // Fail-closed: a password may be set but can't be read, so
-                // starting an unauthenticated session would be wrong.
-                tracing::error!(
-                    %err,
-                    path = %ctx.access_store.path().display(),
-                    "access record unreadable, refusing session"
-                );
-                let _ = out_tx.send(SignalMessage::Bye {
-                    session_id,
-                    reason: None,
-                });
-                *pending_auth = None;
-            } else if matches!(access, crate::access::AccessLoad::Present(_)) {
-                let generation = next_auth_generation();
-                *pending_auth = Some(PendingAuth {
-                    session_id: session_id.clone(),
-                    ice_servers,
-                    login: None,
-                    generation,
-                });
-                tracing::info!(%session_id, "password required, waiting for client authentication");
-                let _ = out_tx.send(SignalMessage::AuthRequired {
-                    session_id: session_id.clone(),
-                });
-                let timer_tx = event_tx.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(AUTH_TIMEOUT).await;
-                    let _ = timer_tx
-                        .send(SessionEvent::AuthTimeout {
-                            session_id,
-                            generation,
-                        })
-                        .await;
-                });
-            } else {
-                // No password: nothing to prove, the newcomer replaces the
-                // running session right away. (With a password the old
-                // session lives on until the newcomer's `PakeFinish`.)
-                supersede_active_session(active, current_session_id, pin, status, out_tx).await;
-                begin_session(
-                    ctx,
-                    session_id,
-                    ice_servers,
-                    None,
-                    registered_ice_servers,
-                    out_tx,
-                    event_tx,
-                    active,
-                    current_session_id,
-                )
-                .await;
-            }
+            on_peer_joined(
+                session_id,
+                ice_servers,
+                ctx,
+                registered_ice_servers,
+                pin,
+                status,
+                out_tx,
+                event_tx,
+                active,
+                current_session_id,
+                pending_auth,
+            )
+            .await;
         }
         SignalMessage::Answer {
             session_id,
             sdp,
             auth,
         } => {
-            if current_session_id.as_deref() != Some(session_id.as_str()) {
-                tracing::debug!(%session_id, "answer for unknown/stale session, ignoring");
-                return;
-            }
-            // Slice 3.2e: when this session was gated by a password, the
-            // client's answer must carry a valid dtls-binding tag for its
-            // own fingerprint before the host applies it -- otherwise a
-            // signaling-server-in-the-middle could swap in its own answer
-            // undetected. No password (`session_key: None`) -- unchanged
-            // behavior from before this slice.
-            if let Some(session_key) = active.as_ref().and_then(|s| s.session_key.as_ref()) {
-                let ok = crate::dtls_bind::fingerprint_from_sdp(&sdp)
-                    .zip(auth.as_deref())
-                    .is_some_and(|(fingerprint, tag)| {
-                        crate::dtls_bind::verify_auth_tag(
-                            session_key.as_bytes(),
-                            "answer",
-                            &fingerprint,
-                            tag,
-                        )
-                    });
-                if !ok {
-                    tracing::warn!(%session_id, "answer failed dtls binding check, ending session");
-                    if let Some(old) = active.take() {
-                        old.shutdown_reporting(out_tx, current_session_id.as_deref())
-                            .await;
-                        let _ = status.send(AgentStatus::Registered {
-                            pin: pin.to_string(),
-                        });
-                    }
-                    *current_session_id = None;
-                    let _ = out_tx.send(SignalMessage::Bye {
-                        session_id,
-                        reason: None,
-                    });
-                    return;
-                }
-            }
-            let set_answer_failed = match active.as_ref() {
-                Some(session) => match session.peer.set_answer(sdp).await {
-                    Ok(()) => false,
-                    Err(err) => {
-                        // Slice E3: a session that cannot apply the answer
-                        // can never connect; end it like a failed binding
-                        // check instead of leaving it hanging.
-                        tracing::warn!(?err, "failed to apply remote answer, ending session");
-                        true
-                    }
-                },
-                None => false,
-            };
-            if set_answer_failed {
-                if let Some(old) = active.take() {
-                    old.shutdown_reporting(out_tx, current_session_id.as_deref())
-                        .await;
-                    let _ = status.send(AgentStatus::Registered {
-                        pin: pin.to_string(),
-                    });
-                }
-                *current_session_id = None;
-                let _ = out_tx.send(SignalMessage::Bye {
-                    session_id,
-                    reason: None,
-                });
-            }
+            on_answer(
+                session_id,
+                sdp,
+                auth,
+                pin,
+                status,
+                out_tx,
+                active,
+                current_session_id,
+            )
+            .await;
         }
         SignalMessage::Ice {
             session_id,
@@ -196,184 +98,41 @@ pub(super) async fn handle_signal_message(
                 tracing::debug!(%session_id, "ice candidate for unknown/stale session, ignoring");
             }
         }
-        // Slice 3.2c: the client's half of the OPAQUE login started by this
-        // `PeerJoined`'s `AuthRequired`. Never logs `payload` (an encoded
-        // OPAQUE protocol message) or any derived key material, only sizes
-        // where useful for debugging.
         SignalMessage::PakeStart {
             session_id,
             payload,
         } => {
-            let matches_pending = pending_auth
-                .as_ref()
-                .is_some_and(|p| p.session_id == session_id);
-            if !matches_pending {
-                tracing::debug!(%session_id, "pake_start for no/unknown pending auth, ignoring");
-                return;
-            }
-
-            if let Some(locked_until) = *auth_locked_until {
-                let now = Instant::now();
-                if locked_until > now {
-                    let retry_after_secs = (locked_until - now).as_secs_f64().ceil() as u32;
-                    tracing::debug!(%session_id, retry_after_secs, "pake_start throttled, too soon after a previous failed attempt");
-                    let _ = out_tx.send(SignalMessage::AuthFailed {
-                        session_id,
-                        retry_after_secs: Some(retry_after_secs.max(1)),
-                    });
-                    return;
-                }
-            }
-
-            // Slice 3.2c fix: this is throttling, not a hard lockout -- it
-            // paces how often an attempt may be *started*, it does not
-            // refuse to run this one. Past `MAX_AUTH_ATTEMPTS`, arm
-            // `auth_locked_until` for the *next* `PakeStart` (checked above,
-            // before this one is even counted) and fall straight through to
-            // running this attempt as usual. A hard refuse-and-return here
-            // (the pre-fix behavior) meant the owner could never actually
-            // log in again after `MAX_AUTH_ATTEMPTS` failures: every later
-            // attempt would hit its own freshly re-armed lockout before
-            // ever reaching `login_start`.
-            *auth_failures += 1;
-            if *auth_failures > MAX_AUTH_ATTEMPTS {
-                let lockout = auth_lockout_duration(*auth_failures);
-                *auth_locked_until = Some(Instant::now() + lockout);
-                tracing::warn!(
-                    %session_id,
-                    auth_failures = *auth_failures,
-                    lockout_secs = lockout.as_secs(),
-                    "login attempt {}, next attempt allowed in {} s",
-                    *auth_failures,
-                    lockout.as_secs()
-                );
-            }
-
-            // Re-read rather than reuse anything cached from `PeerJoined`:
-            // the owner may have cleared the password since (`password
-            // clear`), and this must reflect that right away.
-            let record = match ctx.access_store.load() {
-                crate::access::AccessLoad::Present(record) => record,
-                crate::access::AccessLoad::Missing => {
-                    tracing::warn!("password file disappeared mid-auth");
-                    let _ = out_tx.send(SignalMessage::AuthFailed {
-                        session_id,
-                        retry_after_secs: None,
-                    });
-                    return;
-                }
-                crate::access::AccessLoad::Unusable(err) => {
-                    tracing::error!(
-                        %err,
-                        path = %ctx.access_store.path().display(),
-                        "access record unreadable mid-auth, refusing"
-                    );
-                    let _ = out_tx.send(SignalMessage::AuthFailed {
-                        session_id,
-                        retry_after_secs: None,
-                    });
-                    return;
-                }
-            };
-
-            let request_bytes = match BASE64_URL_SAFE_NO_PAD.decode(&payload) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    tracing::warn!(?err, "invalid base64 in pake_start payload");
-                    let _ = out_tx.send(SignalMessage::AuthFailed {
-                        session_id,
-                        retry_after_secs: None,
-                    });
-                    return;
-                }
-            };
-
-            match crate::access::login_start(&record, &request_bytes) {
-                Ok((login, response_bytes)) => {
-                    if let Some(pending) = pending_auth.as_mut() {
-                        pending.login = Some(login);
-                    }
-                    let _ = out_tx.send(SignalMessage::PakeResponse {
-                        session_id,
-                        payload: BASE64_URL_SAFE_NO_PAD.encode(response_bytes),
-                    });
-                }
-                Err(err) => {
-                    tracing::warn!(?err, "opaque login_start failed");
-                    let _ = out_tx.send(SignalMessage::AuthFailed {
-                        session_id,
-                        retry_after_secs: None,
-                    });
-                }
-            }
+            on_pake_start(
+                session_id,
+                payload,
+                ctx,
+                out_tx,
+                pending_auth,
+                auth_failures,
+                auth_locked_until,
+            )
+            .await;
         }
-        // Slice 3.2c: completes the login `PakeStart` above started. Same
-        // "never log the payload/key material" rule as `PakeStart`.
         SignalMessage::PakeFinish {
             session_id,
             payload,
         } => {
-            let matches_pending = pending_auth
-                .as_ref()
-                .is_some_and(|p| p.session_id == session_id && p.login.is_some());
-            if !matches_pending {
-                tracing::debug!(%session_id, "pake_finish with no pending login, ignoring");
-                return;
-            }
-            // Taken here (not just borrowed): on both a successful and a
-            // failed `login_finish`, the client must start a fresh
-            // `PakeStart` to try again -- `opaque_ke::ServerLogin::finish`
-            // consumes its state either way.
-            let login = pending_auth.as_mut().and_then(|p| p.login.take());
-            let Some(login) = login else {
-                return;
-            };
-
-            let finalization_bytes = match BASE64_URL_SAFE_NO_PAD.decode(&payload) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    tracing::warn!(?err, "invalid base64 in pake_finish payload");
-                    let _ = out_tx.send(SignalMessage::AuthFailed {
-                        session_id,
-                        retry_after_secs: None,
-                    });
-                    return;
-                }
-            };
-
-            match login.login_finish(&finalization_bytes) {
-                Ok(session_key) => {
-                    *auth_failures = 0;
-                    *auth_locked_until = None;
-                    let pending = pending_auth
-                        .take()
-                        .expect("checked Some via matches_pending above");
-                    tracing::info!(%session_id, "client authenticated");
-                    supersede_active_session(active, current_session_id, pin, status, out_tx).await;
-                    begin_session(
-                        ctx,
-                        session_id,
-                        pending.ice_servers,
-                        Some(session_key),
-                        registered_ice_servers,
-                        out_tx,
-                        event_tx,
-                        active,
-                        current_session_id,
-                    )
-                    .await;
-                }
-                Err(err) => {
-                    // The wait stays armed (`pending_auth` is still `Some`,
-                    // just with `login` now `None`) -- the client can retry
-                    // with a fresh `PakeStart`.
-                    tracing::warn!(?err, %session_id, "opaque login_finish failed");
-                    let _ = out_tx.send(SignalMessage::AuthFailed {
-                        session_id,
-                        retry_after_secs: None,
-                    });
-                }
-            }
+            on_pake_finish(
+                session_id,
+                payload,
+                ctx,
+                registered_ice_servers,
+                pin,
+                status,
+                out_tx,
+                event_tx,
+                active,
+                current_session_id,
+                pending_auth,
+                auth_failures,
+                auth_locked_until,
+            )
+            .await;
         }
         SignalMessage::Bye { session_id, .. } => {
             if current_session_id.as_deref() == Some(session_id.as_str()) {
@@ -399,6 +158,360 @@ pub(super) async fn handle_signal_message(
         }
         other => {
             tracing::debug!(?other, "unexpected signal message, ignoring");
+        }
+    }
+}
+
+/// Handles `PeerJoined`: starts a session right away, or arms a password login first.
+#[allow(clippy::too_many_arguments)]
+async fn on_peer_joined(
+    session_id: String,
+    ice_servers: Vec<proto::signal::IceServer>,
+    ctx: &HostContext,
+    registered_ice_servers: &[proto::signal::IceServer],
+    pin: &str,
+    status: &watch::Sender<AgentStatus>,
+    out_tx: &mpsc::UnboundedSender<SignalMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+    active: &mut Option<ActiveSession>,
+    current_session_id: &mut Option<String>,
+    pending_auth: &mut Option<PendingAuth>,
+) {
+    // Slice 3.2c: a new `PeerJoined` supersedes any login the
+    // previous joining peer was in the middle of.
+    *pending_auth = None;
+
+    let access = ctx.access_store.load();
+    if let crate::access::AccessLoad::Unusable(err) = &access {
+        // Fail-closed: a password may be set but can't be read, so
+        // starting an unauthenticated session would be wrong.
+        tracing::error!(
+            %err,
+            path = %ctx.access_store.path().display(),
+            "access record unreadable, refusing session"
+        );
+        let _ = out_tx.send(SignalMessage::Bye {
+            session_id,
+            reason: None,
+        });
+        *pending_auth = None;
+    } else if matches!(access, crate::access::AccessLoad::Present(_)) {
+        let generation = next_auth_generation();
+        *pending_auth = Some(PendingAuth {
+            session_id: session_id.clone(),
+            ice_servers,
+            login: None,
+            generation,
+        });
+        tracing::info!(%session_id, "password required, waiting for client authentication");
+        let _ = out_tx.send(SignalMessage::AuthRequired {
+            session_id: session_id.clone(),
+        });
+        let timer_tx = event_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(AUTH_TIMEOUT).await;
+            let _ = timer_tx
+                .send(SessionEvent::AuthTimeout {
+                    session_id,
+                    generation,
+                })
+                .await;
+        });
+    } else {
+        // No password: nothing to prove, the newcomer replaces the
+        // running session right away. (With a password the old
+        // session lives on until the newcomer's `PakeFinish`.)
+        supersede_active_session(active, current_session_id, pin, status, out_tx).await;
+        begin_session(
+            ctx,
+            session_id,
+            ice_servers,
+            None,
+            registered_ice_servers,
+            out_tx,
+            event_tx,
+            active,
+            current_session_id,
+        )
+        .await;
+    }
+}
+
+/// Handles `Answer`: verifies the dtls binding (when password-gated) and applies it.
+#[allow(clippy::too_many_arguments)]
+async fn on_answer(
+    session_id: String,
+    sdp: String,
+    auth: Option<String>,
+    pin: &str,
+    status: &watch::Sender<AgentStatus>,
+    out_tx: &mpsc::UnboundedSender<SignalMessage>,
+    active: &mut Option<ActiveSession>,
+    current_session_id: &mut Option<String>,
+) {
+    if current_session_id.as_deref() != Some(session_id.as_str()) {
+        tracing::debug!(%session_id, "answer for unknown/stale session, ignoring");
+        return;
+    }
+    // Slice 3.2e: when this session was gated by a password, the
+    // client's answer must carry a valid dtls-binding tag for its
+    // own fingerprint before the host applies it -- otherwise a
+    // signaling-server-in-the-middle could swap in its own answer
+    // undetected. No password (`session_key: None`) -- unchanged
+    // behavior from before this slice.
+    if let Some(session_key) = active.as_ref().and_then(|s| s.session_key.as_ref()) {
+        let ok = crate::dtls_bind::fingerprint_from_sdp(&sdp)
+            .zip(auth.as_deref())
+            .is_some_and(|(fingerprint, tag)| {
+                crate::dtls_bind::verify_auth_tag(
+                    session_key.as_bytes(),
+                    "answer",
+                    &fingerprint,
+                    tag,
+                )
+            });
+        if !ok {
+            tracing::warn!(%session_id, "answer failed dtls binding check, ending session");
+            if let Some(old) = active.take() {
+                old.shutdown_reporting(out_tx, current_session_id.as_deref())
+                    .await;
+                let _ = status.send(AgentStatus::Registered {
+                    pin: pin.to_string(),
+                });
+            }
+            *current_session_id = None;
+            let _ = out_tx.send(SignalMessage::Bye {
+                session_id,
+                reason: None,
+            });
+            return;
+        }
+    }
+    let set_answer_failed = match active.as_ref() {
+        Some(session) => match session.peer.set_answer(sdp).await {
+            Ok(()) => false,
+            Err(err) => {
+                // Slice E3: a session that cannot apply the answer
+                // can never connect; end it like a failed binding
+                // check instead of leaving it hanging.
+                tracing::warn!(?err, "failed to apply remote answer, ending session");
+                true
+            }
+        },
+        None => false,
+    };
+    if set_answer_failed {
+        if let Some(old) = active.take() {
+            old.shutdown_reporting(out_tx, current_session_id.as_deref())
+                .await;
+            let _ = status.send(AgentStatus::Registered {
+                pin: pin.to_string(),
+            });
+        }
+        *current_session_id = None;
+        let _ = out_tx.send(SignalMessage::Bye {
+            session_id,
+            reason: None,
+        });
+    }
+}
+
+/// Handles `PakeStart`: the first half of the OPAQUE login, with attempt throttling.
+async fn on_pake_start(
+    session_id: String,
+    payload: String,
+    ctx: &HostContext,
+    out_tx: &mpsc::UnboundedSender<SignalMessage>,
+    pending_auth: &mut Option<PendingAuth>,
+    auth_failures: &mut u32,
+    auth_locked_until: &mut Option<Instant>,
+) {
+    // Slice 3.2c: the client's half of the OPAQUE login started by this
+    // `PeerJoined`'s `AuthRequired`. Never logs `payload` (an encoded
+    // OPAQUE protocol message) or any derived key material, only sizes
+    // where useful for debugging.
+    let matches_pending = pending_auth
+        .as_ref()
+        .is_some_and(|p| p.session_id == session_id);
+    if !matches_pending {
+        tracing::debug!(%session_id, "pake_start for no/unknown pending auth, ignoring");
+        return;
+    }
+
+    if let Some(locked_until) = *auth_locked_until {
+        let now = Instant::now();
+        if locked_until > now {
+            let retry_after_secs = (locked_until - now).as_secs_f64().ceil() as u32;
+            tracing::debug!(%session_id, retry_after_secs, "pake_start throttled, too soon after a previous failed attempt");
+            let _ = out_tx.send(SignalMessage::AuthFailed {
+                session_id,
+                retry_after_secs: Some(retry_after_secs.max(1)),
+            });
+            return;
+        }
+    }
+
+    // Slice 3.2c fix: this is throttling, not a hard lockout -- it
+    // paces how often an attempt may be *started*, it does not
+    // refuse to run this one. Past `MAX_AUTH_ATTEMPTS`, arm
+    // `auth_locked_until` for the *next* `PakeStart` (checked above,
+    // before this one is even counted) and fall straight through to
+    // running this attempt as usual. A hard refuse-and-return here
+    // (the pre-fix behavior) meant the owner could never actually
+    // log in again after `MAX_AUTH_ATTEMPTS` failures: every later
+    // attempt would hit its own freshly re-armed lockout before
+    // ever reaching `login_start`.
+    *auth_failures += 1;
+    if *auth_failures > MAX_AUTH_ATTEMPTS {
+        let lockout = auth_lockout_duration(*auth_failures);
+        *auth_locked_until = Some(Instant::now() + lockout);
+        tracing::warn!(
+            %session_id,
+            auth_failures = *auth_failures,
+            lockout_secs = lockout.as_secs(),
+            "login attempt {}, next attempt allowed in {} s",
+            *auth_failures,
+            lockout.as_secs()
+        );
+    }
+
+    // Re-read rather than reuse anything cached from `PeerJoined`:
+    // the owner may have cleared the password since (`password
+    // clear`), and this must reflect that right away.
+    let record = match ctx.access_store.load() {
+        crate::access::AccessLoad::Present(record) => record,
+        crate::access::AccessLoad::Missing => {
+            tracing::warn!("password file disappeared mid-auth");
+            let _ = out_tx.send(SignalMessage::AuthFailed {
+                session_id,
+                retry_after_secs: None,
+            });
+            return;
+        }
+        crate::access::AccessLoad::Unusable(err) => {
+            tracing::error!(
+                %err,
+                path = %ctx.access_store.path().display(),
+                "access record unreadable mid-auth, refusing"
+            );
+            let _ = out_tx.send(SignalMessage::AuthFailed {
+                session_id,
+                retry_after_secs: None,
+            });
+            return;
+        }
+    };
+
+    let request_bytes = match BASE64_URL_SAFE_NO_PAD.decode(&payload) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(?err, "invalid base64 in pake_start payload");
+            let _ = out_tx.send(SignalMessage::AuthFailed {
+                session_id,
+                retry_after_secs: None,
+            });
+            return;
+        }
+    };
+
+    match crate::access::login_start(&record, &request_bytes) {
+        Ok((login, response_bytes)) => {
+            if let Some(pending) = pending_auth.as_mut() {
+                pending.login = Some(login);
+            }
+            let _ = out_tx.send(SignalMessage::PakeResponse {
+                session_id,
+                payload: BASE64_URL_SAFE_NO_PAD.encode(response_bytes),
+            });
+        }
+        Err(err) => {
+            tracing::warn!(?err, "opaque login_start failed");
+            let _ = out_tx.send(SignalMessage::AuthFailed {
+                session_id,
+                retry_after_secs: None,
+            });
+        }
+    }
+}
+
+/// Handles `PakeFinish`: completes the OPAQUE login and begins the session on success.
+#[allow(clippy::too_many_arguments)]
+async fn on_pake_finish(
+    session_id: String,
+    payload: String,
+    ctx: &HostContext,
+    registered_ice_servers: &[proto::signal::IceServer],
+    pin: &str,
+    status: &watch::Sender<AgentStatus>,
+    out_tx: &mpsc::UnboundedSender<SignalMessage>,
+    event_tx: mpsc::Sender<SessionEvent>,
+    active: &mut Option<ActiveSession>,
+    current_session_id: &mut Option<String>,
+    pending_auth: &mut Option<PendingAuth>,
+    auth_failures: &mut u32,
+    auth_locked_until: &mut Option<Instant>,
+) {
+    // Slice 3.2c: completes the login `PakeStart` above started. Same
+    // "never log the payload/key material" rule as `PakeStart`.
+    let matches_pending = pending_auth
+        .as_ref()
+        .is_some_and(|p| p.session_id == session_id && p.login.is_some());
+    if !matches_pending {
+        tracing::debug!(%session_id, "pake_finish with no pending login, ignoring");
+        return;
+    }
+    // Taken here (not just borrowed): on both a successful and a
+    // failed `login_finish`, the client must start a fresh
+    // `PakeStart` to try again -- `opaque_ke::ServerLogin::finish`
+    // consumes its state either way.
+    let login = pending_auth.as_mut().and_then(|p| p.login.take());
+    let Some(login) = login else {
+        return;
+    };
+
+    let finalization_bytes = match BASE64_URL_SAFE_NO_PAD.decode(&payload) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(?err, "invalid base64 in pake_finish payload");
+            let _ = out_tx.send(SignalMessage::AuthFailed {
+                session_id,
+                retry_after_secs: None,
+            });
+            return;
+        }
+    };
+
+    match login.login_finish(&finalization_bytes) {
+        Ok(session_key) => {
+            *auth_failures = 0;
+            *auth_locked_until = None;
+            let pending = pending_auth
+                .take()
+                .expect("checked Some via matches_pending above");
+            tracing::info!(%session_id, "client authenticated");
+            supersede_active_session(active, current_session_id, pin, status, out_tx).await;
+            begin_session(
+                ctx,
+                session_id,
+                pending.ice_servers,
+                Some(session_key),
+                registered_ice_servers,
+                out_tx,
+                event_tx,
+                active,
+                current_session_id,
+            )
+            .await;
+        }
+        Err(err) => {
+            // The wait stays armed (`pending_auth` is still `Some`,
+            // just with `login` now `None`) -- the client can retry
+            // with a fresh `PakeStart`.
+            tracing::warn!(?err, %session_id, "opaque login_finish failed");
+            let _ = out_tx.send(SignalMessage::AuthFailed {
+                session_id,
+                retry_after_secs: None,
+            });
         }
     }
 }
@@ -620,111 +733,32 @@ pub(super) async fn handle_session_event(
             }
         }
         SessionEvent::ConnectionState { state, tag } => {
-            // Fix to slice 3.5b: during automatic client reconnection (bye
-            // -> `connect_device` -> `PeerJoined`, all while the old
-            // `PeerConnection` is still tearing down), a state change from
-            // the *old*, already superseded session can land here after a
-            // new session has already taken `active`'s place -- e.g. its
-            // `Closed` arriving right as the new session is starting up.
-            // Acting on it would wrongly end the new session, so it's
-            // dropped unless it's tagged with the session that's actually
-            // current right now.
-            if !active.as_ref().is_some_and(|a| a.session_tag == tag) {
-                tracing::debug!(
-                    ?state,
-                    tag,
-                    "connection state event from a superseded session, ignoring"
-                );
-                return;
-            }
-            tracing::info!(?state, "peer connection state changed");
-            if state == RTCPeerConnectionState::Connected {
-                // Slice 3.5b: also cancels any disconnect grace window in
-                // progress -- the connection recovered on its own.
-                if let Some(active) = active.as_mut() {
-                    active.disconnect_grace.connected();
-                    let _ = status.send(AgentStatus::InSession {
-                        pin: pin.to_string(),
-                    });
-                }
-            } else if state == RTCPeerConnectionState::Disconnected {
-                // Slice 3.5b: `Disconnected` can be a brief ICE hiccup (a
-                // Wi-Fi roam, a dropped packet train) that recovers to
-                // `Connected` on its own -- unlike `Failed`/`Closed`, it
-                // does not end the session right away. Arm a
-                // `DISCONNECT_GRACE` window instead: `Connected` above
-                // cancels it if it arrives first; otherwise
-                // `DisconnectTimeout` below ends the session the same way
-                // `Failed`/`Closed` do. Agent status deliberately stays
-                // `InSession` for the whole window -- no flicker on a
-                // hiccup that self-heals.
-                if let (Some(active), Some(session_id)) =
-                    (active.as_mut(), current_session_id.clone())
-                {
-                    if let Some(generation) = active.disconnect_grace.disconnected() {
-                        let timer_tx = event_tx.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(DISCONNECT_GRACE).await;
-                            let _ = timer_tx
-                                .send(SessionEvent::DisconnectTimeout {
-                                    session_id,
-                                    generation,
-                                })
-                                .await;
-                        });
-                    }
-                }
-            } else if matches!(
+            on_connection_state(
                 state,
-                RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
-            ) {
-                if let Some(old) = active.take() {
-                    old.shutdown_reporting(out_tx, current_session_id.as_deref())
-                        .await;
-                    let _ = status.send(AgentStatus::Registered {
-                        pin: pin.to_string(),
-                    });
-                }
-                // Slice 3.2a/D35: the session just ended on this end
-                // (`Failed`/`Closed`), not via a `Bye` from the peer or an
-                // `EndSession` command -- tell the server so it doesn't keep
-                // the device marked busy for a session that's actually over.
-                if let Some(session_id) = current_session_id.take() {
-                    let _ = out_tx.send(SignalMessage::Bye {
-                        session_id,
-                        reason: None,
-                    });
-                }
-            }
+                tag,
+                pin,
+                status,
+                out_tx,
+                event_tx,
+                active,
+                current_session_id,
+            )
+            .await;
         }
         SessionEvent::DisconnectTimeout {
             session_id,
             generation,
         } => {
-            let matches_current = current_session_id.as_deref() == Some(session_id.as_str());
-            let matches_pending = active
-                .as_ref()
-                .is_some_and(|a| a.disconnect_grace.is_current(generation));
-            if matches_current && matches_pending {
-                tracing::info!(%session_id, "disconnect grace window expired, ending session");
-                if let Some(old) = active.take() {
-                    old.shutdown_reporting(out_tx, current_session_id.as_deref())
-                        .await;
-                    let _ = status.send(AgentStatus::Registered {
-                        pin: pin.to_string(),
-                    });
-                }
-                // Slice 3.2a/D35: same reasoning as `Failed`/`Closed` above
-                // -- the session ended locally, tell the server.
-                if let Some(session_id) = current_session_id.take() {
-                    let _ = out_tx.send(SignalMessage::Bye {
-                        session_id,
-                        reason: None,
-                    });
-                }
-            } else {
-                tracing::debug!(%session_id, generation, "stale disconnect timeout, ignoring");
-            }
+            on_disconnect_timeout(
+                session_id,
+                generation,
+                pin,
+                status,
+                out_tx,
+                active,
+                current_session_id,
+            )
+            .await;
         }
         // Slice 3.2c: a `PendingAuth` (armed on `AuthRequired`) waited out
         // `AUTH_TIMEOUT` without the client completing its login.
@@ -747,45 +781,8 @@ pub(super) async fn handle_session_event(
             }
         }
         SessionEvent::DataChannelClosed { label, tag } => {
-            if label != "control" {
-                tracing::debug!(label, "non-control data channel closed");
-            } else if active.as_ref().is_some_and(|a| a.session_tag == tag) {
-                // Slice 3.5b: the `control` channel closing is a
-                // deliberate end of session from the client (closing the
-                // tab, `pc.close()`) -- end it immediately instead of
-                // waiting for the `Disconnected` grace window. Guarded with
-                // `active.take()` (a no-op if already `None`) since our own
-                // `ActiveSession::shutdown` closing the peer connection also
-                // closes this same channel and can deliver this event again
-                // after the slot is already empty.
-                if let Some(old) = active.take() {
-                    tracing::info!("control data channel closed by remote peer, ending session");
-                    old.shutdown_reporting(out_tx, current_session_id.as_deref())
-                        .await;
-                    let _ = status.send(AgentStatus::Registered {
-                        pin: pin.to_string(),
-                    });
-                }
-                // Slice 3.2a/D35: same reasoning as `Failed`/`Closed` above
-                // -- the session ended locally, tell the server.
-                if let Some(session_id) = current_session_id.take() {
-                    let _ = out_tx.send(SignalMessage::Bye {
-                        session_id,
-                        reason: None,
-                    });
-                }
-            } else {
-                // Fix to slice 3.5b: same reasoning as `ConnectionState`'s
-                // tag check above -- this is the *old* session's `control`
-                // channel finishing its close handshake after a new session
-                // has already taken `active`'s place (e.g. during automatic
-                // client reconnection), not the current session's.
-                tracing::debug!(
-                    label,
-                    tag,
-                    "control data channel closed event from a superseded session, ignoring"
-                );
-            }
+            on_data_channel_closed(label, tag, pin, status, out_tx, active, current_session_id)
+                .await;
         }
         SessionEvent::DisplayGeometryChanged { tag } => {
             // V-2: опрос геометрии дисплея; чужой (вытесненный) сеанс -- молча.
@@ -794,214 +791,15 @@ pub(super) async fn handle_session_event(
             }
         }
         SessionEvent::VideoFailed { tag } => {
-            // V-2: сначала пробуем перезапустить конвейер (смена разрешения,
-            // сон, TDR), и только при исчерпанном бюджете/ошибке -- конец сеанса.
-            if let Some(a) = active.as_mut().filter(|a| a.session_tag == tag) {
-                if recover_pipeline(ctx, a).await {
-                    return;
-                }
-            }
-            if active.as_ref().is_some_and(|a| a.session_tag == tag) {
-                if let Some(old) = active.take() {
-                    tracing::warn!("video pipeline failed, ending session");
-                    old.shutdown_reporting(out_tx, current_session_id.as_deref())
-                        .await;
-                    let _ = status.send(AgentStatus::Registered {
-                        pin: pin.to_string(),
-                    });
-                }
-                if let Some(session_id) = current_session_id.take() {
-                    let _ = out_tx.send(SignalMessage::Bye {
-                        session_id,
-                        reason: Some(proto::signal::ByeReason::VideoFailed),
-                    });
-                }
-            } else {
-                tracing::debug!(
-                    tag,
-                    "video failed event from a superseded session, ignoring"
-                );
-            }
+            on_video_failed(tag, ctx, pin, status, out_tx, active, current_session_id).await;
         }
         SessionEvent::DataChannelMessage {
             label,
             data,
             is_string,
-        } => match label.as_str() {
-            "input" | "pointer" => {
-                if !is_string {
-                    tracing::warn!(label, "non-text message on input channel, ignoring");
-                } else {
-                    match serde_json::from_slice::<proto::input::InputMessage>(&data) {
-                        // `ClipboardText` is never routed through
-                        // `InputRouter` like every other input message
-                        // (slice 2.5b); it is applied on a blocking-pool
-                        // thread so a busy clipboard watcher cannot stall
-                        // this loop (M-7). Never
-                        // logged with its text -- length only (privacy).
-                        Ok(proto::input::InputMessage::ClipboardText { text }) => {
-                            if label == "pointer" {
-                                tracing::warn!(
-                                    label,
-                                    len = text.len(),
-                                    "clipboard_text on the unordered pointer channel, ignoring"
-                                );
-                            } else if let Some(active) = active.as_ref() {
-                                apply_remote_clipboard_text(active.clipboard.clone(), text);
-                            }
-                        }
-                        Ok(msg) => {
-                            if let Some(active) = active.as_mut() {
-                                match active.router.push(msg) {
-                                    Ok(()) => {}
-                                    Err(crate::input::PushError::Closed) => {
-                                        tracing::warn!(label, "input router is no longer running");
-                                    }
-                                    Err(err) => {
-                                        // Throttled: at most one warning per second
-                                        // per session, with a count of what was dropped.
-                                        active.input_dropped += 1;
-                                        let now = Instant::now();
-                                        let due = active.last_input_drop_warn.is_none_or(|t| {
-                                            now.duration_since(t) >= Duration::from_secs(1)
-                                        });
-                                        if due {
-                                            tracing::warn!(
-                                                label,
-                                                ?err,
-                                                dropped = active.input_dropped,
-                                                "input events dropped"
-                                            );
-                                            active.input_dropped = 0;
-                                            active.last_input_drop_warn = Some(now);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(label, ?err, "failed to parse input message");
-                        }
-                    }
-                }
-            }
-            "control" => {
-                if !is_string {
-                    tracing::warn!(label, "non-text message on control channel, ignoring");
-                } else {
-                    match serde_json::from_slice::<ControlMessage>(&data) {
-                        Ok(ControlMessage::Ping { ts }) => {
-                            if let Some(active) = active.as_ref() {
-                                if let Err(err) =
-                                    active.peer.send_control(&ControlMessage::Pong { ts }).await
-                                {
-                                    tracing::warn!(?err, "failed to send pong");
-                                }
-                            }
-                        }
-                        Ok(ControlMessage::SelectDisplay { id }) => {
-                            if let Some(active) = active.as_mut() {
-                                switch_display(ctx, active, id).await;
-                            }
-                        }
-                        Ok(ControlMessage::SetQuality { preset }) => {
-                            if let Some(active) = active.as_mut() {
-                                active.quality_preset = preset;
-                                if let Some(adapt_tx) = &active.video.adapt_tx {
-                                    let _ = adapt_tx.send(Feedback::Preset { preset });
-                                } else {
-                                    tracing::debug!(
-                                        label,
-                                        ?preset,
-                                        "set_quality received with adaptation disabled (--no-adapt), ignoring"
-                                    );
-                                }
-                            }
-                        }
-                        Ok(ControlMessage::SetCurtain { on }) => {
-                            if let Some(active) = active.as_mut() {
-                                let status = set_curtain(ctx, active, on).await;
-                                if let Err(err) = active.peer.send_control(&status).await {
-                                    tracing::warn!(?err, "failed to send curtain status");
-                                }
-                            }
-                        }
-                        Ok(ControlMessage::SwitchInputSource) => {
-                            if let Some(active) = active.as_ref() {
-                                if let Some(msg) =
-                                    switch_input_source(active.input_source.as_deref())
-                                {
-                                    if let Err(err) = active.peer.send_control(&msg).await {
-                                        tracing::warn!(?err, "failed to send input source");
-                                    }
-                                }
-                            }
-                        }
-                        Ok(ControlMessage::SendCtrlAltDel) => {
-                            if active.is_some() && ctx.machine_mode {
-                                // Помощник лишь выставляет событие службе (`SendSAS`
-                                // вызывает она); syscall блокирующий.
-                                tokio::task::spawn_blocking(crate::platform::sas::request);
-                            } else {
-                                tracing::debug!(
-                                    label,
-                                    "send_ctrl_alt_del without active session or machine mode, ignoring"
-                                );
-                            }
-                        }
-                        Ok(ControlMessage::UpdateHost) => {
-                            if let Some(active) = active.as_ref() {
-                                match begin_update(ctx) {
-                                    Err(refusal) => {
-                                        if let Err(err) = active.peer.send_control(&refusal).await {
-                                            tracing::warn!(?err, "failed to send update status");
-                                        }
-                                    }
-                                    Ok(mut rx) => {
-                                        // Статусы уходят в control-канал, пока
-                                        // жив сеанс; задача обновления от этого
-                                        // не зависит.
-                                        let peer = Arc::clone(&active.peer);
-                                        tokio::spawn(async move {
-                                            while let Some(msg) = rx.recv().await {
-                                                if peer.send_control(&msg).await.is_err() {
-                                                    break;
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        Ok(ControlMessage::ClipboardText { text }) => {
-                            // Wrong direction: `ClipboardText` is host ->
-                            // client only on `control` (see
-                            // `proto::control::ControlMessage::ClipboardText`'s
-                            // doc comment; the client -> host direction is
-                            // `proto::input::InputMessage::ClipboardText` on
-                            // `input`, handled above). Named explicitly
-                            // (rather than falling into the catch-all below)
-                            // so its text never reaches a log line, even at
-                            // `trace` (privacy).
-                            tracing::warn!(
-                                label,
-                                len = text.len(),
-                                "clipboard_text on control channel, ignoring (wrong direction)"
-                            );
-                        }
-                        Ok(other) => {
-                            tracing::trace!(label, ?other, "unexpected control message, ignoring");
-                        }
-                        Err(err) => {
-                            tracing::warn!(label, ?err, "failed to parse control message");
-                        }
-                    }
-                }
-            }
-            _ => {
-                tracing::trace!(label, len = data.len(), is_string, "data channel message");
-            }
-        },
+        } => {
+            on_data_channel_message(label, data, is_string, ctx, active).await;
+        }
         SessionEvent::KeyframeRequested => {
             tracing::debug!("keyframe requested by remote peer (PLI/FIR)");
         }
@@ -1034,76 +832,477 @@ pub(super) async fn handle_session_event(
                 }
             }
         }
-        SessionEvent::DataChannelOpen { label } => match (label.as_str(), active.as_ref()) {
-            ("control", Some(active)) => {
-                let msg = displays_message(&active.displays, active.video.display.id);
+        SessionEvent::DataChannelOpen { label } => {
+            on_data_channel_open(label, ctx, active).await;
+        }
+    }
+}
+
+/// Handles `ConnectionState`: ignores superseded sessions, then tracks connect/disconnect/end.
+#[allow(clippy::too_many_arguments)]
+async fn on_connection_state(
+    state: RTCPeerConnectionState,
+    tag: u64,
+    pin: &str,
+    status: &watch::Sender<AgentStatus>,
+    out_tx: &mpsc::UnboundedSender<SignalMessage>,
+    event_tx: &mpsc::Sender<SessionEvent>,
+    active: &mut Option<ActiveSession>,
+    current_session_id: &mut Option<String>,
+) {
+    // Fix to slice 3.5b: during automatic client reconnection (bye
+    // -> `connect_device` -> `PeerJoined`, all while the old
+    // `PeerConnection` is still tearing down), a state change from
+    // the *old*, already superseded session can land here after a
+    // new session has already taken `active`'s place -- e.g. its
+    // `Closed` arriving right as the new session is starting up.
+    // Acting on it would wrongly end the new session, so it's
+    // dropped unless it's tagged with the session that's actually
+    // current right now.
+    if !active.as_ref().is_some_and(|a| a.session_tag == tag) {
+        tracing::debug!(
+            ?state,
+            tag,
+            "connection state event from a superseded session, ignoring"
+        );
+        return;
+    }
+    tracing::info!(?state, "peer connection state changed");
+    if state == RTCPeerConnectionState::Connected {
+        // Slice 3.5b: also cancels any disconnect grace window in
+        // progress -- the connection recovered on its own.
+        if let Some(active) = active.as_mut() {
+            active.disconnect_grace.connected();
+            let _ = status.send(AgentStatus::InSession {
+                pin: pin.to_string(),
+            });
+        }
+    } else if state == RTCPeerConnectionState::Disconnected {
+        // Slice 3.5b: `Disconnected` can be a brief ICE hiccup (a
+        // Wi-Fi roam, a dropped packet train) that recovers to
+        // `Connected` on its own -- unlike `Failed`/`Closed`, it
+        // does not end the session right away. Arm a
+        // `DISCONNECT_GRACE` window instead: `Connected` above
+        // cancels it if it arrives first; otherwise
+        // `DisconnectTimeout` below ends the session the same way
+        // `Failed`/`Closed` do. Agent status deliberately stays
+        // `InSession` for the whole window -- no flicker on a
+        // hiccup that self-heals.
+        if let (Some(active), Some(session_id)) = (active.as_mut(), current_session_id.clone()) {
+            if let Some(generation) = active.disconnect_grace.disconnected() {
+                let timer_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(DISCONNECT_GRACE).await;
+                    let _ = timer_tx
+                        .send(SessionEvent::DisconnectTimeout {
+                            session_id,
+                            generation,
+                        })
+                        .await;
+                });
+            }
+        }
+    } else if matches!(
+        state,
+        RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+    ) {
+        if let Some(old) = active.take() {
+            old.shutdown_reporting(out_tx, current_session_id.as_deref())
+                .await;
+            let _ = status.send(AgentStatus::Registered {
+                pin: pin.to_string(),
+            });
+        }
+        // Slice 3.2a/D35: the session just ended on this end
+        // (`Failed`/`Closed`), not via a `Bye` from the peer or an
+        // `EndSession` command -- tell the server so it doesn't keep
+        // the device marked busy for a session that's actually over.
+        if let Some(session_id) = current_session_id.take() {
+            let _ = out_tx.send(SignalMessage::Bye {
+                session_id,
+                reason: None,
+            });
+        }
+    }
+}
+
+/// Handles `DisconnectTimeout`: ends the session if its grace window really expired.
+async fn on_disconnect_timeout(
+    session_id: String,
+    generation: u64,
+    pin: &str,
+    status: &watch::Sender<AgentStatus>,
+    out_tx: &mpsc::UnboundedSender<SignalMessage>,
+    active: &mut Option<ActiveSession>,
+    current_session_id: &mut Option<String>,
+) {
+    let matches_current = current_session_id.as_deref() == Some(session_id.as_str());
+    let matches_pending = active
+        .as_ref()
+        .is_some_and(|a| a.disconnect_grace.is_current(generation));
+    if matches_current && matches_pending {
+        tracing::info!(%session_id, "disconnect grace window expired, ending session");
+        if let Some(old) = active.take() {
+            old.shutdown_reporting(out_tx, current_session_id.as_deref())
+                .await;
+            let _ = status.send(AgentStatus::Registered {
+                pin: pin.to_string(),
+            });
+        }
+        // Slice 3.2a/D35: same reasoning as `Failed`/`Closed` above
+        // -- the session ended locally, tell the server.
+        if let Some(session_id) = current_session_id.take() {
+            let _ = out_tx.send(SignalMessage::Bye {
+                session_id,
+                reason: None,
+            });
+        }
+    } else {
+        tracing::debug!(%session_id, generation, "stale disconnect timeout, ignoring");
+    }
+}
+
+/// Handles `DataChannelClosed`: a closed `control` channel ends the current session.
+async fn on_data_channel_closed(
+    label: String,
+    tag: u64,
+    pin: &str,
+    status: &watch::Sender<AgentStatus>,
+    out_tx: &mpsc::UnboundedSender<SignalMessage>,
+    active: &mut Option<ActiveSession>,
+    current_session_id: &mut Option<String>,
+) {
+    if label != "control" {
+        tracing::debug!(label, "non-control data channel closed");
+    } else if active.as_ref().is_some_and(|a| a.session_tag == tag) {
+        // Slice 3.5b: the `control` channel closing is a
+        // deliberate end of session from the client (closing the
+        // tab, `pc.close()`) -- end it immediately instead of
+        // waiting for the `Disconnected` grace window. Guarded with
+        // `active.take()` (a no-op if already `None`) since our own
+        // `ActiveSession::shutdown` closing the peer connection also
+        // closes this same channel and can deliver this event again
+        // after the slot is already empty.
+        if let Some(old) = active.take() {
+            tracing::info!("control data channel closed by remote peer, ending session");
+            old.shutdown_reporting(out_tx, current_session_id.as_deref())
+                .await;
+            let _ = status.send(AgentStatus::Registered {
+                pin: pin.to_string(),
+            });
+        }
+        // Slice 3.2a/D35: same reasoning as `Failed`/`Closed` above
+        // -- the session ended locally, tell the server.
+        if let Some(session_id) = current_session_id.take() {
+            let _ = out_tx.send(SignalMessage::Bye {
+                session_id,
+                reason: None,
+            });
+        }
+    } else {
+        // Fix to slice 3.5b: same reasoning as `ConnectionState`'s
+        // tag check above -- this is the *old* session's `control`
+        // channel finishing its close handshake after a new session
+        // has already taken `active`'s place (e.g. during automatic
+        // client reconnection), not the current session's.
+        tracing::debug!(
+            label,
+            tag,
+            "control data channel closed event from a superseded session, ignoring"
+        );
+    }
+}
+
+/// Handles `VideoFailed`: tries to recover the pipeline, otherwise ends the session.
+async fn on_video_failed(
+    tag: u64,
+    ctx: &HostContext,
+    pin: &str,
+    status: &watch::Sender<AgentStatus>,
+    out_tx: &mpsc::UnboundedSender<SignalMessage>,
+    active: &mut Option<ActiveSession>,
+    current_session_id: &mut Option<String>,
+) {
+    // V-2: сначала пробуем перезапустить конвейер (смена разрешения,
+    // сон, TDR), и только при исчерпанном бюджете/ошибке -- конец сеанса.
+    if let Some(a) = active.as_mut().filter(|a| a.session_tag == tag) {
+        if recover_pipeline(ctx, a).await {
+            return;
+        }
+    }
+    if active.as_ref().is_some_and(|a| a.session_tag == tag) {
+        if let Some(old) = active.take() {
+            tracing::warn!("video pipeline failed, ending session");
+            old.shutdown_reporting(out_tx, current_session_id.as_deref())
+                .await;
+            let _ = status.send(AgentStatus::Registered {
+                pin: pin.to_string(),
+            });
+        }
+        if let Some(session_id) = current_session_id.take() {
+            let _ = out_tx.send(SignalMessage::Bye {
+                session_id,
+                reason: Some(proto::signal::ByeReason::VideoFailed),
+            });
+        }
+    } else {
+        tracing::debug!(
+            tag,
+            "video failed event from a superseded session, ignoring"
+        );
+    }
+}
+
+/// Handles `DataChannelMessage`: routes `input`/`pointer` and `control` channel payloads.
+async fn on_data_channel_message(
+    label: String,
+    data: bytes::Bytes,
+    is_string: bool,
+    ctx: &HostContext,
+    active: &mut Option<ActiveSession>,
+) {
+    match label.as_str() {
+        "input" | "pointer" => {
+            if !is_string {
+                tracing::warn!(label, "non-text message on input channel, ignoring");
+            } else {
+                match serde_json::from_slice::<proto::input::InputMessage>(&data) {
+                    // `ClipboardText` is never routed through
+                    // `InputRouter` like every other input message
+                    // (slice 2.5b); it is applied on a blocking-pool
+                    // thread so a busy clipboard watcher cannot stall
+                    // this loop (M-7). Never
+                    // logged with its text -- length only (privacy).
+                    Ok(proto::input::InputMessage::ClipboardText { text }) => {
+                        if label == "pointer" {
+                            tracing::warn!(
+                                label,
+                                len = text.len(),
+                                "clipboard_text on the unordered pointer channel, ignoring"
+                            );
+                        } else if let Some(active) = active.as_ref() {
+                            apply_remote_clipboard_text(active.clipboard.clone(), text);
+                        }
+                    }
+                    Ok(msg) => {
+                        if let Some(active) = active.as_mut() {
+                            match active.router.push(msg) {
+                                Ok(()) => {}
+                                Err(crate::input::PushError::Closed) => {
+                                    tracing::warn!(label, "input router is no longer running");
+                                }
+                                Err(err) => {
+                                    // Throttled: at most one warning per second
+                                    // per session, with a count of what was dropped.
+                                    active.input_dropped += 1;
+                                    let now = Instant::now();
+                                    let due = active.last_input_drop_warn.is_none_or(|t| {
+                                        now.duration_since(t) >= Duration::from_secs(1)
+                                    });
+                                    if due {
+                                        tracing::warn!(
+                                            label,
+                                            ?err,
+                                            dropped = active.input_dropped,
+                                            "input events dropped"
+                                        );
+                                        active.input_dropped = 0;
+                                        active.last_input_drop_warn = Some(now);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(label, ?err, "failed to parse input message");
+                    }
+                }
+            }
+        }
+        "control" => {
+            if !is_string {
+                tracing::warn!(label, "non-text message on control channel, ignoring");
+            } else {
+                match serde_json::from_slice::<ControlMessage>(&data) {
+                    Ok(ControlMessage::Ping { ts }) => {
+                        if let Some(active) = active.as_ref() {
+                            if let Err(err) =
+                                active.peer.send_control(&ControlMessage::Pong { ts }).await
+                            {
+                                tracing::warn!(?err, "failed to send pong");
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::SelectDisplay { id }) => {
+                        if let Some(active) = active.as_mut() {
+                            switch_display(ctx, active, id).await;
+                        }
+                    }
+                    Ok(ControlMessage::SetQuality { preset }) => {
+                        if let Some(active) = active.as_mut() {
+                            active.quality_preset = preset;
+                            if let Some(adapt_tx) = &active.video.adapt_tx {
+                                let _ = adapt_tx.send(Feedback::Preset { preset });
+                            } else {
+                                tracing::debug!(
+                                    label,
+                                    ?preset,
+                                    "set_quality received with adaptation disabled (--no-adapt), ignoring"
+                                );
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::SetCurtain { on }) => {
+                        if let Some(active) = active.as_mut() {
+                            let status = set_curtain(ctx, active, on).await;
+                            if let Err(err) = active.peer.send_control(&status).await {
+                                tracing::warn!(?err, "failed to send curtain status");
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::SwitchInputSource) => {
+                        if let Some(active) = active.as_ref() {
+                            if let Some(msg) = switch_input_source(active.input_source.as_deref()) {
+                                if let Err(err) = active.peer.send_control(&msg).await {
+                                    tracing::warn!(?err, "failed to send input source");
+                                }
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::SendCtrlAltDel) => {
+                        if active.is_some() && ctx.machine_mode {
+                            // Помощник лишь выставляет событие службе (`SendSAS`
+                            // вызывает она); syscall блокирующий.
+                            tokio::task::spawn_blocking(crate::platform::sas::request);
+                        } else {
+                            tracing::debug!(
+                                label,
+                                "send_ctrl_alt_del without active session or machine mode, ignoring"
+                            );
+                        }
+                    }
+                    Ok(ControlMessage::UpdateHost) => {
+                        if let Some(active) = active.as_ref() {
+                            match begin_update(ctx) {
+                                Err(refusal) => {
+                                    if let Err(err) = active.peer.send_control(&refusal).await {
+                                        tracing::warn!(?err, "failed to send update status");
+                                    }
+                                }
+                                Ok(mut rx) => {
+                                    // Статусы уходят в control-канал, пока
+                                    // жив сеанс; задача обновления от этого
+                                    // не зависит.
+                                    let peer = Arc::clone(&active.peer);
+                                    tokio::spawn(async move {
+                                        while let Some(msg) = rx.recv().await {
+                                            if peer.send_control(&msg).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Ok(ControlMessage::ClipboardText { text }) => {
+                        // Wrong direction: `ClipboardText` is host ->
+                        // client only on `control` (see
+                        // `proto::control::ControlMessage::ClipboardText`'s
+                        // doc comment; the client -> host direction is
+                        // `proto::input::InputMessage::ClipboardText` on
+                        // `input`, handled above). Named explicitly
+                        // (rather than falling into the catch-all below)
+                        // so its text never reaches a log line, even at
+                        // `trace` (privacy).
+                        tracing::warn!(
+                            label,
+                            len = text.len(),
+                            "clipboard_text on control channel, ignoring (wrong direction)"
+                        );
+                    }
+                    Ok(other) => {
+                        tracing::trace!(label, ?other, "unexpected control message, ignoring");
+                    }
+                    Err(err) => {
+                        tracing::warn!(label, ?err, "failed to parse control message");
+                    }
+                }
+            }
+        }
+        _ => {
+            tracing::trace!(label, len = data.len(), is_string, "data channel message");
+        }
+    }
+}
+
+/// Handles `DataChannelOpen`: on `control`, sends the initial host state to the client.
+async fn on_data_channel_open(label: String, ctx: &HostContext, active: &Option<ActiveSession>) {
+    match (label.as_str(), active.as_ref()) {
+        ("control", Some(active)) => {
+            let msg = displays_message(&active.displays, active.video.display.id);
+            match active.peer.send_control(&msg).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!("control channel not open yet, dropped initial displays list");
+                }
+                Err(err) => {
+                    tracing::warn!(?err, "failed to send initial displays list");
+                }
+            }
+            let host_info = host_info_message(
+                active.files_enabled,
+                active.curtain.is_some(),
+                active.input_source.is_some(),
+                update_available(ctx),
+                ctx.machine_mode && crate::platform::sas::SUPPORTED,
+            );
+            match active.peer.send_control(&host_info).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!("control channel not open yet, dropped host info");
+                }
+                Err(err) => {
+                    tracing::warn!(?err, "failed to send host info");
+                }
+            }
+            if let Some(msg) = curtain_announce_message(&active.curtain_windows) {
                 match active.peer.send_control(&msg).await {
                     Ok(true) => {}
                     Ok(false) => {
-                        tracing::warn!(
-                            "control channel not open yet, dropped initial displays list"
-                        );
+                        tracing::warn!("control channel not open yet, dropped curtain status");
                     }
                     Err(err) => {
-                        tracing::warn!(?err, "failed to send initial displays list");
-                    }
-                }
-                let host_info = host_info_message(
-                    active.files_enabled,
-                    active.curtain.is_some(),
-                    active.input_source.is_some(),
-                    update_available(ctx),
-                    ctx.machine_mode && crate::platform::sas::SUPPORTED,
-                );
-                match active.peer.send_control(&host_info).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        tracing::warn!("control channel not open yet, dropped host info");
-                    }
-                    Err(err) => {
-                        tracing::warn!(?err, "failed to send host info");
-                    }
-                }
-                if let Some(msg) = curtain_announce_message(&active.curtain_windows) {
-                    match active.peer.send_control(&msg).await {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            tracing::warn!("control channel not open yet, dropped curtain status");
-                        }
-                        Err(err) => {
-                            tracing::warn!(?err, "failed to send curtain status");
-                        }
-                    }
-                }
-                if let Some(msg) = active
-                    .input_source
-                    .as_deref()
-                    .and_then(input_source_message)
-                {
-                    if let Err(err) = active.peer.send_control(&msg).await {
-                        tracing::warn!(?err, "failed to send initial input source");
-                    }
-                }
-                let status = ControlMessage::InputStatus {
-                    available: active.input_available,
-                    reason: active.input_reason.clone(),
-                };
-                match active.peer.send_control(&status).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        tracing::warn!(
-                            "control channel not open yet, dropped initial input status"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(?err, "failed to send initial input status");
+                        tracing::warn!(?err, "failed to send curtain status");
                     }
                 }
             }
-            _ => {
-                tracing::trace!(label, "data channel open");
+            if let Some(msg) = active
+                .input_source
+                .as_deref()
+                .and_then(input_source_message)
+            {
+                if let Err(err) = active.peer.send_control(&msg).await {
+                    tracing::warn!(?err, "failed to send initial input source");
+                }
             }
-        },
+            let status = ControlMessage::InputStatus {
+                available: active.input_available,
+                reason: active.input_reason.clone(),
+            };
+            match active.peer.send_control(&status).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!("control channel not open yet, dropped initial input status");
+                }
+                Err(err) => {
+                    tracing::warn!(?err, "failed to send initial input status");
+                }
+            }
+        }
+        _ => {
+            tracing::trace!(label, "data channel open");
+        }
     }
 }
 
