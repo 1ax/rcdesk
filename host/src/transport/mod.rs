@@ -113,65 +113,94 @@ const PACE_RATE_KBPS: u64 = 12_000;
 const PACE_MIN_SLEEP: Duration = Duration::from_millis(1);
 
 /// Ceiling on the total time spent sending one frame (about one frame
-/// interval at 30 fps). `pace_offsets` raises the send rate above
+/// interval at 30 fps). `PaceBucket` raises the send rate above
 /// `PACE_RATE_KBPS` for big frames (IDRs) so pacing never adds more than
 /// one frame of latency.
 const PACE_MAX_SPREAD: Duration = Duration::from_millis(30);
 
-/// Send-time offset from the start of the frame for each packet, given the
-/// packet sizes in bytes. Packet `i` leaves once the bytes of packets
-/// `0..i` have been sent at `PACE_RATE_KBPS`; if the last packet would then
-/// leave later than `PACE_MAX_SPREAD`, all offsets are scaled so it leaves
-/// exactly at `PACE_MAX_SPREAD` (the rate goes up). The first offset is 0.
-fn pace_offsets(sizes: &[usize]) -> Vec<Duration> {
-    let bits_per_sec = PACE_RATE_KBPS * 1000;
-    let mut sent_bytes: u64 = 0;
-    let mut offsets: Vec<Duration> = Vec::with_capacity(sizes.len());
-    for &size in sizes {
-        offsets.push(Duration::from_secs_f64(
-            (sent_bytes * 8) as f64 / bits_per_sec as f64,
-        ));
-        sent_bytes += size as u64;
-    }
-    if let Some(&last) = offsets.last() {
-        if last > PACE_MAX_SPREAD {
-            let k = PACE_MAX_SPREAD.as_secs_f64() / last.as_secs_f64();
-            for o in &mut offsets {
-                *o = Duration::from_secs_f64(o.as_secs_f64() * k);
-            }
-            if let Some(l) = offsets.last_mut() {
-                *l = PACE_MAX_SPREAD;
-            }
-        }
-    }
-    offsets
-}
-
-/// Hard ceiling on a packet's scheduled send time within one frame. When
-/// late wake-ups push the chain `pace_sched` builds past this, the rest of the
-/// frame leaves immediately without sleeping, which bounds the latency added by
-/// a long run of late packets. `PACE_MAX_SPREAD` stays the ceiling of the
-/// *plan* in `pace_offsets`; this one only limits the shifted schedule.
+/// Hard ceiling on the time since the frame start after which the rest of
+/// the frame leaves without sleeping. Bounds the latency added by a long run
+/// of late wake-ups. `PACE_MAX_SPREAD` is the ceiling of the *plan*
+/// (`PaceBucket`'s rate); this one only limits the real schedule.
 const PACE_HARD_CAP: Duration = Duration::from_millis(60);
 
-/// Scheduled send time (from the frame start) of a packet. `plan_offset` and
-/// `plan_gap` come from `pace_offsets` (gap to the previous packet's plan
-/// offset); `prev_sched` / `prev_sent` are the previous packet's scheduled and
-/// actual send times. A late previous packet shifts the tail of the frame
-/// instead of letting every overdue packet leave in one burst; a packet that
-/// left early (`PACE_MIN_SLEEP`) causes no drift because `prev_sched` is used.
-fn pace_sched(
-    plan_offset: Duration,
-    plan_gap: Duration,
-    prev_sched: Duration,
-    prev_sent: Duration,
-) -> Duration {
-    plan_offset.max(prev_sched.max(prev_sent) + plan_gap)
+/// Token-bucket capacity floor, in bytes: three full RTP packets, about
+/// 2.4 ms at 12 Mbit/s. Larger than the wake-up error of the Windows/tokio
+/// timer (measured 2026-11-21 on a weak Windows host, LAN, 25 fps, ~6 Mbit/s:
+/// `pace_wake_ms_max` 7-12), so a late wake-up is absorbed by the credit that
+/// accumulated meanwhile instead of shifting the whole tail of the frame.
+const PACE_BURST_BYTES: usize = 3600;
+
+/// Token-bucket capacity as time at the frame's rate; the capacity is the
+/// larger of this and `PACE_BURST_BYTES`.
+const PACE_BURST_TIME: Duration = Duration::from_millis(2);
+
+/// Token bucket pacing the packets of one video frame. Pure: time is passed
+/// in as the offset from the frame start. Credit accrues at `rate` up to
+/// `burst_bytes`; a packet leaves once the credit covers it. A late wake-up
+/// finds more credit (capped) and the following packets leave back to back
+/// only up to `burst_bytes`, then the average rate is held again, so lateness
+/// does not accumulate along the frame.
+#[derive(Debug)]
+struct PaceBucket {
+    /// Bytes per second.
+    rate: f64,
+    burst_bytes: f64,
+    /// Available credit in bytes; may go negative after a send.
+    credit: f64,
+    last: Duration,
+    planned: Duration,
+}
+
+impl PaceBucket {
+    fn new(total_bytes: usize) -> Self {
+        let total_bits = total_bytes as f64 * 8.0;
+        let rate_bps =
+            (PACE_RATE_KBPS as f64 * 1000.0).max(total_bits / PACE_MAX_SPREAD.as_secs_f64());
+        let rate = rate_bps / 8.0;
+        let burst_bytes = (PACE_BURST_BYTES as f64).max(rate * PACE_BURST_TIME.as_secs_f64());
+        let planned = Duration::from_secs_f64((total_bytes as f64 - burst_bytes).max(0.0) / rate);
+        Self {
+            rate,
+            burst_bytes,
+            credit: burst_bytes,
+            last: Duration::ZERO,
+            planned,
+        }
+    }
+
+    fn refill(&mut self, now: Duration) {
+        let dt = now.saturating_sub(self.last);
+        self.credit = (self.credit + dt.as_secs_f64() * self.rate).min(self.burst_bytes);
+        self.last = self.last.max(now);
+    }
+
+    /// How long to wait before a packet of `size` bytes may leave.
+    fn wait_for(&mut self, now: Duration, size: usize) -> Duration {
+        self.refill(now);
+        let size = size as f64;
+        if self.credit >= size {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64((size - self.credit) / self.rate)
+        }
+    }
+
+    /// Records that a packet of `size` bytes left at `now`.
+    fn sent(&mut self, now: Duration, size: usize) {
+        self.refill(now);
+        self.credit -= size as f64;
+    }
+
+    /// Planned duration of the frame: everything above the initial burst at
+    /// the bucket's rate.
+    fn planned(&self) -> Duration {
+        self.planned
+    }
 }
 
 /// How much later than planned a frame finished leaving: `spread` (measured
-/// from the frame start to the last packet written) minus `planned` (the last
-/// `pace_offsets` entry). Zero when the frame finished early.
+/// from the frame start to the last packet written) minus `planned` (`PaceBucket::planned`). Zero when the frame finished early.
 fn pace_late(planned: Duration, spread: Duration) -> Duration {
     spread.saturating_sub(planned)
 }
@@ -619,7 +648,7 @@ pub struct PeerSession {
     closed: AtomicBool,
     /// Largest `pace_late` (microseconds) over frames with 2+ packets since
     /// the last `take_pace_stats`. Measures how far the real send time runs
-    /// past the `pace_offsets` plan on Windows, where the timer resolution is
+    /// past the `PaceBucket` plan on Windows, where the timer resolution is
     /// held at 1 ms by `timeBeginPeriod(1)` (V-3, `platform::timer_resolution`).
     pace_late_us_max: AtomicU64,
     /// Largest total send time of one frame (microseconds) over the same
@@ -1236,42 +1265,37 @@ impl PeerSession {
                 // packets) as line-rate bursts, and a live session (2026-11,
                 // wired ends, RTT 130-140 ms) lost 11-150 packets per 5 s at
                 // only 1-6 Mbit/s. Now every packet is spread by
-                // `pace_offsets` (`PACE_RATE_KBPS`, capped at
+                // `PaceBucket` (`PACE_RATE_KBPS`, capped at
                 // `PACE_MAX_SPREAD` per frame, so at most about one frame
                 // interval of latency). Packets due within `PACE_MIN_SLEEP`
                 // go out immediately. Then a Windows host under load (GDI +
                 // software encoder, 2026-11-20, path host>srflx RTT 127 ms)
                 // woke 5-12 ms late and every packet whose time had passed
                 // left back to back: 65-94 lost packets per 5 s at 3 Mbit/s
-                // (Mac host, same path: 0-5). Now a packet's time is also
-                // counted from the previous packet (`pace_sched`): a late
-                // wake-up shifts the tail instead of squeezing it into a
-                // burst, bounded by `PACE_HARD_CAP`.
+                // (Mac host, same path: 0-5). A chain `pace_sched` (a packet
+                // counted from the previous one) fixed the burst but not the
+                // lateness.
+                // V-16b, 2026-11-21: a weak Windows host, LAN, 25 fps, ~6
+                // Mbit/s (0.5.9) showed `pace_wake_ms_max` 7-12,
+                // `pace_write_ms_max` 0.2-1.2, yet `pace_late_ms_max` 31-36,
+                // `pace_spread_ms_max` 59-63 (the `PACE_HARD_CAP`) and up to
+                // 22 dropped per 5 s: at 12 Mbit/s the gap is ~0.8 ms, the
+                // timer wakes 1-2 ms late, and every delay shifted the whole
+                // tail of the frame. Now a token bucket (`PaceBucket`): a
+                // late wake-up is paid for by accumulated credit (at most
+                // `PACE_BURST_BYTES`), the average rate holds and lateness
+                // does not accumulate.
                 let started = Instant::now();
                 let total = packets.len();
                 let sizes: Vec<usize> = packets.iter().map(|p| p.payload.len()).collect();
-                let offsets = pace_offsets(&sizes);
-                let mut prev_sched = Duration::ZERO;
-                let mut prev_sent = Duration::ZERO;
-                let mut prev_offset = Duration::ZERO;
-                for (i, (pkt, offset)) in
-                    packets.into_iter().zip(offsets.iter().copied()).enumerate()
-                {
+                let mut bucket = PaceBucket::new(sizes.iter().sum());
+                for (pkt, size) in packets.into_iter().zip(sizes.iter().copied()) {
                     let mut pkt = pkt;
-                    let sched = if i == 0 {
-                        Duration::ZERO
-                    } else {
-                        pace_sched(
-                            offset,
-                            offset.saturating_sub(prev_offset),
-                            prev_sched,
-                            prev_sent,
-                        )
-                    };
-                    prev_offset = offset;
-                    if sched <= PACE_HARD_CAP {
-                        let due = started + sched;
-                        if due.saturating_duration_since(Instant::now()) >= PACE_MIN_SLEEP {
+                    let now = started.elapsed();
+                    if now <= PACE_HARD_CAP {
+                        let w = bucket.wait_for(now, size);
+                        if w >= PACE_MIN_SLEEP {
+                            let due = Instant::now() + w;
                             tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
                             session.pace_wake_us_max.fetch_max(
                                 Instant::now().saturating_duration_since(due).as_micros() as u64,
@@ -1279,8 +1303,7 @@ impl PeerSession {
                             );
                         }
                     }
-                    prev_sched = sched;
-                    prev_sent = started.elapsed();
+                    bucket.sent(started.elapsed(), size);
                     pkt.header.payload_type = pt;
                     // Stamped after the pacing pause, right before the write:
                     // the receiver's estimator needs the send time, not the
@@ -1299,7 +1322,7 @@ impl PeerSession {
                     }
                 }
                 if total >= 2 {
-                    let planned = offsets.last().copied().unwrap_or_default();
+                    let planned = bucket.planned();
                     let spread = started.elapsed();
                     session.pace_late_us_max.fetch_max(
                         pace_late(planned, spread).as_micros() as u64,
@@ -1722,106 +1745,108 @@ mod tests {
     }
 
     #[test]
-    fn pace_sched_on_time_keeps_plan() {
-        let ms = Duration::from_millis;
-        assert_eq!(pace_sched(ms(10), ms(2), ms(8), ms(8)), ms(10));
-        assert_eq!(pace_sched(ms(10), ms(2), ms(8), ms(7)), ms(10));
-    }
-
-    #[test]
-    fn pace_sched_late_shifts_tail() {
-        let ms = Duration::from_millis;
-        // previous packet planned at 8 ms, left at 18 ms
-        assert_eq!(pace_sched(ms(10), ms(2), ms(8), ms(18)), ms(20));
-    }
-
-    #[test]
-    fn pace_sched_early_send_does_not_drift() {
-        let ms = Duration::from_millis;
-        // previous packet left 0.5 ms early (MIN_SLEEP): plan unchanged
-        let early = ms(8) - Duration::from_micros(500);
-        assert_eq!(pace_sched(ms(10), ms(2), ms(8), early), ms(10));
-    }
-
-    #[test]
-    fn pace_sched_chain_has_no_catch_up_burst() {
-        let sizes = [1200usize; 25];
-        let offsets = pace_offsets(&sizes);
-        let late = Duration::from_millis(10);
-        let mut sent: Vec<Duration> = Vec::new();
-        let mut sched_prev = Duration::ZERO;
-        let mut sent_prev = Duration::ZERO;
-        for i in 0..offsets.len() {
-            let sched = if i == 0 {
-                Duration::ZERO
-            } else {
-                pace_sched(
-                    offsets[i],
-                    offsets[i] - offsets[i - 1],
-                    sched_prev,
-                    sent_prev,
-                )
-            };
-            let now = if i == 5 { sched + late } else { sched };
-            let s = sched.max(now);
-            sent.push(s);
-            sched_prev = sched;
-            sent_prev = s;
-        }
-        let tol = Duration::from_micros(1);
-        for i in 1..sent.len() {
-            let gap = offsets[i] - offsets[i - 1];
-            assert!(
-                sent[i] + tol >= sent[i - 1] + gap,
-                "packet {i}: interval {:?} < gap {gap:?}",
-                sent[i] - sent[i - 1]
-            );
-        }
-        let want = offsets[24] + late;
-        assert!(
-            sent[24].abs_diff(want) <= tol,
-            "last = {:?}, want {want:?}",
-            sent[24]
-        );
-    }
-
-    #[test]
     fn pace_hard_cap_above_plan_ceiling() {
         assert!(PACE_HARD_CAP > PACE_MAX_SPREAD);
     }
 
-    #[test]
-    fn pace_offsets_spreads_frame_at_rate() {
-        let offsets = pace_offsets(&[1200; 25]);
-        assert_eq!(offsets.len(), 25);
-        assert_eq!(offsets[0], Duration::ZERO);
-        let last = offsets[24].as_secs_f64() * 1000.0;
-        assert!((last - 19.2).abs() < 0.1, "last = {last} ms");
-        assert!(offsets.windows(2).all(|w| w[0] <= w[1]));
-    }
-
-    #[test]
-    fn pace_offsets_single_and_empty() {
-        assert_eq!(pace_offsets(&[1200]), vec![Duration::ZERO]);
-        assert!(pace_offsets(&[]).is_empty());
-    }
-
-    #[test]
-    fn pace_offsets_large_frame_scaled_to_max_spread() {
-        let offsets = pace_offsets(&[1200; 270]);
-        assert_eq!(offsets.len(), 270);
-        assert_eq!(offsets[0], Duration::ZERO);
-        assert_eq!(offsets[269], PACE_MAX_SPREAD);
-        assert!(offsets.windows(2).all(|w| w[0] <= w[1]));
-    }
-
-    #[test]
-    fn pace_offsets_proportional_to_accumulated_bytes() {
-        let offsets = pace_offsets(&[1000, 500, 1500, 200]);
-        let unit = 8.0 / (PACE_RATE_KBPS as f64 * 1000.0);
-        for (o, bytes) in offsets.iter().zip([0.0, 1000.0, 1500.0, 3000.0]) {
-            assert!((o.as_secs_f64() - bytes * unit).abs() < 1e-9);
+    /// Simulates sending a frame through `PaceBucket` with a manual clock.
+    /// `sleeper` maps the requested wait to the real sleep length. Returns
+    /// (frame duration, longest run of bytes sent without a sleep, packets
+    /// that left with a zero wait).
+    fn pace_sim(
+        sizes: &[usize],
+        sleeper: impl Fn(Duration) -> Duration,
+    ) -> (Duration, usize, usize) {
+        let mut bucket = PaceBucket::new(sizes.iter().sum());
+        let mut now = Duration::ZERO;
+        let (mut run, mut max_run, mut zero_waits) = (0usize, 0usize, 0usize);
+        for &size in sizes {
+            let w = bucket.wait_for(now, size);
+            if w.is_zero() {
+                zero_waits += 1;
+            }
+            if w >= PACE_MIN_SLEEP {
+                now += sleeper(w);
+                run = 0;
+            }
+            bucket.sent(now, size);
+            run += size;
+            max_run = max_run.max(run);
         }
+        (now, max_run, zero_waits)
+    }
+
+    fn windows_timer(w: Duration) -> Duration {
+        let ms = w.as_secs_f64() * 1000.0;
+        Duration::from_millis(ms.ceil() as u64 + 1)
+    }
+
+    #[test]
+    fn pace_bucket_ideal_timer_holds_rate() {
+        let (d, _, _) = pace_sim(&[1200; 25], |w| w);
+        let ms = d.as_secs_f64() * 1000.0;
+        assert!((ms - 17.6).abs() <= 0.5, "duration = {ms} ms");
+    }
+
+    #[test]
+    fn pace_bucket_late_timer_does_not_accumulate() {
+        let sizes = [1200usize; 25];
+        let (ideal, _, _) = pace_sim(&sizes, |w| w);
+        let (late, _, _) = pace_sim(&sizes, windows_timer);
+        assert!(
+            late <= ideal + Duration::from_millis(3),
+            "late = {late:?}, ideal = {ideal:?}"
+        );
+    }
+
+    #[test]
+    fn pace_bucket_run_without_sleep_bounded_by_burst() {
+        for timer in [
+            (|w| w) as fn(Duration) -> Duration,
+            windows_timer as fn(Duration) -> Duration,
+        ] {
+            let (_, max_run, _) = pace_sim(&[1200; 25], timer);
+            assert!(
+                max_run <= PACE_BURST_BYTES + 1200,
+                "run without sleep = {max_run} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn pace_bucket_large_frame_within_max_spread() {
+        let (d, _, _) = pace_sim(&[1200; 270], |w| w);
+        assert!(
+            d <= PACE_MAX_SPREAD + Duration::from_millis(1),
+            "duration = {d:?}"
+        );
+    }
+
+    #[test]
+    fn pace_bucket_late_sleep_credit_capped_at_burst() {
+        let mut bucket = PaceBucket::new(30_000);
+        // drain the initial credit
+        for _ in 0..3 {
+            bucket.sent(Duration::ZERO, 1200);
+        }
+        let w = bucket.wait_for(Duration::ZERO, 1200);
+        assert!(w > Duration::ZERO);
+        // woke 10 ms late instead of `w`
+        let now = Duration::from_millis(10);
+        let mut immediate = 0;
+        while bucket.wait_for(now, 1200).is_zero() {
+            bucket.sent(now, 1200);
+            immediate += 1;
+            assert!(immediate <= 3, "more than 3 packets left at once");
+        }
+        assert_eq!(immediate, 3);
+    }
+
+    #[test]
+    fn pace_bucket_single_packet_never_waits() {
+        let mut bucket = PaceBucket::new(1200);
+        assert_eq!(bucket.wait_for(Duration::ZERO, 1200), Duration::ZERO);
+        assert_eq!(bucket.planned(), Duration::ZERO);
     }
 
     #[test]
