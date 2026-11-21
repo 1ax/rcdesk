@@ -33,7 +33,8 @@ import {
   type ViewAnchor,
   type Zoom,
 } from "./viewport";
-import { ClipboardBridge, isSafari, loadClipboardSyncSetting, saveClipboardSyncSetting } from "./clipboard";
+import { loadClipboardSyncSetting, saveClipboardSyncSetting } from "./clipboard";
+import { createClipboardUi } from "./clipboardUi";
 import { applyCursor } from "./cursor";
 import { displayOptions, parseDisplayId, shouldShowPicker } from "./displays";
 import {
@@ -271,9 +272,6 @@ const STATS_INTERVAL_MS = 1000;
  * is the server's push of `devices` on every presence/busy change. */
 const DEVICE_LIST_INTERVAL_MS = 60000;
 
-/** How long `#clipboard-note` stays visible after `ClipboardBridge.notify`
- * reports a too-large clipboard text (slice 2.5c, decision 5). */
-const CLIPBOARD_NOTE_MS = 4000;
 
 /** How long `#fullscreen-note` (the "for exit press/hold Esc" hint) stays
  * visible after entering fullscreen (slice 3.5c). */
@@ -409,7 +407,6 @@ export function mount(root: Element | null): void {
     dc.send(JSON.stringify(msg));
     hostUpdateBtn.disabled = true;
   });
-  const clipboardNoteEl = root.querySelector<HTMLSpanElement>("#clipboard-note")!;
   const fullscreenNoteEl = root.querySelector<HTMLSpanElement>("#fullscreen-note")!;
   const touchCursorEl = root.querySelector<HTMLImageElement>("#touch-cursor")!;
   const sessionVideoEl = root.querySelector<HTMLDivElement>(".session-video")!;
@@ -522,7 +519,7 @@ export function mount(root: Element | null): void {
       if (inputChannel?.readyState === "open") inputChannel.send(JSON.stringify(msg));
     },
     isTextSupported: () => hostSupportsText(hostVersion),
-    beforePaste: () => clipboardBridge?.syncBeforePaste() ?? Promise.resolve(),
+    beforePaste: () => clipboardUi.syncBeforePaste(),
     fit: sessionScreen,
     // Клавиатура телефона закрывает большую часть экрана, поэтому картинка
     // подтягивается к 2x вокруг последнего места касания (там поле ввода) и
@@ -676,37 +673,17 @@ export function mount(root: Element | null): void {
   const sessionBarHandle = root.querySelector<HTMLButtonElement>("#session-bar-handle")!;
   const barCollapseBtn = root.querySelector<HTMLButtonElement>("#bar-collapse-btn")!;
   const statsCheckbox = root.querySelector<HTMLInputElement>("#stats-checkbox")!;
-  // Slice E4: clipboard sync is opt-in (off by default), remembered per browser.
-  const clipboardSyncCheckbox = root.querySelector<HTMLInputElement>("#clipboard-sync-checkbox")!;
-  let clipboardSyncEnabled = initialStorage ? loadClipboardSyncSetting(initialStorage) : false;
-  clipboardSyncCheckbox.checked = clipboardSyncEnabled;
-  const coarsePointer = matchMedia("(pointer: coarse)").matches;
-  const clipboardPushBtn = root.querySelector<HTMLButtonElement>("#clipboard-push-btn")!;
-  function renderClipboardPushBtn(): void {
-    clipboardPushBtn.hidden = !(coarsePointer && clipboardSyncEnabled);
-  }
-  renderClipboardPushBtn();
-  clipboardPushBtn.addEventListener("click", () => {
-    void clipboardBridge?.syncFromClient();
-  });
-  // A phone cannot report clipboard changes, so after returning to the tab
-  // (or at session start) the first click sends the phone clipboard to the
-  // host; iOS asks "Paste" (H5-9).
-  let returnSyncArmed = false;
-  function onClipboardReturnClick(e: Event): void {
-    if (!returnSyncArmed) return;
-    // H5-11: only a tap on the remote screen itself, with the phone keyboard
-    // closed -- a tap on the key strip or any button would get iOS's "Paste"
-    // prompt in the way of the keyboard.
-    const t = e.target as HTMLElement | null;
-    if (!t || !t.closest(".session-video") || softKeyboard.isOpen()) return;
-    returnSyncArmed = false;
-    void clipboardBridge?.syncFromClient();
-  }
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && coarsePointer && clipboardBridge !== null) {
-      returnSyncArmed = true;
-    }
+  const clipboardUi = createClipboardUi({
+    root,
+    initialSyncEnabled: initialStorage ? loadClipboardSyncSetting(initialStorage) : false,
+    isSoftKeyboardOpen: () => softKeyboard.isOpen(),
+    getInputChannel: () => inputChannel,
+    isSessionActive: () => session !== null,
+    saveSyncSetting: (enabled) => {
+      const storage = ownerStorage();
+      if (storage) saveClipboardSyncSetting(storage, enabled);
+    },
+    afterToggle: () => focusVideoUnlessTyping(),
   });
   let statsVisible = initialStorage ? loadStatsVisible(initialStorage) : false;
   statsCheckbox.checked = statsVisible;
@@ -775,15 +752,6 @@ export function mount(root: Element | null): void {
   // 2.5a, debt D26), from `ControlMessage::InputStatus`. While true, input
   // is never attached (see `maybeAttachInput`) and `#view-only` shows why.
   let inputBlocked = false;
-  // Mirrors the clipboard with the host for this session (slice 2.5c), or
-  // `null` when there's no session or `navigator.clipboard` isn't available
-  // (e.g. an insecure context) -- see the `joined` handler and `teardown`.
-  let clipboardBridge: ClipboardBridge | null = null;
-  // Whether `onClipboardChange` is currently registered on
-  // `navigator.clipboard` (only where `clipboardchange` exists -- Chrome),
-  // so `teardown` knows whether to remove it.
-  let clipboardChangeAttached = false;
-  let clipboardNoteTimer: ReturnType<typeof setTimeout> | undefined;
   let fullscreenNoteTimer: ReturnType<typeof setTimeout> | undefined;
   // Set once the signaling socket itself closes (not just a session ending)
   // -- disables every connect affordance until `scheduleReconnect`'s next
@@ -837,20 +805,6 @@ export function mount(root: Element | null): void {
   // `performRecoveryAttempt`).
   let recoveryWaitingForSocket = false;
 
-  /** Shows `note` in `#clipboard-note` for `CLIPBOARD_NOTE_MS`, used as
-   * `ClipboardBridge`'s `notify` dependency (decision 5: a too-large
-   * clipboard text, in either direction). */
-  function showClipboardNote(note: string): void {
-    clipboardNoteEl.textContent = note;
-    clipboardNoteEl.hidden = false;
-    if (clipboardNoteTimer !== undefined) clearTimeout(clipboardNoteTimer);
-    clipboardNoteTimer = setTimeout(() => {
-      clipboardNoteEl.hidden = true;
-      clipboardNoteEl.textContent = "";
-      clipboardNoteTimer = undefined;
-    }, CLIPBOARD_NOTE_MS);
-  }
-
   /** Shows `note` in `#fullscreen-note` for `FULLSCREEN_NOTE_MS` -- the "for
    * exit press/hold Esc" hint shown once on entering fullscreen (see the
    * `fullscreenchange` listener below). */
@@ -872,77 +826,6 @@ export function mount(root: Element | null): void {
     }
     fullscreenNoteEl.hidden = true;
     fullscreenNoteEl.textContent = "";
-  }
-
-  /** Creates the `ClipboardBridge` and its listeners (slice E4: only when
-   * the user enabled clipboard sync; also called on toggle mid-session). */
-  function attachClipboardBridge(): void {
-    if (clipboardBridge) return;
-    if (navigator.clipboard) {
-      const clipboard = navigator.clipboard;
-      clipboardBridge = new ClipboardBridge({
-        writeText: (text) => clipboard.writeText(text),
-        readText: () => clipboard.readText(),
-        // The deferred `ClipboardItem` write (decision 3) is a
-        // Safari-only trick -- Chrome already gets the same result from
-        // `writeText` in `onHostText` (decision 1b).
-        writeDeferred: isSafari(navigator.userAgent)
-          ? (blob) => clipboard.write([new ClipboardItem({ "text/plain": blob })])
-          : undefined,
-        send: (msg) => {
-          if (inputChannel?.readyState === "open") {
-            inputChannel.send(JSON.stringify(msg));
-          }
-        },
-        notify: (note) => showClipboardNote(note),
-        setTimeout: (handler, ms) => setTimeout(handler, ms),
-        clearTimeout: (handle) => clearTimeout(handle),
-      });
-      // H5-16: armed only after coming back from another app (see the
-      // `visibilitychange` listener), not at session start -- otherwise the very
-      // first tap on the remote screen pops iOS's "Paste" prompt every session.
-      returnSyncArmed = false;
-      document.addEventListener("click", onClipboardReturnClick, true);
-      window.addEventListener("focus", onClipboardFocusOrGesture);
-      document.addEventListener("pointerdown", onClipboardFocusOrGesture, true);
-      // H5-17: a touch `pointerdown` carries no user activation on iOS
-      // (`writeText` -> NotAllowedError; measured in the simulator), `click` does
-      // -- without it the host's clipboard never reached the phone.
-      document.addEventListener("click", onClipboardFocusOrGesture, true);
-      document.addEventListener("keydown", onClipboardFocusOrGesture, true);
-      if ("onclipboardchange" in clipboard) {
-        clipboard.addEventListener("clipboardchange", onClipboardChange);
-        clipboardChangeAttached = true;
-      }
-    } else {
-      console.warn("navigator.clipboard unavailable; clipboard sync disabled");
-    }
-  }
-
-  /** Removes the bridge and its listeners; with no bridge every
-   * `clipboardBridge?.…` call is a no-op (slice E4). */
-  function detachClipboardBridge(): void {
-    if (clipboardBridge) {
-      document.removeEventListener("click", onClipboardReturnClick, true);
-      returnSyncArmed = false;
-      window.removeEventListener("focus", onClipboardFocusOrGesture);
-      document.removeEventListener("pointerdown", onClipboardFocusOrGesture, true);
-      document.removeEventListener("click", onClipboardFocusOrGesture, true);
-      document.removeEventListener("keydown", onClipboardFocusOrGesture, true);
-      if (clipboardChangeAttached) {
-        navigator.clipboard.removeEventListener("clipboardchange", onClipboardChange);
-        clipboardChangeAttached = false;
-      }
-    }
-    clipboardBridge = null;
-  }
-
-  function onClipboardFocusOrGesture(): void {
-    clipboardBridge?.onFocusOrGesture();
-  }
-
-  function onClipboardChange(): void {
-    void clipboardBridge?.onLocalClipboardChange();
   }
 
   /** Rebuilds `#display-select`'s options from `displays`/`currentDisplay`
@@ -1005,9 +888,9 @@ export function mount(root: Element | null): void {
   const filesPanel = createFilesPanel({
     root,
     sessionVideoEl,
-    showClipboardNote,
+    showClipboardNote: clipboardUi.showNote,
     maxMessageSize: () => session?.maxMessageSize(),
-    forgetClipboardText: () => clipboardBridge?.forgetLastText(),
+    forgetClipboardText: () => clipboardUi.forgetLastText(),
   });
 
   signaling.on("email_code_sent", () => accountPanel.onEmailCodeSent());
@@ -1091,8 +974,8 @@ export function mount(root: Element | null): void {
       // checkbox mid-session takes effect without re-attaching input.
       navigator.clipboard
         ? {
-            beforePaste: () => clipboardBridge?.syncBeforePaste() ?? Promise.resolve(),
-            onCopyShortcut: () => clipboardBridge?.beginDeferredCopy(),
+            beforePaste: () => clipboardUi.syncBeforePaste(),
+            onCopyShortcut: () => clipboardUi.beginDeferredCopy(),
           }
         : undefined,
       // Slice 3.5f: a getter, not `cmdAsCtrl` itself, so a later toggle
@@ -1329,7 +1212,7 @@ export function mount(root: Element | null): void {
         return;
       }
       if (msg.type === "clipboard_text") {
-        clipboardBridge?.onHostText(msg.text);
+        clipboardUi.onHostText(msg.text);
         return;
       }
       applyCursor(video, msg, touchCursorEl);
@@ -1493,16 +1376,11 @@ export function mount(root: Element | null): void {
     hostUpdateBtn.hidden = true;
     hostUpdateBtn.disabled = false;
     try {
-      detachClipboardBridge();
+      clipboardUi.detach();
     } catch (err) {
       console.warn("[rcdesk] clipboard bridge detach failed", err);
     }
-    if (clipboardNoteTimer !== undefined) {
-      clearTimeout(clipboardNoteTimer);
-      clipboardNoteTimer = undefined;
-    }
-    clipboardNoteEl.hidden = true;
-    clipboardNoteEl.textContent = "";
+    clipboardUi.resetNote();
     try {
       session?.close();
     } catch (err) {
@@ -1816,7 +1694,7 @@ export function mount(root: Element | null): void {
     setSessionStatus("connecting");
     updateConnectionBanner();
 
-    if (clipboardSyncEnabled) attachClipboardBridge();
+    if (clipboardUi.isSyncEnabled()) clipboardUi.attach();
 
     // Bound to `session` right after construction, below; captured by
     // `onConnectionStateChange` so a stray event delivered from *this*
@@ -2263,18 +2141,6 @@ export function mount(root: Element | null): void {
     if (controlChannel) sendQualityPreset(controlChannel, preset);
     // Give focus back to the video, same reasoning as `displaySelect`'s
     // change listener above.
-    focusVideoUnlessTyping();
-  });
-
-  clipboardSyncCheckbox.addEventListener("change", () => {
-    clipboardSyncEnabled = clipboardSyncCheckbox.checked;
-    renderClipboardPushBtn();
-    const storage = ownerStorage();
-    if (storage) saveClipboardSyncSetting(storage, clipboardSyncEnabled);
-    if (session !== null) {
-      if (clipboardSyncEnabled) attachClipboardBridge();
-      else detachClipboardBridge();
-    }
     focusVideoUnlessTyping();
   });
 
