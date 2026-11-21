@@ -625,6 +625,13 @@ pub struct PeerSession {
     /// Largest total send time of one frame (microseconds) over the same
     /// window and frames; companion of `pace_late_us_max`.
     pace_spread_us_max: AtomicU64,
+    /// Largest wake-up lateness (microseconds) after `sleep_until` in the
+    /// pacing loop since the last `take_pace_stats`: how much later than `due`
+    /// the task actually resumed. Only packets that really slept count.
+    pace_wake_us_max: AtomicU64,
+    /// Largest duration (microseconds) of one `write_rtp_with_extensions`
+    /// call since the last `take_pace_stats`, errors included, over all frames.
+    pace_write_us_max: AtomicU64,
 }
 
 /// One end of the selected ICE candidate pair, for the `agent.log` path line.
@@ -978,18 +985,28 @@ impl PeerSession {
             closed: AtomicBool::new(false),
             pace_late_us_max: AtomicU64::new(0),
             pace_spread_us_max: AtomicU64::new(0),
+            pace_wake_us_max: AtomicU64::new(0),
+            pace_write_us_max: AtomicU64::new(0),
         });
 
         Ok(session)
     }
 
-    /// `(late_ms_max, spread_ms_max)` of the paced video frames since the last
-    /// call, resetting both counters. Diagnostics only (the `video: Ns summary`
-    /// line), to measure pacing lateness on Windows.
-    pub fn take_pace_stats(&self) -> (f64, f64) {
+    /// `(late_ms_max, spread_ms_max, wake_ms_max, write_ms_max)` of the paced
+    /// video frames since the last call, resetting all counters. Diagnostics
+    /// only (the `video: Ns summary` line), to measure pacing lateness on
+    /// Windows and tell a late wake-up from a slow RTP write.
+    pub fn take_pace_stats(&self) -> (f64, f64, f64, f64) {
         let late = self.pace_late_us_max.swap(0, Ordering::Relaxed);
         let spread = self.pace_spread_us_max.swap(0, Ordering::Relaxed);
-        (late as f64 / 1000.0, spread as f64 / 1000.0)
+        let wake = self.pace_wake_us_max.swap(0, Ordering::Relaxed);
+        let write = self.pace_write_us_max.swap(0, Ordering::Relaxed);
+        (
+            late as f64 / 1000.0,
+            spread as f64 / 1000.0,
+            wake as f64 / 1000.0,
+            write as f64 / 1000.0,
+        )
     }
 
     /// The currently selected ICE candidate pair (host/srflx/relay, RTT), or
@@ -1256,6 +1273,10 @@ impl PeerSession {
                         let due = started + sched;
                         if due.saturating_duration_since(Instant::now()) >= PACE_MIN_SLEEP {
                             tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+                            session.pace_wake_us_max.fetch_max(
+                                Instant::now().saturating_duration_since(due).as_micros() as u64,
+                                Ordering::Relaxed,
+                            );
                         }
                     }
                     prev_sched = sched;
@@ -1265,11 +1286,15 @@ impl PeerSession {
                     // the receiver's estimator needs the send time, not the
                     // frame's capture time.
                     let send_time = abs_send_time(send_clock.ntp64(Instant::now()));
-                    if let Err(err) = session
+                    let write_start = Instant::now();
+                    let written = session
                         .video_track
                         .write_rtp_with_extensions(pkt, &[send_time])
-                        .await
-                    {
+                        .await;
+                    session
+                        .pace_write_us_max
+                        .fetch_max(write_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    if let Err(err) = written {
                         tracing::warn!(?err, "failed to write video packet");
                     }
                 }
