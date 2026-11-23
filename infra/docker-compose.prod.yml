@@ -51,7 +51,7 @@ services:
   # публикацию по одному в compose непрактично, а TURN должен видеть внешний
   # IP клиентов напрямую (не за NAT контейнерной сети).
   coturn:
-    image: coturn/coturn:4.18.0
+    image: coturn/coturn:4.19.2
     network_mode: host
     # 3478 под nobody через file-capability turnserver; no-new-privileges сюда
     # не ставить -- отключает file-caps.
