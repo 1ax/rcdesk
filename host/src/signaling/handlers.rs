@@ -608,6 +608,7 @@ async fn begin_session(
                     last_input_drop_warn: None,
                     input_dropped: 0,
                     cursor_task: parts.cursor_task,
+                    position_task: parts.position_task,
                     input_available: parts.input_available,
                     input_reason: parts.input_reason,
                     view_mode: parts.view_mode,

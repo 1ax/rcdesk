@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 
 use objc2::rc::{autoreleasepool, Retained};
 use objc2_app_kit::{NSBitmapFormat, NSBitmapImageRep, NSCursor};
+use objc2_core_graphics::CGEvent;
 
-use super::{CursorImage, CursorSource, CursorState};
+use super::{CursorImage, CursorSource, CursorState, PositionSource};
 
 /// Minimum interval between "failed to read cursor" debug logs.
 const LOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -187,6 +188,29 @@ impl CursorSource for MacCursorSource {
                 rgba,
             }))
         })
+    }
+}
+
+/// Положение указателя через `CGEventCreate(NULL)` + `CGEventGetLocation`
+/// (VM-2). Это глобальные точки с началом в левом верхнем углу главного
+/// дисплея -- то же пространство, что у `CGDisplayBounds` (откуда берутся
+/// `DisplayInfo.x/y/width/height`) и у `enigo` (`CGEventCreateMouseEvent`),
+/// которым ходит инжектор, так что преобразование не нужно. Вызов дешёвый,
+/// без автоосвобождаемых объектов (событие -- `CFRetained`).
+#[derive(Debug, Default)]
+pub struct MacPositionSource;
+
+impl MacPositionSource {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl PositionSource for MacPositionSource {
+    fn position(&mut self) -> Option<(i32, i32)> {
+        let event = CGEvent::new(None)?;
+        let point = CGEvent::location(Some(&event));
+        Some((point.x.round() as i32, point.y.round() as i32))
     }
 }
 

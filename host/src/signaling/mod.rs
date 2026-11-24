@@ -26,7 +26,7 @@ use webrtc::runtime::Runtime;
 use crate::capture;
 use crate::capture::{DisplayInfo, FrameSource};
 use crate::clipboard::ClipboardBackend;
-use crate::cursor::CursorSource;
+use crate::cursor::{CursorSource, PositionSource};
 use crate::curtain::Curtain;
 use crate::encode::EncoderKind;
 use crate::input::Injector;
@@ -37,6 +37,7 @@ mod client;
 mod control;
 mod display;
 mod handlers;
+mod position;
 mod session;
 mod start;
 mod stats;
@@ -143,6 +144,10 @@ pub struct HostContext {
     /// platform-backed implementation only exists behind `cfg(...)`).
     /// `main.rs` supplies either that or `cursor::NoopCursorSource`.
     pub build_cursor_source: Box<dyn Fn() -> Box<dyn CursorSource> + Send + Sync>,
+    /// Builds a fresh pointer-position source for a new session (VM-2); read
+    /// only while the session is in view mode. `main.rs`/`app.rs` supply the
+    /// real one or `cursor::NoopPositionSource`.
+    pub build_position_source: Box<dyn Fn() -> Box<dyn PositionSource> + Send + Sync>,
     /// Builds a fresh clipboard backend for a new session, the same pattern
     /// as `build_injector`/`build_cursor_source` (slice 2.5b). `None` means
     /// clipboard sync is disabled for every session (`serve --no-clipboard`);
@@ -247,6 +252,9 @@ pub(crate) fn test_ctx() -> HostContext {
         }),
         build_cursor_source: Box::new(|| {
             Box::new(crate::cursor::NoopCursorSource::new()) as Box<dyn CursorSource>
+        }),
+        build_position_source: Box::new(|| {
+            Box::new(crate::cursor::NoopPositionSource::new()) as Box<dyn PositionSource>
         }),
         build_clipboard: None,
         files_enabled: false,

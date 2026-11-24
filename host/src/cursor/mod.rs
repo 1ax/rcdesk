@@ -194,6 +194,111 @@ fn watch_loop(
     }
 }
 
+/// Something that can read the host OS's current pointer *position* (VM-2),
+/// in the global coordinates of `crate::input::CaptureRect`/`DisplayInfo` --
+/// the inverse of the injector's `to_pixel`. Called only on `watch_position`'s
+/// dedicated thread, so a slow platform call never stalls the tokio runtime.
+pub trait PositionSource: Send {
+    /// Reads the pointer position. `None` means the read failed; the caller
+    /// just skips this poll.
+    fn position(&mut self) -> Option<(i32, i32)>;
+}
+
+/// A `PositionSource` for platforms with no real backend and for synthetic
+/// runs: never reports a position.
+#[derive(Debug, Default)]
+pub struct NoopPositionSource;
+
+impl NoopPositionSource {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl PositionSource for NoopPositionSource {
+    fn position(&mut self) -> Option<(i32, i32)> {
+        None
+    }
+}
+
+/// One pointer position read by `watch_position`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PositionSample {
+    pub x: i32,
+    pub y: i32,
+    /// `true` for the first sample after polling was (re-)enabled: the
+    /// consumer must send it even if the position did not change, so a
+    /// viewer who just entered view mode gets the pointer at once.
+    pub fresh: bool,
+}
+
+/// Owns the thread started by `watch_position`; dropping it stops the thread.
+pub struct PositionWatcher {
+    /// Every reading while `enabled` is set (no dedup here: the consumer
+    /// compares *normalized* values, which also depend on the display rect).
+    pub rx: mpsc::Receiver<PositionSample>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for PositionWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Starts a dedicated thread that reads `source.position()` every `period`
+/// **only while `enabled` is set** (in control mode the platform is not
+/// touched at all) and pushes each reading to the returned watcher's `rx`.
+/// The first reading after `enabled` goes (back) up is marked `fresh`.
+///
+/// A separate thread from `watch` on purpose: the shape watcher's dedup and
+/// size filter do not fit a position stream, and on Windows each thread syncs
+/// itself to the input desktop (`platform::desktop::sync_thread`) anyway.
+pub fn watch_position(
+    source: Box<dyn PositionSource>,
+    period: Duration,
+    enabled: Arc<AtomicBool>,
+) -> PositionWatcher {
+    let (tx, rx) = mpsc::channel(2);
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let thread = thread::spawn(move || position_loop(source, period, &enabled, &tx, &thread_stop));
+    PositionWatcher {
+        rx,
+        stop,
+        thread: Some(thread),
+    }
+}
+
+fn position_loop(
+    mut source: Box<dyn PositionSource>,
+    period: Duration,
+    enabled: &AtomicBool,
+    tx: &mpsc::Sender<PositionSample>,
+    stop: &AtomicBool,
+) {
+    let mut fresh = true;
+    while !stop.load(Ordering::Relaxed) {
+        if enabled.load(Ordering::Relaxed) {
+            if let Some((x, y)) = source.position() {
+                match tx.try_send(PositionSample { x, y, fresh }) {
+                    Ok(()) => fresh = false,
+                    // Channel full: keep `fresh` for the next poll.
+                    Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Closed(_)) => return,
+                }
+            }
+        } else {
+            fresh = true;
+        }
+        thread::sleep(period);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +463,136 @@ mod tests {
         let watcher = watch(
             Box::new(FakeCursorSource::new(states)),
             Duration::from_millis(2),
+        );
+        drop(watcher); // must not hang
+    }
+
+    /// Replays fixed positions (then `None`) and counts every `position()` call.
+    struct FakePositionSource {
+        positions: VecDeque<Option<(i32, i32)>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PositionSource for FakePositionSource {
+        fn position(&mut self) -> Option<(i32, i32)> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.positions.pop_front().flatten()
+        }
+    }
+
+    fn fake_positions(
+        positions: Vec<Option<(i32, i32)>>,
+    ) -> (Box<FakePositionSource>, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            Box::new(FakePositionSource {
+                positions: positions.into(),
+                calls: Arc::clone(&calls),
+            }),
+            calls,
+        )
+    }
+
+    fn recv_positions(rx: &mut mpsc::Receiver<PositionSample>, n: usize) -> Vec<PositionSample> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut out = Vec::new();
+        while out.len() < n && Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(s) => out.push(s),
+                Err(_) => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn position_source_is_not_read_while_disabled() {
+        let (source, calls) = fake_positions(vec![Some((1, 2)); 5]);
+        let enabled = Arc::new(AtomicBool::new(false));
+        let mut watcher = watch_position(source, Duration::from_millis(2), enabled);
+
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "platform must stay untouched"
+        );
+        assert!(watcher.rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn first_position_after_enabling_is_fresh_and_later_ones_are_not() {
+        let (source, _) = fake_positions(vec![Some((1, 2)), Some((3, 4))]);
+        let enabled = Arc::new(AtomicBool::new(true));
+        let mut watcher = watch_position(source, Duration::from_millis(2), enabled);
+
+        let got = recv_positions(&mut watcher.rx, 2);
+        assert_eq!(
+            got,
+            vec![
+                PositionSample {
+                    x: 1,
+                    y: 2,
+                    fresh: true
+                },
+                PositionSample {
+                    x: 3,
+                    y: 4,
+                    fresh: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn re_enabling_marks_the_next_position_fresh_again() {
+        let (source, _) = fake_positions(vec![Some((5, 6)); 100]);
+        let enabled = Arc::new(AtomicBool::new(true));
+        let mut watcher = watch_position(source, Duration::from_millis(2), Arc::clone(&enabled));
+        assert!(recv_positions(&mut watcher.rx, 1)[0].fresh);
+
+        enabled.store(false, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(40));
+        while watcher.rx.try_recv().is_ok() {}
+        enabled.store(true, Ordering::Relaxed);
+
+        let got = recv_positions(&mut watcher.rx, 1);
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].fresh,
+            "re-entering view mode starts with a fresh sample"
+        );
+    }
+
+    #[test]
+    fn failed_position_read_is_skipped() {
+        let (source, _) = fake_positions(vec![None, Some((7, 8))]);
+        let enabled = Arc::new(AtomicBool::new(true));
+        let mut watcher = watch_position(source, Duration::from_millis(2), enabled);
+
+        let got = recv_positions(&mut watcher.rx, 1);
+        assert_eq!(
+            got,
+            vec![PositionSample {
+                x: 7,
+                y: 8,
+                fresh: true
+            }]
+        );
+    }
+
+    #[test]
+    fn noop_position_source_never_reports() {
+        assert_eq!(NoopPositionSource::new().position(), None);
+    }
+
+    #[test]
+    fn position_watcher_drop_stops_the_thread() {
+        let (source, _) = fake_positions(vec![]);
+        let watcher = watch_position(
+            source,
+            Duration::from_millis(2),
+            Arc::new(AtomicBool::new(true)),
         );
         drop(watcher); // must not hang
     }

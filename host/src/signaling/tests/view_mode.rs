@@ -258,3 +258,44 @@ async fn set_view_mode_message_toggles_the_shared_flag() {
     assert!(!active.as_ref().unwrap().view_mode.load(Ordering::Relaxed));
     active.unwrap().shutdown().await;
 }
+
+/// Источник положения, считающий обращения к платформе.
+struct CountingPosition(Arc<std::sync::atomic::AtomicUsize>);
+
+impl crate::cursor::PositionSource for CountingPosition {
+    fn position(&mut self) -> Option<(i32, i32)> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Some((10, 10))
+    }
+}
+
+/// VM-2: в режиме управления платформа не читается вообще, в просмотре --
+/// читается, а выход из просмотра снова её замолкает.
+#[tokio::test(flavor = "multi_thread")]
+async fn position_is_read_only_in_view_mode() {
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut ctx = test_ctx();
+    let counter = Arc::clone(&reads);
+    ctx.build_position_source = Box::new(move || {
+        Box::new(CountingPosition(Arc::clone(&counter))) as Box<dyn crate::cursor::PositionSource>
+    });
+    let (mut active, _out, _etx, _erx) = start_active_session(&ctx).await;
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(reads.load(Ordering::Relaxed), 0, "control mode: no reads");
+
+    set_view_mode(&ctx, &mut active, true).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(reads.load(Ordering::Relaxed) > 0, "view mode: polling");
+
+    set_view_mode(&ctx, &mut active, false).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let after_off = reads.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        after_off,
+        "stopped after exit"
+    );
+    active.shutdown().await;
+}

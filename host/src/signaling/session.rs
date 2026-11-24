@@ -346,6 +346,11 @@ pub(super) struct ActiveSession {
     /// the task (below) drops that future, which drops the watcher, which
     /// stops the thread.
     pub(super) cursor_task: tokio::task::JoinHandle<()>,
+    /// Задача положения курсора хоста (VM-2): опрашивает указатель только в
+    /// режиме просмотра и шлёт `ControlMessage::CursorPosition`. Как и
+    /// `cursor_task`, владеет своим наблюдателем (поток останавливается при
+    /// `abort`).
+    pub(super) position_task: tokio::task::JoinHandle<()>,
     /// Whether `start_session` obtained a real input injector for this
     /// session (slice 2.5a, debt D26). `false` means the session is
     /// view-only -- `build_injector` failed (e.g. missing the macOS
@@ -518,6 +523,7 @@ impl ActiveSession {
         self.peer.close().await;
         self.video.stop();
         self.cursor_task.abort();
+        self.position_task.abort();
         self.display_poll_task.abort();
         if let Some(task) = self.clipboard_task {
             task.abort();

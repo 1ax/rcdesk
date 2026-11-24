@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, watch};
 use crate::capture::{self, FrameSource};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::clipboard::ClipboardBackend;
-use crate::cursor::CursorSource;
+use crate::cursor::{CursorSource, PositionSource};
 use crate::device::DeviceStore;
 use crate::encode::EncoderKind;
 use crate::input::Injector;
@@ -189,6 +189,22 @@ pub fn build_real_cursor_source() -> Box<dyn CursorSource> {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn build_real_cursor_source() -> Box<dyn CursorSource> {
     Box::new(crate::cursor::NoopCursorSource::new())
+}
+
+/// Источник положения указателя хоста (VM-2, режим просмотра).
+#[cfg(target_os = "macos")]
+pub fn build_real_position_source() -> Box<dyn PositionSource> {
+    Box::new(crate::cursor::macos::MacPositionSource::new())
+}
+
+#[cfg(target_os = "windows")]
+pub fn build_real_position_source() -> Box<dyn PositionSource> {
+    Box::new(crate::cursor::windows::WinPositionSource::new())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn build_real_position_source() -> Box<dyn PositionSource> {
+    Box::new(crate::cursor::NoopPositionSource::new())
 }
 
 /// The real, platform-backed clipboard backend (slice 2.5b, see
@@ -392,6 +408,7 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
         display,
         build_injector,
         build_cursor_source: Box::new(build_real_cursor_source),
+        build_position_source: Box::new(build_real_position_source),
         build_clipboard,
         files_enabled: !opts.no_files,
         machine_mode: opts.data_dir.is_some(),

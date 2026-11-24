@@ -90,6 +90,14 @@ pub enum ControlMessage {
     },
     /// host -> client: the system cursor is hidden (e.g. while typing).
     CursorHidden,
+    /// host -> client, по `control` (слайс VM-2): положение курсора самого
+    /// хоста, то есть человека за ним. Шлётся только в режиме просмотра:
+    /// видео идёт без курсора, и зритель иначе не видит, куда тот водит
+    /// мышью. `x`/`y` -- доля от размера текущего транслируемого дисплея
+    /// (та же система, что у `InputMessage::PointerMove`, только в обратную
+    /// сторону), НЕ зажимается: значение вне `[0, 1]` значит, что курсор на
+    /// другом мониторе, и клиент его скрывает.
+    CursorPosition { x: f64, y: f64 },
     /// client -> host; the host echoes back `Pong` with the same `ts` so the
     /// client can compute an application-level round trip (see `app.ts`'s
     /// overlay `app N ms`).
@@ -265,6 +273,18 @@ mod tests {
             json,
             r#"{"type":"cursor_shape","width":16,"height":16,"hotspot_x":1.5,"hotspot_y":2.0,"scale":2.0,"rgba":"QUJD"}"#
         );
+
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, msg);
+    }
+
+    /// Слайс VM-2: точная форма положения курсора хоста.
+    #[test]
+    fn cursor_position_round_trips_through_json_with_exact_shape() {
+        let msg = ControlMessage::CursorPosition { x: 0.25, y: 0.5 };
+
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(json, r#"{"type":"cursor_position","x":0.25,"y":0.5}"#);
 
         let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, msg);

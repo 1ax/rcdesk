@@ -222,6 +222,7 @@ async fn start_session_survives_a_failing_injector_and_reports_view_only() {
 
     parts.video.stop();
     parts.cursor_task.abort();
+    parts.position_task.abort();
     if let Some(task) = parts.elevation_task {
         task.abort();
     }
@@ -239,6 +240,7 @@ async fn start_session_reports_input_available_with_a_working_injector() {
 
     parts.video.stop();
     parts.cursor_task.abort();
+    parts.position_task.abort();
     if let Some(task) = parts.elevation_task {
         task.abort();
     }

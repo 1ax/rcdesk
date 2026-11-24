@@ -11,15 +11,16 @@ use std::mem::size_of;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP, BITMAPINFO,
     BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorInfo, GetIconInfo, CURSORINFO, CURSOR_SHOWING, HICON, ICONINFO,
+    GetCursorInfo, GetCursorPos, GetIconInfo, CURSORINFO, CURSOR_SHOWING, HICON, ICONINFO,
 };
 
-use super::{CursorImage, CursorSource, CursorState};
+use super::{CursorImage, CursorSource, CursorState, PositionSource};
 
 /// Minimum interval between "failed to read cursor" debug logs.
 const LOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -372,5 +373,31 @@ impl WinCursorSource {
             scale: 1.0,
             rgba,
         }))
+    }
+}
+/// Положение указателя через `GetCursorPos` (VM-2). Процесс -- per-monitor
+/// DPI-aware (`platform::windows::dpi`), поэтому координаты физические, в
+/// пространстве виртуального рабочего стола -- то же, что `DisplayInfo` и
+/// инжектор (`platform::windows::mouse::move_to` нормализует по
+/// `SM_*VIRTUALSCREEN` с `MOUSEEVENTF_VIRTUALDESK`). Поток опроса -- свой,
+/// поэтому, как у формы курсора, привязывается к входному рабочему столу
+/// (D45): иначе на Winlogon/UAC `GetCursorPos` вернёт ошибку.
+#[derive(Debug, Default)]
+pub struct WinPositionSource;
+
+impl WinPositionSource {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl PositionSource for WinPositionSource {
+    fn position(&mut self) -> Option<(i32, i32)> {
+        crate::platform::desktop::sync_thread();
+        let mut pos = POINT::default();
+        // Safety: `pos` -- валидный изменяемый `POINT`, `GetCursorPos` только
+        // записывает в него и не хранит указатель после вызова.
+        unsafe { GetCursorPos(&mut pos) }.ok()?;
+        Some((pos.x, pos.y))
     }
 }

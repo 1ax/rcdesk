@@ -23,6 +23,7 @@ use crate::input::{Injector, InputRouter, NoopInjector};
 use crate::platform;
 use crate::transport::{PeerSession, SessionConfig, SessionEvent};
 
+use super::position::{PositionGate, CURSOR_POSITION_INTERVAL};
 use super::{HostContext, VideoPipeline};
 
 /// How often the cursor watcher thread polls the platform for the current
@@ -118,6 +119,8 @@ pub(super) struct SessionParts {
     pub(super) displays: Vec<DisplayInfo>,
     pub(super) router: InputRouter,
     pub(super) cursor_task: tokio::task::JoinHandle<()>,
+    /// See `ActiveSession::position_task`.
+    pub(super) position_task: tokio::task::JoinHandle<()>,
     /// See `ActiveSession::input_available`.
     pub(super) input_available: bool,
     /// See `ActiveSession::input_reason`.
@@ -147,6 +150,7 @@ impl SessionParts {
     pub(super) async fn abort(self) {
         self.video.stop();
         self.cursor_task.abort();
+        self.position_task.abort();
         if let Some(task) = self.clipboard_task {
             task.abort();
         }
@@ -424,6 +428,64 @@ pub(super) async fn start_session_with_display_wait(
             tracing::warn!("cursor watcher thread exited, cursor shape updates stop for this session");
         });
 
+        // VM-2: положение курсора хоста для зрителя в режиме просмотра. Поток
+        // опроса читает платформу только пока `view_mode` включён; задача
+        // нормализует по актуальному прямоугольнику дисплея (его обновляют
+        // `set_capture_rect` при старте и в `switch_display`) и шлёт при
+        // изменении, а первое положение после входа в просмотр -- всегда.
+        let mut position_watcher = cursor::watch_position(
+            (ctx.build_position_source)(),
+            CURSOR_POSITION_INTERVAL,
+            Arc::clone(&view_mode),
+        );
+        let position_rect = router.shared_capture_rect();
+        let position_peer = Arc::clone(&peer);
+        let position_view_mode = Arc::clone(&view_mode);
+        let position_task = tokio::spawn(async move {
+            let mut gate = PositionGate::default();
+            // Как у `cursor_task`: недоставленное (канал `control` ещё не
+            // открыт) повторяем, пока не примет или пока не кончился просмотр.
+            let mut pending: Option<ControlMessage> = None;
+            loop {
+                if let Some(msg) = &pending {
+                    if !position_view_mode.load(Ordering::Relaxed) {
+                        pending = None;
+                    } else {
+                        let result = position_peer.send_control(msg).await;
+                        if let Err(err) = &result {
+                            tracing::warn!(?err, "failed to send cursor position");
+                        }
+                        if !cursor_send_keeps_pending(&result) {
+                            pending = None;
+                        }
+                    }
+                }
+                tokio::select! {
+                    sample = position_watcher.rx.recv() => match sample {
+                        Some(sample) => {
+                            // Образец мог прийти уже после выхода из просмотра.
+                            if !position_view_mode.load(Ordering::Relaxed) {
+                                continue;
+                            }
+                            let rect = *position_rect
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if let Some((x, y)) =
+                                gate.update((sample.x, sample.y), rect, sample.fresh)
+                            {
+                                pending = Some(ControlMessage::CursorPosition { x, y });
+                            }
+                        }
+                        None => break,
+                    },
+                    _ = tokio::time::sleep(CURSOR_RETRY_INTERVAL), if pending.is_some() => {}
+                }
+            }
+            tracing::warn!(
+                "cursor position thread exited, host pointer updates stop for this session"
+            );
+        });
+
         // The `file` channel gets its own task (slice 3.4a), fed by the
         // transport's dedicated mpsc rather than `handle_session_event`. A
         // disabled or folder-less session still runs the task so the client
@@ -522,6 +584,7 @@ pub(super) async fn start_session_with_display_wait(
             // caller only closes the peer.
             video.stop();
             cursor_task.abort();
+            position_task.abort();
             if let Some(task) = clipboard_task {
                 task.abort();
             }
@@ -548,6 +611,7 @@ pub(super) async fn start_session_with_display_wait(
             displays,
             router,
             cursor_task,
+            position_task,
             input_available,
             input_reason,
             view_mode,

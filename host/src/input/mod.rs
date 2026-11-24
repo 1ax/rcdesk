@@ -392,6 +392,13 @@ impl InputRouter {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = rect;
     }
 
+    /// Общий с рабочим потоком прямоугольник транслируемого дисплея: им
+    /// пользуется и обратная операция -- нормализация положения курсора
+    /// хоста (VM-2). Читающий видит каждое `set_capture_rect`.
+    pub fn shared_capture_rect(&self) -> Arc<Mutex<CaptureRect>> {
+        Arc::clone(&self.capture_rect)
+    }
+
     /// A sender for feeding messages to the router's worker thread. Cheap to
     /// call repeatedly -- cloning an `mpsc::Sender` is cheap -- so callers
     /// aren't expected to hold onto the result.
