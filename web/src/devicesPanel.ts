@@ -14,8 +14,14 @@ import {
   deviceDot,
   deviceLabel,
   deviceStatusLabel,
+  showViewOnlyBadge,
+  showViewOnlyToggle,
   sortDevices,
   splitDevices,
+  viewOnlyAriaChecked,
+  viewOnlyMenuText,
+  VIEW_ONLY_BADGE_LABEL,
+  VIEW_ONLY_BADGE_TITLE,
 } from "./myDevices";
 import { mikrotikScript, openwrtScript } from "./routerScripts";
 import { WAKE_TIMEOUT_MS, startWake, wakeStatusFor } from "./wake";
@@ -165,6 +171,13 @@ export function createDevicesPanel(deps: DevicesPanelDeps): DevicesPanel {
       statusEl.textContent = wake.status ?? deviceStatusLabel(entry, nowSecs);
       info.appendChild(nameEl);
       info.appendChild(statusEl);
+      if (showViewOnlyBadge(entry)) {
+        const badge = document.createElement("span");
+        badge.className = "device-badge device-view-only-badge";
+        badge.textContent = VIEW_ONLY_BADGE_LABEL;
+        badge.title = VIEW_ONLY_BADGE_TITLE;
+        info.appendChild(badge);
+      }
 
       const connectRowBtn = document.createElement("button");
       connectRowBtn.className = "btn device-connect";
@@ -190,6 +203,19 @@ export function createDevicesPanel(deps: DevicesPanelDeps): DevicesPanel {
       renameBtn.textContent = "Переименовать";
       renameBtn.addEventListener("click", () => {
         renamingDeviceId = entry.device_id;
+        menuOpenId = null;
+        renderDeviceList();
+      });
+
+      const viewOnlyBtn = document.createElement("button");
+      viewOnlyBtn.className = "menu-item device-view-only";
+      viewOnlyBtn.setAttribute("role", "menuitemcheckbox");
+      viewOnlyBtn.setAttribute("aria-checked", viewOnlyAriaChecked(entry));
+      viewOnlyBtn.textContent = viewOnlyMenuText(entry);
+      viewOnlyBtn.addEventListener("click", () => {
+        // The server is the source of truth: the state flips only when the
+        // answering `devices` push arrives.
+        signaling.send({ type: "set_device_view_only", device_id: entry.device_id, on: !entry.view_only });
         menuOpenId = null;
         renderDeviceList();
       });
@@ -233,6 +259,7 @@ export function createDevicesPanel(deps: DevicesPanelDeps): DevicesPanel {
         const pop = document.createElement("div");
         pop.className = "device-menu-pop";
         pop.appendChild(renameBtn);
+        if (showViewOnlyToggle(entry)) pop.appendChild(viewOnlyBtn);
         pop.appendChild(forgetBtn);
         menu.appendChild(pop);
       }

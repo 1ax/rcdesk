@@ -119,6 +119,35 @@ export function clearOwnerToken(storage: Pick<Storage, "removeItem">): void {
   }
 }
 
+/** Menu item text for the per-device "connect in view-only mode" switch. */
+export const VIEW_ONLY_MENU_LABEL = "Подключаться в режиме просмотра";
+
+/** Row badge text, shown while the device's `view_only` flag is on. */
+export const VIEW_ONLY_BADGE_LABEL = "просмотр";
+
+/** Tooltip of the row badge. */
+export const VIEW_ONLY_BADGE_TITLE = "Подключение в режиме просмотра";
+
+/** Whether the view-only switch is offered: only for hosts (they apply it). */
+export function showViewOnlyToggle(entry: DeviceEntry): boolean {
+  return entry.kind === "host";
+}
+
+/** Whether the row shows the "просмотр" badge. */
+export function showViewOnlyBadge(entry: DeviceEntry): boolean {
+  return entry.kind === "host" && entry.view_only;
+}
+
+/** Menu item text with a check mark when the flag is on. */
+export function viewOnlyMenuText(entry: DeviceEntry): string {
+  return `${entry.view_only ? "✓ " : ""}${VIEW_ONLY_MENU_LABEL}`;
+}
+
+/** Value of `aria-checked` for the view-only menu item. */
+export function viewOnlyAriaChecked(entry: DeviceEntry): "true" | "false" {
+  return entry.view_only ? "true" : "false";
+}
+
 /** The status dot of a device row: online (green), busy (amber), offline (grey).
  * Hosts: connectable is online, online-but-busy is busy; routers: online or
  * not; manual (no rcdesk) devices are always offline. */

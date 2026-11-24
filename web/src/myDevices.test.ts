@@ -9,6 +9,10 @@ import {
   loadOwnerToken,
   ruPlural,
   saveOwnerToken,
+  showViewOnlyBadge,
+  showViewOnlyToggle,
+  viewOnlyAriaChecked,
+  viewOnlyMenuText,
   sortDevices,
   splitDevices,
 } from "./myDevices";
@@ -274,5 +278,26 @@ describe("splitDevices", () => {
     ]);
     expect(computers.map((d) => d.device_id)).toEqual(["h1", "m1"]);
     expect(wakers.map((d) => d.device_id)).toEqual(["r1", "r2"]);
+  });
+});
+
+describe("view-only toggle", () => {
+  it("is offered only for hosts", () => {
+    expect(showViewOnlyToggle(device({ kind: "host" }))).toBe(true);
+    expect(showViewOnlyToggle(device({ kind: "router" }))).toBe(false);
+    expect(showViewOnlyToggle(device({ kind: "manual" }))).toBe(false);
+  });
+
+  it("badge shows only for a host with view_only", () => {
+    expect(showViewOnlyBadge(device({ view_only: true }))).toBe(true);
+    expect(showViewOnlyBadge(device({ view_only: false }))).toBe(false);
+    expect(showViewOnlyBadge(device({ kind: "manual", view_only: true }))).toBe(false);
+  });
+
+  it("menu text and aria-checked follow the flag", () => {
+    expect(viewOnlyMenuText(device({ view_only: false }))).toBe("Подключаться в режиме просмотра");
+    expect(viewOnlyMenuText(device({ view_only: true }))).toBe("✓ Подключаться в режиме просмотра");
+    expect(viewOnlyAriaChecked(device({ view_only: false }))).toBe("false");
+    expect(viewOnlyAriaChecked(device({ view_only: true }))).toBe("true");
   });
 });
