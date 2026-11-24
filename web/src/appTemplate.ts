@@ -128,7 +128,7 @@ export function appTemplate(params: { downloadBlock: string }): string {
             <input type="checkbox" id="stats-checkbox" />
             Статистика
           </label>
-          <label class="stats-toggle bar-secondary" title="Синхронизировать буфер обмена с хостом в обе стороны">
+          <label id="clipboard-sync-label" class="stats-toggle bar-secondary" title="Синхронизировать буфер обмена с хостом в обе стороны">
             <input type="checkbox" id="clipboard-sync-checkbox" />
             Буфер обмена
           </label>
@@ -163,6 +163,7 @@ export function appTemplate(params: { downloadBlock: string }): string {
           </label>
           <span id="view-only" class="status view-only" hidden></span>
           <span id="input-blocked" class="status input-blocked" hidden></span>
+          <span id="view-mode-badge" class="status view-mode-badge" hidden></span>
           <span id="host-outdated" class="status host-outdated" hidden>
             <span id="host-outdated-text"></span>
             <button id="host-update-btn" class="btn btn-secondary bar-secondary" hidden>Обновить хост</button>
@@ -171,6 +172,7 @@ export function appTemplate(params: { downloadBlock: string }): string {
           <span id="clipboard-note" class="status clipboard-note" role="status" aria-live="polite" hidden></span>
           <span id="fullscreen-note" class="status fullscreen-note" hidden></span>
           <span id="session-status" class="status" role="status" aria-live="polite"></span>
+          <button id="view-mode-btn" class="btn btn-secondary bar-secondary" hidden></button>
           <button
             id="curtain-btn"
             class="btn btn-secondary curtain-btn bar-secondary"
@@ -225,6 +227,7 @@ export function appTemplate(params: { downloadBlock: string }): string {
         <div class="zoom-layer" id="zoom-layer">
           <video id="video" autoplay playsinline muted aria-label="Экран удалённого компьютера"></video>
           <img id="touch-cursor" class="touch-cursor" alt="" hidden />
+          <img id="host-cursor" class="host-cursor" alt="" hidden />
         </div>
         <div class="connection-banner" id="connection-banner" role="alert" hidden></div>
         <div class="file-drop-hint" id="file-drop-hint" hidden>Отпустите, чтобы отправить на хост</div>

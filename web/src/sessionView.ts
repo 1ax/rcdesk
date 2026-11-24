@@ -7,6 +7,7 @@
  * only through `SessionViewDeps` and the returned `SessionView`.
  */
 import { unmapPointer } from "./input";
+import { hostCursorPlacement } from "./viewMode";
 import {
   KEYBOARD_ZOOM,
   anchorOf,
@@ -48,6 +49,10 @@ export interface SessionViewDeps {
 export interface SessionView {
   /** The `#touch-cursor` overlay (`applyCursor` sets its image). */
   touchCursorEl: HTMLImageElement;
+  /** The `#host-cursor` overlay (view-only mode: the host's own cursor). */
+  hostCursorEl: HTMLImageElement;
+  /** Host cursor position as video-frame fractions, or `null` (hide it). */
+  onHostPosition: (pos: { x: number; y: number } | null) => void;
   /** Virtual-cursor position from the touch input, or `null` (hide it). */
   onTouchCursor: (
     pos: { clientX: number; clientY: number; x: number; y: number } | null,
@@ -81,10 +86,13 @@ export function createSessionView(deps: SessionViewDeps): SessionView {
   const barCollapseBtn = root.querySelector<HTMLButtonElement>("#bar-collapse-btn")!;
   const fullscreenNoteEl = root.querySelector<HTMLSpanElement>("#fullscreen-note")!;
   const touchCursorEl = root.querySelector<HTMLImageElement>("#touch-cursor")!;
+  const hostCursorEl = root.querySelector<HTMLImageElement>("#host-cursor")!;
   const sessionVideoEl = root.querySelector<HTMLDivElement>(".session-video")!;
   const zoomLayer = root.querySelector<HTMLDivElement>("#zoom-layer")!;
 
   let zoom: Zoom = identityZoom();
+  // VM-3: last host cursor position (frame fractions); `null` -- hidden.
+  let hostCursorPos: { x: number; y: number } | null = null;
   // H5-18: frame point at the container centre, to keep it when the container resizes.
   let viewAnchor: ViewAnchor | null = null;
   // Slice H5-2: last virtual-cursor frame position and the zoom to restore
@@ -116,6 +124,7 @@ export function createSessionView(deps: SessionViewDeps): SessionView {
       video.videoHeight,
     );
     placeTouchCursor();
+    placeHostCursor();
   }
   // H5-18: the container changed size (keyboard, bar, rotation) -- keep the
   // frame point that was at the centre there, instead of re-clamping the
@@ -147,6 +156,27 @@ export function createSessionView(deps: SessionViewDeps): SessionView {
     const s = zoom.scale;
     touchCursorEl.style.transform = `translate(${p.clientX - hx / s}px, ${p.clientY - hy / s}px) scale(${1 / s})`;
   }
+  // VM-3: same placement as the touch cursor, for the host cursor overlay;
+  // hidden while there is no valid position or no image yet.
+  function placeHostCursor(): void {
+    const p = hostCursorPlacement(
+      hostCursorPos,
+      { left: 0, top: 0, width: sessionVideoEl.clientWidth, height: sessionVideoEl.clientHeight },
+      video.videoWidth,
+      video.videoHeight,
+    );
+    if (!p || !hostCursorEl.getAttribute("src")) {
+      hostCursorEl.hidden = true;
+      return;
+    }
+    hostCursorEl.hidden = false;
+    const hx = Number(hostCursorEl.dataset.hx ?? 0) || 0;
+    const hy = Number(hostCursorEl.dataset.hy ?? 0) || 0;
+    const s = zoom.scale;
+    hostCursorEl.style.transform = `translate(${p.clientX - hx / s}px, ${p.clientY - hy / s}px) scale(${1 / s})`;
+  }
+  // The cursor image is encoded asynchronously: place it once it has loaded.
+  hostCursorEl.addEventListener("load", placeHostCursor);
   window.addEventListener("resize", () => {
     refitZoom();
     placeTouchCursor();
@@ -227,6 +257,11 @@ export function createSessionView(deps: SessionViewDeps): SessionView {
 
   return {
     touchCursorEl,
+    hostCursorEl,
+    onHostPosition: (pos) => {
+      hostCursorPos = pos;
+      placeHostCursor();
+    },
     onTouchCursor: (pos) => {
       if (!pos) {
         touchCursorWanted = false;
@@ -268,6 +303,7 @@ export function createSessionView(deps: SessionViewDeps): SessionView {
       applyZoom(panBy(zoom, dx, dy, sessionVideoEl.clientWidth, sessionVideoEl.clientHeight));
     },
     onHostCursor: () => {
+      placeHostCursor();
       // H5-10: the overlay stayed hidden while it had no image; show it now.
       if (touchCursorWanted && touchCursorEl.getAttribute("src")) {
         touchCursorEl.hidden = false;
@@ -347,6 +383,13 @@ export function createSessionView(deps: SessionViewDeps): SessionView {
       touchCursorEl.style.width = "";
       touchCursorEl.style.height = "";
       touchCursorWanted = false;
+      hostCursorPos = null;
+      hostCursorEl.hidden = true;
+      hostCursorEl.removeAttribute("src");
+      hostCursorEl.style.visibility = "";
+      hostCursorEl.style.transform = "";
+      hostCursorEl.style.width = "";
+      hostCursorEl.style.height = "";
       zoomBeforeKeyboard = null;
       barAutoCollapsed = false;
       lastTouchCursor = null;

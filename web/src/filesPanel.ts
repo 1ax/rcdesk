@@ -38,6 +38,8 @@ export interface FilesPanelDeps {
   maxMessageSize: () => number | undefined;
   /** Files on the host clipboard replaced the last synced text. */
   forgetClipboardText: () => void;
+  /** View-only mode is on (VM-3): no uploads, drag&drop included. */
+  isViewMode: () => boolean;
 }
 
 export interface FilesPanel {
@@ -271,12 +273,13 @@ export function createFilesPanel(deps: FilesPanelDeps): FilesPanel {
     if (!dragHasFiles(e.dataTransfer)) return;
     e.preventDefault();
     fileDragDepth += 1;
-    if (filesAvailable()) fileDropHint.hidden = false;
+    if (filesAvailable() && !deps.isViewMode()) fileDropHint.hidden = false;
   });
   sessionVideoEl.addEventListener("dragover", (e) => {
     if (!dragHasFiles(e.dataTransfer)) return;
     e.preventDefault();
-    if (e.dataTransfer) e.dataTransfer.dropEffect = filesAvailable() ? "copy" : "none";
+    if (e.dataTransfer) e.dataTransfer.dropEffect =
+        filesAvailable() && !deps.isViewMode() ? "copy" : "none";
   });
   sessionVideoEl.addEventListener("dragleave", (e) => {
     if (!dragHasFiles(e.dataTransfer)) return;
@@ -287,7 +290,7 @@ export function createFilesPanel(deps: FilesPanelDeps): FilesPanel {
     if (!dragHasFiles(e.dataTransfer)) return;
     e.preventDefault();
     hideFileDropHint();
-    if (!filesAvailable() || !e.dataTransfer) return;
+    if (!filesAvailable() || deps.isViewMode() || !e.dataTransfer) return;
     const { files, folders } = pickDroppedFiles(e.dataTransfer);
     submitFiles(files);
     void submitDroppedFolders(folders);

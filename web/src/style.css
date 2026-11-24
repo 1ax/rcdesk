@@ -750,7 +750,8 @@ details.add-menu[hidden] {
 
 /* Slice H1: virtual cursor drawn over the video in touch "trackpad" mode
    (a sensor has no hover, so the CSS cursor is invisible). */
-.touch-cursor {
+.touch-cursor,
+.host-cursor {
   transform-origin: 0 0;
   position: absolute;
   left: 0;
@@ -980,6 +981,39 @@ details.add-menu[hidden] {
 .input-blocked {
   color: var(--danger);
   text-transform: none;
+}
+
+/* Слайс VM-3: режим просмотра. Всё, что действует на хосте, скрыто (хост это
+   и так не выполнит); локальное (дисплей, качество, полный экран, отключение,
+   статистика) остаётся. Свой курсор зрителя над видео -- обычная стрелка. */
+.view-mode-badge {
+  color: var(--danger);
+  text-transform: none;
+}
+
+.session-screen.view-mode #file-fetch-btn,
+.session-screen.view-mode #file-send-btn,
+.session-screen.view-mode #folder-send-btn,
+.session-screen.view-mode #file-status,
+.session-screen.view-mode #download-status,
+.session-screen.view-mode #file-drop-hint,
+.session-screen.view-mode #clipboard-sync-label,
+.session-screen.view-mode #clipboard-push-btn,
+.session-screen.view-mode #curtain-btn,
+.session-screen.view-mode #curtain-status,
+.session-screen.view-mode #layout-btn,
+.session-screen.view-mode #ctrl-alt-del-btn,
+.session-screen.view-mode #host-update-btn,
+.session-screen.view-mode #cmd-as-ctrl-label,
+.session-screen.view-mode #keyboard-btn,
+.session-screen.view-mode #touch-mode-btn,
+.session-screen.view-mode #soft-keys,
+.session-screen.view-mode #soft-input {
+  display: none !important;
+}
+
+.session-screen.view-mode video {
+  cursor: default !important;
 }
 
 /* Слайс D50a: хост старее клиента. */

@@ -46,6 +46,12 @@ import { mountSoftKeyboard } from "./softKeyboardUi";
 import type { SoftKeyboardController } from "./softKeyboardUi";
 import { viewOnlyLabel } from "./inputStatus";
 import {
+  attachViewTouch,
+  inputAttachAllowed,
+  viewModeBadgeText,
+  viewModeButtonView,
+} from "./viewMode";
+import {
   type CurtainState,
   curtainOnClick,
   curtainOnHostInfo,
@@ -376,6 +382,8 @@ export function mount(root: Element | null): void {
   cmdAsCtrlCheckbox.checked = cmdAsCtrl;
   const viewOnlyEl = root.querySelector<HTMLSpanElement>("#view-only")!;
   const inputBlockedEl = root.querySelector<HTMLSpanElement>("#input-blocked")!;
+  const viewModeBadgeEl = root.querySelector<HTMLSpanElement>("#view-mode-badge")!;
+  const viewModeBtn = root.querySelector<HTMLButtonElement>("#view-mode-btn")!;
   const hostOutdatedEl = root.querySelector<HTMLSpanElement>("#host-outdated")!;
   const hostOutdatedTextEl = root.querySelector<HTMLSpanElement>("#host-outdated-text")!;
   const hostUpdateBtn = root.querySelector<HTMLButtonElement>("#host-update-btn")!;
@@ -472,6 +480,48 @@ export function mount(root: Element | null): void {
     curtain = state;
     renderCurtain();
   });
+  // Slice VM-3: view-only mode. The host is the source of truth: `viewMode`
+  // changes only on its `view_mode` message, a click just asks for the
+  // opposite (`viewModeAvailable` is `host_info.view_mode_available`).
+  let viewMode = false;
+  let viewModeAvailable = false;
+  let detachViewTouch: (() => void) | null = null;
+  function renderViewMode(): void {
+    const b = viewModeButtonView(viewMode, viewModeAvailable);
+    viewModeBtn.hidden = b.hidden;
+    viewModeBtn.textContent = b.text;
+    viewModeBtn.title = b.title;
+    viewModeBtn.setAttribute("aria-label", b.title);
+    const badge = viewModeBadgeText(viewMode);
+    viewModeBadgeEl.textContent = badge ?? "";
+    viewModeBadgeEl.hidden = badge === null;
+    sessionScreen.classList.toggle("view-mode", viewMode);
+  }
+  function applyViewMode(on: boolean): void {
+    viewMode = on;
+    renderViewMode();
+    if (on) {
+      detachInput?.();
+      detachInput = null;
+      softKeyboard.hide();
+      detachViewTouch?.();
+      detachViewTouch = attachViewTouch(video, {
+        onPinch: (factor, cx, cy) => sessionView.onPinch(factor, cx, cy),
+        onPan: (dx, dy) => sessionView.onPan(dx, dy),
+      });
+    } else {
+      detachViewTouch?.();
+      detachViewTouch = null;
+      sessionView.onHostPosition(null);
+      maybeAttachInput();
+    }
+  }
+  viewModeBtn.addEventListener("click", () => {
+    const dc = controlChannel;
+    if (!dc || dc.readyState !== "open") return;
+    const msg: ControlMessage = { type: "set_view_mode", on: !viewMode };
+    dc.send(JSON.stringify(msg));
+  });
   // Slice 4.6d: remote keyboard layout indicator/switch (macOS host only).
   const layoutBtn = root.querySelector<HTMLButtonElement>("#layout-btn")!;
   const LAYOUT_DEFAULT_LABEL = "Яз";
@@ -526,7 +576,8 @@ export function mount(root: Element | null): void {
     root,
     initialSyncEnabled: initialStorage ? loadClipboardSyncSetting(initialStorage) : false,
     isSoftKeyboardOpen: () => softKeyboard.isOpen(),
-    getInputChannel: () => inputChannel,
+    // VM-3: in view-only mode nothing goes to the host's clipboard.
+    getInputChannel: () => (viewMode ? null : inputChannel),
     isSessionActive: () => session !== null,
     saveSyncSetting: (enabled) => {
       const storage = ownerStorage();
@@ -695,6 +746,7 @@ export function mount(root: Element | null): void {
     showClipboardNote: clipboardUi.showNote,
     maxMessageSize: () => session?.maxMessageSize(),
     forgetClipboardText: () => clipboardUi.forgetLastText(),
+    isViewMode: () => viewMode,
   });
 
   signaling.on("email_code_sent", () => accountPanel.onEmailCodeSent());
@@ -770,7 +822,7 @@ export function mount(root: Element | null): void {
   // host happened to open them in, independent of the connection state
   // reaching "connected" -- attach as soon as both are in hand.
   function maybeAttachInput(): void {
-    if (detachInput || inputBlocked || !inputChannel || !pointerChannel) return;
+    if (detachInput || !inputAttachAllowed({ inputBlocked, viewMode }) || !inputChannel || !pointerChannel) return;
     detachInput = attachInput(
       video,
       { input: inputChannel, pointer: pointerChannel },
@@ -924,6 +976,8 @@ export function mount(root: Element | null): void {
         renderLayoutBtn(null);
         ctrlAltDelAvailable = msg.ctrl_alt_del_available === true;
         renderCtrlAltDelBtn();
+        viewModeAvailable = msg.view_mode_available === true;
+        renderViewMode();
         // Слайс D50a: плашка, если хост старее клиента.
         const outdated = hostOutdatedLabel(msg.version, __APP_VERSION__);
         hostOutdatedTextEl.textContent = outdated ?? "";
@@ -951,6 +1005,14 @@ export function mount(root: Element | null): void {
       if (msg.type === "curtain_status") {
         curtain = curtainOnStatus(curtain, msg);
         renderCurtain();
+        return;
+      }
+      if (msg.type === "view_mode") {
+        applyViewMode(msg.on);
+        return;
+      }
+      if (msg.type === "cursor_position") {
+        if (viewMode) sessionView.onHostPosition({ x: msg.x, y: msg.y });
         return;
       }
       if (msg.type === "input_status") {
@@ -985,6 +1047,7 @@ export function mount(root: Element | null): void {
         return;
       }
       applyCursor(video, msg, sessionView.touchCursorEl);
+      applyCursor(video, msg, sessionView.hostCursorEl);
       sessionView.onHostCursor();
     });
   }
@@ -1127,6 +1190,11 @@ export function mount(root: Element | null): void {
     renderLayoutBtn(null);
     ctrlAltDelAvailable = false;
     renderCtrlAltDelBtn();
+    viewMode = false;
+    viewModeAvailable = false;
+    detachViewTouch?.();
+    detachViewTouch = null;
+    renderViewMode();
     // A throw in one external call must not skip the rest (a dead channel
     // after Chrome sleep would otherwise leave `session`/`video` alive).
     filesPanel.resetSession();
