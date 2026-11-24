@@ -427,7 +427,9 @@ async fn client_join_succeeds_and_host_is_notified() {
         SignalMessage::PeerJoined {
             session_id,
             ice_servers,
+            view_only,
         } => {
+            assert!(!view_only, "анонимный PIN: флаг пары не применяется");
             assert_eq!(session_id, session_id_client);
             assert!(!ice_servers.is_empty());
             assert_eq!(ice_servers, joined_ice_servers);
@@ -5151,4 +5153,196 @@ async fn pin_join_with_other_name_keeps_device() {
         recv(&mut host_b).await,
         SignalMessage::PeerJoined { .. }
     ));
+}
+
+// ---------------------------------------------------------------------
+// VM-5: личная настройка «подключаться в режиме просмотра»
+// ---------------------------------------------------------------------
+
+async fn set_view_only(ws: &mut WsStream, device_id: &str, on: bool) {
+    send(
+        ws,
+        &SignalMessage::SetDeviceViewOnly {
+            device_id: device_id.to_string(),
+            on,
+        },
+    )
+    .await;
+}
+
+/// `ConnectDevice` владельца `owner`; возвращает `view_only` из `PeerJoined`
+/// хоста и завершает сеанс.
+async fn connect_device_view_only(owner: &mut WsStream, host: &mut WsStream, id: &str) -> bool {
+    send(
+        owner,
+        &SignalMessage::ConnectDevice {
+            device_id: id.to_string(),
+        },
+    )
+    .await;
+    // Пуши `Devices` от сеансов другого владельца могли прийти раньше.
+    let session_id = loop {
+        match recv(owner).await {
+            SignalMessage::Joined { session_id, .. } => break session_id,
+            SignalMessage::Devices { .. } => {}
+            other => panic!("expected joined, got {other:?}"),
+        }
+    };
+    let view_only = match recv(host).await {
+        SignalMessage::PeerJoined { view_only, .. } => view_only,
+        other => panic!("expected peer_joined, got {other:?}"),
+    };
+    send(
+        owner,
+        &SignalMessage::Bye {
+            session_id,
+            reason: None,
+        },
+    )
+    .await;
+    assert!(matches!(recv(host).await, SignalMessage::Bye { .. }));
+    // Пуши `Devices` (busy/idle) владельцу до конца сеанса не нужны.
+    let _ = wait_devices(owner, |d| d.iter().any(|e| e.online && !e.busy)).await;
+    view_only
+}
+
+#[tokio::test]
+async fn set_device_view_only_is_reflected_in_devices_and_connect_carries_it() {
+    let url = spawn_server().await;
+    let (mut host, host_id, _creds, mut owner, _token) = host_linked_to_connected_owner(&url).await;
+
+    set_view_only(&mut owner, &host_id, true).await;
+    let devices = recv_devices(&mut owner).await;
+    assert!(devices[0].view_only);
+
+    assert!(connect_device_view_only(&mut owner, &mut host, &host_id).await);
+
+    set_view_only(&mut owner, &host_id, false).await;
+    let devices = recv_devices(&mut owner).await;
+    assert!(!devices[0].view_only);
+    assert!(!connect_device_view_only(&mut owner, &mut host, &host_id).await);
+}
+
+#[tokio::test]
+async fn set_device_view_only_rejects_foreign_unknown_and_anonymous() {
+    let url = spawn_server().await;
+    let (_host, host_id, _creds, mut owner, _token) = host_linked_to_connected_owner(&url).await;
+
+    let mut stranger = connect(&url).await;
+    hello(&mut stranger, Role::Client).await;
+    client_auth_owner(&mut stranger, None).await;
+    set_view_only(&mut stranger, &host_id, true).await;
+    expect_error(&mut stranger, "device not linked").await;
+    set_view_only(&mut stranger, "no-such-device", true).await;
+    expect_error(&mut stranger, "device not linked").await;
+
+    // Флаг настоящего владельца не изменился.
+    send(&mut owner, &SignalMessage::ListDevices).await;
+    let devices = recv_devices(&mut owner).await;
+    assert!(!devices[0].view_only);
+
+    let mut anonymous = connect(&url).await;
+    hello(&mut anonymous, Role::Client).await;
+    client_auth(&mut anonymous, None).await;
+    set_view_only(&mut anonymous, &host_id, true).await;
+    expect_error(&mut anonymous, "not authenticated").await;
+}
+
+#[tokio::test]
+async fn view_only_flag_of_one_owner_does_not_affect_another() {
+    let (url, db) = spawn_server_with_db().await;
+    let (mut host, host_id, _creds, mut owner_a, _token) =
+        host_linked_to_connected_owner(&url).await;
+    db.insert_owner("other", 1).expect("owner");
+    db.link_device("other", &host_id, 1).expect("link");
+    db.insert_token(
+        "other",
+        "other-token-id",
+        &rcdesk_server::devices::hash_secret("other-secret"),
+        "B",
+        1,
+    )
+    .expect("token");
+    let mut owner_b = connect(&url).await;
+    hello(&mut owner_b, Role::Client).await;
+    client_auth_owner(&mut owner_b, Some("other-secret".to_string())).await;
+
+    set_view_only(&mut owner_a, &host_id, true).await;
+    assert!(recv_devices(&mut owner_a).await[0].view_only);
+
+    send(&mut owner_b, &SignalMessage::ListDevices).await;
+    assert!(!recv_devices(&mut owner_b).await[0].view_only);
+    assert!(!connect_device_view_only(&mut owner_b, &mut host, &host_id).await);
+    assert!(connect_device_view_only(&mut owner_a, &mut host, &host_id).await);
+}
+
+#[tokio::test]
+async fn pin_join_carries_flag_only_for_an_existing_link() {
+    let (url, db) = spawn_server_with_db().await;
+    let mut host = connect(&url).await;
+    hello(&mut host, Role::Host).await;
+    send(
+        &mut host,
+        &SignalMessage::HostRegister {
+            name: "Test Host".to_string(),
+            device: None,
+            session_id: None,
+            pin_rotation: false,
+            ifaces: Vec::new(),
+            os: None,
+        },
+    )
+    .await;
+    let (host_id, pin) = match recv(&mut host).await {
+        SignalMessage::Registered { host_id, pin, .. } => (host_id, pin),
+        other => panic!("expected registered, got {other:?}"),
+    };
+    db.insert_owner("o1", 1).expect("owner");
+    db.link_device("o1", &host_id, 1).expect("link");
+    assert!(db.set_view_only("o1", &host_id, true).expect("flag"));
+    db.insert_token(
+        "o1",
+        "o1-token-id",
+        &rcdesk_server::devices::hash_secret("o1-secret"),
+        "B",
+        1,
+    )
+    .expect("token");
+
+    // Залогиненный владелец со связью: флаг пары доходит до хоста.
+    let mut owner = connect(&url).await;
+    hello(&mut owner, Role::Client).await;
+    client_auth_owner(&mut owner, Some("o1-secret".to_string())).await;
+    send(&mut owner, &SignalMessage::Join { pin: pin.clone() }).await;
+    let session_id = match recv(&mut owner).await {
+        SignalMessage::Joined { session_id, .. } => session_id,
+        other => panic!("expected joined, got {other:?}"),
+    };
+    match recv(&mut host).await {
+        SignalMessage::PeerJoined { view_only, .. } => assert!(view_only),
+        other => panic!("expected peer_joined, got {other:?}"),
+    }
+    send(
+        &mut owner,
+        &SignalMessage::Bye {
+            session_id,
+            reason: None,
+        },
+    )
+    .await;
+    assert!(matches!(recv(&mut host).await, SignalMessage::Bye { .. }));
+
+    // Новый владелец без связи (первая привязка по PIN): флаг `false`.
+    let mut fresh = connect(&url).await;
+    hello(&mut fresh, Role::Client).await;
+    client_auth_owner(&mut fresh, None).await;
+    send(&mut fresh, &SignalMessage::Join { pin }).await;
+    match recv(&mut fresh).await {
+        SignalMessage::Joined { .. } => {}
+        other => panic!("expected joined, got {other:?}"),
+    }
+    match recv(&mut host).await {
+        SignalMessage::PeerJoined { view_only, .. } => assert!(!view_only),
+        other => panic!("expected peer_joined, got {other:?}"),
+    }
 }

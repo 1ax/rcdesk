@@ -21,7 +21,7 @@ use rusqlite::{Connection, OptionalExtension};
 /// Schema version this binary expects (`PRAGMA user_version`). Bump this
 /// and extend `migrate` when the schema changes; `migrate` itself must stay
 /// idempotent (safe to run against an already-migrated database).
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Сколько секунд владелец без устройств и passkey может не появляться,
 /// прежде чем `prune_empty_owners` его удалит (долг D53).
@@ -64,6 +64,8 @@ pub struct OwnedDevice {
     pub last_seen_at: i64,
     /// D92: ОС хоста (`"macos"|"windows"|"other"`), `None` — неизвестна.
     pub host_os: Option<String>,
+    /// VM-5: личный флаг «режим просмотра» пары (владелец, устройство).
+    pub view_only: bool,
 }
 
 /// Строка `wake_devices` (D84/D85): ручное устройство или роутер-будильник.
@@ -915,8 +917,8 @@ impl Db {
             return Ok(false);
         }
         tx.execute(
-            "INSERT OR IGNORE INTO ownership (owner_id, device_id, alias, added_at)
-             SELECT ?2, device_id, alias, added_at FROM ownership WHERE owner_id = ?1",
+            "INSERT OR IGNORE INTO ownership (owner_id, device_id, alias, added_at, view_only)
+             SELECT ?2, device_id, alias, added_at, view_only FROM ownership WHERE owner_id = ?1",
             (from, to),
         )?;
         tx.execute("DELETE FROM ownership WHERE owner_id = ?1", [from])?;
@@ -1125,6 +1127,30 @@ impl Db {
         Ok(changed > 0)
     }
 
+    /// VM-5: ставит личный флаг «режим просмотра» пары (владелец, устройство).
+    /// Returns `false` if no such link exists.
+    pub fn set_view_only(&self, owner_id: &str, device_id: &str, on: bool) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE ownership SET view_only = ?1 WHERE owner_id = ?2 AND device_id = ?3",
+            (on, owner_id, device_id),
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// VM-5: флаг «режим просмотра» пары; `false`, если связи нет.
+    pub fn view_only(&self, owner_id: &str, device_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let flag: Option<bool> = conn
+            .query_row(
+                "SELECT view_only FROM ownership WHERE owner_id = ?1 AND device_id = ?2",
+                (owner_id, device_id),
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(flag.unwrap_or(false))
+    }
+
     /// D84: добавляет «ручное» устройство Wake-on-LAN (kind `manual`, без
     /// токена). Роутеры (`router`) заводит D85.
     #[allow(clippy::too_many_arguments)]
@@ -1261,7 +1287,7 @@ impl Db {
     pub fn devices_for_owner(&self, owner_id: &str) -> anyhow::Result<Vec<OwnedDevice>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT d.device_id, d.name, o.alias, o.added_at, d.last_seen_at, d.host_os
+            "SELECT d.device_id, d.name, o.alias, o.added_at, d.last_seen_at, d.host_os, o.view_only
              FROM ownership o
              JOIN devices d ON d.device_id = o.device_id
              WHERE o.owner_id = ?1
@@ -1276,6 +1302,7 @@ impl Db {
                     added_at: row.get(3)?,
                     last_seen_at: row.get(4)?,
                     host_os: row.get(5)?,
+                    view_only: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1300,8 +1327,8 @@ fn configure(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Полная схема v8.
-const SCHEMA_V8: &str = "CREATE TABLE IF NOT EXISTS devices (
+/// Полная схема v9.
+const SCHEMA_V9: &str = "CREATE TABLE IF NOT EXISTS devices (
             device_id    TEXT PRIMARY KEY,
             secret_hash  TEXT NOT NULL,
             name         TEXT NOT NULL,
@@ -1331,6 +1358,7 @@ const SCHEMA_V8: &str = "CREATE TABLE IF NOT EXISTS devices (
             device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
             alias     TEXT,
             added_at  INTEGER NOT NULL,
+            view_only INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (owner_id, device_id)
          );
          CREATE TABLE IF NOT EXISTS passkeys (
@@ -1386,14 +1414,15 @@ const SCHEMA_V8: &str = "CREATE TABLE IF NOT EXISTS devices (
          );
          CREATE INDEX IF NOT EXISTS wake_devices_owner_id ON wake_devices(owner_id);";
 
-/// Приводит базу к `SCHEMA_VERSION`: версия 0 — сразу полная схема v8,
+/// Приводит базу к `SCHEMA_VERSION`: версия 0 — сразу полная схема v9,
 /// версия 1 — цепочка v1 -> v2 (токен из `owners` переезжает в
 /// `owner_tokens`) -> v3 -> v4, версия 2 — v2 -> v3 (passkey) -> v4,
 /// версия 3 — v3 -> v4 (учётные записи «почта + пароль»), версия 4 —
 /// v4 -> v5 (журнал сеансов), версия 5 — v5 -> v6 (сетевые карты
 /// устройств для Wake-on-LAN), версия 6 — v6 -> v7 (ручные устройства и
 /// роутеры-будильники, `wake_devices`), версия 7 — v7 -> v8 (D92,
-/// `devices.host_os`). Идемпотентна: на актуальной базе — no-op.
+/// `devices.host_os`), версия 8 — v8 -> v9 (VM-5,
+/// `ownership.view_only`). Идемпотентна: на актуальной базе — no-op.
 fn migrate(conn: &Connection) -> anyhow::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
@@ -1406,7 +1435,7 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
     }
 
     if version == 0 {
-        conn.execute_batch(SCHEMA_V8)?;
+        conn.execute_batch(SCHEMA_V9)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         return Ok(());
     }
@@ -1429,7 +1458,20 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
     if version <= 6 {
         migrate_v6_to_v7(conn)?;
     }
-    migrate_v7_to_v8(conn)
+    if version <= 7 {
+        migrate_v7_to_v8(conn)?;
+    }
+    migrate_v8_to_v9(conn)
+}
+
+/// v8 -> v9 (VM-5): `ownership.view_only` -- личная настройка «подключаться
+/// в режиме просмотра» для пары (владелец, устройство). Одна транзакция.
+fn migrate_v8_to_v9(conn: &Connection) -> anyhow::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("ALTER TABLE ownership ADD COLUMN view_only INTEGER NOT NULL DEFAULT 0;")?;
+    tx.pragma_update(None, "user_version", 9)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// v7 -> v8 (D92): `devices.host_os` -- ОС хоста из его регистрации.
@@ -1817,13 +1859,13 @@ mod tests {
     }
 
     #[test]
-    fn fresh_db_has_user_version_eight() {
+    fn fresh_db_has_user_version_nine() {
         let db = Db::in_memory().expect("open in-memory db");
         let conn = db.conn.lock().expect("db mutex poisoned");
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read user_version");
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
@@ -1984,7 +2026,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         let fk: i64 = conn
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .expect("fk");
@@ -2067,7 +2109,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -2127,7 +2169,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -2189,7 +2231,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -2222,6 +2264,10 @@ mod tests {
                 created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
                 host_version TEXT);
              INSERT INTO devices VALUES ('dev1', 'sh', 'My Mac', 10, 20, NULL);
+             CREATE TABLE ownership (
+                owner_id TEXT NOT NULL, device_id TEXT NOT NULL,
+                alias TEXT, added_at INTEGER NOT NULL,
+                PRIMARY KEY (owner_id, device_id));
              PRAGMA user_version = 5;",
         )
         .expect("build v5 database");
@@ -2231,7 +2277,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -2264,6 +2310,10 @@ mod tests {
                 device_id TEXT PRIMARY KEY, secret_hash TEXT NOT NULL,
                 name TEXT NOT NULL, created_at INTEGER NOT NULL,
                 last_seen_at INTEGER NOT NULL, host_version TEXT);
+             CREATE TABLE ownership (
+                owner_id TEXT NOT NULL, device_id TEXT NOT NULL,
+                alias TEXT, added_at INTEGER NOT NULL,
+                PRIMARY KEY (owner_id, device_id));
              PRAGMA user_version = 6;",
         )
         .expect("build v6 database");
@@ -2273,7 +2323,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -2676,17 +2726,21 @@ mod tests {
                 device_id TEXT PRIMARY KEY, secret_hash TEXT NOT NULL,
                 name TEXT NOT NULL, created_at INTEGER NOT NULL,
                 last_seen_at INTEGER NOT NULL, host_version TEXT);
+             CREATE TABLE ownership (
+                owner_id TEXT NOT NULL, device_id TEXT NOT NULL,
+                alias TEXT, added_at INTEGER NOT NULL,
+                PRIMARY KEY (owner_id, device_id));
              INSERT INTO devices VALUES ('dev1', 'h', 'PC', 1, 1, NULL);
              PRAGMA user_version = 7;",
         )
         .expect("build v7 database");
 
-        migrate(&conn).expect("migrate v7 -> v8");
+        migrate(&conn).expect("migrate v7 -> v9");
         migrate(&conn).expect("re-run migration is a no-op");
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
 
         let db = Db {
             conn: Arc::new(Mutex::new(conn)),
@@ -2694,6 +2748,53 @@ mod tests {
         assert_eq!(db.host_os("dev1").expect("get"), None);
         assert!(db.set_host_os("dev1", "macos").expect("set"));
         assert_eq!(db.host_os("dev1").expect("get").as_deref(), Some("macos"));
+    }
+
+    #[test]
+    fn migration_v8_to_v9_adds_view_only_default_false() {
+        let conn = Connection::open_in_memory().expect("open");
+        conn.pragma_update(None, "foreign_keys", true).expect("fk");
+        conn.execute_batch(
+            "CREATE TABLE ownership (
+                owner_id TEXT NOT NULL, device_id TEXT NOT NULL,
+                alias TEXT, added_at INTEGER NOT NULL,
+                PRIMARY KEY (owner_id, device_id));
+             INSERT INTO ownership VALUES ('o1', 'dev1', 'Work', 5);
+             PRAGMA user_version = 8;",
+        )
+        .expect("build v8 database");
+
+        migrate(&conn).expect("migrate v8 -> v9");
+        migrate(&conn).expect("re-run migration is a no-op");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 9);
+
+        let db = Db {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        assert!(!db.view_only("o1", "dev1").expect("get"));
+        assert!(db.set_view_only("o1", "dev1", true).expect("set"));
+        assert!(db.view_only("o1", "dev1").expect("get"));
+    }
+
+    #[test]
+    fn view_only_is_per_owner_and_needs_a_link() {
+        let db = Db::in_memory().expect("open in-memory db");
+        db.insert_owner("a", 1).expect("owner");
+        db.insert_owner("b", 1).expect("owner");
+        db.insert_device("dev1", "h", "PC", 1).expect("device");
+        db.link_device("a", "dev1", 1).expect("link");
+        db.link_device("b", "dev1", 1).expect("link");
+        assert!(!db.set_view_only("c", "dev1", true).expect("no link"));
+        assert!(!db.set_view_only("a", "nope", true).expect("no device"));
+        assert!(db.set_view_only("a", "dev1", true).expect("set"));
+        assert!(db.view_only("a", "dev1").expect("get"));
+        assert!(!db.view_only("b", "dev1").expect("get"));
+        assert!(!db.view_only("c", "dev1").expect("get"));
+        assert!(db.set_view_only("a", "dev1", false).expect("set"));
+        assert!(!db.view_only("a", "dev1").expect("get"));
     }
 
     #[test]
@@ -3119,6 +3220,7 @@ mod tests {
                     added_at: 200,
                     last_seen_at: 100,
                     host_os: None,
+                    view_only: false,
                 },
                 OwnedDevice {
                     device_id: "dev1".to_string(),
@@ -3127,6 +3229,7 @@ mod tests {
                     added_at: 300,
                     last_seen_at: 999,
                     host_os: None,
+                    view_only: false,
                 },
             ]
         );

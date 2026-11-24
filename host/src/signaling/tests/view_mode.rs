@@ -195,6 +195,41 @@ async fn setting_default_starts_session_in_view_mode_only_with_input() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn peer_flag_starts_session_in_view_mode_only_with_input() {
+    // VM-5: настройки хоста нет (пустая папка), режим включает флаг кабинета.
+    let dir = scratch_settings_dir("peer", "{}");
+    let mut ctx = test_ctx();
+    ctx.settings_dir = dir.clone();
+
+    let (active, _out, _etx, _erx) = start_active_session_for_peer(&ctx, true).await;
+    assert!(active.input_available);
+    assert!(active.view_mode.load(Ordering::Relaxed));
+    active.shutdown().await;
+
+    let (active, _out, _etx, _erx) = start_active_session_for_peer(&ctx, false).await;
+    assert!(!active.view_mode.load(Ordering::Relaxed));
+    active.shutdown().await;
+
+    let mut no_input = test_ctx();
+    no_input.settings_dir = dir.clone();
+    no_input.build_injector = Box::new(|| Err(anyhow::anyhow!("нет ввода")));
+    let (active, _out, _etx, _erx) = start_active_session_for_peer(&no_input, true).await;
+    assert!(!active.view_mode.load(Ordering::Relaxed));
+    active.shutdown().await;
+
+    // Настройка хоста действует независимо от флага кабинета.
+    std::fs::write(
+        dir.join(crate::settings::SETTINGS_FILE),
+        r#"{"view_only":true}"#,
+    )
+    .unwrap();
+    let (active, _out, _etx, _erx) = start_active_session_for_peer(&ctx, false).await;
+    assert!(active.view_mode.load(Ordering::Relaxed));
+    active.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn entering_view_mode_drops_the_curtain() {
     let (ctx, log, _calls) = curtain_ctx(vec![101], None);
     let (mut active, _out, _etx, _erx) = start_active_session(&ctx).await;

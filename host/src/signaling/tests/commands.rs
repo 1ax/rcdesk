@@ -43,6 +43,7 @@ async fn clipboard_text_on_input_channel_is_applied_directly_not_routed() {
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -118,6 +119,7 @@ async fn set_quality_reaches_the_adapt_controller() {
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -203,6 +205,7 @@ async fn end_session_command_sends_bye_and_reports_registered() {
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -303,6 +306,7 @@ async fn end_session_command_clears_pending_auth_and_sends_bye() {
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],

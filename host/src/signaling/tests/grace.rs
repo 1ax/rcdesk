@@ -20,6 +20,7 @@ async fn run_while_offline_still_frees_the_slot_on_connection_state_closed() {
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -87,6 +88,7 @@ async fn started_session(
         SignalMessage::PeerJoined {
             session_id: session_id.to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -380,6 +382,7 @@ async fn disconnect_timeout_from_an_old_session_does_not_touch_a_new_one() {
         SignalMessage::PeerJoined {
             session_id: "sess-2".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -452,6 +455,7 @@ async fn connection_state_from_an_old_session_does_not_touch_a_new_one() {
         SignalMessage::PeerJoined {
             session_id: "sess-2".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -522,6 +526,7 @@ async fn data_channel_closed_from_an_old_session_does_not_touch_a_new_one() {
         SignalMessage::PeerJoined {
             session_id: "sess-2".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],

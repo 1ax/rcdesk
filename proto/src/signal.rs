@@ -140,6 +140,11 @@ pub struct DeviceEntry {
     /// поля не шлёт.
     #[serde(default)]
     pub os: Option<crate::control::HostOs>,
+    /// VM-5: личная настройка владельца «подключаться в режиме просмотра»
+    /// (для пары владелец + устройство). `#[serde(default)]`: старый сервер
+    /// поля не шлёт -> `false`.
+    #[serde(default)]
+    pub view_only: bool,
 }
 
 /// Снимок админского кабинета (A3).
@@ -381,6 +386,12 @@ pub enum SignalMessage {
         session_id: String,
         #[serde(default)]
         ice_servers: Vec<IceServer>,
+        /// VM-5: личная настройка «режим просмотра» владельца, который
+        /// подключается (пара владелец + устройство). Итог на хосте =
+        /// локальная настройка хоста OR это поле. `#[serde(default)]`:
+        /// старый сервер/LAN-хаб поля не шлёт -> `false`.
+        #[serde(default)]
+        view_only: bool,
     },
     /// forwarded by server to the other side of the session. `auth` (slice
     /// 3.2e) is the host's proof that this offer's DTLS fingerprint is
@@ -584,6 +595,10 @@ pub enum SignalMessage {
     /// client -> server: убрать устройство из своего списка. В ответ сервер
     /// шлёт обновлённый `Devices`.
     ForgetDevice { device_id: String },
+    /// client -> server (VM-5): включить/выключить личную настройку
+    /// «подключаться в режиме просмотра» для своего устройства. В ответ сервер
+    /// шлёт обновлённый `Devices`.
+    SetDeviceViewOnly { device_id: String, on: bool },
     /// host -> client (slice 3.2c), sent right after `PeerJoined` when the
     /// host has an access password set (`access::AccessStore::load`
     /// returns `Some`): the client must complete an OPAQUE login (`PakeStart`
@@ -761,6 +776,7 @@ mod tests {
                 username: None,
                 credential: None,
             }],
+            view_only: true,
         };
 
         let json = serde_json::to_string(&peer_joined).expect("serialize");
@@ -778,8 +794,33 @@ mod tests {
             SignalMessage::PeerJoined {
                 session_id: "abc123".to_string(),
                 ice_servers: Vec::new(),
+                view_only: false,
             }
         );
+    }
+
+    #[test]
+    fn set_device_view_only_has_exact_json_form() {
+        let msg = SignalMessage::SetDeviceViewOnly {
+            device_id: "d1".to_string(),
+            on: true,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"set_device_view_only","device_id":"d1","on":true}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SignalMessage>(&json).expect("deserialize"),
+            msg
+        );
+    }
+
+    #[test]
+    fn device_entry_without_view_only_field_deserializes_to_false() {
+        let json = r#"{"device_id":"d","name":"n","alias":null,"online":false,"busy":false,"last_seen_at":1}"#;
+        let entry: DeviceEntry = serde_json::from_str(json).expect("deserialize");
+        assert!(!entry.view_only);
     }
 
     #[test]
@@ -874,6 +915,7 @@ mod tests {
                 can_wake: true,
                 kind: DeviceKind::Host,
                 os: None,
+                view_only: false,
             }],
             lan_hub: true,
         };

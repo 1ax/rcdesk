@@ -184,7 +184,7 @@ async fn start_session_survives_a_failing_injector_and_reports_view_only() {
     ctx.build_injector = Box::new(|| Err(anyhow::anyhow!("no Accessibility permission")));
     let (events_tx, _events_rx) = mpsc::channel(64);
 
-    let parts = start_session(&ctx, &[], events_tx)
+    let parts = start_session(&ctx, &[], events_tx, false)
         .await
         .expect("a failing injector must not fail session start");
 
@@ -233,7 +233,7 @@ async fn start_session_reports_input_available_with_a_working_injector() {
     let ctx = test_ctx();
     let (events_tx, _events_rx) = mpsc::channel(64);
 
-    let parts = start_session(&ctx, &[], events_tx).await.unwrap();
+    let parts = start_session(&ctx, &[], events_tx, false).await.unwrap();
 
     assert!(parts.input_available);
     assert_eq!(parts.input_reason, None);
@@ -252,10 +252,11 @@ async fn empty_display_list_yields_bye_with_display_unavailable() {
     ctx.list_displays = Arc::new(|| Ok(Vec::new()));
     let (events_tx, _events_rx) = mpsc::channel(64);
 
-    let err = start_session_with_display_wait(&ctx, &[], events_tx, Duration::from_millis(30))
-        .await
-        .err()
-        .expect("no display must fail the start");
+    let err =
+        start_session_with_display_wait(&ctx, &[], events_tx, false, Duration::from_millis(30))
+            .await
+            .err()
+            .expect("no display must fail the start");
 
     assert_eq!(
         bye_for_start_error("sess-1".to_string(), &err),
@@ -323,6 +324,7 @@ async fn capture_failure_restarts_pipeline_until_budget_is_exhausted() {
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -416,6 +418,7 @@ async fn peer_joined_sends_bye_when_session_start_fails() {
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -447,7 +450,7 @@ async fn peer_joined_sends_bye_when_session_start_fails() {
 async fn session_parts_abort_closes_peer() {
     let ctx = test_ctx();
     let (events_tx, _events_rx) = mpsc::channel(64);
-    let parts = start_session(&ctx, &[], events_tx)
+    let parts = start_session(&ctx, &[], events_tx, false)
         .await
         .expect("session must start");
     let peer = Arc::clone(&parts.peer);

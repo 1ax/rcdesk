@@ -754,6 +754,7 @@ mod tests {
             let peer_joined = serde_json::to_string(&SignalMessage::PeerJoined {
                 session_id: "sess-1".to_string(),
                 ice_servers: vec![],
+                view_only: false,
             })
             .unwrap();
             ws.send(Message::text(peer_joined)).await.unwrap();

@@ -52,10 +52,12 @@ pub(super) async fn handle_signal_message(
         SignalMessage::PeerJoined {
             session_id,
             ice_servers,
+            view_only,
         } => {
             on_peer_joined(
                 session_id,
                 ice_servers,
+                view_only,
                 ctx,
                 registered_ice_servers,
                 pin,
@@ -168,6 +170,7 @@ pub(super) async fn handle_signal_message(
 async fn on_peer_joined(
     session_id: String,
     ice_servers: Vec<proto::signal::IceServer>,
+    peer_view_only: bool,
     ctx: &HostContext,
     registered_ice_servers: &[proto::signal::IceServer],
     pin: &str,
@@ -201,6 +204,7 @@ async fn on_peer_joined(
         *pending_auth = Some(PendingAuth {
             session_id: session_id.clone(),
             ice_servers,
+            peer_view_only,
             login: None,
             generation,
         });
@@ -227,6 +231,7 @@ async fn on_peer_joined(
             ctx,
             session_id,
             ice_servers,
+            peer_view_only,
             None,
             registered_ice_servers,
             out_tx,
@@ -495,6 +500,7 @@ async fn on_pake_finish(
                 ctx,
                 session_id,
                 pending.ice_servers,
+                pending.peer_view_only,
                 Some(session_key),
                 registered_ice_servers,
                 out_tx,
@@ -547,6 +553,7 @@ async fn begin_session(
     ctx: &HostContext,
     session_id: String,
     ice_servers: Vec<proto::signal::IceServer>,
+    peer_view_only: bool,
     session_key: Option<crate::access::SessionKey>,
     registered_ice_servers: &[proto::signal::IceServer],
     out_tx: &mpsc::UnboundedSender<SignalMessage>,
@@ -555,7 +562,7 @@ async fn begin_session(
     current_session_id: &mut Option<String>,
 ) {
     let chosen_ice_servers = peer_ice_servers(&ice_servers, registered_ice_servers);
-    match start_session(ctx, chosen_ice_servers, event_tx).await {
+    match start_session(ctx, chosen_ice_servers, event_tx, peer_view_only).await {
         Ok(parts) => match parts.peer.create_offer().await {
             Ok(sdp) => {
                 // Slice 3.2e: when this session was gated by a password,

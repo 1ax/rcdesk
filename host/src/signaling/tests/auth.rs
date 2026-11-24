@@ -19,6 +19,7 @@ async fn peer_joined_with_a_password_asks_for_auth_and_does_not_offer() {
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -76,6 +77,7 @@ async fn peer_joined_with_unreadable_access_record_sends_bye_and_starts_nothing(
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -133,6 +135,7 @@ async fn full_opaque_login_then_offer() {
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -292,6 +295,7 @@ async fn logged_in_awaiting_answer(
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -509,6 +513,7 @@ async fn wrong_password_client_finish_fails_and_host_stays_pending() {
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -674,6 +679,7 @@ async fn garbage_finalization_yields_auth_failed() {
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],

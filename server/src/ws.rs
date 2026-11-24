@@ -712,6 +712,15 @@ fn host_os_from_str(s: &str) -> Option<HostOs> {
     }
 }
 
+/// VM-5: личный флаг «режим просмотра» пары (владелец, устройство) для
+/// `PeerJoined`; ошибка БД -- `false` (сеанс не должен падать из-за флага).
+fn pair_view_only(db: &Db, owner_id: &str, device_id: &str) -> bool {
+    db.view_only(owner_id, device_id).unwrap_or_else(|err| {
+        tracing::error!(?err, "failed to read view_only flag");
+        false
+    })
+}
+
 /// Builds the `DeviceEntry` list for `Authenticated`/`Devices`: the owner's
 /// linked devices from the persistent store, each combined with its
 /// sign-in-memory presence from the registry. One place for this so the
@@ -744,6 +753,7 @@ fn device_entries_for_owner(
                             .is_empty()),
                 kind: DeviceKind::Host,
                 os: device.host_os.as_deref().and_then(host_os_from_str),
+                view_only: device.view_only,
             }
         })
         .collect();
@@ -772,6 +782,7 @@ fn device_entries_for_owner(
                 DeviceKind::Router
             },
             os: None,
+            view_only: false,
         });
     }
     Ok(entries)
@@ -2148,6 +2159,7 @@ async fn run_client(
                         let _ = host_tx.send(SignalMessage::PeerJoined {
                             ice_servers: ice.ice_servers(ice::now_unix(), &session_id),
                             session_id,
+                            view_only: pair_view_only(db, &owner_id, &device_id),
                         });
                         notify_device_owners(db, registry, &device_id);
                     }
@@ -2484,6 +2496,28 @@ async fn run_client(
                     }
                 }
             }
+            SignalMessage::SetDeviceViewOnly { device_id, on } => {
+                let Some(owner_id) = require_owner(db, &mut session, &tx) else {
+                    continue;
+                };
+
+                match db.set_view_only(&owner_id, &device_id, on) {
+                    Ok(true) => match device_entries_for_owner(db, registry, &owner_id) {
+                        Ok(devices) => {
+                            let _ = tx.send(SignalMessage::Devices { devices });
+                        }
+                        Err(err) => {
+                            tracing::error!(?err, "failed to load devices for owner");
+                            send_error(&tx, "internal error");
+                        }
+                    },
+                    Ok(false) => send_error(&tx, "device not linked"),
+                    Err(err) => {
+                        tracing::error!(?err, "failed to set device view_only");
+                        send_error(&tx, "internal error");
+                    }
+                }
+            }
             SignalMessage::ForgetDevice { device_id } => {
                 let Some(owner_id) = require_owner(db, &mut session, &tx) else {
                     continue;
@@ -2586,9 +2620,16 @@ async fn run_client(
                             // device later without a PIN (slice 3.5b).
                             device_id: Some(host_id.clone()),
                         });
+                        // VM-5: флаг пары только если связь уже была до этого
+                        // входа (`link_device` ниже): новая привязка и
+                        // анонимный PIN -- `false`.
+                        let view_only = owner
+                            .as_deref()
+                            .is_some_and(|owner_id| pair_view_only(db, owner_id, &host_id));
                         let _ = host_tx.send(SignalMessage::PeerJoined {
                             ice_servers: ice.ice_servers(ice::now_unix(), &session_id),
                             session_id,
+                            view_only,
                         });
                         if let Some(pin) = new_pin {
                             let _ = host_tx.send(SignalMessage::PinChanged { pin });

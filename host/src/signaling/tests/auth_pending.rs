@@ -27,6 +27,7 @@ async fn six_pake_starts_in_a_row_throttle_the_host() {
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -145,6 +146,7 @@ async fn login_after_expired_throttle_succeeds_and_resets_the_counter() {
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -271,6 +273,7 @@ async fn bye_for_a_pending_session_clears_it() {
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -330,6 +333,7 @@ async fn auth_timeout_sends_bye() {
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: false,
         },
         &ctx,
         &[],
@@ -430,6 +434,7 @@ impl Slot {
             SignalMessage::PeerJoined {
                 session_id: session_id.to_string(),
                 ice_servers: vec![],
+                view_only: false,
             },
             ctx,
             &[],

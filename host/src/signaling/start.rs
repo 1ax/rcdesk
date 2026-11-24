@@ -282,8 +282,16 @@ pub(super) async fn start_session(
     ctx: &HostContext,
     registered_ice_servers: &[proto::signal::IceServer],
     events: mpsc::Sender<SessionEvent>,
+    peer_view_only: bool,
 ) -> anyhow::Result<SessionParts> {
-    start_session_with_display_wait(ctx, registered_ice_servers, events, DISPLAY_WAIT_TIMEOUT).await
+    start_session_with_display_wait(
+        ctx,
+        registered_ice_servers,
+        events,
+        peer_view_only,
+        DISPLAY_WAIT_TIMEOUT,
+    )
+    .await
 }
 
 /// `start_session` с явным таймаутом ожидания дисплея (в тестах -- крошечным,
@@ -292,6 +300,7 @@ pub(super) async fn start_session_with_display_wait(
     ctx: &HostContext,
     registered_ice_servers: &[proto::signal::IceServer],
     events: mpsc::Sender<SessionEvent>,
+    peer_view_only: bool,
     display_wait_timeout: Duration,
 ) -> anyhow::Result<SessionParts> {
     // Слайс 4.6a: будим дисплей и ждём, пока он появится в списке. Слайс I7:
@@ -375,10 +384,17 @@ pub(super) async fn start_session_with_display_wait(
             };
         let router = InputRouter::new(injector);
         // VM-1: настройка читается в начале каждого сеанса; без ввода режим
-        // просмотра не предлагается (D26), поведение как раньше.
-        let view_only = input_available && crate::settings::default_view_only(&ctx.settings_dir);
+        // просмотра не предлагается (D26), поведение как раньше. VM-5: итог =
+        // настройка хоста OR личный флаг владельца из `PeerJoined`.
+        let host_view_only = crate::settings::default_view_only(&ctx.settings_dir);
+        let view_only = input_available && (host_view_only || peer_view_only);
         if view_only {
-            tracing::info!("сеанс начат в режиме просмотра (настройка хоста)");
+            let source = if host_view_only {
+                "настройка хоста"
+            } else {
+                "кабинет"
+            };
+            tracing::info!(source, "сеанс начат в режиме просмотра");
         }
         let view_mode = Arc::new(AtomicBool::new(view_only));
         router.set_capture_rect(crate::input::CaptureRect::from(&video.display));

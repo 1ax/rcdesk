@@ -572,6 +572,9 @@ pub(super) struct PendingAuth {
     /// can start the session with the same credentials `PeerJoined`
     /// carried, exactly as the no-password path would have used right away.
     pub(super) ice_servers: Vec<proto::signal::IceServer>,
+    /// VM-5: личный флаг «режим просмотра» из этого `PeerJoined` (кабинет),
+    /// сохраняется до успешного `PakeFinish`.
+    pub(super) peer_view_only: bool,
     /// The server half of the in-progress OPAQUE login, set by a successful
     /// `PakeStart` and consumed by the next `PakeFinish`. `None` before the
     /// first `PakeStart`, and again right after a `PakeFinish` that failed

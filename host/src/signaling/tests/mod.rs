@@ -159,6 +159,19 @@ pub(super) async fn start_active_session(
     mpsc::Sender<SessionEvent>,
     mpsc::Receiver<SessionEvent>,
 ) {
+    start_active_session_for_peer(ctx, false).await
+}
+
+/// То же, но `PeerJoined` несёт личный флаг «режим просмотра» (VM-5).
+pub(super) async fn start_active_session_for_peer(
+    ctx: &HostContext,
+    peer_view_only: bool,
+) -> (
+    ActiveSession,
+    mpsc::UnboundedReceiver<SignalMessage>,
+    mpsc::Sender<SessionEvent>,
+    mpsc::Receiver<SessionEvent>,
+) {
     let (out_tx, out_rx) = mpsc::unbounded_channel::<SignalMessage>();
     let (event_tx, event_rx) = mpsc::channel(64);
     let mut active: Option<ActiveSession> = None;
@@ -168,6 +181,7 @@ pub(super) async fn start_active_session(
         SignalMessage::PeerJoined {
             session_id: "sess-1".to_string(),
             ice_servers: vec![],
+            view_only: peer_view_only,
         },
         ctx,
         &[],
