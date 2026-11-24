@@ -1452,12 +1452,36 @@ async fn send_folder(
 struct Session {
     receiver: Receiver,
     downloader: Downloader,
+    /// Режим просмотра (VM-1): новые передачи от клиента отклоняются.
+    view_mode: Arc<AtomicBool>,
 }
 
 impl Session {
     async fn on_message(&mut self, msg: FileChannelMessage) {
         if msg.is_string {
             match serde_json::from_slice::<FileMessage>(&msg.data) {
+                // VM-1: в режиме просмотра новые передачи и запросы
+                // отклоняются; уже идущие не рвём (их `Start` был раньше).
+                Ok(FileMessage::Start { id, .. }) if self.view_mode.load(Ordering::Relaxed) => {
+                    tracing::debug!(id, "start refused: view mode");
+                    self.receiver
+                        .send(&FileMessage::Abort {
+                            id,
+                            reason: AbortReason::Disabled,
+                        })
+                        .await;
+                }
+                Ok(FileMessage::Fetch { list_id, fetch })
+                    if self.view_mode.load(Ordering::Relaxed) =>
+                {
+                    tracing::debug!(list_id, "fetch refused: view mode");
+                    self.receiver
+                        .send(&FileMessage::Abort {
+                            id: fetch.unwrap_or(list_id),
+                            reason: AbortReason::Disabled,
+                        })
+                        .await;
+                }
                 Ok(FileMessage::Fetch { list_id, fetch }) => {
                     self.downloader.fetch(list_id, fetch).await
                 }
@@ -1489,6 +1513,7 @@ pub async fn run(
     dir: Option<PathBuf>,
     user: FsUser,
     mut commands: mpsc::Receiver<FilesCommand>,
+    view_mode: Arc<AtomicBool>,
 ) {
     if let Some(dir) = dir.clone() {
         // Fire and forget: the sweep must not delay the session start.
@@ -1509,6 +1534,7 @@ pub async fn run(
             budget: ReceiveBudget::default(),
         },
         downloader: Downloader::new(channel, user),
+        view_mode,
     };
     let mut commands_open = true;
     loop {
@@ -1776,6 +1802,7 @@ mod tests {
                     budget: ReceiveBudget::default(),
                 },
                 downloader: Downloader::new(channel, user.clone()),
+                view_mode: Arc::new(AtomicBool::new(false)),
             };
             Self {
                 session,
@@ -2037,6 +2064,7 @@ mod tests {
                 budget: ReceiveBudget::default(),
             },
             downloader: Downloader::new(channel, FsUser::current()),
+            view_mode: Arc::new(AtomicBool::new(false)),
         };
         let dirs = ["../x", "/etc", "C:\\Windows", "a/../../b", ".."];
         for (i, d) in dirs.iter().enumerate() {
@@ -2360,6 +2388,7 @@ mod tests {
             Some(dir.clone()),
             h.user.clone(),
             cmd_rx,
+            Arc::new(AtomicBool::new(false)),
         ));
         tx.send(start(1, "a.bin", 10)).await.unwrap();
         tx.send(chunk(b"abc")).await.unwrap();
@@ -2388,6 +2417,7 @@ mod tests {
             Some(dir.clone()),
             h.user.clone(),
             cmd_rx,
+            Arc::new(AtomicBool::new(false)),
         ));
         tx.send(start(1, "a.bin", 10)).await.unwrap();
         for _ in 0..200 {
@@ -2439,6 +2469,46 @@ mod tests {
             }]
         );
         assert!(!h.dir.exists());
+    }
+
+    #[tokio::test]
+    async fn view_mode_refuses_new_start_and_fetch_with_disabled() {
+        let mut h = Harness::new(true);
+        h.session.view_mode.store(true, Ordering::Relaxed);
+        h.feed(vec![start(5, "a.txt", 3), chunk(b"abc"), fetch(7)])
+            .await;
+        assert_eq!(
+            h.sent(),
+            vec![
+                FileMessage::Abort {
+                    id: 5,
+                    reason: AbortReason::Disabled
+                },
+                FileMessage::Abort {
+                    id: 7,
+                    reason: AbortReason::Disabled
+                }
+            ]
+        );
+        assert!(h.files().is_empty());
+    }
+
+    #[tokio::test]
+    async fn view_mode_does_not_cut_a_running_receive() {
+        let mut h = Harness::new(true);
+        h.feed(vec![start(1, "a.bin", 10), chunk(b"abc")]).await;
+        h.session.view_mode.store(true, Ordering::Relaxed);
+        h.feed(vec![start(2, "b.bin", 1)]).await;
+        assert_eq!(
+            h.sent(),
+            vec![FileMessage::Abort {
+                id: 2,
+                reason: AbortReason::Disabled
+            }]
+        );
+        h.feed(vec![chunk(b"defghij"), text(&FileMessage::End { id: 1 })])
+            .await;
+        assert_eq!(h.files(), vec!["a.bin".to_string()]);
     }
 
     // ---- host -> client (3.4c) ----
@@ -2958,6 +3028,7 @@ mod tests {
             Some(h.dir.join("recv")),
             h.user.clone(),
             cmd_rx,
+            Arc::new(AtomicBool::new(false)),
         ));
         cmd_tx.send(FilesCommand::Offer(vec![a])).await.unwrap();
         h.wait_log_len(1).await;

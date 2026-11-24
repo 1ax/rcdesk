@@ -189,6 +189,10 @@ pub enum ControlMessage {
         /// режим Windows. Старый JSON без поля -- `false`.
         #[serde(default)]
         ctrl_alt_del_available: bool,
+        /// Хост умеет режим просмотра (слайс VM-1): есть ввод, который можно
+        /// отключить. Старый JSON без поля -- `false`.
+        #[serde(default)]
+        view_mode_available: bool,
     },
     /// client -> host: включить (`on: true`) или выключить шторку (слайс
     /// 4.2c). Шторка закрывает физический монитор хоста чёрным окном
@@ -200,6 +204,16 @@ pub enum ControlMessage {
     /// ошибки. `reason` -- человекочитаемая причина, когда запрошенное
     /// состояние не достигнуто (или шторка снята по ошибке), иначе `None`.
     CurtainStatus { on: bool, reason: Option<String> },
+    /// client -> host: включить (`on: true`) или выключить режим просмотра
+    /// (слайс VM-1). В режиме просмотра хост ничего не делает от имени
+    /// подключившегося: ввод, шторка, раскладка, Ctrl+Alt+Del, обновление,
+    /// буфер обмена и новые передачи файлов отключены. Хост отвечает
+    /// `ViewMode`; без `HostInfo.view_mode_available` запрос игнорируется.
+    SetViewMode { on: bool },
+    /// host -> client: текущий режим просмотра (слайс VM-1). Шлётся при
+    /// открытии `control` (только если режим доступен) и в ответ на каждый
+    /// `SetViewMode`. Начальное значение задаёт настройка хоста.
+    ViewMode { on: bool },
     /// client -> host: переключить раскладку клавиатуры хоста на следующую
     /// (слайс 4.6c). Хост отвечает `InputSource` с новой меткой.
     SwitchInputSource,
@@ -463,13 +477,14 @@ mod tests {
                 version: Some("0.1.1".to_string()),
                 update_available: true,
                 ctrl_alt_del_available: false,
+                view_mode_available: false,
             };
 
             let json = serde_json::to_string(&msg).expect("serialize");
             assert_eq!(
                 json,
                 format!(
-                    r#"{{"type":"host_info","os":"{wire}","files_enabled":true,"curtain_available":false,"input_source_available":true,"version":"0.1.1","update_available":true,"ctrl_alt_del_available":false}}"#
+                    r#"{{"type":"host_info","os":"{wire}","files_enabled":true,"curtain_available":false,"input_source_available":true,"version":"0.1.1","update_available":true,"ctrl_alt_del_available":false,"view_mode_available":false}}"#
                 )
             );
 
@@ -528,6 +543,7 @@ mod tests {
                 version: None,
                 update_available: false,
                 ctrl_alt_del_available: false,
+                view_mode_available: false,
             }
         );
     }
@@ -541,6 +557,7 @@ mod tests {
             msg,
             ControlMessage::HostInfo {
                 ctrl_alt_del_available: false,
+                view_mode_available: false,
                 ..
             }
         ));
@@ -549,12 +566,13 @@ mod tests {
     /// Слайс D46: `ctrl_alt_del_available: true` переживает round-trip.
     #[test]
     fn host_info_with_ctrl_alt_del_available_round_trips() {
-        let json = r#"{"type":"host_info","os":"windows","files_enabled":true,"curtain_available":false,"input_source_available":false,"version":"0.2.3","update_available":false,"ctrl_alt_del_available":true}"#;
+        let json = r#"{"type":"host_info","os":"windows","files_enabled":true,"curtain_available":false,"input_source_available":false,"version":"0.2.3","update_available":false,"ctrl_alt_del_available":true,"view_mode_available":false}"#;
         let msg: ControlMessage = serde_json::from_str(json).expect("deserialize");
         assert!(matches!(
             msg,
             ControlMessage::HostInfo {
                 ctrl_alt_del_available: true,
+                view_mode_available: false,
                 ..
             }
         ));
@@ -585,7 +603,7 @@ mod tests {
     /// Слайс D50a: `version` переживает круговой round-trip.
     #[test]
     fn host_info_with_version_round_trips() {
-        let json = r#"{"type":"host_info","os":"windows","files_enabled":true,"curtain_available":false,"input_source_available":false,"version":"0.2.3","update_available":false,"ctrl_alt_del_available":false}"#;
+        let json = r#"{"type":"host_info","os":"windows","files_enabled":true,"curtain_available":false,"input_source_available":false,"version":"0.2.3","update_available":false,"ctrl_alt_del_available":false,"view_mode_available":false}"#;
         let msg: ControlMessage = serde_json::from_str(json).expect("deserialize");
         assert!(matches!(
             &msg,
@@ -593,6 +611,51 @@ mod tests {
         ));
         let again = serde_json::to_string(&msg).expect("serialize");
         assert_eq!(again, json);
+    }
+
+    /// Слайс VM-1: `SetViewMode` и `ViewMode` -- точная форма JSON.
+    #[test]
+    fn view_mode_messages_round_trip_through_json_with_exact_shape() {
+        let set = ControlMessage::SetViewMode { on: true };
+        let json = serde_json::to_string(&set).expect("serialize");
+        assert_eq!(json, r#"{"type":"set_view_mode","on":true}"#);
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, set);
+
+        let status = ControlMessage::ViewMode { on: false };
+        let json = serde_json::to_string(&status).expect("serialize");
+        assert_eq!(json, r#"{"type":"view_mode","on":false}"#);
+        let round_tripped: ControlMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped, status);
+    }
+
+    /// Слайс VM-1: JSON без `view_mode_available` разбирается в `false`.
+    #[test]
+    fn host_info_without_view_mode_available_parses_as_false() {
+        let json = r#"{"type":"host_info","os":"windows","files_enabled":true,"curtain_available":false,"input_source_available":false,"version":"0.2.3","update_available":false,"ctrl_alt_del_available":false}"#;
+        let msg: ControlMessage = serde_json::from_str(json).expect("deserialize");
+        assert!(matches!(
+            msg,
+            ControlMessage::HostInfo {
+                view_mode_available: false,
+                ..
+            }
+        ));
+    }
+
+    /// Слайс VM-1: `view_mode_available: true` переживает round-trip.
+    #[test]
+    fn host_info_with_view_mode_available_round_trips() {
+        let json = r#"{"type":"host_info","os":"windows","files_enabled":true,"curtain_available":false,"input_source_available":false,"version":"0.2.3","update_available":false,"ctrl_alt_del_available":false,"view_mode_available":true}"#;
+        let msg: ControlMessage = serde_json::from_str(json).expect("deserialize");
+        assert!(matches!(
+            &msg,
+            ControlMessage::HostInfo {
+                view_mode_available: true,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_string(&msg).expect("serialize"), json);
     }
 
     #[test]

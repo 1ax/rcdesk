@@ -1,7 +1,8 @@
-//! Настройки хоста, которые пишет человек, а не хост (D47-4): файл
+//! Настройки хоста, которые задаёт человек, а не хост (D47-4): файл
 //! `settings.json` в каталоге данных. Поля: адрес сигнального сервера
-//! (например, LAN-хаба) и признак «служба поднимает LAN-хаб у себя» (D47-5).
-//! Хост этот файл никогда не пишет.
+//! (например, LAN-хаба), признак «служба поднимает LAN-хаб у себя» (D47-5) и
+//! режим просмотра по умолчанию (VM-1). Файл пишет человек или команда
+//! `rcdesk-host settings`; работающий хост его только читает.
 
 use std::path::Path;
 
@@ -21,6 +22,9 @@ struct Settings {
     /// `true` -- служба Windows запускает LAN-хаб внутри себя.
     #[serde(default)]
     hub: Option<bool>,
+    /// `true` -- сеансы по умолчанию открываются в режиме просмотра (VM-1).
+    #[serde(default)]
+    view_only: Option<bool>,
 }
 
 /// Адрес сигнального сервера по приоритету: флаг `--server` > поле `server`
@@ -118,6 +122,41 @@ fn server_from_file(dir: &Path) -> Option<String> {
 /// разбора -- `false`.
 pub fn hub_enabled(dir: &Path) -> bool {
     load(dir).and_then(|s| s.hub) == Some(true)
+}
+
+/// Режим просмотра по умолчанию (`"view_only": true`, VM-1); любая ошибка
+/// чтения или разбора, как и отсутствие поля, -- `false`.
+pub fn default_view_only(dir: &Path) -> bool {
+    load(dir).and_then(|s| s.view_only) == Some(true)
+}
+
+/// Записывает `"view_only": on` в `dir/settings.json`, сохраняя остальные
+/// поля. Нет файла -- создаётся `{}`; файл не читается, битый или не объект --
+/// ошибка, файл не трогается. Запись атомарная (temp + rename).
+pub fn set_view_only(dir: &Path, on: bool) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let path = dir.join(SETTINGS_FILE);
+    let mut value = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+            .with_context(|| format!("{} не разобрался как JSON", path.display()))?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+        Err(err) => {
+            return Err(
+                anyhow::Error::new(err).context(format!("не удалось прочитать {}", path.display()))
+            )
+        }
+    };
+    let Some(object) = value.as_object_mut() else {
+        anyhow::bail!("{} не JSON-объект, файл не тронут", path.display());
+    };
+    object.insert("view_only".to_string(), serde_json::Value::Bool(on));
+    let mut bytes = serde_json::to_vec_pretty(&value)?;
+    bytes.push(b'\n');
+    crate::fsutil::write_atomic_mode(&path, &bytes, 0o644)
+        .with_context(|| format!("не удалось записать {}", path.display()))
 }
 
 #[cfg(test)]
@@ -249,6 +288,66 @@ mod tests {
         assert!(!hub_enabled(&dir), "false");
         write(&dir, "{ not json");
         assert!(!hub_enabled(&dir), "битый");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn view_only_true_enables_default() {
+        let dir = scratch_dir("vo-true");
+        write(&dir, r#"{"view_only":true}"#);
+        assert!(default_view_only(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn view_only_off_missing_or_broken_is_false() {
+        let dir = scratch_dir("vo-off");
+        assert!(!default_view_only(&dir), "нет файла");
+        write(&dir, r#"{"hub":true}"#);
+        assert!(!default_view_only(&dir), "нет поля");
+        write(&dir, r#"{"view_only":false}"#);
+        assert!(!default_view_only(&dir), "false");
+        write(&dir, "{ not json");
+        assert!(!default_view_only(&dir), "битый");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_view_only_keeps_other_fields() {
+        let dir = scratch_dir("vo-set");
+        write(&dir, r#"{"server":"wss://h:1/ws","hub":true,"x":{"a":2}}"#);
+        set_view_only(&dir, true).unwrap();
+        assert!(default_view_only(&dir));
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(SETTINGS_FILE)).unwrap()).unwrap();
+        assert_eq!(v["server"], "wss://h:1/ws");
+        assert_eq!(v["hub"], true);
+        assert_eq!(v["x"]["a"], 2);
+        set_view_only(&dir, false).unwrap();
+        assert!(!default_view_only(&dir));
+        assert!(hub_enabled(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_view_only_creates_missing_file() {
+        let dir = scratch_dir("vo-create");
+        set_view_only(&dir, true).unwrap();
+        assert!(default_view_only(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_view_only_refuses_non_object_and_broken_and_leaves_file() {
+        let dir = scratch_dir("vo-refuse");
+        for content in ["[1,2]", "\"str\"", "{ not json"] {
+            write(&dir, content);
+            assert!(set_view_only(&dir, true).is_err(), "{content}");
+            assert_eq!(
+                std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap(),
+                content
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

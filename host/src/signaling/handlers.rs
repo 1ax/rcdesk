@@ -1,7 +1,7 @@
 //! Signaling-loop handlers: incoming signal messages, agent commands and
 //! transport session events, plus session start/supersede.
 
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,8 +18,9 @@ use crate::clipboard::ClipboardSync;
 use crate::transport::SessionEvent;
 
 use super::control::{
-    begin_update, host_info_message, input_source_message, spawn_input_source_poll,
-    switch_input_source, update_available, INPUT_SOURCE_POLL_INTERVAL,
+    begin_update, host_info_message, input_source_message, set_view_mode, spawn_input_source_poll,
+    switch_input_source, update_available, view_mode_on, INPUT_SOURCE_POLL_INTERVAL,
+    VIEW_MODE_CURTAIN_REASON,
 };
 use super::display::{
     curtain_announce_message, displays_message, recover_pipeline, refresh_display_geometry,
@@ -609,6 +610,7 @@ async fn begin_session(
                     cursor_task: parts.cursor_task,
                     input_available: parts.input_available,
                     input_reason: parts.input_reason,
+                    view_mode: parts.view_mode,
                     clipboard: parts.clipboard,
                     clipboard_task: parts.clipboard_task,
                     elevation_task: parts.elevation_task,
@@ -1054,7 +1056,7 @@ async fn on_video_failed(
 }
 
 /// Handles `DataChannelMessage`: routes `input`/`pointer` and `control` channel payloads.
-async fn on_data_channel_message(
+pub(super) async fn on_data_channel_message(
     label: String,
     data: bytes::Bytes,
     is_string: bool,
@@ -1062,6 +1064,11 @@ async fn on_data_channel_message(
     active: &mut Option<ActiveSession>,
 ) {
     match label.as_str() {
+        // VM-1: в режиме просмотра весь ввод (включая буфер клиента ->
+        // хост) отбрасывается. `trace`: движения мыши идут десятками в секунду.
+        "input" | "pointer" if view_mode_on(active) => {
+            tracing::trace!(label, len = data.len(), "input dropped: view mode");
+        }
         "input" | "pointer" => {
             if !is_string {
                 tracing::warn!(label, "non-text message on input channel, ignoring");
@@ -1133,6 +1140,24 @@ async fn on_data_channel_message(
                             }
                         }
                     }
+                    // VM-1: в режиме просмотра на хосте ничего не делаем от
+                    // имени зрителя.
+                    Ok(
+                        ControlMessage::SwitchInputSource
+                        | ControlMessage::SendCtrlAltDel
+                        | ControlMessage::UpdateHost,
+                    ) if view_mode_on(active) => {
+                        tracing::debug!(label, "control request ignored: view mode");
+                    }
+                    Ok(ControlMessage::SetViewMode { on }) => {
+                        if let Some(active) = active.as_mut() {
+                            for msg in set_view_mode(ctx, active, on).await {
+                                if let Err(err) = active.peer.send_control(&msg).await {
+                                    tracing::warn!(?err, "failed to send view mode reply");
+                                }
+                            }
+                        }
+                    }
                     Ok(ControlMessage::SelectDisplay { id }) => {
                         if let Some(active) = active.as_mut() {
                             switch_display(ctx, active, id).await;
@@ -1154,7 +1179,15 @@ async fn on_data_channel_message(
                     }
                     Ok(ControlMessage::SetCurtain { on }) => {
                         if let Some(active) = active.as_mut() {
-                            let status = set_curtain(ctx, active, on).await;
+                            let status = if on && active.view_mode.load(Ordering::Relaxed) {
+                                tracing::debug!(label, "curtain refused: view mode");
+                                ControlMessage::CurtainStatus {
+                                    on: false,
+                                    reason: Some(VIEW_MODE_CURTAIN_REASON.to_string()),
+                                }
+                            } else {
+                                set_curtain(ctx, active, on).await
+                            };
                             if let Err(err) = active.peer.send_control(&status).await {
                                 tracing::warn!(?err, "failed to send curtain status");
                             }
@@ -1256,6 +1289,7 @@ async fn on_data_channel_open(label: String, ctx: &HostContext, active: &Option<
                 active.input_source.is_some(),
                 update_available(ctx),
                 ctx.machine_mode && crate::platform::sas::SUPPORTED,
+                active.input_available,
             );
             match active.peer.send_control(&host_info).await {
                 Ok(true) => {}
@@ -1297,6 +1331,14 @@ async fn on_data_channel_open(label: String, ctx: &HostContext, active: &Option<
                 }
                 Err(err) => {
                     tracing::warn!(?err, "failed to send initial input status");
+                }
+            }
+            if active.input_available {
+                let msg = ControlMessage::ViewMode {
+                    on: active.view_mode.load(Ordering::Relaxed),
+                };
+                if let Err(err) = active.peer.send_control(&msg).await {
+                    tracing::warn!(?err, "failed to send initial view mode");
                 }
             }
         }

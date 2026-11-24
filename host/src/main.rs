@@ -155,6 +155,15 @@ enum Command {
         #[command(subcommand)]
         action: PasswordAction,
     },
+    /// Настройки хоста в `settings.json` (VM-1). Хост читает их в начале
+    /// каждого сеанса -- перезапуск не нужен.
+    Settings {
+        /// Каталог данных вместо выбираемого автоматически (как у `password`).
+        #[arg(long, global = true, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
+        #[command(subcommand)]
+        action: SettingsAction,
+    },
     /// LAN-хаб (D47): сигнальный сервер и веб-клиент в одном процессе, HTTPS с
     /// самоподписанным сертификатом -- для сети без интернета и `rcdesk.app`.
     /// Хост на самом хабе подключается к `ws://127.0.0.1:<local-port>/ws`.
@@ -254,6 +263,23 @@ enum PasswordAction {
     Status,
 }
 
+#[derive(Subcommand)]
+enum SettingsAction {
+    /// Режим просмотра по умолчанию: подключившийся видит экран, но ничего не
+    /// делает на хосте; во время сеанса его переключает сам подключившийся.
+    ViewOnly {
+        #[arg(value_enum)]
+        state: ViewOnlyState,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ViewOnlyState {
+    On,
+    Off,
+    Status,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Must happen before any GDI/enigo/GetSystemMetrics call -- see
@@ -337,6 +363,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Autostart { action } => run_autostart(action),
         Command::Password { data_dir, action } => run_password(data_dir, action),
+        Command::Settings { data_dir, action } => run_settings(data_dir, action),
         Command::Hub {
             port,
             local_port,
@@ -665,6 +692,26 @@ fn run_password(explicit_dir: Option<PathBuf>, action: PasswordAction) -> anyhow
                 std::process::exit(1);
             }
         },
+    }
+    Ok(())
+}
+
+/// `rcdesk-host settings view-only on|off|status` (VM-1). Каталог выбирается
+/// так же, как у `password` (`--data-dir` либо автоматически).
+fn run_settings(explicit_dir: Option<PathBuf>, action: SettingsAction) -> anyhow::Result<()> {
+    let (data_dir, _machine) = password_dir(explicit_dir);
+    let SettingsAction::ViewOnly { state } = action;
+    match state {
+        ViewOnlyState::On | ViewOnlyState::Off => {
+            let on = matches!(state, ViewOnlyState::On);
+            rcdesk_host::settings::set_view_only(&data_dir, on)?;
+            println!("view-only: {}", if on { "on" } else { "off" });
+            println!("Хост применит настройку в следующем сеансе -- перезапуск не нужен.");
+        }
+        ViewOnlyState::Status => {
+            let on = rcdesk_host::settings::default_view_only(&data_dir);
+            println!("view-only: {}", if on { "on" } else { "off" });
+        }
     }
     Ok(())
 }

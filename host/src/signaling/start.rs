@@ -2,7 +2,7 @@
 //! joining peer (`start_session`), the display wait after wake, ICE server
 //! selection, and the cursor and Windows elevation background watchers.
 
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -122,6 +122,8 @@ pub(super) struct SessionParts {
     pub(super) input_available: bool,
     /// See `ActiveSession::input_reason`.
     pub(super) input_reason: Option<String>,
+    /// See `ActiveSession::view_mode`.
+    pub(super) view_mode: Arc<AtomicBool>,
     /// See `ActiveSession::clipboard`.
     pub(super) clipboard: Option<Arc<Mutex<ClipboardSync>>>,
     /// See `ActiveSession::clipboard_task`.
@@ -368,6 +370,13 @@ pub(super) async fn start_session_with_display_wait(
                 }
             };
         let router = InputRouter::new(injector);
+        // VM-1: настройка читается в начале каждого сеанса; без ввода режим
+        // просмотра не предлагается (D26), поведение как раньше.
+        let view_only = input_available && crate::settings::default_view_only(&ctx.settings_dir);
+        if view_only {
+            tracing::info!("сеанс начат в режиме просмотра (настройка хоста)");
+        }
+        let view_mode = Arc::new(AtomicBool::new(view_only));
         router.set_capture_rect(crate::input::CaptureRect::from(&video.display));
 
         // The watcher's background thread is polled by this task, not directly
@@ -456,8 +465,14 @@ pub(super) async fn start_session_with_display_wait(
                     let mut clipboard_watcher =
                         clipboard::watch(Arc::clone(&sync), clipboard::CLIPBOARD_POLL_INTERVAL);
                     let clipboard_peer = Arc::clone(&peer);
+                    let clipboard_view_mode = Arc::clone(&view_mode);
                     let task = tokio::spawn(async move {
                         while let Some(event) = clipboard_watcher.rx.recv().await {
+                            // VM-1: в режиме просмотра буфер хоста наружу не
+                            // уходит; события пропускаются, не копятся.
+                            if clipboard_view_mode.load(Ordering::Relaxed) {
+                                continue;
+                            }
                             match event {
                                 ClipboardEvent::Text(text) => {
                                     let msg = ControlMessage::ClipboardText { text };
@@ -521,6 +536,7 @@ pub(super) async fn start_session_with_display_wait(
             files_dir,
             files_user,
             files_cmd_rx,
+            Arc::clone(&view_mode),
         ));
 
         Ok(SessionParts {
@@ -534,6 +550,7 @@ pub(super) async fn start_session_with_display_wait(
             cursor_task,
             input_available,
             input_reason,
+            view_mode,
             clipboard,
             clipboard_task,
             elevation_task,

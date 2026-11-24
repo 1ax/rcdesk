@@ -4,6 +4,7 @@ mod commands;
 mod curtain;
 mod grace;
 mod start;
+mod view_mode;
 
 use super::control::begin_update;
 use super::display::{

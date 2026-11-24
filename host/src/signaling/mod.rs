@@ -175,6 +175,9 @@ pub struct HostContext {
     /// из сеанса: `UpdateHost` отвечает отказом, а
     /// `HostInfo.update_available` ложно.
     pub update_dirs: Option<UpdateDirs>,
+    /// Каталог данных с `settings.json`: в начале каждого сеанса из него
+    /// читается режим просмотра по умолчанию (VM-1).
+    pub settings_dir: std::path::PathBuf,
 }
 
 /// One host agent's current phase, as reported through the `watch` channel
@@ -261,6 +264,12 @@ pub(crate) fn test_ctx() -> HostContext {
             std::thread::current().id()
         ))),
         update_dirs: None,
+        // Каталога нет -- настройка не задана, режим просмотра выключен.
+        settings_dir: std::env::temp_dir().join(format!(
+            "rcdesk-host-signaling-test-settings-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )),
     }
 }
 

@@ -411,6 +411,8 @@ pub fn build_host_context(opts: &ServeOptions) -> anyhow::Result<HostContext> {
         },
         // D50d: каталоги обновления проставляет вызывающий (агент, `serve`).
         update_dirs: None,
+        // VM-1: `settings.json` лежит в каталоге данных хоста.
+        settings_dir: opts.resolved_data_dir(),
     })
 }
 

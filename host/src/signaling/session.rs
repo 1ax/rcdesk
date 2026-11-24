@@ -357,6 +357,11 @@ pub(super) struct ActiveSession {
     /// Human-readable reason for `input_available == false` (the error from
     /// `build_injector`), or `None` when input is available.
     pub(super) input_reason: Option<String>,
+    /// Режим просмотра сеанса (VM-1): `true` -- хост ничего не делает от
+    /// имени подключившегося. Разделяется с задачей буфера и задачей файлов.
+    /// Режим доступен только при `input_available`; без него флаг всегда
+    /// `false`.
+    pub(super) view_mode: Arc<AtomicBool>,
     /// Clipboard sync state for this session (slice 2.5b), shared between
     /// `clipboard_task`'s watcher thread and
     /// `handle_session_event`'s handling of `InputMessage::ClipboardText` on

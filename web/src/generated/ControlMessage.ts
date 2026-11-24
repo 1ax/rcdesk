@@ -32,4 +32,9 @@ update_available: boolean,
  * Хост умеет послать Ctrl+Alt+Del (слайс D46) -- только полный
  * режим Windows. Старый JSON без поля -- `false`.
  */
-ctrl_alt_del_available: boolean, } | { "type": "set_curtain", on: boolean, } | { "type": "curtain_status", on: boolean, reason: string | null, } | { "type": "switch_input_source" } | { "type": "send_ctrl_alt_del" } | { "type": "input_source", label: string, } | { "type": "update_host" } | { "type": "update_status", state: UpdateState, version: string | null, message: string | null, received?: number | null, total?: number | null, };
+ctrl_alt_del_available: boolean, 
+/**
+ * Хост умеет режим просмотра (слайс VM-1): есть ввод, который можно
+ * отключить. Старый JSON без поля -- `false`.
+ */
+view_mode_available: boolean, } | { "type": "set_curtain", on: boolean, } | { "type": "curtain_status", on: boolean, reason: string | null, } | { "type": "set_view_mode", on: boolean, } | { "type": "view_mode", on: boolean, } | { "type": "switch_input_source" } | { "type": "send_ctrl_alt_del" } | { "type": "input_source", label: string, } | { "type": "update_host" } | { "type": "update_status", state: UpdateState, version: string | null, message: string | null, received?: number | null, total?: number | null, };

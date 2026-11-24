@@ -2,6 +2,7 @@
 //! update (`UpdateHost`) and the keyboard-layout (input source) switching and
 //! polling.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +13,8 @@ use proto::control::ControlMessage;
 use crate::input_source::InputSourceSwitcher;
 use crate::transport::PeerSession;
 
+use super::display::set_curtain;
+use super::session::ActiveSession;
 use super::HostContext;
 
 /// Builds the `ControlMessage::HostInfo` announcement (slice 3.5f), sent
@@ -22,6 +25,7 @@ pub(super) fn host_info_message(
     input_source_available: bool,
     update_available: bool,
     ctrl_alt_del_available: bool,
+    view_mode_available: bool,
 ) -> ControlMessage {
     ControlMessage::HostInfo {
         os: crate::platform::host_os(),
@@ -31,7 +35,48 @@ pub(super) fn host_info_message(
         version: Some(crate::build_info::VERSION.to_string()),
         update_available,
         ctrl_alt_del_available,
+        view_mode_available,
     }
+}
+
+/// Причина отказа шторки в режиме просмотра (`CurtainStatus.reason`).
+pub(super) const VIEW_MODE_CURTAIN_REASON: &str = "режим просмотра";
+
+/// Включён ли режим просмотра в активном сеансе (VM-1); без сеанса -- `false`.
+pub(super) fn view_mode_on(active: &Option<ActiveSession>) -> bool {
+    active
+        .as_ref()
+        .is_some_and(|a| a.view_mode.load(Ordering::Relaxed))
+}
+
+/// Обрабатывает `SetViewMode` (VM-1): возвращает сообщения для клиента по
+/// порядку. Без доступного режима (нет ввода, D26) запрос игнорируется --
+/// ответа нет. При переходе в просмотр отпускает всё зажатое (`ReleaseAll`
+/// через роутер ввода) и снимает шторку; ответ -- всегда `ViewMode`.
+pub(super) async fn set_view_mode(
+    ctx: &HostContext,
+    active: &mut ActiveSession,
+    on: bool,
+) -> Vec<ControlMessage> {
+    if !active.input_available {
+        tracing::debug!(on, "set_view_mode without input, ignoring");
+        return Vec::new();
+    }
+    let was = active.view_mode.swap(on, Ordering::Relaxed);
+    let mut replies = Vec::new();
+    if was != on {
+        tracing::info!(on, "режим просмотра переключён клиентом");
+        if on {
+            if let Err(err) = active.router.push(proto::input::InputMessage::ReleaseAll) {
+                tracing::debug!(?err, "release_all on entering view mode failed");
+            }
+            if !active.curtain_windows.is_empty() {
+                replies.push(set_curtain(ctx, active, false).await);
+            }
+        }
+    }
+    replies.push(ControlMessage::ViewMode { on });
+    replies
 }
 
 /// Хост умеет обновиться из сеанса (слайс D50d): известны каталоги и
@@ -219,7 +264,7 @@ mod tests {
     #[test]
     fn host_info_message_reports_this_hosts_os() {
         assert_eq!(
-            host_info_message(true, false, false, false, false),
+            host_info_message(true, false, false, false, false, false),
             ControlMessage::HostInfo {
                 os: crate::platform::host_os(),
                 files_enabled: true,
@@ -228,10 +273,11 @@ mod tests {
                 version: Some(crate::build_info::VERSION.to_string()),
                 update_available: false,
                 ctrl_alt_del_available: false,
+                view_mode_available: false,
             }
         );
         assert_eq!(
-            host_info_message(false, true, true, false, false),
+            host_info_message(false, true, true, false, false, false),
             ControlMessage::HostInfo {
                 os: crate::platform::host_os(),
                 files_enabled: false,
@@ -240,6 +286,7 @@ mod tests {
                 version: Some(crate::build_info::VERSION.to_string()),
                 update_available: false,
                 ctrl_alt_del_available: false,
+                view_mode_available: false,
             }
         );
     }
@@ -249,9 +296,21 @@ mod tests {
     fn host_info_reports_ctrl_alt_del_availability() {
         for available in [true, false] {
             assert!(matches!(
-                host_info_message(true, false, false, false, available),
+                host_info_message(true, false, false, false, available, false),
                 ControlMessage::HostInfo { ctrl_alt_del_available, .. }
                     if ctrl_alt_del_available == available
+            ));
+        }
+    }
+
+    /// Слайс VM-1: флаг `view_mode_available` доезжает до `HostInfo`.
+    #[test]
+    fn host_info_reports_view_mode_availability() {
+        for available in [true, false] {
+            assert!(matches!(
+                host_info_message(true, false, false, false, false, available),
+                ControlMessage::HostInfo { view_mode_available, .. }
+                    if view_mode_available == available
             ));
         }
     }
@@ -262,7 +321,7 @@ mod tests {
         let ctx = test_ctx();
         assert!(!update_available(&ctx));
         assert!(matches!(
-            host_info_message(true, false, false, update_available(&ctx), false),
+            host_info_message(true, false, false, update_available(&ctx), false, false),
             ControlMessage::HostInfo {
                 update_available: false,
                 ..
@@ -328,7 +387,7 @@ mod tests {
     fn host_info_reports_input_source_availability() {
         for available in [true, false] {
             assert!(matches!(
-                host_info_message(true, false, available, false, false),
+                host_info_message(true, false, available, false, false, false),
                 ControlMessage::HostInfo { input_source_available, .. }
                     if input_source_available == available
             ));
